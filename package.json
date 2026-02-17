@@ -1,10 +1,10 @@
 {
-  "name": "jinja-template-operator",
+  "name": "valkey-operator",
   "version": "0.0.0-development",
-  "description": "A Kubernetes operator that generates ConfigMaps and Secrets using Jinja-like templates",
+  "description": "A Kubernetes operator for managing Valkey and Sentinel instances",
   "repository": {
     "type": "git",
-    "url": "https://github.com/guided-traffic/jinja-template-operator.git"
+    "url": "https://github.com/guided-traffic/valkey-operator.git"
   },
   "author": "Guided Traffic",
   "license": "Apache-2.0",

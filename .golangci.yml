@@ -45,7 +45,7 @@ linters-settings:
       - name: unreachable-code
 
   goimports:
-    local-prefixes: github.com/guided-traffic/jinja-template-operator
+    local-prefixes: github.com/guided-traffic/valkey-operator
 
   goconst:
     min-len: 3

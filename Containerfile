@@ -40,12 +40,12 @@ ARG GIT_COMMIT
 ARG BUILD_TIME
 
 # Add OCI labels for better metadata
-LABEL org.opencontainers.image.title="Jinja Template Operator" \
-      org.opencontainers.image.description="A Kubernetes operator that generates ConfigMaps and Secrets using Jinja-like templates" \
+LABEL org.opencontainers.image.title="Valkey Operator" \
+      org.opencontainers.image.description="A Kubernetes operator for managing Valkey and Sentinel instances" \
       org.opencontainers.image.vendor="Guided Traffic" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.documentation="https://github.com/guided-traffic/jinja-template-operator" \
-      org.opencontainers.image.source="https://github.com/guided-traffic/jinja-template-operator" \
+      org.opencontainers.image.documentation="https://github.com/guided-traffic/valkey-operator" \
+      org.opencontainers.image.source="https://github.com/guided-traffic/valkey-operator" \
       org.opencontainers.image.version="${BUILD_NUMBER:-dev}" \
       org.opencontainers.image.revision="${GIT_COMMIT:-unknown}" \
       org.opencontainers.image.created="${BUILD_TIME:-0}"

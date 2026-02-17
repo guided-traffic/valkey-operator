@@ -1,5 +1,5 @@
 # Image URL to use for building/pushing image targets
-IMG ?= guidedtraffic/jinja-template-operator:latest
+IMG ?= guidedtraffic/valkey-operator:latest
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.29.0
@@ -101,24 +101,24 @@ test-e2e: ## Run E2E tests against a running Kind cluster.
 .PHONY: kind-create
 kind-create: ## Create a Kind cluster for local testing.
 	@echo "Creating Kind cluster..."
-	@echo 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: jinja-operator-test\nnodes:\n- role: control-plane' | sed 's/\\n/\n/g' > /tmp/kind-config.yaml
+	@echo 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: valkey-operator-test\nnodes:\n- role: control-plane' | sed 's/\\n/\n/g' > /tmp/kind-config.yaml
 	kind create cluster --config /tmp/kind-config.yaml --wait 120s
 
 .PHONY: kind-delete
 kind-delete: ## Delete the Kind test cluster.
 	@echo "Deleting Kind cluster..."
-	-kind delete cluster --name jinja-operator-test
+	-kind delete cluster --name valkey-operator-test
 
 .PHONY: kind-load
 kind-load: docker-build ## Build and load the operator image into Kind.
 	@echo "Loading image into Kind cluster..."
-	kind load docker-image ${IMG} --name jinja-operator-test
+	kind load docker-image ${IMG} --name valkey-operator-test
 
 .PHONY: e2e-local
 e2e-local: kind-create kind-load ## Run full E2E test locally with Kind.
 	@echo "Installing operator via Helm..."
-	helm install jinja-template-operator deploy/helm/jinja-template-operator \
-		--namespace jinja-template-operator-system \
+	helm install valkey-operator deploy/helm/valkey-operator \
+		--namespace valkey-operator-system \
 		--create-namespace \
 		--values test/e2e/helm-values.yaml \
 		--wait \
@@ -193,20 +193,20 @@ vuln: ## Check for vulnerabilities.
 
 ##@ Code Generation
 
-HELM_CHART_DIR = deploy/helm/jinja-template-operator
-CRD_SOURCE = config/crd/bases/jto.gtrfc.com_jinjatemplates.yaml
+HELM_CHART_DIR = deploy/helm/valkey-operator
 CRD_HELM_TARGET = $(HELM_CHART_DIR)/templates/crd.yaml
 
 .PHONY: sync-helm-crd
-sync-helm-crd: ## Sync generated CRD into Helm chart (single source of truth: config/crd/bases/).
-	@echo "Syncing CRD to Helm chart..."
-	@awk '/^  name: jinjatemplates\.jto\.gtrfc\.com$$/ { \
-		print; \
-		print "  labels:"; \
-		print "    {{- include \"jinja-template-operator.labels\" . | nindent 4 }}"; \
-		next \
-	} {print}' $(CRD_SOURCE) > $(CRD_HELM_TARGET)
-	@echo "CRD synced to $(CRD_HELM_TARGET)"
+sync-helm-crd: ## Sync generated CRDs into Helm chart (single source of truth: config/crd/bases/).
+	@echo "Syncing CRDs to Helm chart..."
+	@echo "# Generated - do not edit manually. Use 'make sync-helm-crd'." > $(CRD_HELM_TARGET)
+	@for crd in config/crd/bases/*.yaml; do \
+		if [ -f "$$crd" ]; then \
+			echo "---" >> $(CRD_HELM_TARGET); \
+			cat "$$crd" >> $(CRD_HELM_TARGET); \
+		fi; \
+	done
+	@echo "CRDs synced to $(CRD_HELM_TARGET)"
 
 ##@ Build
 

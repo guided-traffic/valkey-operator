@@ -1,0 +1,2 @@
+# CRD will be synced from config/crd/bases/ via `make sync-helm-crd`
+# Placeholder until CRDs are generated

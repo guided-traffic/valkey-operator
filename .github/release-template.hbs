@@ -5,7 +5,7 @@
 {{#if process.env.TEST_COVERAGE}}
 ![Coverage](https://img.shields.io/badge/coverage-{{process.env.TEST_COVERAGE}}%25-{{#if (gte process.env.TEST_COVERAGE 80)}}brightgreen{{else}}{{#if (gte process.env.TEST_COVERAGE 60)}}yellow{{else}}red{{/if}}{{/if}})
 {{/if}}
-![Go Version](https://img.shields.io/badge/go-1.25-blue)
+![Go Version](https://img.shields.io/badge/go-1.26-blue)
 ![Security](https://img.shields.io/badge/security-✅%20passed-green)
 ![Linting](https://img.shields.io/badge/linting-✅%20passed-green)
 
@@ -27,24 +27,22 @@
 
 ## 🐳 Docker Images
 
-This release is available as Docker images for multiple architectures:
+This release is available as Docker images:
 
 ```bash
 # Latest version
-docker pull ghcr.io/guided-traffic/s3-encryption-proxy:latest
+docker pull guidedtraffic/valkey-operator:latest
 
 # Specific version
-docker pull ghcr.io/guided-traffic/s3-encryption-proxy:{{version}}
+docker pull guidedtraffic/valkey-operator:{{version}}
 ```
 
-**Supported platforms:** linux/amd64, linux/arm64
+## ⎈ Helm Chart
 
-## 📥 Download Assets
-
-Pre-built binaries and coverage reports are attached to this release:
-- `s3-encryption-proxy-{{gitTag}}-linux-amd64` - Main proxy binary
-- `s3ep-keygen-{{gitTag}}-linux-amd64` - Key generation utility
-- `coverage-{{gitTag}}.out` - Coverage profile (Go format)
-- `coverage-{{gitTag}}.txt` - Coverage report (human readable)
+```bash
+helm repo add valkey-operator https://guided-traffic.github.io/valkey-operator/
+helm repo update
+helm install valkey-operator valkey-operator/valkey-operator --version {{version}}
+```
 
 {{> footer}}

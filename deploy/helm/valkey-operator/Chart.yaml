@@ -1,0 +1,18 @@
+apiVersion: v2
+name: valkey-operator
+description: A Kubernetes operator for managing Valkey and Sentinel instances
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: Guided Traffic
+    url: https://github.com/guided-traffic
+keywords:
+  - valkey
+  - redis
+  - sentinel
+  - operator
+  - kubernetes
+home: https://github.com/guided-traffic/valkey-operator
+sources:
+  - https://github.com/guided-traffic/valkey-operator
