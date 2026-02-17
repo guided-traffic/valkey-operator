@@ -113,6 +113,16 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
+	// Check for rolling update (image change on running pods).
+	rollingResult := r.checkAndHandleRollingUpdate(ctx, valkey)
+	if rollingResult.Error != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Rolling update error: %v", rollingResult.Error))
+		return ctrl.Result{}, rollingResult.Error
+	}
+	if rollingResult.NeedsRequeue {
+		return ctrl.Result{RequeueAfter: rollingResult.RequeueAfter}, nil
+	}
+
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
 		return ctrl.Result{}, err

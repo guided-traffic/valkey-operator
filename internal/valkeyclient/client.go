@@ -75,6 +75,15 @@ func (c *Client) SentinelMaster(name string) (*SentinelMasterInfo, error) {
 	return parseSentinelMasterInfo(resp), nil
 }
 
+// SentinelFailover sends SENTINEL FAILOVER <name> to trigger a manual failover.
+func (c *Client) SentinelFailover(name string) error {
+	_, err := c.exec("SENTINEL", "FAILOVER", name)
+	if err != nil {
+		return fmt.Errorf("sentinel failover %s on %s: %w", name, c.addr, err)
+	}
+	return nil
+}
+
 // exec sends a RESP command and reads the response.
 func (c *Client) exec(args ...string) (string, error) {
 	conn, err := net.DialTimeout("tcp", c.addr, c.timeout)
