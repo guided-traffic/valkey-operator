@@ -1,3 +1,5 @@
+// Package valkeyclient provides a lightweight Valkey/Redis RESP protocol client
+// for health checking and replication monitoring.
 package valkeyclient
 
 import (
@@ -27,12 +29,12 @@ type ReplicationInfo struct {
 
 // SentinelMasterInfo holds parsed SENTINEL MASTER output.
 type SentinelMasterInfo struct {
-	Name    string
-	IP      string
-	Port    string
+	Name      string
+	IP        string
+	Port      string
 	NumSlaves int
-	Quorum  int
-	Flags   string
+	Quorum    int
+	Flags     string
 }
 
 // New creates a new Valkey client for the given address (host:port).
@@ -79,7 +81,7 @@ func (c *Client) exec(args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		return "", err

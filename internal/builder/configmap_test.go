@@ -137,8 +137,64 @@ func TestGenerateValkeyConf_AuthEnabled(t *testing.T) {
 
 	conf := GenerateValkeyConf(v, false)
 
-	// Auth section should be present (password injected at runtime).
+	// Auth section should be present (password injected at runtime via command-line args).
 	assert.Contains(t, conf, "# Auth")
+	// Password should NOT be embedded in the ConfigMap (it comes from the Secret env var).
+	assert.NotContains(t, conf, "requirepass")
+	assert.NotContains(t, conf, "masterauth")
+}
+
+func TestGenerateValkeyConf_AuthEnabled_NoPasswordInConfig(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	conf := GenerateValkeyConf(v, false)
+
+	// The ConfigMap must never contain the actual password or Secret name.
+	assert.NotContains(t, conf, "my-secret")
+}
+
+func TestGenerateValkeyConf_AuthWithHA(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// Master config.
+	masterConf := GenerateValkeyConf(v, false)
+	assert.Contains(t, masterConf, "# Auth")
+	assert.NotContains(t, masterConf, "replicaof")
+
+	// Replica config.
+	replicaConf := GenerateValkeyConf(v, true)
+	assert.Contains(t, replicaConf, "# Auth")
+	assert.Contains(t, replicaConf, "replicaof")
+}
+
+func TestGenerateValkeyConf_AuthWithTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	conf := GenerateValkeyConf(v, false)
+
+	assert.Contains(t, conf, "# Auth")
+	assert.Contains(t, conf, "tls-port 16379")
 }
 
 func TestGenerateValkeyConf_NoEmptyLines(t *testing.T) {

@@ -1,17 +1,15 @@
+version: "2"
+
 run:
-  timeout: 5m
   allow-parallel-runners: true
 
 linters:
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gofmt
-    - goimports
     - misspell
     - unconvert
     - unparam
@@ -19,42 +17,54 @@ linters:
     - prealloc
     - revive
 
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+  exclusions:
     rules:
-      - name: blank-imports
-      - name: context-as-argument
-      - name: context-keys-type
-      - name: dot-imports
-      - name: error-return
-      - name: error-strings
-      - name: error-naming
-      - name: exported
-      - name: increment-decrement
-      - name: var-naming
-      - name: var-declaration
-      - name: package-comments
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: unexported-return
-      - name: indent-error-flow
-      - name: errorf
-      - name: empty-block
-      - name: superfluous-else
-      - name: unreachable-code
+      # Exclude some linters from running on test files.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - goconst
+      # Allow the 'common' package name despite var-naming rule.
+      - text: "avoid meaningless package names"
+        linters:
+          - revive
 
-  goimports:
-    local-prefixes: github.com/guided-traffic/valkey-operator
+formatters:
+  enable:
+    - gofmt
+    - goimports
 
-  goconst:
-    min-len: 3
-    min-occurrences: 3
-
-issues:
-  exclude-rules:
-    # Exclude some linters from running on tests files.
-    - path: _test\.go
-      linters:
-        - errcheck
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/guided-traffic/valkey-operator
         - goconst

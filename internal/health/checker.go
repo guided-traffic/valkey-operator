@@ -1,3 +1,5 @@
+// Package health provides health checking and cluster state assessment
+// for Valkey and Sentinel instances.
 package health
 
 import (
@@ -83,7 +85,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 
 	// Check sentinel view if sentinel is enabled.
 	if v.IsSentinelEnabled() {
-		state.SentinelMonitoring = h.checkSentinel(ctx, v, masterPod)
+		state.SentinelMonitoring = h.checkSentinel(ctx, v)
 	}
 
 	return state
@@ -136,7 +138,7 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey) (string, stri
 }
 
 // checkSentinel checks if sentinel instances are monitoring the cluster correctly.
-func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey, expectedMasterPod string) bool {
+func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 	logger := log.FromContext(ctx)
 	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
 	monitorName := builder.SentinelMonitorName(v)

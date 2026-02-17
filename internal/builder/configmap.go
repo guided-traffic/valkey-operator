@@ -69,11 +69,12 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 		)
 	}
 
-	// Auth configuration placeholder (password injected at runtime via Secret).
+	// Auth configuration — password is injected at runtime via environment variable.
+	// The valkey-server command is started with --requirepass and --masterauth flags
+	// that reference the VALKEY_PASSWORD environment variable from the auth Secret.
 	if v.IsAuthEnabled() {
 		lines = append(lines,
-			"# Auth (password set via requirepass at runtime)",
-			"# requirepass is injected via command-line argument or environment variable",
+			"# Auth (password injected via command-line arguments from Secret)",
 			"",
 		)
 	}

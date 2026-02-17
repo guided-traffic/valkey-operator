@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -566,4 +566,344 @@ func TestReconcile_StandaloneDoesNotCreateSentinel(t *testing.T) {
 	// No replica configmap either.
 	err = c.Get(context.Background(), types.NamespacedName{Name: "standalone-replica-config", Namespace: "default"}, cm)
 	assert.True(t, apierrors.IsNotFound(err))
+}
+
+// --- Auth Tests ---
+
+func TestReconcile_Auth_StatefulSetHasEnvVar(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Should have the auth env var.
+	require.Len(t, container.Env, 1)
+	assert.Equal(t, builder.AuthSecretEnvName, container.Env[0].Name)
+	require.NotNil(t, container.Env[0].ValueFrom)
+	require.NotNil(t, container.Env[0].ValueFrom.SecretKeyRef)
+	assert.Equal(t, "my-secret", container.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "password", container.Env[0].ValueFrom.SecretKeyRef.Key)
+}
+
+func TestReconcile_Auth_CommandHasAuthFlags(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Command should use shell with auth flags.
+	assert.Equal(t, "sh", container.Command[0])
+	assert.Contains(t, container.Command[2], "--requirepass")
+	assert.Contains(t, container.Command[2], "--masterauth")
+}
+
+func TestReconcile_Auth_ConfigMapNoPassword(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	// The password must NOT appear in the ConfigMap.
+	assert.NotContains(t, cm.Data[builder.ValkeyConfigKey], "supersecret")
+	assert.NotContains(t, cm.Data[builder.ValkeyConfigKey], "my-secret")
+	// But auth section should be present.
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "# Auth")
+}
+
+func TestReconcile_Auth_ProbeHasAuth(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Readiness probe should use auth.
+	require.NotNil(t, container.ReadinessProbe)
+	require.NotNil(t, container.ReadinessProbe.Exec)
+	probeCmd := container.ReadinessProbe.Exec.Command
+	assert.Equal(t, "sh", probeCmd[0])
+	assert.Contains(t, probeCmd[2], "-a")
+	assert.Contains(t, probeCmd[2], "$VALKEY_PASSWORD")
+}
+
+func TestReconcile_Auth_HA_SentinelConfigHasAuth(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Sentinel ConfigMap should have auth placeholder.
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data["sentinel.conf"], "sentinel auth-pass test %VALKEY_PASSWORD%")
+	// The actual password should NOT be in the ConfigMap.
+	assert.NotContains(t, cm.Data["sentinel.conf"], "supersecret")
+}
+
+func TestReconcile_Auth_HA_SentinelStatefulSetHasAuthEnv(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v, authSecret)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sentinelSts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel", Namespace: "default",
+	}, sentinelSts)
+
+	require.NoError(t, err)
+
+	// Sentinel init container should have the auth env var.
+	require.Len(t, sentinelSts.Spec.Template.Spec.InitContainers, 1)
+	initContainer := sentinelSts.Spec.Template.Spec.InitContainers[0]
+	require.Len(t, initContainer.Env, 1)
+	assert.Equal(t, builder.AuthSecretEnvName, initContainer.Env[0].Name)
+	assert.Equal(t, "my-secret", initContainer.Env[0].ValueFrom.SecretKeyRef.Name)
+}
+
+func TestReconcile_Auth_WithoutAuth_NoEnvVars(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// No env vars.
+	assert.Empty(t, container.Env)
+
+	// Direct command (no shell wrapper).
+	assert.Equal(t, "valkey-server", container.Command[0])
+
+	// Probe should be direct (no shell).
+	assert.Equal(t, "valkey-cli", container.ReadinessProbe.Exec.Command[0])
+}
+
+// --- FindValkeyForSecret ---
+
+func TestFindValkeyForSecret_MatchingSecret(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+	}
+
+	requests := r.findValkeyForSecret(context.Background(), secret)
+
+	require.Len(t, requests, 1)
+	assert.Equal(t, "test", requests[0].Name)
+	assert.Equal(t, "default", requests[0].Namespace)
+}
+
+func TestFindValkeyForSecret_NonMatchingSecret(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-secret",
+			Namespace: "default",
+		},
+	}
+
+	requests := r.findValkeyForSecret(context.Background(), secret)
+
+	assert.Empty(t, requests)
+}
+
+func TestFindValkeyForSecret_NoAuth(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "some-secret",
+			Namespace: "default",
+		},
+	}
+
+	requests := r.findValkeyForSecret(context.Background(), secret)
+
+	assert.Empty(t, requests)
+}
+
+func TestFindValkeyForSecret_MultipleValkeys(t *testing.T) {
+	v1 := newTestValkey("v1", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "shared-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	v2 := newTestValkey("v2", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "shared-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	v3 := newTestValkey("v3", "default", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "other-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+	r, _ := newTestReconciler(v1, v2, v3)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "shared-secret",
+			Namespace: "default",
+		},
+	}
+
+	requests := r.findValkeyForSecret(context.Background(), secret)
+
+	// Only v1 and v2 reference shared-secret.
+	assert.Len(t, requests, 2)
 }

@@ -1,3 +1,5 @@
+// Package builder provides functions for constructing Kubernetes resources
+// for Valkey operator managed instances.
 package builder
 
 import (

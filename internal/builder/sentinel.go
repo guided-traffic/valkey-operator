@@ -113,10 +113,11 @@ func GenerateSentinelConf(v *vkov1.Valkey) string {
 	)
 
 	// Auth configuration if enabled.
+	// The sentinel init container will replace the placeholder with the actual password.
 	if v.IsAuthEnabled() {
 		lines = append(lines,
-			"# Auth (password will be set via runtime injection)",
-			fmt.Sprintf("# sentinel auth-pass %s <password>", monitorName),
+			"# Auth",
+			fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
 			"",
 		)
 	}
@@ -230,30 +231,58 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		})
 	}
 
+	// Build the init container command. If auth is enabled, replace the password placeholder.
+	initCommand := fmt.Sprintf("cp /etc/sentinel-readonly/%s %s/%s", SentinelConfigKey, SentinelConfigMountPath, SentinelConfigKey)
+	if v.IsAuthEnabled() {
+		// After copying, replace the placeholder with the actual password from the env var.
+		initCommand = fmt.Sprintf(
+			"cp /etc/sentinel-readonly/%s %s/%s && sed -i \"s|%%VALKEY_PASSWORD%%|$%s|g\" %s/%s",
+			SentinelConfigKey, SentinelConfigMountPath, SentinelConfigKey,
+			AuthSecretEnvName, SentinelConfigMountPath, SentinelConfigKey,
+		)
+	}
+
+	initContainer := corev1.Container{
+		Name:  "init-sentinel-config",
+		Image: v.Spec.Image,
+		Command: []string{
+			"sh", "-c",
+			initCommand,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "sentinel-config-readonly",
+				MountPath: "/etc/sentinel-readonly",
+				ReadOnly:  true,
+			},
+			{
+				Name:      SentinelConfigVolumeName,
+				MountPath: SentinelConfigMountPath,
+			},
+		},
+	}
+
+	// Inject auth env var into the init container if auth is enabled.
+	if v.IsAuthEnabled() {
+		initContainer.Env = append(initContainer.Env, corev1.EnvVar{
+			Name: AuthSecretEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: v.Spec.Auth.SecretName,
+					},
+					Key: v.Spec.Auth.SecretPasswordKey,
+				},
+			},
+		})
+	}
+
 	return corev1.PodSpec{
 		ServiceAccountName: "default",
 		// Init container copies the sentinel config to a writable volume.
 		// Sentinel needs to rewrite its config file at runtime.
 		InitContainers: []corev1.Container{
-			{
-				Name:  "init-sentinel-config",
-				Image: v.Spec.Image,
-				Command: []string{
-					"sh", "-c",
-					fmt.Sprintf("cp /etc/sentinel-readonly/%s %s/%s", SentinelConfigKey, SentinelConfigMountPath, SentinelConfigKey),
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{
-						Name:      "sentinel-config-readonly",
-						MountPath: "/etc/sentinel-readonly",
-						ReadOnly:  true,
-					},
-					{
-						Name:      SentinelConfigVolumeName,
-						MountPath: SentinelConfigMountPath,
-					},
-				},
-			},
+			initContainer,
 		},
 		Containers: []corev1.Container{
 			buildSentinelContainer(v),

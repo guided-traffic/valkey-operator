@@ -76,7 +76,40 @@ func TestGenerateSentinelConf_WithAuth(t *testing.T) {
 	conf := GenerateSentinelConf(v)
 
 	assert.Contains(t, conf, "# Auth")
-	assert.Contains(t, conf, "sentinel auth-pass")
+	// Should contain the actual sentinel auth-pass directive with placeholder.
+	assert.Contains(t, conf, "sentinel auth-pass test %VALKEY_PASSWORD%")
+}
+
+func TestGenerateSentinelConf_WithAuth_PlaceholderFormat(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "auth-secret",
+			SecretPasswordKey: "pass",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Monitor name should match the Valkey resource name.
+	assert.Contains(t, conf, "sentinel auth-pass my-cluster %VALKEY_PASSWORD%")
+}
+
+func TestGenerateSentinelConf_WithoutAuth_NoAuthPass(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.NotContains(t, conf, "sentinel auth-pass")
+	assert.NotContains(t, conf, "# Auth")
 }
 
 func TestGenerateSentinelConf_MasterAddress(t *testing.T) {
@@ -218,8 +251,8 @@ func TestBuildSentinelStatefulSet_CustomPodLabels(t *testing.T) {
 func TestBuildSentinelStatefulSet_CustomPodAnnotations(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
-			Enabled:    true,
-			Replicas:   3,
+			Enabled:  true,
+			Replicas: 3,
 			PodAnnotations: map[string]string{
 				"example.com/sentinel": "true",
 			},
@@ -438,7 +471,7 @@ func TestBuildStatefulSet_HAMode(t *testing.T) {
 	assert.Contains(t, container.Command[1], WritableConfigMountPath)
 
 	// Should have master config, replica config, and writable config volumes.
-	volumeNames := make([]string, 0)
+	volumeNames := make([]string, 0, len(sts.Spec.Template.Spec.Volumes))
 	for _, vol := range sts.Spec.Template.Spec.Volumes {
 		volumeNames = append(volumeNames, vol.Name)
 	}
@@ -471,4 +504,107 @@ func TestBuildReadService(t *testing.T) {
 	assert.Equal(t, "default", svc.Namespace)
 	assert.Len(t, svc.Spec.Ports, 1)
 	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
+}
+
+// --- Sentinel Auth StatefulSet ---
+
+func TestBuildSentinelStatefulSet_WithAuth_InitContainerHasEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	// Init container should have the auth env var to replace the placeholder.
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+
+	require.Len(t, initContainer.Env, 1)
+	assert.Equal(t, AuthSecretEnvName, initContainer.Env[0].Name)
+	require.NotNil(t, initContainer.Env[0].ValueFrom)
+	require.NotNil(t, initContainer.Env[0].ValueFrom.SecretKeyRef)
+	assert.Equal(t, "my-secret", initContainer.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "password", initContainer.Env[0].ValueFrom.SecretKeyRef.Key)
+
+	// Init container command should include sed replacement.
+	assert.Contains(t, initContainer.Command[2], "sed")
+	assert.Contains(t, initContainer.Command[2], "%VALKEY_PASSWORD%")
+}
+
+func TestBuildSentinelStatefulSet_WithoutAuth_InitContainerNoEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	// Init container should NOT have env vars when auth is not enabled.
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+	assert.Empty(t, initContainer.Env)
+
+	// Init container command should just copy (no sed).
+	assert.NotContains(t, initContainer.Command[2], "sed")
+}
+
+func TestBuildSentinelStatefulSet_WithAuth_ConfigContainsAuthPlaceholder(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cm := BuildSentinelConfigMap(v)
+
+	// The sentinel config should contain the placeholder.
+	assert.Contains(t, cm.Data[SentinelConfigKey], "sentinel auth-pass test %VALKEY_PASSWORD%")
+}
+
+func TestBuildSentinelStatefulSet_WithAuthAndTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	// Should have init container with auth env var.
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	assert.Len(t, sts.Spec.Template.Spec.InitContainers[0].Env, 1)
+
+	// Should have TLS volume.
+	hasTLS := false
+	for _, vol := range sts.Spec.Template.Spec.Volumes {
+		if vol.Name == TLSVolumeName {
+			hasTLS = true
+		}
+	}
+	assert.True(t, hasTLS, "TLS volume should be present alongside auth")
+
+	// Sentinel config should have both TLS and auth.
+	cm := BuildSentinelConfigMap(v)
+	assert.Contains(t, cm.Data[SentinelConfigKey], "tls-port")
+	assert.Contains(t, cm.Data[SentinelConfigKey], "sentinel auth-pass")
 }

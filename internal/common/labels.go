@@ -1,3 +1,5 @@
+// Package common provides shared labels, constants, and utility functions
+// used across the Valkey operator.
 package common
 
 import (
@@ -8,24 +10,32 @@ import (
 )
 
 const (
-	// Standard Kubernetes recommended labels.
+	// LabelComponent is the standard Kubernetes recommended label for the component.
 	LabelComponent = "app.kubernetes.io/component"
-	LabelInstance  = "app.kubernetes.io/instance"
+	// LabelInstance is the standard Kubernetes recommended label for the instance.
+	LabelInstance = "app.kubernetes.io/instance"
+	// LabelManagedBy is the standard Kubernetes recommended label for the manager.
 	LabelManagedBy = "app.kubernetes.io/managed-by"
-	LabelName      = "app.kubernetes.io/name"
-	LabelVersion   = "app.kubernetes.io/version"
+	// LabelName is the standard Kubernetes recommended label for the name.
+	LabelName = "app.kubernetes.io/name"
+	// LabelVersion is the standard Kubernetes recommended label for the version.
+	LabelVersion = "app.kubernetes.io/version"
 
-	// Operator-specific labels.
-	LabelCluster      = "vko.gtrfc.com/cluster"
+	// LabelCluster is the operator-specific label for the cluster name.
+	LabelCluster = "vko.gtrfc.com/cluster"
+	// LabelInstanceName is the operator-specific label for the instance name.
 	LabelInstanceName = "vko.gtrfc.com/instanceName"
+	// LabelInstanceRole is the operator-specific label for the instance role.
 	LabelInstanceRole = "vko.gtrfc.com/instanceRole"
 
-	// Component values.
-	ComponentValkey   = "valkey"
+	// ComponentValkey is the component value for Valkey instances.
+	ComponentValkey = "valkey"
+	// ComponentSentinel is the component value for Sentinel instances.
 	ComponentSentinel = "sentinel"
 
-	// Role values.
-	RoleMaster  = "master"
+	// RoleMaster is the role value for the master instance.
+	RoleMaster = "master"
+	// RoleReplica is the role value for a replica instance.
 	RoleReplica = "replica"
 
 	// ManagedBy is the constant value for the managed-by label.

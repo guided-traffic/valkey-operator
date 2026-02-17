@@ -1,4 +1,4 @@
-package common
+package common_test
 
 import (
 	"testing"
@@ -8,9 +8,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-func newTestValkey(name, image string) *vkov1.Valkey {
+func newTestValkey(name string) *vkov1.Valkey {
 	return &vkov1.Valkey{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -18,7 +19,7 @@ func newTestValkey(name, image string) *vkov1.Valkey {
 		},
 		Spec: vkov1.ValkeySpec{
 			Replicas: 3,
-			Image:    image,
+			Image:    "valkey/valkey:8.0",
 		},
 	}
 }
@@ -80,7 +81,7 @@ func TestExtractVersionFromImage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ExtractVersionFromImage(tt.image)
+			result := common.ExtractVersionFromImage(tt.image)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -89,51 +90,51 @@ func TestExtractVersionFromImage(t *testing.T) {
 // --- BaseLabels ---
 
 func TestBaseLabels(t *testing.T) {
-	v := newTestValkey("my-cluster", "valkey/valkey:8.0")
+	v := newTestValkey("my-cluster")
 
-	labels := BaseLabels(v, ComponentValkey)
+	labels := common.BaseLabels(v, common.ComponentValkey)
 
 	expected := map[string]string{
-		LabelComponent: "valkey",
-		LabelInstance:   "my-cluster",
-		LabelManagedBy:  ManagedBy,
-		LabelName:       "valkey",
-		LabelVersion:    "8.0",
-		LabelCluster:    "my-cluster",
+		common.LabelComponent: "valkey",
+		common.LabelInstance:  "my-cluster",
+		common.LabelManagedBy: common.ManagedBy,
+		common.LabelName:      "valkey",
+		common.LabelVersion:   "8.0",
+		common.LabelCluster:   "my-cluster",
 	}
 
 	assert.Equal(t, expected, labels)
 }
 
 func TestBaseLabels_Sentinel(t *testing.T) {
-	v := newTestValkey("my-cluster", "valkey/valkey:8.0")
+	v := newTestValkey("my-cluster")
 
-	labels := BaseLabels(v, ComponentSentinel)
+	labels := common.BaseLabels(v, common.ComponentSentinel)
 
-	assert.Equal(t, "sentinel", labels[LabelComponent])
-	assert.Equal(t, "my-cluster", labels[LabelInstance])
+	assert.Equal(t, "sentinel", labels[common.LabelComponent])
+	assert.Equal(t, "my-cluster", labels[common.LabelInstance])
 }
 
 // --- PodLabels ---
 
 func TestPodLabels_WithUserLabels(t *testing.T) {
-	v := newTestValkey("test", "valkey/valkey:8.0")
+	v := newTestValkey("test")
 	userLabels := map[string]string{
 		"custom-label": "custom-value",
 		"app":          "my-app",
 	}
 
-	labels := PodLabels(v, ComponentValkey, "test-0", RoleMaster, userLabels)
+	labels := common.PodLabels(v, common.ComponentValkey, "test-0", common.RoleMaster, userLabels)
 
 	// Operator-managed labels present.
-	assert.Equal(t, "valkey", labels[LabelComponent])
-	assert.Equal(t, "test", labels[LabelInstance])
-	assert.Equal(t, ManagedBy, labels[LabelManagedBy])
-	assert.Equal(t, "valkey", labels[LabelName])
-	assert.Equal(t, "8.0", labels[LabelVersion])
-	assert.Equal(t, "test", labels[LabelCluster])
-	assert.Equal(t, "test-0", labels[LabelInstanceName])
-	assert.Equal(t, RoleMaster, labels[LabelInstanceRole])
+	assert.Equal(t, "valkey", labels[common.LabelComponent])
+	assert.Equal(t, "test", labels[common.LabelInstance])
+	assert.Equal(t, common.ManagedBy, labels[common.LabelManagedBy])
+	assert.Equal(t, "valkey", labels[common.LabelName])
+	assert.Equal(t, "8.0", labels[common.LabelVersion])
+	assert.Equal(t, "test", labels[common.LabelCluster])
+	assert.Equal(t, "test-0", labels[common.LabelInstanceName])
+	assert.Equal(t, common.RoleMaster, labels[common.LabelInstanceRole])
 
 	// User labels present.
 	assert.Equal(t, "custom-value", labels["custom-label"])
@@ -141,47 +142,47 @@ func TestPodLabels_WithUserLabels(t *testing.T) {
 }
 
 func TestPodLabels_OperatorLabelsOverrideUser(t *testing.T) {
-	v := newTestValkey("test", "valkey/valkey:8.0")
+	v := newTestValkey("test")
 	userLabels := map[string]string{
-		LabelManagedBy: "someone-else", // Should be overridden.
+		common.LabelManagedBy: "someone-else", // Should be overridden.
 	}
 
-	labels := PodLabels(v, ComponentValkey, "test-0", RoleMaster, userLabels)
+	labels := common.PodLabels(v, common.ComponentValkey, "test-0", common.RoleMaster, userLabels)
 
-	assert.Equal(t, ManagedBy, labels[LabelManagedBy], "operator labels must take precedence")
+	assert.Equal(t, common.ManagedBy, labels[common.LabelManagedBy], "operator labels must take precedence")
 }
 
 func TestPodLabels_NilUserLabels(t *testing.T) {
-	v := newTestValkey("test", "valkey/valkey:8.0")
+	v := newTestValkey("test")
 
-	labels := PodLabels(v, ComponentValkey, "test-0", RoleReplica, nil)
+	labels := common.PodLabels(v, common.ComponentValkey, "test-0", common.RoleReplica, nil)
 
 	require.NotNil(t, labels)
-	assert.Equal(t, "valkey", labels[LabelComponent])
-	assert.Equal(t, "test-0", labels[LabelInstanceName])
-	assert.Equal(t, RoleReplica, labels[LabelInstanceRole])
+	assert.Equal(t, "valkey", labels[common.LabelComponent])
+	assert.Equal(t, "test-0", labels[common.LabelInstanceName])
+	assert.Equal(t, common.RoleReplica, labels[common.LabelInstanceRole])
 }
 
 func TestPodLabels_ReplicaRole(t *testing.T) {
-	v := newTestValkey("test", "valkey/valkey:8.0")
+	v := newTestValkey("test")
 
-	labels := PodLabels(v, ComponentValkey, "test-1", RoleReplica, nil)
+	labels := common.PodLabels(v, common.ComponentValkey, "test-1", common.RoleReplica, nil)
 
-	assert.Equal(t, RoleReplica, labels[LabelInstanceRole])
-	assert.Equal(t, "test-1", labels[LabelInstanceName])
+	assert.Equal(t, common.RoleReplica, labels[common.LabelInstanceRole])
+	assert.Equal(t, "test-1", labels[common.LabelInstanceName])
 }
 
 // --- SelectorLabels ---
 
 func TestSelectorLabels(t *testing.T) {
-	v := newTestValkey("test", "valkey/valkey:8.0")
+	v := newTestValkey("test")
 
-	labels := SelectorLabels(v, ComponentValkey)
+	labels := common.SelectorLabels(v, common.ComponentValkey)
 
 	expected := map[string]string{
-		LabelInstance:   "test",
-		LabelManagedBy:  ManagedBy,
-		LabelComponent:  "valkey",
+		common.LabelInstance:  "test",
+		common.LabelManagedBy: common.ManagedBy,
+		common.LabelComponent: "valkey",
 	}
 
 	assert.Equal(t, expected, labels)
@@ -191,19 +192,19 @@ func TestSelectorLabels(t *testing.T) {
 // --- StatefulSetName ---
 
 func TestStatefulSetName(t *testing.T) {
-	v := newTestValkey("my-cluster", "valkey/valkey:8.0")
+	v := newTestValkey("my-cluster")
 
-	assert.Equal(t, "my-cluster", StatefulSetName(v, ComponentValkey))
-	assert.Equal(t, "my-cluster-sentinel", StatefulSetName(v, ComponentSentinel))
+	assert.Equal(t, "my-cluster", common.StatefulSetName(v, common.ComponentValkey))
+	assert.Equal(t, "my-cluster-sentinel", common.StatefulSetName(v, common.ComponentSentinel))
 }
 
 // --- HeadlessServiceName ---
 
 func TestHeadlessServiceName(t *testing.T) {
-	v := newTestValkey("my-cluster", "valkey/valkey:8.0")
+	v := newTestValkey("my-cluster")
 
-	assert.Equal(t, "my-cluster-headless", HeadlessServiceName(v, ComponentValkey))
-	assert.Equal(t, "my-cluster-sentinel-headless", HeadlessServiceName(v, ComponentSentinel))
+	assert.Equal(t, "my-cluster-headless", common.HeadlessServiceName(v, common.ComponentValkey))
+	assert.Equal(t, "my-cluster-sentinel-headless", common.HeadlessServiceName(v, common.ComponentSentinel))
 }
 
 // --- MergeLabels ---
@@ -212,7 +213,7 @@ func TestMergeLabels(t *testing.T) {
 	a := map[string]string{"a": "1", "b": "2"}
 	b := map[string]string{"b": "override", "c": "3"}
 
-	result := MergeLabels(a, b)
+	result := common.MergeLabels(a, b)
 
 	expected := map[string]string{
 		"a": "1",
@@ -223,7 +224,7 @@ func TestMergeLabels(t *testing.T) {
 }
 
 func TestMergeLabels_NilMaps(t *testing.T) {
-	result := MergeLabels(nil, nil)
+	result := common.MergeLabels(nil, nil)
 	require.NotNil(t, result)
 	assert.Empty(t, result)
 }
@@ -231,7 +232,7 @@ func TestMergeLabels_NilMaps(t *testing.T) {
 func TestMergeLabels_SingleMap(t *testing.T) {
 	a := map[string]string{"a": "1"}
 
-	result := MergeLabels(a)
+	result := common.MergeLabels(a)
 
 	assert.Equal(t, map[string]string{"a": "1"}, result)
 }
@@ -240,7 +241,7 @@ func TestMergeLabels_EmptyAndNonEmpty(t *testing.T) {
 	a := map[string]string{}
 	b := map[string]string{"b": "2"}
 
-	result := MergeLabels(a, b)
+	result := common.MergeLabels(a, b)
 
 	assert.Equal(t, map[string]string{"b": "2"}, result)
 }
@@ -251,7 +252,7 @@ func TestMergeAnnotations_SameAsMergeLabels(t *testing.T) {
 	a := map[string]string{"x": "1"}
 	b := map[string]string{"y": "2"}
 
-	result := MergeAnnotations(a, b)
+	result := common.MergeAnnotations(a, b)
 
 	assert.Equal(t, map[string]string{"x": "1", "y": "2"}, result)
 }

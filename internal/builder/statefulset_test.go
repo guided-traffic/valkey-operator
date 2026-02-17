@@ -400,3 +400,195 @@ func TestStatefulSetHasChanged_SameImage(t *testing.T) {
 
 	assert.False(t, StatefulSetHasChanged(a, b))
 }
+
+// --- Auth Tests ---
+
+func TestBuildStatefulSet_WithAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	sts := BuildStatefulSet(v)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Container should have env var from auth Secret.
+	require.Len(t, container.Env, 1)
+	assert.Equal(t, AuthSecretEnvName, container.Env[0].Name)
+	require.NotNil(t, container.Env[0].ValueFrom)
+	require.NotNil(t, container.Env[0].ValueFrom.SecretKeyRef)
+	assert.Equal(t, "my-secret", container.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "password", container.Env[0].ValueFrom.SecretKeyRef.Key)
+
+	// Command should use shell to expand env var for auth flags.
+	assert.Equal(t, "sh", container.Command[0])
+	assert.Equal(t, "-c", container.Command[1])
+	assert.Contains(t, container.Command[2], "--requirepass")
+	assert.Contains(t, container.Command[2], "--masterauth")
+	assert.Contains(t, container.Command[2], "$VALKEY_PASSWORD")
+}
+
+func TestBuildStatefulSet_WithAuthCustomKey(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "custom-auth",
+			SecretPasswordKey: "redis-pass",
+		}
+	})
+
+	sts := BuildStatefulSet(v)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	require.Len(t, container.Env, 1)
+	assert.Equal(t, "custom-auth", container.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "redis-pass", container.Env[0].ValueFrom.SecretKeyRef.Key)
+}
+
+func TestBuildStatefulSet_WithoutAuth_NoEnvVars(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// No env vars should be present.
+	assert.Empty(t, container.Env)
+
+	// Command should be direct valkey-server (no shell wrapper).
+	assert.Equal(t, "valkey-server", container.Command[0])
+}
+
+func TestBuildStatefulSet_WithAuthAndTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Should have auth env var.
+	require.Len(t, container.Env, 1)
+	assert.Equal(t, AuthSecretEnvName, container.Env[0].Name)
+
+	// Command should include auth.
+	assert.Contains(t, container.Command[2], "--requirepass")
+
+	// TLS volumes should still be present.
+	hasVolume := false
+	for _, vol := range sts.Spec.Template.Spec.Volumes {
+		if vol.Name == TLSVolumeName {
+			hasVolume = true
+		}
+	}
+	assert.True(t, hasVolume, "TLS volume should be present alongside auth")
+}
+
+func TestBuildStatefulSet_WithAuth_HAMode(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildStatefulSet(v)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+
+	// Should have auth env var.
+	require.Len(t, container.Env, 1)
+	assert.Equal(t, AuthSecretEnvName, container.Env[0].Name)
+
+	// In HA mode, should use writable config path.
+	assert.Contains(t, container.Command[2], WritableConfigMountPath)
+	assert.Contains(t, container.Command[2], "--requirepass")
+	assert.Contains(t, container.Command[2], "--masterauth")
+}
+
+// --- Probe Command Auth ---
+
+func TestProbeCommand_Auth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := ProbeCommand(v)
+
+	// Should use shell to expand env var.
+	assert.Equal(t, "sh", cmd[0])
+	assert.Equal(t, "-c", cmd[1])
+	assert.Contains(t, cmd[2], "-a")
+	assert.Contains(t, cmd[2], "$VALKEY_PASSWORD")
+	assert.Contains(t, cmd[2], "ping")
+}
+
+func TestProbeCommand_AuthWithTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	cmd := ProbeCommand(v)
+
+	assert.Equal(t, "sh", cmd[0])
+	assert.Equal(t, "-c", cmd[1])
+	assert.Contains(t, cmd[2], "--tls")
+	assert.Contains(t, cmd[2], "-a")
+	assert.Contains(t, cmd[2], "$VALKEY_PASSWORD")
+	assert.Contains(t, cmd[2], "ping")
+	assert.Contains(t, cmd[2], "16379")
+}
+
+// --- StatefulSetHasChanged Auth ---
+
+func TestStatefulSetHasChanged_EnvVarAdded(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Add auth to desired (simulating auth being enabled).
+	desired.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{
+		{
+			Name: AuthSecretEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"},
+					Key:                  "password",
+				},
+			},
+		},
+	}
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_CommandChanged(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Simulate command change (auth flags added).
+	desired.Spec.Template.Spec.Containers[0].Command = []string{"sh", "-c", "exec valkey-server /etc/valkey/valkey.conf --requirepass \"$VALKEY_PASSWORD\""}
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}

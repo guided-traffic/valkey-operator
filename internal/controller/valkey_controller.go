@@ -1,3 +1,5 @@
+// Package controller implements the Kubernetes reconciliation logic
+// for Valkey custom resources.
 package controller
 
 import (
@@ -17,7 +19,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -37,6 +41,7 @@ type ValkeyReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles a reconciliation request for a Valkey resource.
@@ -527,7 +532,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterProvisioning",
-			Message:            fmt.Sprintf("Valkey: %d/%d, Sentinel: %d/%d ready",
+			Message: fmt.Sprintf("Valkey: %d/%d, Sentinel: %d/%d ready",
 				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels),
 		})
 	default:
@@ -565,5 +570,47 @@ func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findValkeyForSecret),
+		).
 		Complete(r)
+}
+
+// findValkeyForSecret maps a Secret change to the Valkey resources that reference it.
+// This ensures reconciliation triggers when a referenced auth Secret changes.
+func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	logger := log.FromContext(ctx)
+
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+
+	// List all Valkey resources in the same namespace.
+	valkeyList := &vkov1.ValkeyList{}
+	if err := r.List(ctx, valkeyList, client.InNamespace(secret.Namespace)); err != nil {
+		logger.Error(err, "failed to list Valkey resources for Secret watch")
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range valkeyList.Items {
+		v := &valkeyList.Items[i]
+		if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secret.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      v.Name,
+					Namespace: v.Namespace,
+				},
+			})
+		}
+	}
+
+	if len(requests) > 0 {
+		logger.Info("Secret changed, triggering reconcile for Valkey resources",
+			"secret", secret.Name, "count", len(requests))
+	}
+
+	return requests
 }

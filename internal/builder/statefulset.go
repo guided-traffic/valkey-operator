@@ -37,6 +37,9 @@ const (
 
 	// WritableConfigMountPath is the mount path for the writable config (HA mode).
 	WritableConfigMountPath = "/etc/valkey-active"
+
+	// AuthSecretEnvName is the environment variable name used to inject the Valkey password.
+	AuthSecretEnvName = "VALKEY_PASSWORD"
 )
 
 // BuildStatefulSet builds the StatefulSet for Valkey instances.
@@ -249,13 +252,24 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		containerPort = TLSPort
 	}
 
+	// Build command with optional auth arguments.
+	cmd := []string{
+		"valkey-server",
+		cfgMount + "/" + ValkeyConfigKey,
+	}
+	if v.IsAuthEnabled() {
+		// Use shell to expand the environment variable for password injection.
+		cmd = []string{
+			"sh", "-c",
+			fmt.Sprintf("exec valkey-server %s/%s --requirepass \"$%s\" --masterauth \"$%s\"",
+				cfgMount, ValkeyConfigKey, AuthSecretEnvName, AuthSecretEnvName),
+		}
+	}
+
 	container := corev1.Container{
-		Name:  ValkeyContainerName,
-		Image: v.Spec.Image,
-		Command: []string{
-			"valkey-server",
-			cfgMount + "/" + ValkeyConfigKey,
-		},
+		Name:    ValkeyContainerName,
+		Image:   v.Spec.Image,
+		Command: cmd,
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "valkey",
@@ -289,6 +303,21 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 			FailureThreshold:    5,
 		},
 		Resources: v.Spec.Resources,
+	}
+
+	// Inject auth password from Secret as environment variable.
+	if v.IsAuthEnabled() {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name: AuthSecretEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: v.Spec.Auth.SecretName,
+					},
+					Key: v.Spec.Auth.SecretPasswordKey,
+				},
+			},
+		})
 	}
 
 	return container
@@ -360,6 +389,16 @@ func StatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 		if resourceListChanged(dRes.Requests, cRes.Requests) || resourceListChanged(dRes.Limits, cRes.Limits) {
 			return true
 		}
+
+		// Check environment variables (e.g., auth Secret reference changes).
+		if !envVarsEqual(desired.Spec.Template.Spec.Containers[0].Env, current.Spec.Template.Spec.Containers[0].Env) {
+			return true
+		}
+
+		// Check command changes (e.g., auth flags added/removed).
+		if !stringSliceEqual(desired.Spec.Template.Spec.Containers[0].Command, current.Spec.Template.Spec.Containers[0].Command) {
+			return true
+		}
 	}
 
 	return false
@@ -392,6 +431,51 @@ func resourceListChanged(a, b corev1.ResourceList) bool {
 	return false
 }
 
+// envVarsEqual returns true if two env var slices are equal.
+func envVarsEqual(a, b []corev1.EnvVar) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+		if a[i].Value != b[i].Value {
+			return false
+		}
+		// Compare SecretKeyRef.
+		aRef := a[i].ValueFrom
+		bRef := b[i].ValueFrom
+		if (aRef == nil) != (bRef == nil) {
+			return false
+		}
+		if aRef != nil && bRef != nil {
+			if (aRef.SecretKeyRef == nil) != (bRef.SecretKeyRef == nil) {
+				return false
+			}
+			if aRef.SecretKeyRef != nil && bRef.SecretKeyRef != nil {
+				if aRef.SecretKeyRef.Name != bRef.SecretKeyRef.Name || aRef.SecretKeyRef.Key != bRef.SecretKeyRef.Key {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// stringSliceEqual returns true if two string slices are equal.
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ServicePort returns the Valkey client port, accounting for TLS configuration.
 func ServicePort(v *vkov1.Valkey) int32 {
 	if v.IsTLSEnabled() {
@@ -400,8 +484,27 @@ func ServicePort(v *vkov1.Valkey) int32 {
 	return int32(ValkeyPort)
 }
 
-// ProbeCommand returns the probe command, accounting for TLS.
+// ProbeCommand returns the probe command, accounting for TLS and auth.
+// When auth is enabled, the probe uses a shell command to expand the
+// VALKEY_PASSWORD environment variable for the -a flag.
 func ProbeCommand(v *vkov1.Valkey) []string {
+	if v.IsAuthEnabled() {
+		// Use shell to expand the env var for the password.
+		var cmdStr string
+		if v.IsTLSEnabled() {
+			cmdStr = fmt.Sprintf(
+				"valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -p %d -a \"$%s\" ping",
+				TLSPort, AuthSecretEnvName,
+			)
+		} else {
+			cmdStr = fmt.Sprintf(
+				"valkey-cli -a \"$%s\" ping",
+				AuthSecretEnvName,
+			)
+		}
+		return []string{"sh", "-c", cmdStr}
+	}
+
 	if v.IsTLSEnabled() {
 		return []string{
 			"valkey-cli",
@@ -409,7 +512,7 @@ func ProbeCommand(v *vkov1.Valkey) []string {
 			"--cert", "/tls/tls.crt",
 			"--key", "/tls/tls.key",
 			"--cacert", "/tls/ca.crt",
-			"-p", "16379",
+			"-p", fmt.Sprintf("%d", TLSPort),
 			"ping",
 		}
 	}
