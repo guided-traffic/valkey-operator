@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"fmt"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -15,14 +17,26 @@ const (
 	// ValkeyContainerName is the name of the main Valkey container.
 	ValkeyContainerName = "valkey"
 
-	// ConfigVolumeName is the name of the volume for the Valkey configuration.
+	// ConfigVolumeName is the name of the volume for the master Valkey configuration (readonly).
 	ConfigVolumeName = "config"
+
+	// ReplicaConfigVolumeName is the name of the volume for the replica configuration (readonly, HA mode).
+	ReplicaConfigVolumeName = "replica-config"
+
+	// WritableConfigVolumeName is the name of the writable config volume (HA mode, populated by init container).
+	WritableConfigVolumeName = "writable-config"
 
 	// DataVolumeName is the name of the volume for persistent data.
 	DataVolumeName = "data"
 
-	// ConfigMountPath is the mount path for the Valkey configuration.
+	// ConfigMountPath is the mount path for the master Valkey configuration (readonly).
 	ConfigMountPath = "/etc/valkey"
+
+	// ReplicaConfigMountPath is the mount path for the replica configuration (readonly, HA mode).
+	ReplicaConfigMountPath = "/etc/valkey-replica"
+
+	// WritableConfigMountPath is the mount path for the writable config (HA mode).
+	WritableConfigMountPath = "/etc/valkey-active"
 )
 
 // BuildStatefulSet builds the StatefulSet for Valkey instances.
@@ -87,6 +101,67 @@ func buildPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		},
 	}
 
+	var initContainers []corev1.Container
+
+	// In HA mode, use an init container to select the right config (master vs replica).
+	if v.IsSentinelEnabled() {
+		// Add replica config volume.
+		volumes = append(volumes, corev1.Volume{
+			Name: ReplicaConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: ReplicaConfigMapName(v),
+					},
+				},
+			},
+		})
+
+		// Add writable config volume (init container will copy the right config here).
+		volumes = append(volumes, corev1.Volume{
+			Name: WritableConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+
+		// Init container selects master or replica config based on pod ordinal.
+		initContainers = append(initContainers, corev1.Container{
+			Name:  "init-config-selector",
+			Image: v.Spec.Image,
+			Command: []string{
+				"sh", "-c",
+				// Pod-0 is the initial master; all others are replicas.
+				fmt.Sprintf(
+					`ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+if [ "$ORDINAL" = "0" ]; then
+  cp %s/%s %s/%s
+else
+  cp %s/%s %s/%s
+fi`,
+					ConfigMountPath, ValkeyConfigKey, WritableConfigMountPath, ValkeyConfigKey,
+					ReplicaConfigMountPath, ValkeyConfigKey, WritableConfigMountPath, ValkeyConfigKey,
+				),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      ConfigVolumeName,
+					MountPath: ConfigMountPath,
+					ReadOnly:  true,
+				},
+				{
+					Name:      ReplicaConfigVolumeName,
+					MountPath: ReplicaConfigMountPath,
+					ReadOnly:  true,
+				},
+				{
+					Name:      WritableConfigVolumeName,
+					MountPath: WritableConfigMountPath,
+				},
+			},
+		})
+	}
+
 	// If persistence is NOT enabled, use an emptyDir for data.
 	if !v.IsPersistenceEnabled() {
 		volumes = append(volumes, corev1.Volume{
@@ -97,22 +172,49 @@ func buildPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		})
 	}
 
-	return corev1.PodSpec{
+	spec := corev1.PodSpec{
 		ServiceAccountName: "default",
 		Containers: []corev1.Container{
 			buildValkeyContainer(v),
 		},
 		Volumes: volumes,
 	}
+
+	if len(initContainers) > 0 {
+		spec.InitContainers = initContainers
+	}
+
+	return spec
+}
+
+// configMountForContainer returns the config mount path used by the valkey container.
+// In HA mode, this is the writable config directory (populated by init container).
+// In standalone mode, this is the readonly ConfigMap mount.
+func configMountForContainer(v *vkov1.Valkey) string {
+	if v.IsSentinelEnabled() {
+		return WritableConfigMountPath
+	}
+	return ConfigMountPath
+}
+
+// configVolumeNameForContainer returns the volume name to mount for the valkey config.
+func configVolumeNameForContainer(v *vkov1.Valkey) string {
+	if v.IsSentinelEnabled() {
+		return WritableConfigVolumeName
+	}
+	return ConfigVolumeName
 }
 
 // buildValkeyContainer builds the main Valkey container spec.
 func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
+	cfgMount := configMountForContainer(v)
+	cfgVolume := configVolumeNameForContainer(v)
+
 	volumeMounts := []corev1.VolumeMount{
 		{
-			Name:      ConfigVolumeName,
-			MountPath: ConfigMountPath,
-			ReadOnly:  true,
+			Name:      cfgVolume,
+			MountPath: cfgMount,
+			ReadOnly:  !v.IsSentinelEnabled(), // Writable in HA mode (init container writes here).
 		},
 		{
 			Name:      DataVolumeName,
@@ -125,7 +227,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		Image: v.Spec.Image,
 		Command: []string{
 			"valkey-server",
-			ConfigMountPath + "/" + ValkeyConfigKey,
+			cfgMount + "/" + ValkeyConfigKey,
 		},
 		Ports: []corev1.ContainerPort{
 			{

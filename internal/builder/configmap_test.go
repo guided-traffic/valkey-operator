@@ -41,7 +41,7 @@ func TestConfigMapName(t *testing.T) {
 func TestGenerateValkeyConf_Standalone_NoPersistence(t *testing.T) {
 	v := newTestValkey("test")
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	assert.Contains(t, conf, "bind 0.0.0.0")
 	assert.Contains(t, conf, "port 6379")
@@ -66,7 +66,7 @@ func TestGenerateValkeyConf_PersistenceRDB(t *testing.T) {
 		}
 	})
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	assert.Contains(t, conf, "save 900 1")
 	assert.Contains(t, conf, "save 300 10")
@@ -87,7 +87,7 @@ func TestGenerateValkeyConf_PersistenceAOF(t *testing.T) {
 		}
 	})
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	assert.Contains(t, conf, "appendonly yes")
 	assert.Contains(t, conf, "appendfilename \"appendonly.aof\"")
@@ -105,7 +105,7 @@ func TestGenerateValkeyConf_PersistenceBoth(t *testing.T) {
 		}
 	})
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	assert.Contains(t, conf, "save 900 1")
 	assert.Contains(t, conf, "appendonly yes")
@@ -117,7 +117,7 @@ func TestGenerateValkeyConf_TLSEnabled(t *testing.T) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	assert.Contains(t, conf, "tls-port 16379")
 	assert.Contains(t, conf, "port 0")
@@ -135,7 +135,7 @@ func TestGenerateValkeyConf_AuthEnabled(t *testing.T) {
 		}
 	})
 
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	// Auth section should be present (password injected at runtime).
 	assert.Contains(t, conf, "# Auth")
@@ -143,7 +143,7 @@ func TestGenerateValkeyConf_AuthEnabled(t *testing.T) {
 
 func TestGenerateValkeyConf_NoEmptyLines(t *testing.T) {
 	v := newTestValkey("test")
-	conf := GenerateValkeyConf(v)
+	conf := GenerateValkeyConf(v, false)
 
 	// Config should not start or end with empty line (just reasonable formatting).
 	lines := strings.Split(conf, "\n")

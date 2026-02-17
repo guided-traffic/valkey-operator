@@ -27,8 +27,19 @@ func ConfigMapName(v *vkov1.Valkey) string {
 	return fmt.Sprintf("%s-config", v.Name)
 }
 
+// MasterAddress returns the DNS address of the master pod (pod-0 of the StatefulSet).
+// Used for `replicaof` configuration in replica pods.
+func MasterAddress(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-0.%s.%s.svc.cluster.local",
+		common.StatefulSetName(v, common.ComponentValkey),
+		common.HeadlessServiceName(v, common.ComponentValkey),
+		v.Namespace,
+	)
+}
+
 // GenerateValkeyConf generates the valkey.conf content based on the CRD spec.
-func GenerateValkeyConf(v *vkov1.Valkey) string {
+// The isReplica parameter controls whether replicaof directives are included.
+func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 	var lines []string
 
 	// Network configuration.
@@ -67,6 +78,11 @@ func GenerateValkeyConf(v *vkov1.Valkey) string {
 		)
 	}
 
+	// Replication configuration (HA mode).
+	if v.IsSentinelEnabled() {
+		lines = append(lines, replicationConfig(v, isReplica)...)
+	}
+
 	// Persistence configuration.
 	lines = append(lines, persistenceConfig(v)...)
 
@@ -92,6 +108,31 @@ func GenerateValkeyConf(v *vkov1.Valkey) string {
 	)
 
 	return strings.Join(lines, "\n")
+}
+
+// replicationConfig returns replication-related config lines for HA mode.
+func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
+	var lines []string
+
+	lines = append(lines, "# Replication")
+
+	if isReplica {
+		// Replicas connect to the master. Sentinel will reconfigure this dynamically.
+		lines = append(lines,
+			fmt.Sprintf("replicaof %s %d", MasterAddress(v), ValkeyPort),
+		)
+	}
+
+	// Allow replicas to serve stale data during sync.
+	lines = append(lines,
+		"replica-serve-stale-data yes",
+		"replica-read-only yes",
+		"repl-diskless-sync yes",
+		"repl-diskless-sync-delay 5",
+		"",
+	)
+
+	return lines
 }
 
 // persistenceConfig returns the persistence-related config lines.
@@ -156,7 +197,13 @@ func persistenceConfig(v *vkov1.Valkey) []string {
 	return lines
 }
 
+// ReplicaConfigMapName returns the name for the replica Valkey ConfigMap (HA mode).
+func ReplicaConfigMapName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-replica-config", v.Name)
+}
+
 // BuildConfigMap builds the ConfigMap for Valkey configuration.
+// In standalone mode or for the master in HA mode, isReplica should be false.
 func BuildConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -165,7 +212,22 @@ func BuildConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 			Labels:    common.BaseLabels(v, common.ComponentValkey),
 		},
 		Data: map[string]string{
-			ValkeyConfigKey: GenerateValkeyConf(v),
+			ValkeyConfigKey: GenerateValkeyConf(v, false),
+		},
+	}
+}
+
+// BuildReplicaConfigMap builds the ConfigMap for Valkey replica configuration (HA mode).
+// It includes the `replicaof` directive pointing to the master.
+func BuildReplicaConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ReplicaConfigMapName(v),
+			Namespace: v.Namespace,
+			Labels:    common.BaseLabels(v, common.ComponentValkey),
+		},
+		Data: map[string]string{
+			ValkeyConfigKey: GenerateValkeyConf(v, true),
 		},
 	}
 }

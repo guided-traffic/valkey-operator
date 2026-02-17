@@ -5,11 +5,11 @@ metadata:
   labels:
     {{- include "valkey-operator.labels" . | nindent 4 }}
 rules:
+  # Valkey CRD access
   - apiGroups:
       - vko.gtrfc.com
     resources:
       - valkeys
-      - sentinels
     verbs:
       - create
       - delete
@@ -22,7 +22,6 @@ rules:
       - vko.gtrfc.com
     resources:
       - valkeys/status
-      - sentinels/status
     verbs:
       - get
       - patch
@@ -31,16 +30,14 @@ rules:
       - vko.gtrfc.com
     resources:
       - valkeys/finalizers
-      - sentinels/finalizers
     verbs:
       - update
+  # Core resources managed by the operator
   - apiGroups:
       - ""
     resources:
-      - pods
-      - services
       - configmaps
-      - secrets
+      - services
     verbs:
       - create
       - delete
@@ -48,6 +45,22 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
       - watch
   - apiGroups:
       - apps
@@ -61,6 +74,7 @@ rules:
       - patch
       - update
       - watch
+  # Events for status reporting
   - apiGroups:
       - ""
     resources:
@@ -68,6 +82,33 @@ rules:
     verbs:
       - create
       - patch
+  # NetworkPolicies
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  # cert-manager Certificates
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  # Leader election
   - apiGroups:
       - coordination.k8s.io
     resources:

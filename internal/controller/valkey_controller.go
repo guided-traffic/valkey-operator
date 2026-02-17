@@ -63,6 +63,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile replica ConfigMap in HA mode.
+	if valkey.IsSentinelEnabled() {
+		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Reconcile headless Service.
 	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
 		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
@@ -79,6 +87,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.reconcileStatefulSet(ctx, valkey); err != nil {
 		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile StatefulSet: %v", err))
 		return ctrl.Result{}, err
+	}
+
+	// Reconcile Sentinel resources if enabled.
+	if valkey.IsSentinelEnabled() {
+		if err := r.reconcileSentinelResources(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Sentinel resources: %v", err))
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Update status based on StatefulSet readiness.
@@ -111,6 +127,35 @@ func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valk
 	// Update if config content has changed.
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
 		logger.Info("Updating ConfigMap", "name", desired.Name)
+		current.Data = desired.Data
+		current.Labels = desired.Labels
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
+// reconcileReplicaConfigMap ensures the replica ConfigMap exists in HA mode.
+func (r *ValkeyReconciler) reconcileReplicaConfigMap(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildReplicaConfigMap(v)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on replica ConfigMap: %w", err)
+	}
+
+	current := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating replica ConfigMap", "name", desired.Name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
+		logger.Info("Updating replica ConfigMap", "name", desired.Name)
 		current.Data = desired.Data
 		current.Labels = desired.Labels
 		return r.Update(ctx, current)
@@ -193,6 +238,91 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	return nil
 }
 
+// reconcileSentinelResources reconciles all Sentinel-related resources.
+func (r *ValkeyReconciler) reconcileSentinelResources(ctx context.Context, v *vkov1.Valkey) error {
+	// Sentinel ConfigMap.
+	if err := r.reconcileSentinelConfigMap(ctx, v); err != nil {
+		return fmt.Errorf("sentinel configmap: %w", err)
+	}
+
+	// Sentinel headless Service.
+	if err := r.reconcileSentinelHeadlessService(ctx, v); err != nil {
+		return fmt.Errorf("sentinel headless service: %w", err)
+	}
+
+	// Sentinel StatefulSet.
+	if err := r.reconcileSentinelStatefulSet(ctx, v); err != nil {
+		return fmt.Errorf("sentinel statefulset: %w", err)
+	}
+
+	return nil
+}
+
+// reconcileSentinelConfigMap ensures the Sentinel ConfigMap matches the desired state.
+func (r *ValkeyReconciler) reconcileSentinelConfigMap(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSentinelConfigMap(v)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on Sentinel ConfigMap: %w", err)
+	}
+
+	current := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Sentinel ConfigMap", "name", desired.Name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
+		logger.Info("Updating Sentinel ConfigMap", "name", desired.Name)
+		current.Data = desired.Data
+		current.Labels = desired.Labels
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
+// reconcileSentinelHeadlessService ensures the Sentinel headless Service exists.
+func (r *ValkeyReconciler) reconcileSentinelHeadlessService(ctx context.Context, v *vkov1.Valkey) error {
+	desired := builder.BuildSentinelHeadlessService(v)
+	return r.reconcileService(ctx, v, desired)
+}
+
+// reconcileSentinelStatefulSet ensures the Sentinel StatefulSet exists and matches desired state.
+func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSentinelStatefulSet(v)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on Sentinel StatefulSet: %w", err)
+	}
+
+	current := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Sentinel StatefulSet", "name", desired.Name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if builder.SentinelStatefulSetHasChanged(desired, current) {
+		logger.Info("Updating Sentinel StatefulSet", "name", desired.Name)
+		current.Spec.Replicas = desired.Spec.Replicas
+		current.Spec.Template = desired.Spec.Template
+		current.Labels = desired.Labels
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
 // updateStatus reads the current StatefulSet and updates the Valkey status accordingly.
 func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) error {
 	sts := &appsv1.StatefulSet{}
@@ -216,14 +346,24 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 	readyReplicas := sts.Status.ReadyReplicas
 	v.Status.ReadyReplicas = readyReplicas
 
-	// Determine phase.
+	// In HA mode, also check Sentinel readiness.
+	if v.IsSentinelEnabled() {
+		return r.updateHAStatus(ctx, v, readyReplicas)
+	}
+
+	// Standalone mode status logic.
+	return r.updateStandaloneStatus(ctx, v, readyReplicas)
+}
+
+// updateStandaloneStatus updates the status for standalone mode.
+func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.Valkey, readyReplicas int32) error {
 	switch {
 	case readyReplicas == v.Spec.Replicas:
 		v.Status.Phase = vkov1.ValkeyPhaseOK
 		v.Status.Message = "All replicas are ready"
 
 		// In standalone mode, the single pod is the master.
-		if v.Spec.Replicas == 1 && !v.IsSentinelEnabled() {
+		if v.Spec.Replicas == 1 {
 			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
 		}
 
@@ -255,6 +395,75 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 			ObservedGeneration: v.Generation,
 			Reason:             "NoReplicasReady",
 			Message:            "No replicas are ready yet",
+		})
+	}
+
+	return r.Status().Update(ctx, v)
+}
+
+// updateHAStatus updates the status for HA (Sentinel) mode.
+func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, readyReplicas int32) error {
+	sentinelReady := int32(0)
+
+	// Check Sentinel StatefulSet readiness.
+	sentinelSts := &appsv1.StatefulSet{}
+	sentinelName := types.NamespacedName{
+		Name:      fmt.Sprintf("%s-sentinel", v.Name),
+		Namespace: v.Namespace,
+	}
+	if err := r.Get(ctx, sentinelName, sentinelSts); err == nil {
+		sentinelReady = sentinelSts.Status.ReadyReplicas
+	}
+
+	expectedSentinels := int32(3)
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
+		expectedSentinels = v.Spec.Sentinel.Replicas
+	}
+
+	allValkeyReady := readyReplicas == v.Spec.Replicas
+	allSentinelReady := sentinelReady == expectedSentinels
+
+	switch {
+	case allValkeyReady && allSentinelReady:
+		v.Status.Phase = vkov1.ValkeyPhaseOK
+		v.Status.Message = fmt.Sprintf("HA cluster ready: %d/%d valkey, %d/%d sentinel",
+			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
+
+		// Set master pod — default to pod-0 initially; health checker will update later.
+		if v.Status.MasterPod == "" {
+			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+		}
+
+		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: v.Generation,
+			Reason:             "HAClusterReady",
+			Message:            "All Valkey and Sentinel instances are ready",
+		})
+	case readyReplicas > 0 || sentinelReady > 0:
+		v.Status.Phase = vkov1.ValkeyPhaseProvisioning
+		v.Status.Message = fmt.Sprintf("HA cluster provisioning: %d/%d valkey, %d/%d sentinel",
+			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
+
+		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: v.Generation,
+			Reason:             "HAClusterProvisioning",
+			Message:            fmt.Sprintf("Valkey: %d/%d, Sentinel: %d/%d ready",
+				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels),
+		})
+	default:
+		v.Status.Phase = vkov1.ValkeyPhaseProvisioning
+		v.Status.Message = "Waiting for HA cluster pods to become ready"
+
+		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: v.Generation,
+			Reason:             "HAClusterNotReady",
+			Message:            "No HA cluster pods are ready yet",
 		})
 	}
 

@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -348,4 +349,221 @@ func TestReconcile_FullStandaloneSetup(t *testing.T) {
 
 	// Verify resources.
 	assert.Equal(t, resource.MustParse("500m"), sts.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU])
+}
+
+// --- HA Mode (Sentinel) ---
+
+func TestReconcile_HA_CreatesSentinelConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data, "sentinel.conf")
+	assert.Contains(t, cm.Data["sentinel.conf"], "sentinel monitor test")
+}
+
+func TestReconcile_HA_CreatesReplicaConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-replica-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data, builder.ValkeyConfigKey)
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "replicaof")
+}
+
+func TestReconcile_HA_CreatesSentinelHeadlessService(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-headless", Namespace: "default",
+	}, svc)
+
+	require.NoError(t, err)
+	assert.Equal(t, corev1.ClusterIPNone, svc.Spec.ClusterIP)
+	assert.True(t, svc.Spec.PublishNotReadyAddresses)
+	require.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(26379), svc.Spec.Ports[0].Port)
+}
+
+func TestReconcile_HA_CreatesSentinelStatefulSet(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), *sts.Spec.Replicas)
+	assert.Equal(t, "test-sentinel-headless", sts.Spec.ServiceName)
+	assert.Equal(t, "valkey/valkey:8.0", sts.Spec.Template.Spec.Containers[0].Image)
+	assert.Equal(t, "sentinel", sts.Spec.Template.Labels["app.kubernetes.io/component"])
+}
+
+func TestReconcile_HA_ValkeyStatefulSetHasInitContainer(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts)
+
+	require.NoError(t, err)
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	assert.Equal(t, "init-config-selector", sts.Spec.Template.Spec.InitContainers[0].Name)
+}
+
+func TestReconcile_HA_AllResourcesCreated(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+			PodLabels: map[string]string{
+				"app": "sentinel",
+			},
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "ha", "default")
+
+	// Valkey resources.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-config", Namespace: "default"}, &corev1.ConfigMap{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-replica-config", Namespace: "default"}, &corev1.ConfigMap{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-headless", Namespace: "default"}, &corev1.Service{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, &corev1.Service{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, &appsv1.StatefulSet{}))
+
+	// Sentinel resources.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-sentinel-config", Namespace: "default"}, &corev1.ConfigMap{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-sentinel-headless", Namespace: "default"}, &corev1.Service{}))
+	sentinelSts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-sentinel", Namespace: "default"}, sentinelSts))
+
+	// Verify sentinel custom labels.
+	assert.Equal(t, "sentinel", sentinelSts.Spec.Template.Labels["app"])
+}
+
+func TestReconcile_HA_SentinelOwnerReferences(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Sentinel ConfigMap.
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel-config", Namespace: "default"}, cm))
+	assert.Len(t, cm.OwnerReferences, 1)
+	assert.Equal(t, "test", cm.OwnerReferences[0].Name)
+
+	// Sentinel headless Service.
+	svc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel-headless", Namespace: "default"}, svc))
+	assert.Len(t, svc.OwnerReferences, 1)
+
+	// Sentinel StatefulSet.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel", Namespace: "default"}, sts))
+	assert.Len(t, sts.OwnerReferences, 1)
+}
+
+func TestReconcile_HA_Idempotent(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	// Reconcile multiple times — should not error.
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+}
+
+func TestReconcile_StandaloneDoesNotCreateSentinel(t *testing.T) {
+	v := newTestValkey("standalone", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "standalone", "default")
+
+	// No sentinel resources should exist.
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "standalone-sentinel-config", Namespace: "default"}, cm)
+	assert.True(t, apierrors.IsNotFound(err))
+
+	svc := &corev1.Service{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "standalone-sentinel-headless", Namespace: "default"}, svc)
+	assert.True(t, apierrors.IsNotFound(err))
+
+	sts := &appsv1.StatefulSet{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "standalone-sentinel", Namespace: "default"}, sts)
+	assert.True(t, apierrors.IsNotFound(err))
+
+	// No replica configmap either.
+	err = c.Get(context.Background(), types.NamespacedName{Name: "standalone-replica-config", Namespace: "default"}, cm)
+	assert.True(t, apierrors.IsNotFound(err))
 }

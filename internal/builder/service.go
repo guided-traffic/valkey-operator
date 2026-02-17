@@ -43,7 +43,8 @@ func BuildHeadlessService(v *vkov1.Valkey) *corev1.Service {
 
 // BuildClientService builds the client-facing Service that points to the master pod.
 // In standalone mode, it simply selects all Valkey pods.
-// In HA mode, it will be refined to select the master via label selector.
+// In HA mode, it uses selector labels (traffic is distributed across all pods).
+// A dedicated read service can be used for read replicas.
 func BuildClientService(v *vkov1.Valkey) *corev1.Service {
 	labels := common.BaseLabels(v, common.ComponentValkey)
 	selector := common.SelectorLabels(v, common.ComponentValkey)
@@ -51,6 +52,33 @@ func BuildClientService(v *vkov1.Valkey) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ClientServiceName(v),
+			Namespace: v.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: selector,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "valkey",
+					Port:       ValkeyPort,
+					TargetPort: intstr.FromString("valkey"),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+// BuildReadService builds a read-only Service that routes to all Valkey pods (replicas + master).
+// Useful for read-heavy workloads in HA mode.
+func BuildReadService(v *vkov1.Valkey) *corev1.Service {
+	labels := common.BaseLabels(v, common.ComponentValkey)
+	selector := common.SelectorLabels(v, common.ComponentValkey)
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ReadServiceName(v),
 			Namespace: v.Namespace,
 			Labels:    labels,
 		},

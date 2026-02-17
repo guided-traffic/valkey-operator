@@ -211,4 +211,114 @@ func TestStandaloneMode_Integration(t *testing.T) {
 		// Cleanup.
 		require.NoError(t, k8sClient.Delete(ctx, v, client.GracePeriodSeconds(0)))
 	})
+
+	t.Run("deploy HA cluster with sentinel", func(t *testing.T) {
+		v := &vkov1.Valkey{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ha-test",
+				Namespace: "default",
+			},
+			Spec: vkov1.ValkeySpec{
+				Replicas: 3,
+				Image:    "valkey/valkey:8.0",
+				Sentinel: &vkov1.SentinelSpec{
+					Enabled:  true,
+					Replicas: 3,
+					PodLabels: map[string]string{
+						"app": "sentinel",
+					},
+				},
+			},
+		}
+
+		require.NoError(t, k8sClient.Create(ctx, v))
+
+		// Wait for Valkey StatefulSet.
+		require.Eventually(t, func() bool {
+			sts := &appsv1.StatefulSet{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "ha-test", Namespace: "default",
+			}, sts)
+			return err == nil
+		}, 10*time.Second, 250*time.Millisecond, "Valkey StatefulSet should be created")
+
+		// Wait for Sentinel StatefulSet.
+		require.Eventually(t, func() bool {
+			sts := &appsv1.StatefulSet{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "ha-test-sentinel", Namespace: "default",
+			}, sts)
+			return err == nil
+		}, 10*time.Second, 250*time.Millisecond, "Sentinel StatefulSet should be created")
+
+		// Verify Valkey StatefulSet.
+		valkeySts := &appsv1.StatefulSet{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test", Namespace: "default",
+		}, valkeySts))
+		assert.Equal(t, int32(3), *valkeySts.Spec.Replicas)
+		// HA mode should have init container for config selection.
+		require.Len(t, valkeySts.Spec.Template.Spec.InitContainers, 1)
+		assert.Equal(t, "init-config-selector", valkeySts.Spec.Template.Spec.InitContainers[0].Name)
+
+		// Verify Sentinel StatefulSet.
+		sentinelSts := &appsv1.StatefulSet{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sentinel", Namespace: "default",
+		}, sentinelSts))
+		assert.Equal(t, int32(3), *sentinelSts.Spec.Replicas)
+		assert.Equal(t, "ha-test-sentinel-headless", sentinelSts.Spec.ServiceName)
+		assert.Equal(t, "sentinel", sentinelSts.Spec.Template.Labels["app.kubernetes.io/component"])
+		assert.Equal(t, "sentinel", sentinelSts.Spec.Template.Labels["app"])
+
+		// Verify ConfigMaps.
+		masterCm := &corev1.ConfigMap{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-config", Namespace: "default",
+		}, masterCm))
+		assert.NotContains(t, masterCm.Data["valkey.conf"], "replicaof")
+		assert.Contains(t, masterCm.Data["valkey.conf"], "replica-serve-stale-data yes")
+
+		replicaCm := &corev1.ConfigMap{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-replica-config", Namespace: "default",
+		}, replicaCm))
+		assert.Contains(t, replicaCm.Data["valkey.conf"], "replicaof")
+
+		sentinelCm := &corev1.ConfigMap{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sentinel-config", Namespace: "default",
+		}, sentinelCm))
+		assert.Contains(t, sentinelCm.Data["sentinel.conf"], "sentinel monitor ha-test")
+
+		// Verify Services.
+		headlessSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-headless", Namespace: "default",
+		}, headlessSvc))
+
+		sentinelSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sentinel-headless", Namespace: "default",
+		}, sentinelSvc))
+		assert.Equal(t, int32(26379), sentinelSvc.Spec.Ports[0].Port)
+
+		// Verify owner references on all sentinel resources.
+		assert.Len(t, sentinelSts.OwnerReferences, 1)
+		assert.Equal(t, "ha-test", sentinelSts.OwnerReferences[0].Name)
+		assert.Len(t, sentinelCm.OwnerReferences, 1)
+		assert.Len(t, sentinelSvc.OwnerReferences, 1)
+
+		// Verify status.
+		require.Eventually(t, func() bool {
+			updated := &vkov1.Valkey{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "ha-test", Namespace: "default",
+			}, updated)
+			return err == nil && updated.Status.Phase != ""
+		}, 10*time.Second, 250*time.Millisecond, "Status phase should be set")
+
+		// Cleanup.
+		require.NoError(t, k8sClient.Delete(ctx, v, client.GracePeriodSeconds(0)))
+	})
 }

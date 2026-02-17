@@ -114,8 +114,20 @@ kind-load: docker-build ## Build and load the operator image into Kind.
 	@echo "Loading image into Kind cluster..."
 	kind load docker-image ${IMG} --name valkey-operator-test
 
+.PHONY: cert-manager-install
+cert-manager-install: ## Install cert-manager into the cluster.
+	@echo "Installing cert-manager..."
+	kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
+	@echo "Waiting for cert-manager to be ready..."
+	kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+	kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+	kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+	@echo "Creating self-signed ClusterIssuer..."
+	@sleep 5
+	@kubectl apply -f test/e2e/testdata/cert-manager-issuer.yaml
+
 .PHONY: e2e-local
-e2e-local: kind-create kind-load ## Run full E2E test locally with Kind.
+e2e-local: kind-create kind-load cert-manager-install ## Run full E2E test locally with Kind.
 	@echo "Installing operator via Helm..."
 	helm install valkey-operator deploy/helm/valkey-operator \
 		--namespace valkey-operator-system \
