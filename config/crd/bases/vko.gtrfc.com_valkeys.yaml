@@ -239,9 +239,17 @@ spec:
                 description: TLS configures TLS encryption.
                 properties:
                   certManager:
-                    description: CertManager configures cert-manager integration for
-                      automatic certificate management.
+                    description: |-
+                      CertManager configures cert-manager integration for automatic certificate management.
+                      Mutually exclusive with SecretName.
                     properties:
+                      extraDnsNames:
+                        description: |-
+                          ExtraDNSNames specifies additional DNS names to include in the certificate
+                          beyond the automatically generated ones (pod DNS names, service names).
+                        items:
+                          type: string
+                        type: array
                       issuer:
                         description: Issuer references the cert-manager issuer to
                           use.
@@ -272,6 +280,12 @@ spec:
                     default: false
                     description: Enabled activates TLS encryption.
                     type: boolean
+                  secretName:
+                    description: |-
+                      SecretName references an existing Kubernetes Secret containing TLS certificates.
+                      The Secret must contain keys: tls.crt, tls.key, and ca.crt.
+                      Mutually exclusive with CertManager.
+                    type: string
                 type: object
             required:
             - image

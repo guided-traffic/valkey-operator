@@ -88,6 +88,11 @@ type CertManagerIssuerSpec struct {
 type CertManagerSpec struct {
 	// Issuer references the cert-manager issuer to use.
 	Issuer CertManagerIssuerSpec `json:"issuer"`
+
+	// ExtraDNSNames specifies additional DNS names to include in the certificate
+	// beyond the automatically generated ones (pod DNS names, service names).
+	// +optional
+	ExtraDNSNames []string `json:"extraDnsNames,omitempty"`
 }
 
 // TLSSpec defines TLS configuration for Valkey.
@@ -97,8 +102,15 @@ type TLSSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
 
 	// CertManager configures cert-manager integration for automatic certificate management.
+	// Mutually exclusive with SecretName.
 	// +optional
 	CertManager *CertManagerSpec `json:"certManager,omitempty"`
+
+	// SecretName references an existing Kubernetes Secret containing TLS certificates.
+	// The Secret must contain keys: tls.crt, tls.key, and ca.crt.
+	// Mutually exclusive with CertManager.
+	// +optional
+	SecretName string `json:"secretName,omitempty"`
 }
 
 // MetricsSpec defines metrics/exporter configuration.
@@ -251,6 +263,16 @@ func (v *Valkey) IsAuthEnabled() bool {
 // IsTLSEnabled returns true if TLS is configured and enabled.
 func (v *Valkey) IsTLSEnabled() bool {
 	return v.Spec.TLS != nil && v.Spec.TLS.Enabled
+}
+
+// IsCertManagerEnabled returns true if TLS is enabled and cert-manager is configured.
+func (v *Valkey) IsCertManagerEnabled() bool {
+	return v.IsTLSEnabled() && v.Spec.TLS.CertManager != nil
+}
+
+// IsTLSSecretProvided returns true if TLS is enabled with a user-provided Secret.
+func (v *Valkey) IsTLSSecretProvided() bool {
+	return v.IsTLSEnabled() && v.Spec.TLS.SecretName != ""
 }
 
 // IsMetricsEnabled returns true if metrics exporter is enabled.

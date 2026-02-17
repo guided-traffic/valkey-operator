@@ -77,7 +77,8 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 	}
 
 	// Count ready replicas from master's perspective.
-	state.ReadyReplicas = int32(masterInfo.ConnectedSlaves)
+	// #nosec G115 — ConnectedSlaves is bounded by the number of pods in the cluster, safe to convert.
+	state.ReadyReplicas = int32(min(masterInfo.ConnectedSlaves, int(state.TotalReplicas)))
 	state.AllSynced = !masterInfo.MasterSyncInProgress && state.ReadyReplicas == state.TotalReplicas
 
 	// Check sentinel view if sentinel is enabled.

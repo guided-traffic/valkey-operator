@@ -127,6 +127,87 @@ func TestIsTLSEnabled(t *testing.T) {
 	}
 }
 
+func TestIsCertManagerEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      *TLSSpec
+		expected bool
+	}{
+		{
+			name:     "nil TLS spec",
+			tls:      nil,
+			expected: false,
+		},
+		{
+			name:     "TLS disabled with cert-manager",
+			tls:      &TLSSpec{Enabled: false, CertManager: &CertManagerSpec{Issuer: CertManagerIssuerSpec{Kind: "Issuer", Name: "ca"}}},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled without cert-manager",
+			tls:      &TLSSpec{Enabled: true, SecretName: "my-secret"},
+			expected: false,
+		},
+		{
+			name: "TLS enabled with cert-manager",
+			tls: &TLSSpec{
+				Enabled: true,
+				CertManager: &CertManagerSpec{
+					Issuer: CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.TLS = tt.tls
+			})
+			assert.Equal(t, tt.expected, v.IsCertManagerEnabled())
+		})
+	}
+}
+
+func TestIsTLSSecretProvided(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      *TLSSpec
+		expected bool
+	}{
+		{
+			name:     "nil TLS spec",
+			tls:      nil,
+			expected: false,
+		},
+		{
+			name:     "TLS disabled with secret",
+			tls:      &TLSSpec{Enabled: false, SecretName: "my-secret"},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled with empty secret name",
+			tls:      &TLSSpec{Enabled: true},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled with secret name",
+			tls:      &TLSSpec{Enabled: true, SecretName: "my-tls-secret"},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.TLS = tt.tls
+			})
+			assert.Equal(t, tt.expected, v.IsTLSSecretProvided())
+		})
+	}
+}
+
 func TestIsMetricsEnabled(t *testing.T) {
 	tests := []struct {
 		name     string

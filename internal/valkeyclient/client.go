@@ -128,7 +128,9 @@ func readFullResponse(conn net.Conn) (string, error) {
 	case strings.HasPrefix(line, "$"):
 		// Bulk string.
 		size := 0
-		fmt.Sscanf(line[1:], "%d", &size)
+		if _, err := fmt.Sscanf(line[1:], "%d", &size); err != nil {
+			return "", fmt.Errorf("parsing bulk string size: %w", err)
+		}
 		if size < 0 {
 			return "", nil
 		}
@@ -146,7 +148,9 @@ func readFullResponse(conn net.Conn) (string, error) {
 	case strings.HasPrefix(line, "*"):
 		// Array — read all elements.
 		count := 0
-		fmt.Sscanf(line[1:], "%d", &count)
+		if _, err := fmt.Sscanf(line[1:], "%d", &count); err != nil {
+			return "", fmt.Errorf("parsing array count: %w", err)
+		}
 		for i := 0; i < count; i++ {
 			elemLine, err := reader.ReadString('\n')
 			if err != nil {
@@ -156,7 +160,9 @@ func readFullResponse(conn net.Conn) (string, error) {
 
 			if strings.HasPrefix(elemLine, "$") {
 				size := 0
-				fmt.Sscanf(elemLine[1:], "%d", &size)
+				if _, err := fmt.Sscanf(elemLine[1:], "%d", &size); err != nil {
+					return "", fmt.Errorf("parsing array element size: %w", err)
+				}
 				if size < 0 {
 					result.WriteString("(nil)\n")
 					continue
@@ -201,7 +207,7 @@ func parseReplicationInfo(raw string) *ReplicationInfo {
 		case "role":
 			info.Role = val
 		case "connected_slaves":
-			fmt.Sscanf(val, "%d", &info.ConnectedSlaves)
+			_, _ = fmt.Sscanf(val, "%d", &info.ConnectedSlaves)
 		case "master_host":
 			info.MasterHost = val
 		case "master_port":
@@ -233,8 +239,8 @@ func parseSentinelMasterInfo(raw string) *SentinelMasterInfo {
 	info.IP = kvMap["ip"]
 	info.Port = kvMap["port"]
 	info.Flags = kvMap["flags"]
-	fmt.Sscanf(kvMap["num-slaves"], "%d", &info.NumSlaves)
-	fmt.Sscanf(kvMap["quorum"], "%d", &info.Quorum)
+	_, _ = fmt.Sscanf(kvMap["num-slaves"], "%d", &info.NumSlaves)
+	_, _ = fmt.Sscanf(kvMap["quorum"], "%d", &info.Quorum)
 
 	return info
 }

@@ -68,13 +68,40 @@ func GenerateSentinelConf(v *vkov1.Valkey) string {
 		quorum = int(v.Spec.Sentinel.Replicas/2) + 1
 	}
 
+	// Use TLS port for monitoring when TLS is enabled.
+	monitorPort := ValkeyPort
+	if v.IsTLSEnabled() {
+		monitorPort = TLSPort
+	}
+
+	// Sentinel port configuration.
+	if v.IsTLSEnabled() {
+		lines = append(lines,
+			"# Sentinel configuration",
+			"port 0",
+			fmt.Sprintf("tls-port %d", SentinelPort),
+			fmt.Sprintf("dir %s", SentinelDataDir),
+			"",
+			"# TLS configuration",
+			"tls-cert-file /tls/tls.crt",
+			"tls-key-file /tls/tls.key",
+			"tls-ca-cert-file /tls/ca.crt",
+			"tls-replication yes",
+			"tls-auth-clients optional",
+			"",
+		)
+	} else {
+		lines = append(lines,
+			"# Sentinel configuration",
+			fmt.Sprintf("port %d", SentinelPort),
+			fmt.Sprintf("dir %s", SentinelDataDir),
+			"",
+		)
+	}
+
 	lines = append(lines,
-		"# Sentinel configuration",
-		fmt.Sprintf("port %d", SentinelPort),
-		fmt.Sprintf("dir %s", SentinelDataDir),
-		"",
 		"# Monitor configuration",
-		fmt.Sprintf("sentinel monitor %s %s %d %d", monitorName, masterAddr, ValkeyPort, quorum),
+		fmt.Sprintf("sentinel monitor %s %s %d %d", monitorName, masterAddr, monitorPort, quorum),
 		fmt.Sprintf("sentinel down-after-milliseconds %s %d", monitorName, SentinelDownAfterMilliseconds),
 		fmt.Sprintf("sentinel failover-timeout %s %d", monitorName, SentinelFailoverTimeout),
 		fmt.Sprintf("sentinel parallel-syncs %s %d", monitorName, SentinelParallelSyncs),
@@ -166,6 +193,43 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 
 // buildSentinelPodSpec builds the PodSpec for Sentinel pods.
 func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
+	volumes := []corev1.Volume{
+		{
+			Name: "sentinel-config-readonly",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: SentinelConfigMapName(v),
+					},
+				},
+			},
+		},
+		{
+			Name: SentinelConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	// Add TLS volume if TLS is enabled.
+	if v.IsTLSEnabled() {
+		volumes = append(volumes, corev1.Volume{
+			Name: TLSVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: SentinelTLSSecretName(v),
+				},
+			},
+		})
+	}
+
 	return corev1.PodSpec{
 		ServiceAccountName: "default",
 		// Init container copies the sentinel config to a writable volume.
@@ -194,35 +258,32 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		Containers: []corev1.Container{
 			buildSentinelContainer(v),
 		},
-		Volumes: []corev1.Volume{
-			{
-				Name: "sentinel-config-readonly",
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: SentinelConfigMapName(v),
-						},
-					},
-				},
-			},
-			{
-				Name: SentinelConfigVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			},
-			{
-				Name: DataVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			},
-		},
+		Volumes: volumes,
 	}
 }
 
 // buildSentinelContainer builds the Sentinel container spec.
 func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      SentinelConfigVolumeName,
+			MountPath: SentinelConfigMountPath,
+		},
+		{
+			Name:      DataVolumeName,
+			MountPath: SentinelDataDir,
+		},
+	}
+
+	// Mount TLS certificates if TLS is enabled.
+	if v.IsTLSEnabled() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
+	}
+
 	return corev1.Container{
 		Name:  SentinelContainerName,
 		Image: v.Spec.Image,
@@ -237,16 +298,7 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      SentinelConfigVolumeName,
-				MountPath: SentinelConfigMountPath,
-			},
-			{
-				Name:      DataVolumeName,
-				MountPath: SentinelDataDir,
-			},
-		},
+		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				TCPSocket: &corev1.TCPSocketAction{

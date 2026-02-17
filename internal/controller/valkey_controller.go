@@ -10,7 +10,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +37,7 @@ type ValkeyReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles a reconciliation request for a Valkey resource.
 func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -67,6 +70,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if valkey.IsSentinelEnabled() {
 		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
 			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Reconcile TLS Certificates (cert-manager) if enabled.
+	if valkey.IsCertManagerEnabled() {
+		if err := r.reconcileTLSCertificates(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile TLS Certificates: %v", err))
 			return ctrl.Result{}, err
 		}
 	}
@@ -317,6 +328,71 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 		current.Spec.Replicas = desired.Spec.Replicas
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
+// reconcileTLSCertificates reconciles cert-manager Certificate resources for TLS.
+func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov1.Valkey) error {
+	// Reconcile Valkey Certificate.
+	desired := builder.BuildValkeyCertificate(v)
+	if err := r.reconcileCertificate(ctx, v, desired); err != nil {
+		return fmt.Errorf("valkey certificate: %w", err)
+	}
+
+	// Reconcile Sentinel Certificate if Sentinel is enabled.
+	if v.IsSentinelEnabled() {
+		desiredSentinel := builder.BuildSentinelCertificate(v)
+		if err := r.reconcileCertificate(ctx, v, desiredSentinel); err != nil {
+			return fmt.Errorf("sentinel certificate: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileCertificate ensures a cert-manager Certificate resource matches the desired state.
+func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Valkey, desired *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	// Set owner reference manually for unstructured objects.
+	ownerRef := builder.CertificateOwnerRef(v)
+	blockOwnerDeletion := true
+	isController := true
+	ownerRef.BlockOwnerDeletion = &blockOwnerDeletion
+	ownerRef.Controller = &isController
+	desired.SetOwnerReferences([]metav1.OwnerReference{ownerRef})
+
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cert-manager.io",
+		Version: "v1",
+		Kind:    "Certificate",
+	})
+
+	name := desired.GetName()
+	namespace := desired.GetNamespace()
+
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Certificate", "name", name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Compare spec content to determine if update is needed.
+	desiredSpec, _, _ := unstructured.NestedMap(desired.Object, "spec")
+	currentSpec, _, _ := unstructured.NestedMap(current.Object, "spec")
+
+	if !equality.Semantic.DeepEqual(desiredSpec, currentSpec) {
+		logger.Info("Updating Certificate", "name", name)
+		current.Object["spec"] = desired.Object["spec"]
+		current.SetLabels(desired.GetLabels())
+		current.SetOwnerReferences(desired.GetOwnerReferences())
 		return r.Update(ctx, current)
 	}
 

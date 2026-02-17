@@ -116,10 +116,16 @@ func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
 
 	lines = append(lines, "# Replication")
 
+	// Use TLS port for replication when TLS is enabled.
+	replicationPort := ValkeyPort
+	if v.IsTLSEnabled() {
+		replicationPort = TLSPort
+	}
+
 	if isReplica {
 		// Replicas connect to the master. Sentinel will reconfigure this dynamically.
 		lines = append(lines,
-			fmt.Sprintf("replicaof %s %d", MasterAddress(v), ValkeyPort),
+			fmt.Sprintf("replicaof %s %d", MasterAddress(v), replicationPort),
 		)
 	}
 

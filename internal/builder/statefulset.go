@@ -172,6 +172,18 @@ fi`,
 		})
 	}
 
+	// Add TLS volume if TLS is enabled.
+	if v.IsTLSEnabled() {
+		volumes = append(volumes, corev1.Volume{
+			Name: TLSVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: ValkeyTLSSecretName(v),
+				},
+			},
+		})
+	}
+
 	spec := corev1.PodSpec{
 		ServiceAccountName: "default",
 		Containers: []corev1.Container{
@@ -222,6 +234,21 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		},
 	}
 
+	// Mount TLS certificates if TLS is enabled.
+	if v.IsTLSEnabled() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
+	}
+
+	// Determine the container port.
+	containerPort := int32(ValkeyPort)
+	if v.IsTLSEnabled() {
+		containerPort = TLSPort
+	}
+
 	container := corev1.Container{
 		Name:  ValkeyContainerName,
 		Image: v.Spec.Image,
@@ -232,7 +259,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "valkey",
-				ContainerPort: ValkeyPort,
+				ContainerPort: containerPort,
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
@@ -240,7 +267,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{
-					Command: []string{"valkey-cli", "ping"},
+					Command: ProbeCommand(v),
 				},
 			},
 			InitialDelaySeconds: 5,
@@ -252,7 +279,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{
-					Command: []string{"valkey-cli", "ping"},
+					Command: ProbeCommand(v),
 				},
 			},
 			InitialDelaySeconds: 15,
