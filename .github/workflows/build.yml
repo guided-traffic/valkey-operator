@@ -1,0 +1,246 @@
+name: Release Docker & Helm
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: read
+  attestations: write
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.12.0
+            network=host
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Docker meta
+        id: tag_names
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            guidedtraffic/s3-encryption-proxy
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+          labels: |
+            org.opencontainers.image.title=S3 Encryption Proxy
+            org.opencontainers.image.description=A transparent S3 proxy with client-side encryption capabilities
+            org.opencontainers.image.vendor=Guided Traffic
+            org.opencontainers.image.licenses=BSL-1.1
+            org.opencontainers.image.documentation=https://github.com/guided-traffic/s3-encryption-proxy
+            org.opencontainers.image.source=https://github.com/guided-traffic/s3-encryption-proxy
+
+      - name: Get current epoch time
+        id: time
+        run: echo "epoch=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          file: Containerfile
+          context: .
+          build-args: |
+            BUILD_NUMBER=${{ github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.time.outputs.epoch }}
+          platforms: linux/amd64  # ,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tag_names.outputs.tags }}
+          labels: ${{ steps.tag_names.outputs.labels }}
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+          # Security features for better Docker Hub score
+          provenance: true
+          sbom: true
+          # Enable attestation features
+          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=S3 Encryption Proxy
+
+      - name: Generate and upload SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@v0
+        with:
+          image: guidedtraffic/s3-encryption-proxy:${{ github.ref_name }}
+          format: spdx-json
+          upload-artifact: true
+          upload-release-assets: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SBOM to release
+        if: github.event_name != 'pull_request' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ github.workspace }}/guidedtraffic-s3-encryption-proxy_*.spdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Scout scan
+        if: github.event_name != 'pull_request'
+        uses: docker/scout-action@v1
+        with:
+          command: quickview,cves,recommendations
+          image: guidedtraffic/s3-encryption-proxy:${{ github.ref_name }}
+          sarif-file: scout-report.sarif
+          summary: true
+
+  release-helm-gh:
+    name: Release Helm Chart to GitHub Pages
+    needs: build
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.12.0
+
+      - name: Update Chart Version
+        run: |
+          # Extrahiere Version aus dem Release-Tag (ohne 'v' Prefix)
+          VERSION=${GITHUB_REF_NAME#v}
+          # Aktualisiere Chart und App Version
+          sed -i "s/^version:.*$/version: ${VERSION}/" deploy/helm/s3-encryption-proxy/Chart.yaml
+          sed -i "s/^appVersion:.*$/appVersion: \"${VERSION}\"/" deploy/helm/s3-encryption-proxy/Chart.yaml
+          # Aktualisiere Image Tag in values.yaml
+          sed -i "s/^  tag:.*$/  tag: \"${VERSION}\"/" deploy/helm/s3-encryption-proxy/values.yaml
+
+      - name: Create Helm Package
+        run: |
+          cd deploy/helm
+          helm package s3-encryption-proxy/
+          mkdir -p repo
+          mv *.tgz repo/
+          # Erstelle temporären Index für das neue Chart
+          helm repo index repo/ --url https://guided-traffic.github.io/s3-encryption-proxy/
+          cd ../..
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Save Chart Package
+        run: |
+          mkdir -p /tmp/helm-charts
+          cp -r deploy/helm/repo/* /tmp/helm-charts/
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Pages
+        run: |
+          # Kopiere neue Charts ins Root-Verzeichnis
+          cp /tmp/helm-charts/*.tgz .
+
+          # Merge mit existierendem index.yaml falls vorhanden
+          if [ -f index.yaml ]; then
+            # Erstelle temporären Ordner für Merge
+            mkdir -p temp-repo
+            cp *.tgz temp-repo/
+            # Merge mit existierendem Index
+            helm repo index temp-repo/ --url https://guided-traffic.github.io/s3-encryption-proxy/ --merge index.yaml
+            cp temp-repo/index.yaml .
+            rm -rf temp-repo
+          else
+            # Erstelle neuen Index falls keiner existiert
+            helm repo index . --url https://guided-traffic.github.io/s3-encryption-proxy/
+          fi
+
+          git add --force *.tgz index.yaml
+          git commit -m "Release Helm chart for $GITHUB_REF_NAME"
+          git push --force origin gh-pages
+
+      - name: Update Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tgz
+            index.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # we don't release to dockerhub for now
+  # release-helm-docker:
+  #   name: Release Helm Chart to Docker Hub (OCI)
+  #   needs: build
+  #   runs-on: self-hosted
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v6
+  #       with:
+  #         fetch-depth: 0
+
+  #     - name: Install Helm
+  #       uses: azure/setup-helm@v4
+  #       with:
+  #         version: v3.12.0
+
+  #     - name: Login to Docker Hub
+  #       uses: docker/login-action@v3
+  #       with:
+  #         username: guidedtraffic
+  #         password: ${{ secrets.DOCKERHUB_PAT }}
+
+  #     - name: Update Chart Version
+  #       run: |
+  #         # Extrahiere Version aus dem Release-Tag (ohne 'v' Prefix)
+  #         VERSION=${GITHUB_REF_NAME#v}
+  #         # Aktualisiere Chart und App Version
+  #         sed -i "s/^version:.*$/version: ${VERSION}/" deploy/helm/s3-encryption-proxy/Chart.yaml
+  #         sed -i "s/^appVersion:.*$/appVersion: \"${VERSION}\"/" deploy/helm/s3-encryption-proxy/Chart.yaml
+  #         # Aktualisiere Image Tag in values.yaml
+  #         sed -i "s/^  tag:.*$/  tag: \"${VERSION}\"/" deploy/helm/s3-encryption-proxy/values.yaml
+
+  #     - name: Package and Push Helm Chart to Docker Hub
+  #       run: |
+  #         # Change directory
+  #         cd deploy/helm
+
+  #         # Package the chart
+  #         helm package s3-encryption-proxy/
+
+  #         # Push to Docker Hub as OCI artifact
+  #         VERSION=${GITHUB_REF_NAME#v}
+  #         helm push s3-encryption-proxy-helm-${VERSION}.tgz oci://registry-1.docker.io/guidedtraffic
