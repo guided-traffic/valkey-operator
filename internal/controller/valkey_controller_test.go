@@ -27,6 +27,7 @@ func TestValkeyReconciler_Reconcile(t *testing.T) {
 		},
 		Spec: vkov1.ValkeySpec{
 			Replicas: 3,
+			Image:    "valkey/valkey:8.0",
 		},
 	}
 
