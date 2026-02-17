@@ -317,28 +317,12 @@ func StatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 		}
 	}
 
-	// Check labels on pod template.
-	desiredLabels := desired.Spec.Template.Labels
-	currentLabels := current.Spec.Template.Labels
-	if len(desiredLabels) != len(currentLabels) {
+	// Check labels and annotations on pod template.
+	if stringMapChanged(desired.Spec.Template.Labels, current.Spec.Template.Labels) {
 		return true
 	}
-	for k, v := range desiredLabels {
-		if currentLabels[k] != v {
-			return true
-		}
-	}
-
-	// Check annotations on pod template.
-	desiredAnnotations := desired.Spec.Template.Annotations
-	currentAnnotations := current.Spec.Template.Annotations
-	if len(desiredAnnotations) != len(currentAnnotations) {
+	if stringMapChanged(desired.Spec.Template.Annotations, current.Spec.Template.Annotations) {
 		return true
-	}
-	for k, v := range desiredAnnotations {
-		if currentAnnotations[k] != v {
-			return true
-		}
 	}
 
 	// Check resource requirements.
@@ -351,6 +335,19 @@ func StatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 		}
 	}
 
+	return false
+}
+
+// stringMapChanged returns true if two string maps differ in length or content.
+func stringMapChanged(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return true
+		}
+	}
 	return false
 }
 
