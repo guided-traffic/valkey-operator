@@ -126,8 +126,14 @@ cert-manager-install: ## Install cert-manager into the cluster.
 	@sleep 5
 	@kubectl apply -f test/e2e/testdata/cert-manager-issuer.yaml
 
+E2E_IMG ?= valkey-operator:test
+
 .PHONY: e2e-local
-e2e-local: kind-create kind-load cert-manager-install ## Run full E2E test locally with Kind.
+e2e-local: kind-create cert-manager-install ## Run full E2E test locally with Kind.
+	@echo "Building E2E image..."
+	docker build -f Containerfile -t $(E2E_IMG) .
+	@echo "Loading E2E image into Kind cluster..."
+	kind load docker-image $(E2E_IMG) --name valkey-operator-test
 	@echo "Installing operator via Helm..."
 	helm install valkey-operator deploy/helm/valkey-operator \
 		--namespace valkey-operator-system \

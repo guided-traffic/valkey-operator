@@ -7,11 +7,11 @@
 package e2e
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -167,121 +167,30 @@ func (tc *testClients) getValkeyStatus(t *testing.T, namespace, name string) map
 	return status
 }
 
-// getPodIP returns the IP of a pod.
-func (tc *testClients) getPodIP(t *testing.T, namespace, name string) string {
-	t.Helper()
-	ctx := context.Background()
-
-	pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
-	require.NoError(t, err, "Failed to get pod %s/%s", namespace, name)
-	require.NotEmpty(t, pod.Status.PodIP, "Pod %s has no IP yet", name)
-	return pod.Status.PodIP
-}
-
-// valkeyExec executes a Valkey command via a RESP connection to a pod.
-// Returns the response string.
+// valkeyExec executes a Valkey command via kubectl exec + valkey-cli inside the pod.
+// This avoids direct TCP connections to Pod IPs which are unreachable from
+// the host on macOS with Kind/Docker Desktop.
 func (tc *testClients) valkeyExec(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
-	ctx := context.Background()
 
-	// Get the pod IP directly.
-	ip := tc.getPodIP(t, namespace, podName)
-	addr := fmt.Sprintf("%s:%d", ip, port)
-
-	return valkeyCommand(t, ctx, addr, args...)
-}
-
-// valkeyCommand sends a RESP command to a Valkey server and returns the response.
-func valkeyCommand(t *testing.T, ctx context.Context, addr string, args ...string) string {
-	t.Helper()
-
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	require.NoError(t, err, "Failed to connect to Valkey at %s", addr)
-	defer conn.Close()
-
-	// Set a deadline for the entire operation.
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// Send RESP command.
-	cmd := formatRESP(args)
-	_, err = conn.Write([]byte(cmd))
-	require.NoError(t, err, "Failed to write command to Valkey")
-
-	// Read response.
-	reader := bufio.NewReader(conn)
-	response, err := readRESPResponse(reader)
-	require.NoError(t, err, "Failed to read response from Valkey")
-
-	return response
-}
-
-// formatRESP formats a command as a RESP array.
-func formatRESP(args []string) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
-	for _, arg := range args {
-		sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
+	cliArgs := []string{
+		"exec", podName,
+		"-n", namespace,
+		"--", "valkey-cli",
+		"--raw",
+		"-p", fmt.Sprintf("%d", port),
 	}
-	return sb.String()
-}
+	cliArgs = append(cliArgs, args...)
 
-// readRESPResponse reads a full RESP response from a buffered reader.
-func readRESPResponse(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("reading response: %w", err)
-	}
-	line = strings.TrimRight(line, "\r\n")
+	cmd := exec.CommandContext(context.Background(), "kubectl", cliArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	switch {
-	case strings.HasPrefix(line, "+"):
-		// Simple string.
-		return line[1:], nil
-	case strings.HasPrefix(line, "-"):
-		// Error.
-		return "", fmt.Errorf("valkey error: %s", line[1:])
-	case strings.HasPrefix(line, ":"):
-		// Integer.
-		return line[1:], nil
-	case strings.HasPrefix(line, "$"):
-		// Bulk string.
-		length := 0
-		_, err := fmt.Sscanf(line, "$%d", &length)
-		if err != nil {
-			return "", fmt.Errorf("parsing bulk string length: %w", err)
-		}
-		if length == -1 {
-			return "(nil)", nil
-		}
-		data := make([]byte, length+2) // +2 for \r\n
-		_, err = reader.Read(data)
-		if err != nil {
-			return "", fmt.Errorf("reading bulk string data: %w", err)
-		}
-		return string(data[:length]), nil
-	case strings.HasPrefix(line, "*"):
-		// Array — read all elements and join with newlines.
-		count := 0
-		_, err := fmt.Sscanf(line, "*%d", &count)
-		if err != nil {
-			return "", fmt.Errorf("parsing array count: %w", err)
-		}
-		if count == -1 {
-			return "(nil)", nil
-		}
-		var parts []string
-		for i := 0; i < count; i++ {
-			elem, err := readRESPResponse(reader)
-			if err != nil {
-				return "", fmt.Errorf("reading array element %d: %w", i, err)
-			}
-			parts = append(parts, elem)
-		}
-		return strings.Join(parts, "\n"), nil
-	default:
-		return line, nil
-	}
+	err := cmd.Run()
+	require.NoError(t, err, "kubectl exec failed for pod %s: %s", podName, stderr.String())
+
+	return strings.TrimSpace(stdout.String())
 }
 
 // waitForPodReady waits until a specific pod is in Ready condition.

@@ -3,10 +3,10 @@
 package e2e
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"net"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -468,24 +468,23 @@ func (tc *testClients) waitForStatefulSetOrDeploymentReady(t *testing.T, namespa
 func (tc *testClients) valkeyExecAllowError(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
-	ip := tc.getPodIP(t, namespace, podName)
-	addr := fmt.Sprintf("%s:%d", ip, port)
+	cliArgs := []string{
+		"exec", podName,
+		"-n", namespace,
+		"--", "valkey-cli",
+		"--raw",
+		"-p", fmt.Sprintf("%d", port),
+	}
+	cliArgs = append(cliArgs, args...)
 
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.DialContext(t.Context(), "tcp", addr)
-	require.NoError(t, err, "Failed to connect to Valkey at %s", addr)
-	defer conn.Close()
+	cmd := exec.CommandContext(t.Context(), "kubectl", cliArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = cmd.Run()
 
-	cmd := formatRESP(args)
-	_, err = conn.Write([]byte(cmd))
-	require.NoError(t, err, "Failed to write command to Valkey")
-
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	require.NoError(t, err)
-	return strings.TrimRight(line, "\r\n")
+	return strings.TrimSpace(stdout.String())
 }
 
 // Helper functions for unstructured nested access.
