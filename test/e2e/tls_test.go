@@ -438,8 +438,17 @@ func TestE2E_TLS_Standalone(t *testing.T) {
 
 	t.Run("TLS INFO server shows TLS port", func(t *testing.T) {
 		podName := fmt.Sprintf("%s-0", name)
+
+		// Valkey 8.x reports the active listener port under tcp_port in INFO server,
+		// so we use CONFIG GET port to verify the plaintext port is disabled.
+		resp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "CONFIG", "GET", "port")
+		assert.Contains(t, resp, "0", "Plaintext port should be 0 (disabled)")
+
+		// Also verify TLS port is active via INFO server listener info.
 		info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "server")
-		assert.Contains(t, info, "tcp_port:0", "Non-TLS port should be 0 (disabled)")
+		assert.Contains(t, info, "tcp_port:", "INFO server should report tcp_port")
+		t.Logf("INFO server (TLS relevant):\n%s",
+			filterInfoLines(info, "tcp_port", "tls", "ssl", "listener"))
 	})
 
 	// --- Log analysis ---
@@ -753,9 +762,17 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 	t.Run("INFO server confirms TLS on all pods", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
+
+			// Valkey 8.x reports the active listener port under tcp_port in INFO server,
+			// so we use CONFIG GET port to verify the plaintext port is disabled.
+			resp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "CONFIG", "GET", "port")
+			assert.Contains(t, resp, "0",
+				"Pod %s plaintext port should be disabled", podName)
+
+			// Also verify TLS port is active via INFO server listener info.
 			info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "server")
-			assert.Contains(t, info, "tcp_port:0",
-				"Pod %s non-TLS port should be disabled", podName)
+			assert.Contains(t, info, "tcp_port:",
+				"Pod %s INFO server should report tcp_port", podName)
 		}
 	})
 
@@ -1320,9 +1337,15 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 
 	t.Run("Valkey INFO server confirms TLS configuration", func(t *testing.T) {
 		podName := fmt.Sprintf("%s-0", name)
-		info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "server")
 
-		assert.Contains(t, info, "tcp_port:0", "Non-TLS port should be disabled (0)")
+		// Valkey 8.x reports the active listener port under tcp_port in INFO server,
+		// so we use CONFIG GET port to verify the plaintext port is disabled.
+		resp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "CONFIG", "GET", "port")
+		assert.Contains(t, resp, "0", "Plaintext port should be disabled (0)")
+
+		// Also verify TLS port is active via INFO server listener info.
+		info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "server")
+		assert.Contains(t, info, "tcp_port:", "INFO server should report tcp_port")
 		t.Logf("Master INFO server (TLS relevant):\n%s",
 			filterInfoLines(info, "tcp_port", "tls", "ssl", "config_file"))
 	})
