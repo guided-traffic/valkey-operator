@@ -199,13 +199,15 @@ func assertNoErrorsInLogs(t *testing.T, logs string, podName string) {
 	t.Helper()
 
 	// Critical patterns that indicate misconfiguration or failure.
+	// Note: "wrong version number" is intentionally excluded because it is an
+	// expected log entry when a plaintext client connects to a TLS port (e.g.
+	// during the plaintext-rejection E2E sub-test or health-check probes).
 	criticalPatterns := []string{
 		"Connection refused",
 		"TLS handshake error",
 		"certificate verify failed",
 		"SSL_CTX_use_certificate",
 		"SSL_CTX_use_PrivateKey",
-		"wrong version number",
 		"FATAL",
 		"PANIC",
 		"no such file or directory",
