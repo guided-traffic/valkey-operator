@@ -191,47 +191,15 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	// Check the current state machine phase.
 	currentState := r.getRollingUpdateState(v)
 
-	// Detect stale state from a previous rolling update. If no pods have the
-	// desired image yet (updatedCount == 0) but the state machine is past the
-	// replica-replacement phase, the state annotations are left over from a
-	// prior rolling update that completed just as the desired image changed
-	// (e.g., quick consecutive image changes). Clear the stale state so the
-	// new rolling update starts fresh from replica replacement.
-	if updatedCount == 0 && currentState != "" && currentState != stateReplacingReplicas {
-		logger.Info("Clearing stale rolling update state from previous update",
-			"staleState", currentState)
-		if err := r.clearRollingUpdateState(ctx, v); err != nil {
-			return RollingUpdateResult{Error: err}
-		}
-		currentState = ""
+	// Detect and clear stale state from a previous rolling update.
+	currentState, err = r.clearStaleRollingUpdateState(ctx, v, currentState, updatedCount)
+	if err != nil {
+		return RollingUpdateResult{Error: err}
 	}
 
-	// If sentinel was reset after a timed-out failover (cooldown from a previous
-	// failover prevented it), retrigger failover now — but only after sentinel
-	// has had enough time to rediscover the topology via INFO polling.
+	// If sentinel was reset after a timed-out failover, retrigger failover.
 	if currentState == stateFailoverReset {
-		// Check if enough time has passed since the reset for sentinel to
-		// rediscover replicas. Without this guard, concurrent reconciles
-		// retrigger immediately and get NOGOODSLAVE.
-		if !r.hasMinWaitElapsed(v, failoverResetMinWait) {
-			logger.Info("Waiting for sentinel to rediscover replicas after reset")
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 10 * time.Second}
-		}
-
-		logger.Info("Retriggering sentinel failover after reset")
-
-		if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
-			return RollingUpdateResult{Error: err}
-		}
-		if err := r.setFailoverTimestamp(ctx, v); err != nil {
-			return RollingUpdateResult{Error: err}
-		}
-
-		if err := r.triggerSentinelFailover(ctx, v); err != nil {
-			logger.Info("Sentinel failover retry failed, will retry", "error", err)
-		}
-
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
+		return r.handleFailoverRetrigger(ctx, v)
 	}
 
 	// If failover was already triggered, skip straight to post-failover handling.
@@ -258,6 +226,54 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 
 	// Step 3: Replace any remaining pods with old image.
 	return r.replaceRemainingPods(ctx, v, pods)
+}
+
+// clearStaleRollingUpdateState detects stale state from a previous rolling update.
+// If no pods have the desired image yet (updatedCount == 0) but the state machine
+// is past the replica-replacement phase, the state annotations are left over from
+// a prior rolling update. Clear the stale state so the new rolling update starts
+// fresh from replica replacement.
+func (r *ValkeyReconciler) clearStaleRollingUpdateState(ctx context.Context, v *vkov1.Valkey, currentState string, updatedCount int) (string, error) {
+	if updatedCount == 0 && currentState != "" && currentState != stateReplacingReplicas {
+		logger := log.FromContext(ctx)
+		logger.Info("Clearing stale rolling update state from previous update",
+			"staleState", currentState)
+		if err := r.clearRollingUpdateState(ctx, v); err != nil {
+			return currentState, err
+		}
+		return "", nil
+	}
+	return currentState, nil
+}
+
+// handleFailoverRetrigger retriggers a sentinel failover after a previous reset.
+// After a sentinel reset, sentinel needs time to rediscover replicas via INFO
+// polling (~10s). This method waits for that minimum period before retriggering.
+func (r *ValkeyReconciler) handleFailoverRetrigger(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	// Check if enough time has passed since the reset for sentinel to
+	// rediscover replicas. Without this guard, concurrent reconciles
+	// retrigger immediately and get NOGOODSLAVE.
+	if !r.hasMinWaitElapsed(v) {
+		logger.Info("Waiting for sentinel to rediscover replicas after reset")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 10 * time.Second}
+	}
+
+	logger.Info("Retriggering sentinel failover after reset")
+
+	if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+	if err := r.setFailoverTimestamp(ctx, v); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	if err := r.triggerSentinelFailover(ctx, v); err != nil {
+		logger.Info("Sentinel failover retry failed, will retry", "error", err)
+	}
+
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 }
 
 // finalizeRollingUpdate verifies cluster topology after all pods are updated,
@@ -799,10 +815,10 @@ func (r *ValkeyReconciler) isFailoverTimedOut(v *vkov1.Valkey) bool {
 	return time.Since(ts) > failoverRetryTimeout
 }
 
-// hasMinWaitElapsed checks whether at least minWait has elapsed since the
-// failover timestamp. Used to prevent retriggering failover too quickly after
-// a SENTINEL RESET, giving sentinel time to rediscover replicas.
-func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey, minWait time.Duration) bool {
+// hasMinWaitElapsed checks whether at least failoverResetMinWait has elapsed
+// since the failover timestamp. Used to prevent retriggering failover too
+// quickly after a SENTINEL RESET, giving sentinel time to rediscover replicas.
+func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey) bool {
 	if v.Annotations == nil {
 		return true
 	}
@@ -814,7 +830,7 @@ func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey, minWait time.Durat
 	if err != nil {
 		return true // Corrupted timestamp — allow to proceed.
 	}
-	return time.Since(ts) >= minWait
+	return time.Since(ts) >= failoverResetMinWait
 }
 
 // resetSentinelState reconfigures all sentinel instances by removing and re-adding

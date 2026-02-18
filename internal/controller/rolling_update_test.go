@@ -758,7 +758,7 @@ func TestHasMinWaitElapsed_NoTimestamp(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, _ := newTestReconciler(v)
 
-	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+	assert.True(t, r.hasMinWaitElapsed(v),
 		"Should return true when no timestamp is set")
 }
 
@@ -825,7 +825,7 @@ func TestHasMinWaitElapsed_RecentTimestamp(t *testing.T) {
 		annotationFailoverTimestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	assert.False(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+	assert.False(t, r.hasMinWaitElapsed(v),
 		"Should return false for a recent timestamp")
 }
 
@@ -838,7 +838,7 @@ func TestHasMinWaitElapsed_OldTimestamp(t *testing.T) {
 		annotationFailoverTimestamp: oldTime.Format(time.RFC3339),
 	}
 
-	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+	assert.True(t, r.hasMinWaitElapsed(v),
 		"Should return true for an old timestamp")
 }
 
@@ -850,6 +850,6 @@ func TestHasMinWaitElapsed_CorruptedTimestamp(t *testing.T) {
 		annotationFailoverTimestamp: "invalid-timestamp",
 	}
 
-	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+	assert.True(t, r.hasMinWaitElapsed(v),
 		"Should return true for corrupted timestamp to allow progress")
 }
