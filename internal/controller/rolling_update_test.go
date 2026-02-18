@@ -508,3 +508,145 @@ func TestReconcile_RollingUpdate_OnDeleteStrategy(t *testing.T) {
 	assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type,
 		"StatefulSet should use OnDelete strategy so the operator controls pod replacement")
 }
+
+// --- Failover Timestamp and State Tests ---
+
+func TestSetFailoverTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	err := r.setFailoverTimestamp(context.Background(), v)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, v.Annotations[annotationFailoverTimestamp])
+
+	// Verify the timestamp is valid RFC3339.
+	ts, err := time.Parse(time.RFC3339, v.Annotations[annotationFailoverTimestamp])
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now().UTC(), ts, 5*time.Second)
+}
+
+func TestIsFailoverTimedOut_NotSet(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	assert.False(t, r.isFailoverTimedOut(v), "Should not be timed out when no timestamp is set")
+}
+
+func TestIsFailoverTimedOut_RecentTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	assert.False(t, r.isFailoverTimedOut(v), "Should not be timed out for a recent timestamp")
+}
+
+func TestIsFailoverTimedOut_OldTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	oldTime := time.Now().UTC().Add(-failoverRetryTimeout - time.Minute)
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: oldTime.Format(time.RFC3339),
+	}
+
+	assert.True(t, r.isFailoverTimedOut(v), "Should be timed out for an old timestamp")
+}
+
+func TestIsFailoverTimedOut_CorruptedTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: "invalid-timestamp",
+	}
+
+	assert.True(t, r.isFailoverTimedOut(v), "Should treat corrupted timestamp as timed out")
+}
+
+func TestClearRollingUpdateState_CleansUpFailoverTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateFailoverTriggered,
+		annotationFailoverTimestamp:  time.Now().UTC().Format(time.RFC3339),
+	}
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.clearRollingUpdateState(context.Background(), v)
+	require.NoError(t, err)
+
+	assert.Empty(t, v.Annotations[annotationRollingUpdateState])
+	assert.Empty(t, v.Annotations[annotationFailoverTimestamp])
+}
+
+func TestClearRollingUpdateState_NothingToClean(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	err := r.clearRollingUpdateState(context.Background(), v)
+	require.NoError(t, err)
+}
+
+func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
+	v := newTestValkey("ha-post", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// Set recent failover timestamp — should not retry yet.
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateFailoverTriggered,
+		annotationFailoverTimestamp:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Pod-0 and Pod-1 have the new image, Pod-2 still has the old one (the master being replaced).
+	// No actual Valkey running, so no master is detected by GetReplicationInfo.
+	pod0 := createPodForSts(v, 0, "valkey/valkey:9.0", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:9.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	// Create a StatefulSet manually to avoid going through reconcileOnce.
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ha-post",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "ha-post"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "ha-post"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "valkey", Image: "valkey/valkey:9.0"},
+					},
+				},
+			},
+		},
+	}
+
+	r, _ := newTestReconciler(v, pod0, pod1, pod2, sts)
+
+	pods, masterIdx, err := r.collectPodStates(context.Background(), v, sts)
+	require.NoError(t, err)
+
+	// handlePostFailover should requeue because no pod reports role=master
+	// (no actual Valkey is running in unit tests).
+	result := r.handlePostFailover(context.Background(), v, pods, masterIdx)
+	assert.True(t, result.NeedsRequeue, "Should requeue when no new master is found")
+	assert.Nil(t, result.Error)
+}

@@ -118,3 +118,8 @@ func TestFormatRESP_WaitCommand(t *testing.T) {
 	resp := formatRESP([]string{"WAIT", "2", "5000"})
 	assert.Equal(t, "*3\r\n$4\r\nWAIT\r\n$1\r\n2\r\n$4\r\n5000\r\n", resp)
 }
+
+func TestFormatRESP_SentinelResetCommand(t *testing.T) {
+	resp := formatRESP([]string{"SENTINEL", "RESET", "mymaster"})
+	assert.Equal(t, "*3\r\n$8\r\nSENTINEL\r\n$5\r\nRESET\r\n$8\r\nmymaster\r\n", resp)
+}

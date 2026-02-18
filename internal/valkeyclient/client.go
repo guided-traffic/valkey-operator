@@ -84,6 +84,17 @@ func (c *Client) SentinelFailover(name string) error {
 	return nil
 }
 
+// SentinelReset sends SENTINEL RESET <pattern> to reset all matching masters.
+// This clears the sentinel's internal failover cooldown state, allowing
+// a new failover to be triggered immediately. The pattern "*" matches all masters.
+func (c *Client) SentinelReset(pattern string) error {
+	_, err := c.exec("SENTINEL", "RESET", pattern)
+	if err != nil {
+		return fmt.Errorf("sentinel reset %s on %s: %w", pattern, c.addr, err)
+	}
+	return nil
+}
+
 // Wait sends the WAIT command to block until all the previous write commands
 // are acknowledged by at least numReplicas replicas, or until the timeout
 // (in milliseconds) expires. It returns the number of replicas that acknowledged.
