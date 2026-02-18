@@ -1,0 +1,374 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.3
+  name: valkeys.vko.gtrfc.com
+spec:
+  group: vko.gtrfc.com
+  names:
+    kind: Valkey
+    listKind: ValkeyList
+    plural: valkeys
+    shortNames:
+    - vk
+    singular: valkey
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Desired number of Valkey replicas
+      jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - description: Number of ready replicas
+      jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - description: Current phase
+      jsonPath: .status.phase
+      name: Phase
+      type: string
+    - description: Current master pod
+      jsonPath: .status.masterPod
+      name: Master
+      type: string
+    - description: Valkey image
+      jsonPath: .spec.image
+      name: Image
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: Valkey is the Schema for the valkeys API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ValkeySpec defines the desired state of Valkey.
+            properties:
+              auth:
+                description: Auth configures authentication.
+                properties:
+                  secretName:
+                    description: SecretName is the name of the Kubernetes Secret containing
+                      the password.
+                    type: string
+                  secretPasswordKey:
+                    default: password
+                    description: SecretPasswordKey is the key within the Secret that
+                      holds the password.
+                    type: string
+                type: object
+              image:
+                description: Image is the Valkey container image to use.
+                minLength: 1
+                type: string
+              metrics:
+                description: Metrics configures the metrics exporter.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled activates the metrics exporter sidecar.
+                    type: boolean
+                type: object
+              networkPolicy:
+                description: NetworkPolicy configures network policies.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled activates NetworkPolicy creation.
+                    type: boolean
+                  namePrefix:
+                    description: NamePrefix is prepended to generated NetworkPolicy
+                      names.
+                    type: string
+                type: object
+              persistence:
+                description: Persistence configures data persistence.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled activates persistent storage for Valkey data.
+                    type: boolean
+                  mode:
+                    default: rdb
+                    description: 'Mode selects the persistence strategy: rdb, aof,
+                      or both.'
+                    enum:
+                    - rdb
+                    - aof
+                    - both
+                    type: string
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 1Gi
+                    description: Size is the requested storage size.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  storageClass:
+                    description: StorageClass is the name of the StorageClass to use.
+                      Empty string means default.
+                    type: string
+                type: object
+              podAnnotations:
+                additionalProperties:
+                  type: string
+                description: PodAnnotations are additional annotations applied to
+                  Valkey pods.
+                type: object
+              podLabels:
+                additionalProperties:
+                  type: string
+                description: PodLabels are additional labels applied to Valkey pods.
+                type: object
+              replicas:
+                default: 1
+                description: Replicas is the number of Valkey instances to run.
+                format: int32
+                minimum: 1
+                type: integer
+              resources:
+                description: Resources defines the compute resource requirements for
+                  Valkey containers.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              sentinel:
+                description: Sentinel configures Sentinel-based HA mode.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled activates Sentinel-based HA mode.
+                    type: boolean
+                  podAnnotations:
+                    additionalProperties:
+                      type: string
+                    description: PodAnnotations are additional annotations applied
+                      to Sentinel pods.
+                    type: object
+                  podLabels:
+                    additionalProperties:
+                      type: string
+                    description: PodLabels are additional labels applied to Sentinel
+                      pods.
+                    type: object
+                  replicas:
+                    default: 3
+                    description: Replicas is the number of Sentinel instances to run.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+              tls:
+                description: TLS configures TLS encryption.
+                properties:
+                  certManager:
+                    description: |-
+                      CertManager configures cert-manager integration for automatic certificate management.
+                      Mutually exclusive with SecretName.
+                    properties:
+                      extraDnsNames:
+                        description: |-
+                          ExtraDNSNames specifies additional DNS names to include in the certificate
+                          beyond the automatically generated ones (pod DNS names, service names).
+                        items:
+                          type: string
+                        type: array
+                      issuer:
+                        description: Issuer references the cert-manager issuer to
+                          use.
+                        properties:
+                          group:
+                            default: cert-manager.io
+                            description: Group is the API group of the issuer (defaults
+                              to cert-manager.io).
+                            type: string
+                          kind:
+                            description: Kind is the kind of the issuer (Issuer or
+                              ClusterIssuer).
+                            enum:
+                            - Issuer
+                            - ClusterIssuer
+                            type: string
+                          name:
+                            description: Name is the name of the issuer resource.
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
+                    required:
+                    - issuer
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enabled activates TLS encryption.
+                    type: boolean
+                  secretName:
+                    description: |-
+                      SecretName references an existing Kubernetes Secret containing TLS certificates.
+                      The Secret must contain keys: tls.crt, tls.key, and ca.crt.
+                      Mutually exclusive with CertManager.
+                    type: string
+                type: object
+            required:
+            - image
+            type: object
+          status:
+            description: ValkeyStatus defines the observed state of Valkey.
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the Valkey state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              masterPod:
+                description: MasterPod is the name of the current master pod.
+                type: string
+              message:
+                description: Message is a human-readable description of the current
+                  state.
+                type: string
+              phase:
+                description: Phase describes the current lifecycle phase of the Valkey
+                  cluster.
+                type: string
+              readyReplicas:
+                description: ReadyReplicas is the number of ready Valkey instances.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
