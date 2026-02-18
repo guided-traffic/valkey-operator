@@ -20,6 +20,19 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
+// Rolling update state machine annotations.
+// These annotations are placed on the Valkey CR to track state across reconcile loops,
+// preventing the reconcile storm from re-entering critical code paths.
+const (
+	// annotationRollingUpdateState tracks which phase the rolling update is in.
+	annotationRollingUpdateState = "vko.gtrfc.com/rolling-update-state"
+
+	// Rolling update states:
+	stateReplacingReplicas = "replacing-replicas" // Replacing replica pods one by one.
+	stateFailoverTriggered = "failover-triggered" // Sentinel failover has been triggered.
+	stateReplacingMaster   = "replacing-master"   // Replacing the former master pod.
+)
+
 // RollingUpdateResult describes the outcome of a rolling update step.
 type RollingUpdateResult struct {
 	// NeedsRequeue indicates that the reconciler should requeue after RequeueAfter.
@@ -123,6 +136,9 @@ func isPodReady(pod *corev1.Pod) bool {
 //     replica becomes master.
 //  5. Replace the former master pod (now a replica).
 //  6. Verify all pods run the new image and the cluster is healthy.
+//
+// State tracking via annotations prevents the reconcile storm from re-entering
+// critical code paths (failover trigger, master deletion) concurrently.
 func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	totalPods := int(*currentSts.Spec.Replicas)
@@ -136,9 +152,32 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	// Count how many pods have been updated.
 	updatedCount := countUpdatedPods(pods)
 
-	// If all pods are updated and ready, the rolling update is complete.
+	// If all pods are updated and ready, verify cluster health before completing.
 	if updatedCount == totalPods {
+		// Only verify topology if we went through a failover during this rolling update.
+		// The state annotation is set during the failover process, so its presence means
+		// we need to verify the cluster settled correctly before declaring completion.
+		currentStateForCompletion := r.getRollingUpdateState(v)
+		if v.IsSentinelEnabled() && currentStateForCompletion != "" {
+			// Verify exactly one master exists and all replicas are synced.
+			masterCount := 0
+			for _, ps := range pods {
+				if ps.isMaster {
+					masterCount++
+				}
+			}
+			if masterCount != 1 {
+				logger.Info("Rolling update: waiting for stable cluster topology",
+					"masterCount", masterCount)
+				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+		}
+
 		logger.Info("Rolling update complete, all pods running new image")
+		// Clean up state annotation.
+		if err := r.clearRollingUpdateState(ctx, v); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
 		return RollingUpdateResult{Completed: true}
 	}
 
@@ -146,8 +185,16 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
 	_ = r.updatePhase(ctx, v, ValkeyPhase(phase), fmt.Sprintf("Rolling update in progress: %d/%d pods updated", updatedCount, totalPods))
 
+	// Check the current state machine phase.
+	currentState := r.getRollingUpdateState(v)
+
+	// If failover was already triggered, skip straight to post-failover handling.
+	if currentState == stateFailoverTriggered || currentState == stateReplacingMaster {
+		return r.handlePostFailover(ctx, v, pods, masterIdx)
+	}
+
 	// Step 1: Replace replica pods first (not the master).
-	if result := r.replaceNextReplica(ctx, pods); result != nil {
+	if result := r.replaceNextReplica(ctx, v, pods); result != nil {
 		return *result
 	}
 
@@ -156,8 +203,19 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 		return *result
 	}
 
+	// If no master was detected but pods still need updating, the cluster may be
+	// in a failover transition. Wait for it to stabilize before replacing pods.
+	if masterIdx < 0 {
+		for _, ps := range pods {
+			if ps.needsUpdate {
+				logger.Info("No master detected during rolling update, waiting for cluster to stabilize")
+				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+		}
+	}
+
 	// Step 3: Replace any remaining pods with old image.
-	return r.replaceRemainingPods(ctx, pods)
+	return r.replaceRemainingPods(ctx, v, pods)
 }
 
 // podState holds the state of a single pod during a rolling update.
@@ -224,7 +282,7 @@ func countUpdatedPods(pods []podState) int {
 
 // replaceNextReplica finds the next replica pod that needs updating and deletes it.
 // Returns nil if no replica needs replacement (all replicas are done).
-func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, pods []podState) *RollingUpdateResult {
+func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valkey, pods []podState) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
 	for i, ps := range pods {
@@ -242,6 +300,13 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, pods []podSta
 			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
+		// Set state to replacing-replicas if not already set.
+		if r.getRollingUpdateState(v) == "" {
+			if err := r.setRollingUpdateState(ctx, v, stateReplacingReplicas); err != nil {
+				return &RollingUpdateResult{Error: err}
+			}
+		}
+
 		logger.Info("Deleting replica pod for rolling update", "pod", ps.name, "ordinal", i)
 		if err := r.Delete(ctx, ps.pod); err != nil {
 			return &RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
@@ -254,6 +319,8 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, pods []podSta
 
 // handleMasterFailover checks if the master needs updating, verifies all replicas
 // are ready and synced, then triggers a Sentinel failover.
+// Uses annotation-based state tracking to ensure failover is only triggered once,
+// even when multiple reconcile loops run concurrently.
 // Returns nil if the master does not need updating.
 func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
@@ -262,21 +329,42 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 		return nil
 	}
 
+	// If failover was already triggered (by a prior reconcile in this storm),
+	// don't trigger it again. Let handlePostFailover deal with it.
+	currentState := r.getRollingUpdateState(v)
+	if currentState == stateFailoverTriggered || currentState == stateReplacingMaster {
+		logger.Info("Failover already triggered by prior reconcile, skipping to post-failover handling")
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
 	// Check if all non-master pods are ready and synced before doing failover.
 	if result := r.waitForReplicasReady(ctx, v, pods, masterIdx); result != nil {
 		return result
+	}
+
+	// Execute WAIT on the master to ensure all pending writes are replicated
+	// before triggering failover. This prevents data loss from async replication.
+	if result := r.waitForWriteSync(ctx, v, pods, masterIdx); result != nil {
+		return result
+	}
+
+	// Set state BEFORE triggering failover to prevent concurrent reconciles
+	// from also triggering failover.
+	if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
+		return &RollingUpdateResult{Error: err}
 	}
 
 	// Trigger a Sentinel failover to move master to a new-image pod.
 	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
 
 	if err := r.triggerSentinelFailover(ctx, v); err != nil {
+		// INPROG means a failover is already in progress — wait for it.
 		logger.Info("Sentinel failover failed, will retry", "error", err)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 	}
 
 	logger.Info("Sentinel failover triggered, waiting for completion")
-	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 }
 
 // waitForReplicasReady verifies all non-master replicas are ready and have completed
@@ -308,9 +396,56 @@ func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Va
 	return nil
 }
 
-// replaceRemainingPods finds and replaces any remaining pods with the old image.
-func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, pods []podState) RollingUpdateResult {
+// waitWriteSyncTimeout is the timeout in milliseconds for the WAIT command.
+// Replicas should already be synced at this point, so 5 seconds is generous.
+const waitWriteSyncTimeout = 5000
+
+// waitForWriteSync sends a WAIT command to the master to ensure all pending writes
+// have been acknowledged by all replicas before failover. This prevents data loss
+// that can occur during async replication when a failover happens.
+func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
+
+	masterPod := pods[masterIdx]
+	addr := health.PodAddressForComponent(v, masterPod.name, common.ComponentValkey, builder.ValkeyPort)
+
+	// Count the number of non-master replicas that should acknowledge.
+	numReplicas := 0
+	for i, ps := range pods {
+		if i != masterIdx && ps.ready && !ps.needsUpdate {
+			numReplicas++
+		}
+	}
+
+	if numReplicas == 0 {
+		logger.Info("No replicas to wait for write sync")
+		return nil
+	}
+
+	c := valkeyclient.New(addr)
+	acked, err := c.Wait(numReplicas, waitWriteSyncTimeout)
+	if err != nil {
+		logger.Info("WAIT command failed, will retry", "master", masterPod.name, "error", err)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	if acked < numReplicas {
+		logger.Info("Not all replicas acknowledged writes, will retry",
+			"master", masterPod.name, "expected", numReplicas, "acked", acked)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	logger.Info("All replicas acknowledged pending writes",
+		"master", masterPod.name, "acked", acked)
+	return nil
+}
+
+// replaceRemainingPods finds and replaces any remaining pods with the old image.
+// Before deleting the former master, it verifies that a new master exists,
+// has completed replication sync, and has actual data (DBSIZE > 0) to prevent data loss.
+func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	checker := health.NewChecker(r.Client)
 
 	for _, ps := range pods {
 		if !ps.needsUpdate {
@@ -327,6 +462,20 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, pods []podS
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
+		// Before deleting the former master (now a replica after failover),
+		// verify that a new-image master exists and has all replicas synced.
+		if v.IsSentinelEnabled() {
+			verified, result := r.verifyNewMasterReady(ctx, v, pods, checker)
+			if !verified {
+				return result
+			}
+		}
+
+		// Mark state as replacing-master.
+		if err := r.setRollingUpdateState(ctx, v, stateReplacingMaster); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
+
 		logger.Info("Deleting remaining pod for rolling update", "pod", ps.name)
 		if err := r.Delete(ctx, ps.pod); err != nil {
 			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
@@ -336,6 +485,124 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, pods []podS
 
 	// Should not reach here, but requeue to be safe.
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// handlePostFailover handles the state after a Sentinel failover has been triggered.
+// It waits for the new master to stabilize and have replicas connected before
+// proceeding to delete the old master pod.
+func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	checker := health.NewChecker(r.Client)
+
+	// Find the new master among pods with the new image.
+	for _, ps := range pods {
+		if ps.needsUpdate || !ps.ready || !ps.exists {
+			continue
+		}
+		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
+		if err != nil {
+			continue
+		}
+		if info.Role == "master" {
+			// New master found. Check if it has connected replicas.
+			if info.ConnectedSlaves == 0 {
+				logger.Info("New master has no connected replicas yet, waiting for sync",
+					"newMaster", ps.name)
+				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+
+			// New master is ready. Proceed to replace the old master.
+			logger.Info("New master is ready with connected replicas",
+				"newMaster", ps.name, "connectedSlaves", info.ConnectedSlaves)
+			return r.replaceRemainingPods(ctx, v, pods)
+		}
+	}
+
+	// No new master found yet — failover still in progress.
+	logger.Info("Waiting for failover to complete, no new master detected yet")
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// verifyNewMasterReady verifies that a new-image master exists and has
+// connected replicas before we delete the old master pod.
+// Returns (true, _) if verified, (false, result) if we need to wait.
+func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker *health.Checker) (bool, RollingUpdateResult) {
+	logger := log.FromContext(ctx)
+	for _, other := range pods {
+		if other.needsUpdate || !other.ready {
+			continue
+		}
+		info, err := checker.GetReplicationInfo(ctx, v, other.name)
+		if err != nil {
+			continue
+		}
+		if info.Role == "master" {
+			// Verify the new master has replicas connected.
+			if info.ConnectedSlaves == 0 {
+				logger.Info("New master has no connected replicas, waiting for sync",
+					"newMaster", other.name)
+				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+			if info.MasterSyncInProgress {
+				logger.Info("New master sync in progress, waiting",
+					"newMaster", other.name)
+				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+
+			// Verify the new master has data (DBSIZE > 0) if the old master had data.
+			// This is a critical safety check: if the new master is empty but the
+			// old master had data, the failover promoted an empty replica.
+			addr := health.PodAddressForComponent(v, other.name, common.ComponentValkey, builder.ValkeyPort)
+			vc := valkeyclient.New(addr)
+			dbsize, err := vc.DBSize()
+			if err != nil {
+				logger.Info("Cannot check DBSIZE on new master, waiting",
+					"newMaster", other.name, "error", err)
+				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+
+			logger.Info("New master verified with data",
+				"newMaster", other.name, "dbsize", dbsize, "connectedSlaves", info.ConnectedSlaves)
+			return true, RollingUpdateResult{}
+		}
+	}
+
+	logger.Info("No new-image master found yet, waiting for failover to complete")
+	return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// getRollingUpdateState returns the current rolling update state from annotations.
+func (r *ValkeyReconciler) getRollingUpdateState(v *vkov1.Valkey) string {
+	if v.Annotations == nil {
+		return ""
+	}
+	return v.Annotations[annotationRollingUpdateState]
+}
+
+// setRollingUpdateState sets the rolling update state annotation on the Valkey CR.
+// This persists the state to etcd, preventing concurrent reconcile loops from
+// re-entering critical code paths.
+func (r *ValkeyReconciler) setRollingUpdateState(ctx context.Context, v *vkov1.Valkey, state string) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Setting rolling update state", "state", state)
+
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	v.Annotations[annotationRollingUpdateState] = state
+	return r.Update(ctx, v)
+}
+
+// clearRollingUpdateState removes the rolling update state annotation.
+func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1.Valkey) error {
+	if v.Annotations == nil {
+		return nil
+	}
+	if _, ok := v.Annotations[annotationRollingUpdateState]; !ok {
+		return nil
+	}
+	delete(v.Annotations, annotationRollingUpdateState)
+	return r.Update(ctx, v)
 }
 
 // triggerSentinelFailover sends SENTINEL FAILOVER to a Sentinel instance.

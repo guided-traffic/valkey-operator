@@ -128,22 +128,73 @@ func buildPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 			},
 		})
 
-		// Init container selects master or replica config based on pod ordinal.
+		// Init container queries Sentinel for the actual master.
+		// On first boot (Sentinel not yet available), falls back to ordinal-based logic.
+		// This prevents data loss during rolling updates when master has moved from pod-0.
+		sentinelHeadless := common.HeadlessServiceName(v, common.ComponentSentinel)
+		monitorName := SentinelMonitorName(v)
+		replicationPort := ValkeyPort
+		if v.IsTLSEnabled() {
+			replicationPort = TLSPort
+		}
+
 		initContainers = append(initContainers, corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
 			Command: []string{
 				"sh", "-c",
-				// Pod-0 is the initial master; all others are replicas.
 				fmt.Sprintf(
-					`ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
-if [ "$ORDINAL" = "0" ]; then
-  cp %s/%s %s/%s
+					`# Query Sentinel for the actual master address.
+# This is critical for rolling updates: after failover, the master may not be pod-0.
+SENTINEL_HOST="%[1]s.%[2]s.svc.cluster.local"
+MONITOR="%[3]s"
+MY_HOST="$HOSTNAME.%[4]s.%[2]s.svc.cluster.local"
+MASTER_ADDR=""
+
+# Try each sentinel pod to get the master address.
+for i in 0 1 2; do
+  SHOST="%[5]s-${i}.${SENTINEL_HOST}"
+  RESULT=$(timeout 3 valkey-cli -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
+  if [ -n "$RESULT" ]; then
+    MASTER_ADDR=$(echo "$RESULT" | head -1)
+    echo "Sentinel returned master: $MASTER_ADDR"
+    break
+  fi
+done
+
+if [ -n "$MASTER_ADDR" ]; then
+  # Sentinel is available — use the actual master address.
+  if echo "$MASTER_ADDR" | grep -q "$MY_HOST"; then
+    echo "This pod IS the master per Sentinel, using master config"
+    cp %[7]s/%[8]s %[9]s/%[8]s
+  else
+    echo "This pod is a replica per Sentinel, master=$MASTER_ADDR"
+    cp %[7]s/%[8]s %[9]s/%[8]s
+    echo "" >> %[9]s/%[8]s
+    echo "# Replication (configured by init container via Sentinel discovery)" >> %[9]s/%[8]s
+    echo "replicaof $MASTER_ADDR %[10]d" >> %[9]s/%[8]s
+  fi
 else
-  cp %s/%s %s/%s
+  # Sentinel not available (first boot). Use ordinal-based fallback.
+  ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+  echo "Sentinel not available, using ordinal-based config (ordinal=$ORDINAL)"
+  if [ "$ORDINAL" = "0" ]; then
+    cp %[7]s/%[8]s %[9]s/%[8]s
+  else
+    cp %[11]s/%[8]s %[9]s/%[8]s
+  fi
 fi`,
-					ConfigMountPath, ValkeyConfigKey, WritableConfigMountPath, ValkeyConfigKey,
-					ReplicaConfigMountPath, ValkeyConfigKey, WritableConfigMountPath, ValkeyConfigKey,
+					sentinelHeadless,                                       // 1: sentinel headless service
+					v.Namespace,                                            // 2: namespace
+					monitorName,                                            // 3: sentinel monitor name
+					common.HeadlessServiceName(v, common.ComponentValkey),  // 4: valkey headless service
+					common.StatefulSetName(v, common.ComponentSentinel),    // 5: sentinel statefulset name
+					SentinelPort,                                           // 6: sentinel port
+					ConfigMountPath,                                        // 7: master config mount
+					ValkeyConfigKey,                                        // 8: config file name
+					WritableConfigMountPath,                                // 9: writable config mount
+					replicationPort,                                        // 10: replication port
+					ReplicaConfigMountPath,                                 // 11: replica config mount
 				),
 			},
 			VolumeMounts: []corev1.VolumeMount{

@@ -113,3 +113,8 @@ func TestNewClient(t *testing.T) {
 	c := New("localhost:6379")
 	assert.Equal(t, "localhost:6379", c.addr)
 }
+
+func TestFormatRESP_WaitCommand(t *testing.T) {
+	resp := formatRESP([]string{"WAIT", "2", "5000"})
+	assert.Equal(t, "*3\r\n$4\r\nWAIT\r\n$1\r\n2\r\n$4\r\n5000\r\n", resp)
+}

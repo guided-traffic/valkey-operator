@@ -84,6 +84,34 @@ func (c *Client) SentinelFailover(name string) error {
 	return nil
 }
 
+// Wait sends the WAIT command to block until all the previous write commands
+// are acknowledged by at least numReplicas replicas, or until the timeout
+// (in milliseconds) expires. It returns the number of replicas that acknowledged.
+func (c *Client) Wait(numReplicas int, timeoutMs int) (int, error) {
+	resp, err := c.exec("WAIT", fmt.Sprintf("%d", numReplicas), fmt.Sprintf("%d", timeoutMs))
+	if err != nil {
+		return 0, fmt.Errorf("wait on %s: %w", c.addr, err)
+	}
+	var acked int
+	if _, err := fmt.Sscanf(resp, "%d", &acked); err != nil {
+		return 0, fmt.Errorf("parsing wait response %q on %s: %w", resp, c.addr, err)
+	}
+	return acked, nil
+}
+
+// DBSize sends the DBSIZE command and returns the number of keys in the current database.
+func (c *Client) DBSize() (int, error) {
+	resp, err := c.exec("DBSIZE")
+	if err != nil {
+		return 0, fmt.Errorf("dbsize on %s: %w", c.addr, err)
+	}
+	var size int
+	if _, err := fmt.Sscanf(resp, "%d", &size); err != nil {
+		return 0, fmt.Errorf("parsing dbsize response %q on %s: %w", resp, c.addr, err)
+	}
+	return size, nil
+}
+
 // exec sends a RESP command and reads the response.
 func (c *Client) exec(args ...string) (string, error) {
 	conn, err := net.DialTimeout("tcp", c.addr, c.timeout)
@@ -134,6 +162,10 @@ func readFullResponse(conn net.Conn) (string, error) {
 	case strings.HasPrefix(line, "-"):
 		// Error.
 		return "", fmt.Errorf("valkey error: %s", line[1:])
+
+	case strings.HasPrefix(line, ":"):
+		// Integer response.
+		return line[1:], nil
 
 	case strings.HasPrefix(line, "$"):
 		// Bulk string.
