@@ -163,31 +163,7 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 
 	// If all pods are updated and ready, verify cluster health before completing.
 	if updatedCount == totalPods {
-		// Only verify topology if we went through a failover during this rolling update.
-		// The state annotation is set during the failover process, so its presence means
-		// we need to verify the cluster settled correctly before declaring completion.
-		currentStateForCompletion := r.getRollingUpdateState(v)
-		if v.IsSentinelEnabled() && currentStateForCompletion != "" {
-			// Verify exactly one master exists and all replicas are synced.
-			masterCount := 0
-			for _, ps := range pods {
-				if ps.isMaster {
-					masterCount++
-				}
-			}
-			if masterCount != 1 {
-				logger.Info("Rolling update: waiting for stable cluster topology",
-					"masterCount", masterCount)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-		}
-
-		logger.Info("Rolling update complete, all pods running new image")
-		// Clean up state annotation.
-		if err := r.clearRollingUpdateState(ctx, v); err != nil {
-			return RollingUpdateResult{Error: err}
-		}
-		return RollingUpdateResult{Completed: true}
+		return r.finalizeRollingUpdate(ctx, v, pods)
 	}
 
 	// Update status with progress.
@@ -214,17 +190,60 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 
 	// If no master was detected but pods still need updating, the cluster may be
 	// in a failover transition. Wait for it to stabilize before replacing pods.
-	if masterIdx < 0 {
-		for _, ps := range pods {
-			if ps.needsUpdate {
-				logger.Info("No master detected during rolling update, waiting for cluster to stabilize")
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-		}
+	if masterIdx < 0 && hasPendingUpdates(pods) {
+		logger.Info("No master detected during rolling update, waiting for cluster to stabilize")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
 	// Step 3: Replace any remaining pods with old image.
 	return r.replaceRemainingPods(ctx, v, pods)
+}
+
+// finalizeRollingUpdate verifies cluster topology after all pods are updated,
+// then cleans up state annotations and marks the rolling update as complete.
+func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	// Only verify topology if we went through a failover during this rolling update.
+	// The state annotation is set during the failover process, so its presence means
+	// we need to verify the cluster settled correctly before declaring completion.
+	currentState := r.getRollingUpdateState(v)
+	if v.IsSentinelEnabled() && currentState != "" {
+		masterCount := countMasters(pods)
+		if masterCount != 1 {
+			logger.Info("Rolling update: waiting for stable cluster topology",
+				"masterCount", masterCount)
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+	}
+
+	logger.Info("Rolling update complete, all pods running new image")
+	// Clean up state annotation.
+	if err := r.clearRollingUpdateState(ctx, v); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+	return RollingUpdateResult{Completed: true}
+}
+
+// countMasters returns the number of pods with the master role.
+func countMasters(pods []podState) int {
+	count := 0
+	for _, ps := range pods {
+		if ps.isMaster {
+			count++
+		}
+	}
+	return count
+}
+
+// hasPendingUpdates returns true if any pod still needs an update.
+func hasPendingUpdates(pods []podState) bool {
+	for _, ps := range pods {
+		if ps.needsUpdate {
+			return true
+		}
+	}
+	return false
 }
 
 // podState holds the state of a single pod during a rolling update.
