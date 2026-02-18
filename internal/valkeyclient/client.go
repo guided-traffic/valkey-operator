@@ -119,7 +119,6 @@ func formatRESP(args []string) string {
 // readFullResponse reads the complete RESP response from the connection.
 func readFullResponse(conn net.Conn) (string, error) {
 	reader := bufio.NewReader(conn)
-	var result strings.Builder
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -138,64 +137,69 @@ func readFullResponse(conn net.Conn) (string, error) {
 
 	case strings.HasPrefix(line, "$"):
 		// Bulk string.
-		size := 0
-		if _, err := fmt.Sscanf(line[1:], "%d", &size); err != nil {
-			return "", fmt.Errorf("parsing bulk string size: %w", err)
-		}
-		if size < 0 {
-			return "", nil
-		}
-		buf := make([]byte, size+2) // +2 for \r\n
-		n := 0
-		for n < len(buf) {
-			read, err := reader.Read(buf[n:])
-			if err != nil {
-				return "", err
-			}
-			n += read
-		}
-		return string(buf[:size]), nil
+		return readBulkString(reader, line)
 
 	case strings.HasPrefix(line, "*"):
 		// Array — read all elements.
-		count := 0
-		if _, err := fmt.Sscanf(line[1:], "%d", &count); err != nil {
-			return "", fmt.Errorf("parsing array count: %w", err)
-		}
-		for i := 0; i < count; i++ {
-			elemLine, err := reader.ReadString('\n')
-			if err != nil {
-				return "", err
-			}
-			elemLine = strings.TrimRight(elemLine, "\r\n")
-
-			if strings.HasPrefix(elemLine, "$") {
-				size := 0
-				if _, err := fmt.Sscanf(elemLine[1:], "%d", &size); err != nil {
-					return "", fmt.Errorf("parsing array element size: %w", err)
-				}
-				if size < 0 {
-					result.WriteString("(nil)\n")
-					continue
-				}
-				buf := make([]byte, size+2)
-				n := 0
-				for n < len(buf) {
-					read, err := reader.Read(buf[n:])
-					if err != nil {
-						return "", err
-					}
-					n += read
-				}
-				result.WriteString(string(buf[:size]))
-				result.WriteString("\n")
-			}
-		}
-		return result.String(), nil
+		return readArray(reader, line)
 
 	default:
 		return line, nil
 	}
+}
+
+// readBulkString reads a RESP bulk string from the reader.
+// The header line (e.g. "$6") must be passed in.
+func readBulkString(reader *bufio.Reader, header string) (string, error) {
+	size := 0
+	if _, err := fmt.Sscanf(header[1:], "%d", &size); err != nil {
+		return "", fmt.Errorf("parsing bulk string size: %w", err)
+	}
+	if size < 0 {
+		return "", nil
+	}
+	buf := make([]byte, size+2) // +2 for \r\n
+	n := 0
+	for n < len(buf) {
+		read, err := reader.Read(buf[n:])
+		if err != nil {
+			return "", err
+		}
+		n += read
+	}
+	return string(buf[:size]), nil
+}
+
+// readArray reads a RESP array response from the reader.
+// The header line (e.g. "*3") must be passed in.
+func readArray(reader *bufio.Reader, header string) (string, error) {
+	count := 0
+	if _, err := fmt.Sscanf(header[1:], "%d", &count); err != nil {
+		return "", fmt.Errorf("parsing array count: %w", err)
+	}
+
+	var result strings.Builder
+	for i := 0; i < count; i++ {
+		elemLine, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		elemLine = strings.TrimRight(elemLine, "\r\n")
+
+		if strings.HasPrefix(elemLine, "$") {
+			val, err := readBulkString(reader, elemLine)
+			if err != nil {
+				return "", err
+			}
+			if val == "" {
+				result.WriteString("(nil)\n")
+			} else {
+				result.WriteString(val)
+				result.WriteString("\n")
+			}
+		}
+	}
+	return result.String(), nil
 }
 
 // parseReplicationInfo parses the INFO replication output into structured data.

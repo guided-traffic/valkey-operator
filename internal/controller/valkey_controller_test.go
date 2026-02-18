@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -906,4 +907,102 @@ func TestFindValkeyForSecret_MultipleValkeys(t *testing.T) {
 
 	// Only v1 and v2 reference shared-secret.
 	assert.Len(t, requests, 2)
+}
+
+// --- NetworkPolicy Reconciliation ---
+
+func TestReconcile_CreatesValkeyNetworkPolicy(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.NetworkPolicyName(v), Namespace: "default",
+	}, np)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test", np.Name)
+	assert.Equal(t, "valkey", np.Spec.PodSelector.MatchLabels["app.kubernetes.io/component"])
+}
+
+func TestReconcile_CreatesNetworkPolicies_HA(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Valkey NetworkPolicy.
+	valkeyNP := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.NetworkPolicyName(v), Namespace: "default",
+	}, valkeyNP)
+	require.NoError(t, err)
+	assert.Len(t, valkeyNP.Spec.Ingress[0].From, 2, "should allow from Valkey and Sentinel")
+
+	// Sentinel NetworkPolicy.
+	sentinelNP := &networkingv1.NetworkPolicy{}
+	err = c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SentinelNetworkPolicyName(v), Namespace: "default",
+	}, sentinelNP)
+	require.NoError(t, err)
+	assert.Equal(t, "sentinel", sentinelNP.Spec.PodSelector.MatchLabels["app.kubernetes.io/component"])
+}
+
+func TestReconcile_NoNetworkPolicyWhenDisabled(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.NetworkPolicyName(v), Namespace: "default",
+	}, np)
+
+	assert.True(t, apierrors.IsNotFound(err), "NetworkPolicy should not be created when disabled")
+}
+
+func TestReconcile_NetworkPolicy_WithNamePrefix(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{
+			Enabled:    true,
+			NamePrefix: "my-prefix",
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "my-prefix-test", Namespace: "default",
+	}, np)
+
+	require.NoError(t, err)
+	assert.Equal(t, "my-prefix-test", np.Name)
+}
+
+func TestReconcile_NetworkPolicy_NoSentinelPolicyWithoutSentinel(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Sentinel NetworkPolicy should NOT be created.
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SentinelNetworkPolicyName(v), Namespace: "default",
+	}, np)
+
+	assert.True(t, apierrors.IsNotFound(err), "Sentinel NetworkPolicy should not exist without Sentinel")
 }

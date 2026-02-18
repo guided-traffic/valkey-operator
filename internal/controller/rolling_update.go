@@ -125,20 +125,57 @@ func isPodReady(pod *corev1.Pod) bool {
 //  6. Verify all pods run the new image and the cluster is healthy.
 func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
+	totalPods := int(*currentSts.Spec.Replicas)
+
+	// Collect pod states.
+	pods, masterIdx, err := r.collectPodStates(ctx, v, currentSts)
+	if err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	// Count how many pods have been updated.
+	updatedCount := countUpdatedPods(pods)
+
+	// If all pods are updated and ready, the rolling update is complete.
+	if updatedCount == totalPods {
+		logger.Info("Rolling update complete, all pods running new image")
+		return RollingUpdateResult{Completed: true}
+	}
+
+	// Update status with progress.
+	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
+	_ = r.updatePhase(ctx, v, ValkeyPhase(phase), fmt.Sprintf("Rolling update in progress: %d/%d pods updated", updatedCount, totalPods))
+
+	// Step 1: Replace replica pods first (not the master).
+	if result := r.replaceNextReplica(ctx, pods); result != nil {
+		return *result
+	}
+
+	// Step 2: All replicas are updated. Now handle the master failover and replacement.
+	if result := r.handleMasterFailover(ctx, v, pods, masterIdx); result != nil {
+		return *result
+	}
+
+	// Step 3: Replace any remaining pods with old image.
+	return r.replaceRemainingPods(ctx, pods)
+}
+
+// podState holds the state of a single pod during a rolling update.
+type podState struct {
+	name        string
+	pod         *corev1.Pod
+	needsUpdate bool
+	isMaster    bool
+	ready       bool
+	exists      bool
+}
+
+// collectPodStates gathers the current state of all pods in the StatefulSet.
+func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) ([]podState, int, error) {
 	desiredImage := v.Spec.Image
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	totalPods := int(*currentSts.Spec.Replicas)
 	checker := health.NewChecker(r.Client)
-
-	// Collect pod states.
-	type podState struct {
-		name       string
-		pod        *corev1.Pod
-		needsUpdate bool
-		isMaster   bool
-		ready      bool
-		exists     bool
-	}
 
 	pods := make([]podState, totalPods)
 	masterIdx := -1
@@ -151,10 +188,9 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 		ps := podState{name: podName}
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				ps.exists = false
 				ps.needsUpdate = true
 			} else {
-				return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
+				return nil, -1, fmt.Errorf("getting pod %s: %w", podName, err)
 			}
 		} else {
 			ps.pod = pod
@@ -169,108 +205,113 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 				masterIdx = i
 			}
 		}
-
 		pods[i] = ps
 	}
 
-	// Count how many pods have been updated.
-	updatedCount := 0
+	return pods, masterIdx, nil
+}
+
+// countUpdatedPods returns how many pods are updated and ready.
+func countUpdatedPods(pods []podState) int {
+	count := 0
 	for _, ps := range pods {
 		if !ps.needsUpdate && ps.ready {
-			updatedCount++
+			count++
 		}
 	}
+	return count
+}
 
-	// If all pods are updated and ready, the rolling update is complete.
-	if updatedCount == totalPods {
-		logger.Info("Rolling update complete, all pods running new image")
-		return RollingUpdateResult{Completed: true}
-	}
+// replaceNextReplica finds the next replica pod that needs updating and deletes it.
+// Returns nil if no replica needs replacement (all replicas are done).
+func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, pods []podState) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
 
-	// Update status with progress.
-	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
-	_ = r.updatePhase(ctx, v, ValkeyPhase(phase), fmt.Sprintf("Rolling update in progress: %d/%d pods updated", updatedCount, totalPods))
-
-	// Step 1: Replace replica pods first (not the master).
 	for i, ps := range pods {
 		if !ps.needsUpdate || ps.isMaster {
 			continue
 		}
 
-		// Check if the pod was recently deleted and hasn't come back yet.
 		if !ps.exists {
 			logger.Info("Waiting for pod to be recreated", "pod", ps.name)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		// If pod exists but isn't ready yet (was recently replaced), wait for it.
-		if ps.exists && !ps.ready {
+		if !ps.ready {
 			logger.Info("Waiting for replaced pod to become ready", "pod", ps.name)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		// If the pod exists, is ready, but has the old image, delete it.
-		// Because the StatefulSet uses OnDelete update strategy, deleting the pod
-		// causes the StatefulSet controller to recreate it with the new template.
 		logger.Info("Deleting replica pod for rolling update", "pod", ps.name, "ordinal", i)
 		if err := r.Delete(ctx, ps.pod); err != nil {
-			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
+			return &RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
 		}
-
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	// Step 2: All replicas are updated. Now handle the master.
-	if masterIdx >= 0 && pods[masterIdx].needsUpdate {
-		// Check if all non-master pods are ready and synced before doing failover.
-		allReplicasReady := true
-		for i, ps := range pods {
-			if i == masterIdx {
-				continue
-			}
-			if !ps.ready || ps.needsUpdate {
-				allReplicasReady = false
-				break
-			}
-		}
+	return nil
+}
 
-		if !allReplicasReady {
+// handleMasterFailover checks if the master needs updating, verifies all replicas
+// are ready and synced, then triggers a Sentinel failover.
+// Returns nil if the master does not need updating.
+func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	if masterIdx < 0 || !pods[masterIdx].needsUpdate {
+		return nil
+	}
+
+	// Check if all non-master pods are ready and synced before doing failover.
+	if result := r.waitForReplicasReady(ctx, v, pods, masterIdx); result != nil {
+		return result
+	}
+
+	// Trigger a Sentinel failover to move master to a new-image pod.
+	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
+
+	if err := r.triggerSentinelFailover(ctx, v); err != nil {
+		logger.Info("Sentinel failover failed, will retry", "error", err)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	logger.Info("Sentinel failover triggered, waiting for completion")
+	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// waitForReplicasReady verifies all non-master replicas are ready and have completed
+// replication sync. Returns a requeue result if any replica is not ready.
+func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	checker := health.NewChecker(r.Client)
+
+	for i, ps := range pods {
+		if i == masterIdx {
+			continue
+		}
+		if !ps.ready || ps.needsUpdate {
 			logger.Info("Waiting for all replicas to be ready before master failover")
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		// Verify replication is synced on all replicas before failover.
-		for i, ps := range pods { //nolint:govet // shadow is fine
-			if i == masterIdx || !ps.ready {
-				continue
-			}
-			info, err := checker.GetReplicationInfo(ctx, v, ps.name)
-			if err != nil {
-				logger.Info("Cannot verify replication sync, waiting", "pod", ps.name, "error", err)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-			if info.MasterSyncInProgress {
-				logger.Info("Replication sync still in progress, waiting", "pod", ps.name)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
+		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
+		if err != nil {
+			logger.Info("Cannot verify replication sync, waiting", "pod", ps.name, "error", err)
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
-
-		// Step 2a: Trigger a Sentinel failover to move master to a new-image pod.
-		_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
-
-		if err := r.triggerSentinelFailover(ctx, v); err != nil {
-			logger.Info("Sentinel failover failed, will retry", "error", err)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		if info.MasterSyncInProgress {
+			logger.Info("Replication sync still in progress, waiting", "pod", ps.name)
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
-
-		// Wait for failover to complete — the old master should no longer be master.
-		logger.Info("Sentinel failover triggered, waiting for completion")
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	// Step 3: Master has been failed over. The former master should now be a replica
-	// (or the masterIdx was not found because the failover changed roles).
-	// Look for any remaining pods with old image.
+	return nil
+}
+
+// replaceRemainingPods finds and replaces any remaining pods with the old image.
+func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, pods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
 	for _, ps := range pods {
 		if !ps.needsUpdate {
 			continue
@@ -290,7 +331,6 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 		if err := r.Delete(ctx, ps.pod); err != nil {
 			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
 		}
-
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 

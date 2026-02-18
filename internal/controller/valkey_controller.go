@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,9 +40,10 @@ type ValkeyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles a reconciliation request for a Valkey resource.
@@ -65,52 +67,9 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// Reconcile ConfigMap.
-	if err := r.reconcileConfigMap(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ConfigMap: %v", err))
+	// Reconcile all managed resources.
+	if err := r.reconcileResources(ctx, valkey); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	// Reconcile replica ConfigMap in HA mode.
-	if valkey.IsSentinelEnabled() {
-		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Reconcile TLS Certificates (cert-manager) if enabled.
-	if valkey.IsCertManagerEnabled() {
-		if err := r.reconcileTLSCertificates(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile TLS Certificates: %v", err))
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Reconcile headless Service.
-	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
-		return ctrl.Result{}, err
-	}
-
-	// Reconcile client Service.
-	if err := r.reconcileClientService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile client Service: %v", err))
-		return ctrl.Result{}, err
-	}
-
-	// Reconcile StatefulSet.
-	if err := r.reconcileStatefulSet(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile StatefulSet: %v", err))
-		return ctrl.Result{}, err
-	}
-
-	// Reconcile Sentinel resources if enabled.
-	if valkey.IsSentinelEnabled() {
-		if err := r.reconcileSentinelResources(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Sentinel resources: %v", err))
-			return ctrl.Result{}, err
-		}
 	}
 
 	// Check for rolling update (image change on running pods).
@@ -129,6 +88,67 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// reconcileResources reconciles all Kubernetes resources managed by the operator.
+func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1.Valkey) error {
+	// Reconcile ConfigMap.
+	if err := r.reconcileConfigMap(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ConfigMap: %v", err))
+		return err
+	}
+
+	// Reconcile replica ConfigMap in HA mode.
+	if valkey.IsSentinelEnabled() {
+		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
+			return err
+		}
+	}
+
+	// Reconcile TLS Certificates (cert-manager) if enabled.
+	if valkey.IsCertManagerEnabled() {
+		if err := r.reconcileTLSCertificates(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile TLS Certificates: %v", err))
+			return err
+		}
+	}
+
+	// Reconcile headless Service.
+	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
+		return err
+	}
+
+	// Reconcile client Service.
+	if err := r.reconcileClientService(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile client Service: %v", err))
+		return err
+	}
+
+	// Reconcile StatefulSet.
+	if err := r.reconcileStatefulSet(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile StatefulSet: %v", err))
+		return err
+	}
+
+	// Reconcile Sentinel resources if enabled.
+	if valkey.IsSentinelEnabled() {
+		if err := r.reconcileSentinelResources(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Sentinel resources: %v", err))
+			return err
+		}
+	}
+
+	// Reconcile NetworkPolicies if enabled.
+	if valkey.IsNetworkPolicyEnabled() {
+		if err := r.reconcileNetworkPolicies(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile NetworkPolicies: %v", err))
+			return err
+		}
+	}
+
+	return nil
 }
 
 // reconcileConfigMap ensures the Valkey ConfigMap matches the desired state.
@@ -414,6 +434,53 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 	return nil
 }
 
+// reconcileNetworkPolicies reconciles all NetworkPolicy resources.
+func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov1.Valkey) error {
+	// Valkey NetworkPolicy.
+	desiredValkey := builder.BuildValkeyNetworkPolicy(v)
+	if err := r.reconcileNetworkPolicy(ctx, v, desiredValkey); err != nil {
+		return fmt.Errorf("valkey networkpolicy: %w", err)
+	}
+
+	// Sentinel NetworkPolicy (only if Sentinel is enabled).
+	if v.IsSentinelEnabled() {
+		desiredSentinel := builder.BuildSentinelNetworkPolicy(v)
+		if err := r.reconcileNetworkPolicy(ctx, v, desiredSentinel); err != nil {
+			return fmt.Errorf("sentinel networkpolicy: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileNetworkPolicy ensures a single NetworkPolicy matches the desired state.
+func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.Valkey, desired *networkingv1.NetworkPolicy) error {
+	logger := log.FromContext(ctx)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on NetworkPolicy %s: %w", desired.Name, err)
+	}
+
+	current := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating NetworkPolicy", "name", desired.Name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if builder.NetworkPolicyHasChanged(desired, current) {
+		logger.Info("Updating NetworkPolicy", "name", desired.Name)
+		current.Spec = desired.Spec
+		current.Labels = desired.Labels
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
 // updateStatus reads the current StatefulSet and updates the Valkey status accordingly.
 func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) error {
 	sts := &appsv1.StatefulSet{}
@@ -580,6 +647,7 @@ func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findValkeyForSecret),
