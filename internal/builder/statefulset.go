@@ -184,17 +184,17 @@ else
     cp %[11]s/%[8]s %[9]s/%[8]s
   fi
 fi`,
-					sentinelHeadless,                                       // 1: sentinel headless service
-					v.Namespace,                                            // 2: namespace
-					monitorName,                                            // 3: sentinel monitor name
-					common.HeadlessServiceName(v, common.ComponentValkey),  // 4: valkey headless service
-					common.StatefulSetName(v, common.ComponentSentinel),    // 5: sentinel statefulset name
-					SentinelPort,                                           // 6: sentinel port
-					ConfigMountPath,                                        // 7: master config mount
-					ValkeyConfigKey,                                        // 8: config file name
-					WritableConfigMountPath,                                // 9: writable config mount
-					replicationPort,                                        // 10: replication port
-					ReplicaConfigMountPath,                                 // 11: replica config mount
+					sentinelHeadless, // 1: sentinel headless service
+					v.Namespace,      // 2: namespace
+					monitorName,      // 3: sentinel monitor name
+					common.HeadlessServiceName(v, common.ComponentValkey), // 4: valkey headless service
+					common.StatefulSetName(v, common.ComponentSentinel),   // 5: sentinel statefulset name
+					SentinelPort,            // 6: sentinel port
+					ConfigMountPath,         // 7: master config mount
+					ValkeyConfigKey,         // 8: config file name
+					WritableConfigMountPath, // 9: writable config mount
+					replicationPort,         // 10: replication port
+					ReplicaConfigMountPath,  // 11: replica config mount
 				),
 			},
 			VolumeMounts: []corev1.VolumeMount{
