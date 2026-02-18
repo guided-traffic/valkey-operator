@@ -293,16 +293,32 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		// Sync sentinel with the actual current master. After a failover the master
-		// may have changed (e.g. pod-0 → pod-2), but sentinel's initial config file
-		// still points to pod-0. Without this, the next rolling update finds sentinel
-		// monitoring a stale address with num-slaves=0 and failover becomes impossible.
+		// Wait for all replicas to be connected to the master before syncing sentinel.
+		// The sentinel reset (REMOVE + MONITOR) is destructive and can temporarily
+		// disrupt replica connections. We must ensure the cluster is fully stable
+		// (all replicas connected and synced) before performing the reset.
+		checker := health.NewChecker(r.Client)
+		expectedReplicas := len(pods) - 1
 		for _, ps := range pods {
 			if ps.isMaster {
+				info, err := checker.GetReplicationInfo(ctx, v, ps.name)
+				if err != nil {
+					logger.Info("Cannot verify replication before sentinel sync, waiting",
+						"master", ps.name, "error", err)
+					return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+				}
+				if info.ConnectedSlaves < expectedReplicas {
+					logger.Info("Waiting for all replicas to connect before sentinel sync",
+						"master", ps.name, "connectedSlaves", info.ConnectedSlaves,
+						"expected", expectedReplicas)
+					return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+				}
+
 				headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 				masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
 				logger.Info("Syncing sentinel with current master before finalization",
-					"master", ps.name, "masterAddr", masterAddr)
+					"master", ps.name, "masterAddr", masterAddr,
+					"connectedSlaves", info.ConnectedSlaves)
 				r.resetSentinelState(ctx, v, masterAddr)
 				break
 			}
@@ -900,6 +916,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		_ = c.SentinelSet(monitorName, "failover-timeout", fmt.Sprintf("%d", builder.SentinelFailoverTimeout))
 		_ = c.SentinelSet(monitorName, "parallel-syncs", fmt.Sprintf("%d", builder.SentinelParallelSyncs))
 		_ = c.SentinelSet(monitorName, "resolve-hostnames", "yes")
+		_ = c.SentinelSet(monitorName, "announce-hostnames", "yes")
 
 		logger.Info("Sentinel reconfigured successfully", "sentinel", podName, "masterAddr", masterAddr)
 	}
