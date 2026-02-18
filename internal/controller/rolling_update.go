@@ -41,7 +41,13 @@ const (
 // failoverRetryTimeout is the duration after which a sentinel failover is considered
 // stale and will be retried with a sentinel reset. This handles the case where
 // sentinel refuses a failover due to its internal cooldown (failover-timeout).
-const failoverRetryTimeout = 60 * time.Second
+const failoverRetryTimeout = 30 * time.Second
+
+// failoverResetMinWait is the minimum time to wait after a SENTINEL RESET
+// before retriggering failover. After a reset, sentinel needs time to
+// rediscover the replicas via INFO polling (~10s). Without this wait,
+// SENTINEL FAILOVER returns NOGOODSLAVE because no replicas are known yet.
+const failoverResetMinWait = 20 * time.Second
 
 // RollingUpdateResult describes the outcome of a rolling update step.
 type RollingUpdateResult struct {
@@ -97,10 +103,21 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	}
 
 	if !needsRollingUpdate {
-		return RollingUpdateResult{} // No rolling update needed.
+		// If no pods need updating but rolling update state annotations are still
+		// present, the previous rolling update completed (all pods updated) but
+		// finalizeRollingUpdate was never called. This happens when the last
+		// reconcile of the rolling update sees all pods updated via handlePostFailover →
+		// replaceRemainingPods (which requeues), but the next reconcile enters
+		// checkAndHandleRollingUpdate and exits here before reaching finalizeRollingUpdate.
+		// Proceed to handleRollingUpdate so the updatedCount == totalPods check
+		// triggers finalizeRollingUpdate and cleans up the state.
+		if r.getRollingUpdateState(v) == "" {
+			return RollingUpdateResult{} // No rolling update needed.
+		}
+		logger.Info("All pods updated but rolling update state still present, finalizing")
+	} else {
+		logger.Info("Rolling update detected", "desiredImage", desiredImage)
 	}
-
-	logger.Info("Rolling update detected", "desiredImage", desiredImage)
 
 	if v.IsSentinelEnabled() {
 		return r.handleRollingUpdate(ctx, v, currentSts)
@@ -174,10 +191,33 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	// Check the current state machine phase.
 	currentState := r.getRollingUpdateState(v)
 
+	// Detect stale state from a previous rolling update. If no pods have the
+	// desired image yet (updatedCount == 0) but the state machine is past the
+	// replica-replacement phase, the state annotations are left over from a
+	// prior rolling update that completed just as the desired image changed
+	// (e.g., quick consecutive image changes). Clear the stale state so the
+	// new rolling update starts fresh from replica replacement.
+	if updatedCount == 0 && currentState != "" && currentState != stateReplacingReplicas {
+		logger.Info("Clearing stale rolling update state from previous update",
+			"staleState", currentState)
+		if err := r.clearRollingUpdateState(ctx, v); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
+		currentState = ""
+	}
+
 	// If sentinel was reset after a timed-out failover (cooldown from a previous
-	// failover prevented it), retrigger failover now. By this point sentinel has
-	// had time to rediscover the topology after the reset.
+	// failover prevented it), retrigger failover now — but only after sentinel
+	// has had enough time to rediscover the topology via INFO polling.
 	if currentState == stateFailoverReset {
+		// Check if enough time has passed since the reset for sentinel to
+		// rediscover replicas. Without this guard, concurrent reconciles
+		// retrigger immediately and get NOGOODSLAVE.
+		if !r.hasMinWaitElapsed(v, failoverResetMinWait) {
+			logger.Info("Waiting for sentinel to rediscover replicas after reset")
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 10 * time.Second}
+		}
+
 		logger.Info("Retriggering sentinel failover after reset")
 
 		if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
@@ -235,6 +275,21 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 			logger.Info("Rolling update: waiting for stable cluster topology",
 				"masterCount", masterCount)
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+
+		// Sync sentinel with the actual current master. After a failover the master
+		// may have changed (e.g. pod-0 → pod-2), but sentinel's initial config file
+		// still points to pod-0. Without this, the next rolling update finds sentinel
+		// monitoring a stale address with num-slaves=0 and failover becomes impossible.
+		for _, ps := range pods {
+			if ps.isMaster {
+				headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+				masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
+				logger.Info("Syncing sentinel with current master before finalization",
+					"master", ps.name, "masterAddr", masterAddr)
+				r.resetSentinelState(ctx, v, masterAddr)
+				break
+			}
 		}
 	}
 
@@ -598,8 +653,20 @@ func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valk
 	if r.isFailoverTimedOut(v) {
 		logger.Info("Failover timed out, resetting sentinel state and scheduling retry")
 
-		// Reset sentinel to clear the failover cooldown.
-		r.resetSentinelState(ctx, v)
+		// Determine the correct master address from the pods we already know about.
+		// Since handlePostFailover didn't find a new-image master, use the old master
+		// (which has the old image and still reports as master to its local INFO).
+		masterAddr := ""
+		for _, ps := range freshPods {
+			if ps.isMaster {
+				headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+				masterAddr = fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
+				break
+			}
+		}
+
+		// Reset sentinel with the correct master address.
+		r.resetSentinelState(ctx, v, masterAddr)
 
 		// Update the failover timestamp for the retry.
 		if err := r.setFailoverTimestamp(ctx, v); err != nil {
@@ -732,14 +799,58 @@ func (r *ValkeyReconciler) isFailoverTimedOut(v *vkov1.Valkey) bool {
 	return time.Since(ts) > failoverRetryTimeout
 }
 
-// resetSentinelState sends SENTINEL RESET to all sentinel instances to clear
-// internal failover cooldown state. This is necessary when a second failover
-// needs to be triggered shortly after a previous one (e.g., during consecutive
-// rolling updates). Best-effort: errors are logged but not returned.
-func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valkey) {
+// hasMinWaitElapsed checks whether at least minWait has elapsed since the
+// failover timestamp. Used to prevent retriggering failover too quickly after
+// a SENTINEL RESET, giving sentinel time to rediscover replicas.
+func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey, minWait time.Duration) bool {
+	if v.Annotations == nil {
+		return true
+	}
+	tsStr, ok := v.Annotations[annotationFailoverTimestamp]
+	if !ok || tsStr == "" {
+		return true
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true // Corrupted timestamp — allow to proceed.
+	}
+	return time.Since(ts) >= minWait
+}
+
+// resetSentinelState reconfigures all sentinel instances by removing and re-adding
+// the monitored master. Unlike SENTINEL RESET (which reverts to the initial config
+// from the config file and loses the current master address after failovers), this
+// approach preserves the correct master by using the provided masterAddr.
+//
+// If masterAddr is empty, falls back to the default master address (pod-0).
+//
+// This is necessary when a failover needs to be retried after a timeout — sentinel's
+// internal state may be stale or have cooldowns that prevent another failover.
+// Best-effort: errors are logged but not returned.
+func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valkey, masterAddr string) {
 	logger := log.FromContext(ctx)
 	monitorName := builder.SentinelMonitorName(v)
 	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
+
+	// Calculate quorum (same logic as sentinel config generation).
+	quorum := builder.SentinelQuorum
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
+		quorum = int(v.Spec.Sentinel.Replicas/2) + 1
+	}
+
+	if masterAddr == "" {
+		// Fallback to the default master address (pod-0).
+		masterAddr = builder.MasterAddress(v)
+		logger.Info("No master address provided, falling back to default", "masterAddr", masterAddr)
+	}
+
+	logger.Info("Reconfiguring sentinel with correct master", "masterAddr", masterAddr)
+
+	// Use the appropriate port for monitoring.
+	monitorPort := builder.ValkeyPort
+	if v.IsTLSEnabled() {
+		monitorPort = builder.TLSPort
+	}
 
 	sentinelReplicas := int32(3)
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
@@ -751,11 +862,30 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		c := valkeyclient.New(addr)
-		if err := c.SentinelReset(monitorName); err != nil {
-			logger.V(1).Info("Sentinel reset failed (best-effort)", "sentinel", podName, "error", err)
-		} else {
-			logger.Info("Sentinel state reset successfully", "sentinel", podName)
+
+		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
+		if err := c.SentinelRemove(monitorName); err != nil {
+			logger.V(1).Info("Sentinel remove failed (best-effort)", "sentinel", podName, "error", err)
+			// Fallback to SENTINEL RESET if REMOVE fails.
+			if err := c.SentinelReset(monitorName); err != nil {
+				logger.V(1).Info("Sentinel reset also failed", "sentinel", podName, "error", err)
+			}
+			continue
 		}
+
+		// Re-add the monitor with the correct current master address.
+		if err := c.SentinelMonitorAdd(monitorName, masterAddr, monitorPort, quorum); err != nil {
+			logger.V(1).Info("Sentinel monitor add failed", "sentinel", podName, "error", err)
+			continue
+		}
+
+		// Reconfigure sentinel parameters to match our desired settings.
+		_ = c.SentinelSet(monitorName, "down-after-milliseconds", fmt.Sprintf("%d", builder.SentinelDownAfterMilliseconds))
+		_ = c.SentinelSet(monitorName, "failover-timeout", fmt.Sprintf("%d", builder.SentinelFailoverTimeout))
+		_ = c.SentinelSet(monitorName, "parallel-syncs", fmt.Sprintf("%d", builder.SentinelParallelSyncs))
+		_ = c.SentinelSet(monitorName, "resolve-hostnames", "yes")
+
+		logger.Info("Sentinel reconfigured successfully", "sentinel", podName, "masterAddr", masterAddr)
 	}
 }
 

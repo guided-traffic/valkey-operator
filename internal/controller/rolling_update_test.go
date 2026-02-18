@@ -650,3 +650,206 @@ func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 	assert.True(t, result.NeedsRequeue, "Should requeue when no new master is found")
 	assert.Nil(t, result.Error)
 }
+
+func TestHandleRollingUpdate_HA_ClearsStaleStateOnNewRollingUpdate(t *testing.T) {
+	// Simulate a scenario where a first rolling update completed (8.0→8.1)
+	// and left stale state annotations, then a second update (8.1→8.0)
+	// starts immediately. All pods have the old desired image (8.1) and
+	// the state is failover-triggered from the first update.
+	v := newTestValkey("ha-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0" // Desired image for the second rolling update.
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// Stale annotations from the first rolling update.
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateFailoverTriggered,
+		annotationFailoverTimestamp:  time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+	}
+
+	// All pods run 8.1 (old image from first rolling update), all need update to 8.0.
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.1", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.1", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.1", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "ha-test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "ha-test", Namespace: "default"}, sts))
+
+	result := r.handleRollingUpdate(context.Background(), v, sts)
+
+	// Should NOT be stuck in handlePostFailover. Instead, the stale state should
+	// be cleared and a replica should be deleted (starting the new rolling update fresh).
+	assert.True(t, result.NeedsRequeue, "Should requeue to continue rolling update")
+	assert.Nil(t, result.Error)
+
+	// Verify stale state was cleared.
+	updatedV := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-test", Namespace: "default"}, updatedV))
+	_, hasState := updatedV.Annotations[annotationRollingUpdateState]
+	// State should either be cleared or set to replacing-replicas (new update started).
+	if hasState {
+		assert.Equal(t, stateReplacingReplicas, updatedV.Annotations[annotationRollingUpdateState],
+			"State should be replacing-replicas for the new rolling update, not stale failover state")
+	}
+
+	// At least one pod should have been deleted (replica replacement started).
+	deletedCount := 0
+	for i := 0; i < 3; i++ {
+		pod := &corev1.Pod{}
+		podName := fmt.Sprintf("ha-test-%d", i)
+		err := c.Get(context.Background(), types.NamespacedName{Name: podName, Namespace: "default"}, pod)
+		if err != nil {
+			deletedCount++
+		}
+	}
+	assert.Equal(t, 1, deletedCount, "Should delete one replica pod after clearing stale state")
+}
+
+func TestHandleRollingUpdate_HA_DoesNotClearValidState(t *testing.T) {
+	// When some pods are already updated (updatedCount > 0) and state is
+	// failover-triggered, it's a valid ongoing update — do NOT clear.
+	v := newTestValkey("ha-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// State annotation from the current rolling update.
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateFailoverTriggered,
+		annotationFailoverTimestamp:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Pod 1 and 2 already updated to 9.0 (updated + ready), pod 0 still on 8.0 (master).
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:9.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:9.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "ha-test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "ha-test", Namespace: "default"}, sts))
+
+	result := r.handleRollingUpdate(context.Background(), v, sts)
+
+	// Should enter handlePostFailover (state is valid).
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+
+	// Verify state was NOT cleared (it's a valid failover-triggered state).
+	updatedV := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-test", Namespace: "default"}, updatedV))
+	assert.Contains(t, updatedV.Annotations, annotationRollingUpdateState,
+		"Valid rolling update state should not be cleared")
+}
+
+func TestHasMinWaitElapsed_NoTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+		"Should return true when no timestamp is set")
+}
+
+func TestCheckAndHandleRollingUpdate_FinalizesStuckState(t *testing.T) {
+	// Scenario: A rolling update completed (all pods have the desired image)
+	// but finalizeRollingUpdate was never called, leaving state annotations behind.
+	// checkAndHandleRollingUpdate must detect this and still enter the handler
+	// instead of returning early with an empty result.
+	//
+	// We use a standalone Valkey (no sentinel) to avoid the master topology check
+	// in finalizeRollingUpdate which requires a live cluster. The standalone handler
+	// will see all pods updated and return Completed: true.
+	v := newTestValkey("standalone-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.Image = "valkey/valkey:8.1"
+		// No sentinel — standalone mode.
+	})
+
+	// Stale state from a completed rolling update.
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateReplacingReplicas,
+	}
+
+	// The single pod already has the desired image (8.1) and is ready.
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.1", true)
+
+	r, _ := newTestReconciler(v, pod0)
+	reconcileOnce(t, r, "standalone-test", "default")
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), v)
+
+	// The handler should have been called and returned Completed.
+	// Without the fix, checkAndHandleRollingUpdate would return an empty result
+	// because needsRollingUpdate is false, leaving the state stuck.
+	assert.True(t, result.Completed, "Rolling update should be marked as completed")
+	assert.Nil(t, result.Error)
+}
+
+func TestCheckAndHandleRollingUpdate_NoStateNoRollingUpdate(t *testing.T) {
+	// When no pods need updating and no state annotation exists,
+	// checkAndHandleRollingUpdate should return an empty result (no action needed).
+	v := newTestValkey("standalone-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.Image = "valkey/valkey:8.1"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.1", true)
+
+	r, _ := newTestReconciler(v, pod0)
+	reconcileOnce(t, r, "standalone-test", "default")
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), v)
+
+	assert.False(t, result.NeedsRequeue, "Should not need requeue")
+	assert.False(t, result.Completed, "Should not be completed (no rolling update)")
+	assert.Nil(t, result.Error)
+}
+
+func TestHasMinWaitElapsed_RecentTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	assert.False(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+		"Should return false for a recent timestamp")
+}
+
+func TestHasMinWaitElapsed_OldTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	oldTime := time.Now().UTC().Add(-failoverResetMinWait - time.Minute)
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: oldTime.Format(time.RFC3339),
+	}
+
+	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+		"Should return true for an old timestamp")
+}
+
+func TestHasMinWaitElapsed_CorruptedTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: "invalid-timestamp",
+	}
+
+	assert.True(t, r.hasMinWaitElapsed(v, failoverResetMinWait),
+		"Should return true for corrupted timestamp to allow progress")
+}

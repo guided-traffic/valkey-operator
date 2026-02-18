@@ -95,6 +95,36 @@ func (c *Client) SentinelReset(pattern string) error {
 	return nil
 }
 
+// SentinelRemove sends SENTINEL REMOVE <name> to remove a monitored master
+// and all its associated replicas and sentinels from sentinel's tracking.
+func (c *Client) SentinelRemove(name string) error {
+	_, err := c.exec("SENTINEL", "REMOVE", name)
+	if err != nil {
+		return fmt.Errorf("sentinel remove %s on %s: %w", name, c.addr, err)
+	}
+	return nil
+}
+
+// SentinelMonitorAdd sends SENTINEL MONITOR <name> <ip> <port> <quorum>
+// to add a new master to sentinel monitoring.
+func (c *Client) SentinelMonitorAdd(name, ip string, port, quorum int) error {
+	_, err := c.exec("SENTINEL", "MONITOR", name, ip, fmt.Sprintf("%d", port), fmt.Sprintf("%d", quorum))
+	if err != nil {
+		return fmt.Errorf("sentinel monitor %s %s:%d on %s: %w", name, ip, port, c.addr, err)
+	}
+	return nil
+}
+
+// SentinelSet sends SENTINEL SET <name> <option> <value> to change a sentinel
+// configuration parameter for a monitored master.
+func (c *Client) SentinelSet(name, option, value string) error {
+	_, err := c.exec("SENTINEL", "SET", name, option, value)
+	if err != nil {
+		return fmt.Errorf("sentinel set %s %s %s on %s: %w", name, option, value, c.addr, err)
+	}
+	return nil
+}
+
 // Wait sends the WAIT command to block until all the previous write commands
 // are acknowledged by at least numReplicas replicas, or until the timeout
 // (in milliseconds) expires. It returns the number of replicas that acknowledged.
