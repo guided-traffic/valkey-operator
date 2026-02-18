@@ -174,8 +174,9 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	// Check the current state machine phase.
 	currentState := r.getRollingUpdateState(v)
 
-	// If sentinel was reset after a timed-out failover, retrigger failover now.
-	// By this point sentinel has had time to rediscover the topology.
+	// If sentinel was reset after a timed-out failover (cooldown from a previous
+	// failover prevented it), retrigger failover now. By this point sentinel has
+	// had time to rediscover the topology after the reset.
 	if currentState == stateFailoverReset {
 		logger.Info("Retriggering sentinel failover after reset")
 
@@ -407,16 +408,20 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 		return &RollingUpdateResult{Error: err}
 	}
 
-	// Trigger a Sentinel failover to move master to a new-image pod.
+	// Optimistic failover: try directly without resetting sentinel first.
+	// In the common case (first rolling update) there is no cooldown and
+	// failover succeeds immediately, preserving HA without interruption.
+	// If sentinel has a cooldown from a previous failover, the failover
+	// will silently fail and the retry path in handlePostFailover will
+	// reset sentinel and retrigger after a delay.
 	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
 
 	if err := r.triggerSentinelFailover(ctx, v); err != nil {
-		// INPROG means a failover is already in progress — wait for it.
-		logger.Info("Sentinel failover failed, will retry", "error", err)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
+		logger.Info("Sentinel failover command failed, will retry via post-failover handler", "error", err)
+	} else {
+		logger.Info("Sentinel failover triggered, waiting for completion")
 	}
 
-	logger.Info("Sentinel failover triggered, waiting for completion")
 	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 }
 
