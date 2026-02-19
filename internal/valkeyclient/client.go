@@ -4,6 +4,7 @@ package valkeyclient
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -13,8 +14,9 @@ import (
 // Client is a minimal Valkey/Redis client using raw RESP protocol.
 // It does not depend on any external Redis Go client library.
 type Client struct {
-	addr    string
-	timeout time.Duration
+	addr      string
+	timeout   time.Duration
+	tlsConfig *tls.Config
 }
 
 // ReplicationInfo holds parsed INFO replication output.
@@ -42,6 +44,16 @@ func New(addr string) *Client {
 	return &Client{
 		addr:    addr,
 		timeout: 5 * time.Second,
+	}
+}
+
+// NewTLS creates a new Valkey client that connects using TLS.
+// The tlsConfig must contain at least the CA certificate for server verification.
+func NewTLS(addr string, tlsConfig *tls.Config) *Client {
+	return &Client{
+		addr:      addr,
+		timeout:   5 * time.Second,
+		tlsConfig: tlsConfig,
 	}
 }
 
@@ -155,7 +167,15 @@ func (c *Client) DBSize() (int, error) {
 
 // exec sends a RESP command and reads the response.
 func (c *Client) exec(args ...string) (string, error) {
-	conn, err := net.DialTimeout("tcp", c.addr, c.timeout)
+	var conn net.Conn
+	var err error
+
+	if c.tlsConfig != nil {
+		dialer := &net.Dialer{Timeout: c.timeout}
+		conn, err = tls.DialWithDialer(dialer, "tcp", c.addr, c.tlsConfig)
+	} else {
+		conn, err = net.DialTimeout("tcp", c.addr, c.timeout)
+	}
 	if err != nil {
 		return "", err
 	}

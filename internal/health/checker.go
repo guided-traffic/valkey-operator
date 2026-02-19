@@ -4,6 +4,8 @@ package health
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -58,8 +60,16 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 		TotalReplicas: v.Spec.Replicas - 1, // Minus master.
 	}
 
+	// Build TLS config once for all health check connections.
+	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for health check", "error", err)
+		state.Error = fmt.Errorf("TLS config: %w", err)
+		return state
+	}
+
 	// Find the master by querying each pod.
-	masterPod, masterAddr, err := h.findMaster(ctx, v)
+	masterPod, masterAddr, err := h.findMaster(ctx, v, tlsConfig)
 	if err != nil {
 		logger.Info("Could not find master via INFO replication", "error", err)
 		state.Error = err
@@ -70,7 +80,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 	state.MasterAddress = masterAddr
 
 	// Check master replication info.
-	masterClient := valkeyclient.New(masterAddr)
+	masterClient := h.newValkeyClient(masterAddr, tlsConfig)
 	masterInfo, err := masterClient.InfoReplication()
 	if err != nil {
 		logger.Info("Could not get master replication info", "pod", masterPod, "error", err)
@@ -93,25 +103,40 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 
 // PingPod sends a PING to a specific Valkey pod.
 func (h *Checker) PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error {
-	addr := podAddress(v, podName, builder.ValkeyPort)
-	c := valkeyclient.New(addr)
+	port := int(builder.ServicePort(v))
+	addr := podAddress(v, podName, port)
+
+	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		return fmt.Errorf("TLS config for ping: %w", err)
+	}
+
+	c := h.newValkeyClient(addr, tlsConfig)
 	return c.Ping()
 }
 
 // GetReplicationInfo returns the replication info for a specific Valkey pod.
 func (h *Checker) GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error) {
-	addr := podAddress(v, podName, builder.ValkeyPort)
-	c := valkeyclient.New(addr)
+	port := int(builder.ServicePort(v))
+	addr := podAddress(v, podName, port)
+
+	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		return nil, fmt.Errorf("TLS config for replication info: %w", err)
+	}
+
+	c := h.newValkeyClient(addr, tlsConfig)
 	return c.InfoReplication()
 }
 
 // findMaster iterates over all Valkey pods and finds the one reporting role=master.
-func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey) (string, string, error) {
+func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, tlsConfig *tls.Config) (string, string, error) {
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	port := int(builder.ServicePort(v))
 
 	for i := int32(0); i < v.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
-		addr := podAddress(v, podName, builder.ValkeyPort)
+		addr := podAddress(v, podName, port)
 
 		// Check if pod is running first.
 		pod := &corev1.Pod{}
@@ -123,7 +148,7 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey) (string, stri
 			continue
 		}
 
-		c := valkeyclient.New(addr)
+		c := h.newValkeyClient(addr, tlsConfig)
 		info, err := c.InfoReplication()
 		if err != nil {
 			continue
@@ -148,12 +173,22 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
 
+	// Build TLS config for sentinel connections (uses sentinel TLS secret).
+	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for sentinel health check", "error", err)
+		return false
+	}
+
+	// Sentinel port: always 26379 (TLS or not — sentinel uses tls-port 26379).
+	port := builder.SentinelPort
+
 	agreeing := 0
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := podAddress(v, podName, builder.SentinelPort)
+		addr := podAddress(v, podName, port)
 
-		c := valkeyclient.New(addr)
+		c := h.newValkeyClient(addr, tlsConfig)
 		masterInfo, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			logger.V(1).Info("Sentinel not responding", "pod", podName, "error", err)
@@ -167,6 +202,48 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 	}
 
 	return agreeing > int(sentinelReplicas/2)
+}
+
+// buildTLSConfig constructs a tls.Config for connecting to TLS-enabled Valkey/Sentinel pods.
+// It reads the CA certificate from the specified Kubernetes Secret.
+// Returns nil (no TLS) if TLS is not enabled on the Valkey CR.
+func (h *Checker) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretName string) (*tls.Config, error) {
+	if !v.IsTLSEnabled() {
+		return nil, nil
+	}
+
+	// Read the TLS secret containing the CA certificate.
+	secret := &corev1.Secret{}
+	err := h.client.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: v.Namespace,
+	}, secret)
+	if err != nil {
+		return nil, fmt.Errorf("reading TLS secret %s: %w", secretName, err)
+	}
+
+	caCert, ok := secret.Data["ca.crt"]
+	if !ok {
+		return nil, fmt.Errorf("TLS secret %s missing ca.crt", secretName)
+	}
+
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate from secret %s", secretName)
+	}
+
+	return &tls.Config{
+		RootCAs:    certPool,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+// newValkeyClient creates a valkeyclient.Client, using TLS if tlsConfig is non-nil.
+func (h *Checker) newValkeyClient(addr string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if tlsConfig != nil {
+		return valkeyclient.NewTLS(addr, tlsConfig)
+	}
+	return valkeyclient.New(addr)
 }
 
 // podAddress returns the FQDN address for a pod using the headless service.

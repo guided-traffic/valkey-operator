@@ -4,6 +4,8 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"reflect"
 
@@ -30,6 +32,7 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/health"
+	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 // InstanceChecker verifies connectivity and health of Valkey instances.
@@ -53,6 +56,47 @@ func (r *ValkeyReconciler) getInstanceChecker() InstanceChecker {
 		return r.InstanceChecker
 	}
 	return health.NewChecker(r.Client)
+}
+
+// buildTLSConfig reads the TLS CA certificate from the specified Secret
+// and returns a tls.Config suitable for connecting to TLS-enabled Valkey/Sentinel pods.
+// Returns nil if TLS is not enabled.
+func (r *ValkeyReconciler) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretName string) (*tls.Config, error) {
+	if !v.IsTLSEnabled() {
+		return nil, nil
+	}
+
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: v.Namespace,
+	}, secret)
+	if err != nil {
+		return nil, fmt.Errorf("reading TLS secret %s: %w", secretName, err)
+	}
+
+	caCert, ok := secret.Data["ca.crt"]
+	if !ok {
+		return nil, fmt.Errorf("TLS secret %s missing ca.crt", secretName)
+	}
+
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate from secret %s", secretName)
+	}
+
+	return &tls.Config{
+		RootCAs:    certPool,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+// newValkeyClient creates a Valkey RESP client, using TLS if tlsConfig is non-nil.
+func (r *ValkeyReconciler) newValkeyClient(addr string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if tlsConfig != nil {
+		return valkeyclient.NewTLS(addr, tlsConfig)
+	}
+	return valkeyclient.New(addr)
 }
 
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
