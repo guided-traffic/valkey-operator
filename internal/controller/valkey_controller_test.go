@@ -459,7 +459,7 @@ func TestReconcile_Standalone_Error_WhenConnectivityFails(t *testing.T) {
 	require.NoError(t, c.Status().Update(context.Background(), sts))
 
 	// Second reconcile should detect connectivity failure.
-	reconcileOnce(t, r, "test", "default")
+	result := reconcileOnce(t, r, "test", "default")
 
 	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
 	require.NoError(t, err)
@@ -467,6 +467,9 @@ func TestReconcile_Standalone_Error_WhenConnectivityFails(t *testing.T) {
 	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase)
 	assert.Contains(t, v.Status.Message, "unreachable")
 	assert.Contains(t, v.Status.Message, "connection refused")
+
+	// Must requeue so transient errors are retried.
+	assert.NotZero(t, result.RequeueAfter, "Error phase must trigger a requeue")
 }
 
 func TestReconcile_HA_OK_WhenClusterHealthy(t *testing.T) {
@@ -538,7 +541,7 @@ func TestReconcile_HA_Error_WhenClusterUnreachable(t *testing.T) {
 	require.NoError(t, c.Status().Update(context.Background(), sentinelSts))
 
 	// Reconcile should detect cluster health check failure.
-	reconcileOnce(t, r, "test", "default")
+	result := reconcileOnce(t, r, "test", "default")
 
 	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
 	require.NoError(t, err)
@@ -546,6 +549,9 @@ func TestReconcile_HA_Error_WhenClusterUnreachable(t *testing.T) {
 	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase)
 	assert.Contains(t, v.Status.Message, "Cluster health check failed")
 	assert.Contains(t, v.Status.Message, "no master found")
+
+	// Must requeue so transient errors are retried.
+	assert.NotZero(t, result.RequeueAfter, "Error phase must trigger a requeue")
 }
 
 func TestReconcile_HA_Syncing_WhenReplicationInProgress(t *testing.T) {
@@ -585,7 +591,7 @@ func TestReconcile_HA_Syncing_WhenReplicationInProgress(t *testing.T) {
 	require.NoError(t, c.Status().Update(context.Background(), sentinelSts))
 
 	// Reconcile should report Syncing.
-	reconcileOnce(t, r, "test", "default")
+	result := reconcileOnce(t, r, "test", "default")
 
 	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
 	require.NoError(t, err)
@@ -593,6 +599,9 @@ func TestReconcile_HA_Syncing_WhenReplicationInProgress(t *testing.T) {
 	assert.Equal(t, vkov1.ValkeyphaseSyncing, v.Status.Phase)
 	assert.Contains(t, v.Status.Message, "Replication syncing")
 	assert.Equal(t, "test-0", v.Status.MasterPod)
+
+	// Must requeue so the controller retries until sync completes.
+	assert.NotZero(t, result.RequeueAfter, "Syncing phase must trigger a requeue")
 }
 
 // --- Owner References ---

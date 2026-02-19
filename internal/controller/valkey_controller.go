@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -150,6 +151,15 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Requeue when the instance is not yet healthy so transient connectivity
+	// failures (e.g. pod just restarted) are retried automatically.
+	// Status-only updates do not trigger the GenerationChangedPredicate,
+	// so without this explicit requeue the resource would stay in Error/Syncing.
+	if valkey.Status.Phase == vkov1.ValkeyPhaseError || valkey.Status.Phase == vkov1.ValkeyphaseSyncing {
+		logger.Info("Instance not healthy, requeuing", "phase", valkey.Status.Phase)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
