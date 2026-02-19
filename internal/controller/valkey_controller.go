@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,20 +19,40 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/health"
 )
+
+// InstanceChecker verifies connectivity and health of Valkey instances.
+// Implementations must provide PingPod for basic connectivity checks and
+// CheckCluster for full HA cluster health verification.
+type InstanceChecker interface {
+	PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error
+	CheckCluster(ctx context.Context, v *vkov1.Valkey) *health.ClusterState
+}
 
 // ValkeyReconciler reconciles a Valkey object.
 type ValkeyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme          *runtime.Scheme
+	InstanceChecker InstanceChecker
+}
+
+// getInstanceChecker returns the configured InstanceChecker or creates a default one.
+func (r *ValkeyReconciler) getInstanceChecker() InstanceChecker {
+	if r.InstanceChecker != nil {
+		return r.InstanceChecker
+	}
+	return health.NewChecker(r.Client)
 }
 
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
@@ -420,8 +441,12 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 	}
 
 	// Compare spec content to determine if update is needed.
+	// Remove fields that cert-manager's webhook adds/manages to avoid
+	// infinite update loops (e.g., privateKey.rotationPolicy added in v1.18.0).
 	desiredSpec, _, _ := unstructured.NestedMap(desired.Object, "spec")
 	currentSpec, _, _ := unstructured.NestedMap(current.Object, "spec")
+	cleanseCertificateSpec(desiredSpec)
+	cleanseCertificateSpec(currentSpec)
 
 	if !equality.Semantic.DeepEqual(desiredSpec, currentSpec) {
 		logger.Info("Updating Certificate", "name", name)
@@ -432,6 +457,19 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 	}
 
 	return nil
+}
+
+// cleanseCertificateSpec removes fields from a cert-manager Certificate spec
+// that are added or managed by the cert-manager admission webhook.
+// This prevents the operator from fighting with the webhook over defaulted fields
+// (e.g., privateKey.rotationPolicy added in cert-manager v1.18.0).
+func cleanseCertificateSpec(spec map[string]interface{}) {
+	if spec == nil {
+		return
+	}
+	// cert-manager's webhook adds spec.privateKey with defaults.
+	// Remove the entire privateKey field if we didn't explicitly set it.
+	delete(spec, "privateKey")
 }
 
 // reconcileNetworkPolicies reconciles all NetworkPolicy resources.
@@ -515,23 +553,40 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 
 // updateStandaloneStatus updates the status for standalone mode.
 func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.Valkey, readyReplicas int32) error {
+	// Capture previous status to detect changes.
+	prevStatus := v.Status.DeepCopy()
+
 	switch {
 	case readyReplicas == v.Spec.Replicas:
-		v.Status.Phase = vkov1.ValkeyPhaseOK
-		v.Status.Message = "All replicas are ready"
+		// Verify actual connectivity to Valkey instances before reporting OK.
+		if err := r.verifyValkeyConnectivity(ctx, v); err != nil {
+			v.Status.Phase = vkov1.ValkeyPhaseError
+			v.Status.Message = fmt.Sprintf("Instance unreachable: %v", err)
 
-		// In standalone mode, the single pod is the master.
-		if v.Spec.Replicas == 1 {
-			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: v.Generation,
+				Reason:             "ConnectivityCheckFailed",
+				Message:            fmt.Sprintf("Operator cannot reach Valkey instance: %v", err),
+			})
+		} else {
+			v.Status.Phase = vkov1.ValkeyPhaseOK
+			v.Status.Message = "All replicas are ready"
+
+			// In standalone mode, the single pod is the master.
+			if v.Spec.Replicas == 1 {
+				v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+			}
+
+			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: v.Generation,
+				Reason:             "AllReplicasReady",
+				Message:            "All Valkey replicas are ready",
+			})
 		}
-
-		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: v.Generation,
-			Reason:             "AllReplicasReady",
-			Message:            "All Valkey replicas are ready",
-		})
 	case readyReplicas > 0:
 		v.Status.Phase = vkov1.ValkeyPhaseProvisioning
 		v.Status.Message = fmt.Sprintf("Waiting for replicas: %d/%d ready", readyReplicas, v.Spec.Replicas)
@@ -554,6 +609,11 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			Reason:             "NoReplicasReady",
 			Message:            "No replicas are ready yet",
 		})
+	}
+
+	// Only update if status actually changed to prevent infinite reconcile loops.
+	if statusUnchanged(prevStatus, &v.Status) {
+		return nil
 	}
 
 	return r.Status().Update(ctx, v)
@@ -581,24 +641,53 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 	allValkeyReady := readyReplicas == v.Spec.Replicas
 	allSentinelReady := sentinelReady == expectedSentinels
 
+	// Capture previous status to detect changes.
+	prevStatus := v.Status.DeepCopy()
+
 	switch {
 	case allValkeyReady && allSentinelReady:
-		v.Status.Phase = vkov1.ValkeyPhaseOK
-		v.Status.Message = fmt.Sprintf("HA cluster ready: %d/%d valkey, %d/%d sentinel",
-			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
+		// Verify actual cluster health before reporting OK.
+		checker := r.getInstanceChecker()
+		clusterState := checker.CheckCluster(ctx, v)
 
-		// Set master pod — default to pod-0 initially; health checker will update later.
-		if v.Status.MasterPod == "" {
-			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+		if clusterState.Error != nil {
+			v.Status.Phase = vkov1.ValkeyPhaseError
+			v.Status.Message = fmt.Sprintf("Cluster health check failed: %v", clusterState.Error)
+
+			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: v.Generation,
+				Reason:             "ClusterHealthCheckFailed",
+				Message:            fmt.Sprintf("Operator cannot verify cluster health: %v", clusterState.Error),
+			})
+		} else if !clusterState.AllSynced {
+			v.Status.Phase = vkov1.ValkeyphaseSyncing
+			v.Status.MasterPod = clusterState.MasterPod
+			v.Status.Message = fmt.Sprintf("Replication syncing: %d/%d replicas ready",
+				clusterState.ReadyReplicas, clusterState.TotalReplicas)
+
+			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: v.Generation,
+				Reason:             "ReplicationSyncing",
+				Message:            fmt.Sprintf("Replication in progress: %d/%d replicas synced", clusterState.ReadyReplicas, clusterState.TotalReplicas),
+			})
+		} else {
+			v.Status.Phase = vkov1.ValkeyPhaseOK
+			v.Status.MasterPod = clusterState.MasterPod
+			v.Status.Message = fmt.Sprintf("HA cluster ready: %d/%d valkey, %d/%d sentinel",
+				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
+
+			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: v.Generation,
+				Reason:             "HAClusterReady",
+				Message:            "All Valkey and Sentinel instances are ready",
+			})
 		}
-
-		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: v.Generation,
-			Reason:             "HAClusterReady",
-			Message:            "All Valkey and Sentinel instances are ready",
-		})
 	case readyReplicas > 0 || sentinelReady > 0:
 		v.Status.Phase = vkov1.ValkeyPhaseProvisioning
 		v.Status.Message = fmt.Sprintf("HA cluster provisioning: %d/%d valkey, %d/%d sentinel",
@@ -625,7 +714,34 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		})
 	}
 
+	// Only update if status actually changed to prevent infinite reconcile loops.
+	if statusUnchanged(prevStatus, &v.Status) {
+		return nil
+	}
+
 	return r.Status().Update(ctx, v)
+}
+
+// statusUnchanged compares the key fields of two ValkeyStatus values.
+// It returns true if phase, message, readyReplicas, masterPod, and conditions
+// are all equal, meaning no status update is necessary.
+func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
+	if prev.Phase != curr.Phase {
+		return false
+	}
+	if prev.Message != curr.Message {
+		return false
+	}
+	if prev.ReadyReplicas != curr.ReadyReplicas {
+		return false
+	}
+	if prev.MasterPod != curr.MasterPod {
+		return false
+	}
+	if !reflect.DeepEqual(prev.Conditions, curr.Conditions) {
+		return false
+	}
+	return true
 }
 
 // updatePhase is a convenience function to update only the phase and message.
@@ -635,15 +751,33 @@ func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, pha
 		return err
 	}
 
+	// Skip update if nothing changed.
+	if v.Status.Phase == phase && v.Status.Message == message {
+		return nil
+	}
+
 	v.Status.Phase = phase
 	v.Status.Message = message
 	return r.Status().Update(ctx, v)
 }
 
+// verifyValkeyConnectivity pings all Valkey pods to verify operator connectivity.
+// Returns nil if all pods respond, or the first error encountered.
+func (r *ValkeyReconciler) verifyValkeyConnectivity(ctx context.Context, v *vkov1.Valkey) error {
+	checker := r.getInstanceChecker()
+	for i := int32(0); i < v.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", v.Name, i)
+		if err := checker.PingPod(ctx, v, podName); err != nil {
+			return fmt.Errorf("%s: %w", podName, err)
+		}
+	}
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vkov1.Valkey{}).
+		For(&vkov1.Valkey{}, ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
