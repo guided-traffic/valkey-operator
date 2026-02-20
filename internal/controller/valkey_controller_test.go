@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,6 +22,7 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/health"
 )
 
 func testScheme() *runtime.Scheme {
@@ -31,17 +33,42 @@ func testScheme() *runtime.Scheme {
 	return s
 }
 
+// mockInstanceChecker implements InstanceChecker for unit tests.
+type mockInstanceChecker struct {
+	pingErr      error
+	clusterState *health.ClusterState
+}
+
+func (m *mockInstanceChecker) PingPod(_ context.Context, _ *vkov1.Valkey, _ string) error {
+	return m.pingErr
+}
+
+func (m *mockInstanceChecker) CheckCluster(_ context.Context, v *vkov1.Valkey) *health.ClusterState {
+	if m.clusterState != nil {
+		return m.clusterState
+	}
+	// Default: healthy cluster.
+	return &health.ClusterState{
+		MasterPod:          fmt.Sprintf("%s-0", v.Name),
+		ReadyReplicas:      v.Spec.Replicas - 1,
+		TotalReplicas:      v.Spec.Replicas - 1,
+		AllSynced:          true,
+		SentinelMonitoring: v.IsSentinelEnabled(),
+	}
+}
+
 func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client) {
 	s := testScheme()
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(objs...).
-		WithStatusSubresource(&vkov1.Valkey{}).
+		WithStatusSubresource(&vkov1.Valkey{}, &appsv1.StatefulSet{}).
 		Build()
 
 	return &ValkeyReconciler{
-		Client: fakeClient,
-		Scheme: s,
+		Client:          fakeClient,
+		Scheme:          s,
+		InstanceChecker: &mockInstanceChecker{},
 	}, fakeClient
 }
 
@@ -162,6 +189,131 @@ func TestReconcile_Idempotent(t *testing.T) {
 	reconcileOnce(t, r, "test", "default")
 }
 
+// TestReconcile_Idempotent_NoUnnecessaryStatusUpdates verifies that repeated
+// reconciles with no spec or readiness changes do not write the status,
+// preventing infinite reconcile loops caused by status update watch events.
+func TestReconcile_Idempotent_NoUnnecessaryStatusUpdates(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates resources and sets initial status.
+	reconcileOnce(t, r, "test", "default")
+
+	// Capture the resource version after the first reconcile.
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+	rvAfterFirst := v.ResourceVersion
+
+	// Second reconcile — nothing changed, should NOT update status.
+	reconcileOnce(t, r, "test", "default")
+
+	err = c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+	rvAfterSecond := v.ResourceVersion
+
+	assert.Equal(t, rvAfterFirst, rvAfterSecond,
+		"ResourceVersion should not change on idempotent reconcile — status should not be rewritten")
+}
+
+// TestReconcile_HA_Idempotent_NoUnnecessaryStatusUpdates verifies that
+// HA mode reconciles do not trigger unnecessary status updates.
+func TestReconcile_HA_Idempotent_NoUnnecessaryStatusUpdates(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	// First reconcile.
+	reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+	rvAfterFirst := v.ResourceVersion
+
+	// Second reconcile — no changes, should NOT update status.
+	reconcileOnce(t, r, "test", "default")
+
+	err = c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+	rvAfterSecond := v.ResourceVersion
+
+	assert.Equal(t, rvAfterFirst, rvAfterSecond,
+		"ResourceVersion should not change on idempotent HA reconcile — status should not be rewritten")
+}
+
+// TestStatusUnchanged_DetectsChanges verifies the statusUnchanged helper.
+func TestStatusUnchanged_DetectsChanges(t *testing.T) {
+	base := &vkov1.ValkeyStatus{
+		Phase:         vkov1.ValkeyPhaseProvisioning,
+		Message:       "test message",
+		ReadyReplicas: 1,
+		MasterPod:     "test-0",
+	}
+
+	// Same values — should be unchanged.
+	same := base.DeepCopy()
+	assert.True(t, statusUnchanged(base, same), "identical status should be unchanged")
+
+	// Different phase — should be changed.
+	diffPhase := base.DeepCopy()
+	diffPhase.Phase = vkov1.ValkeyPhaseOK
+	assert.False(t, statusUnchanged(base, diffPhase), "different phase should be detected")
+
+	// Different message — should be changed.
+	diffMessage := base.DeepCopy()
+	diffMessage.Message = "new message"
+	assert.False(t, statusUnchanged(base, diffMessage), "different message should be detected")
+
+	// Different readyReplicas — should be changed.
+	diffReplicas := base.DeepCopy()
+	diffReplicas.ReadyReplicas = 3
+	assert.False(t, statusUnchanged(base, diffReplicas), "different readyReplicas should be detected")
+
+	// Different masterPod — should be changed.
+	diffMaster := base.DeepCopy()
+	diffMaster.MasterPod = "test-1"
+	assert.False(t, statusUnchanged(base, diffMaster), "different masterPod should be detected")
+}
+
+// TestCleanseCertificateSpec_RemovesPrivateKey verifies that cert-manager
+// webhook-added fields are removed before comparison.
+func TestCleanseCertificateSpec_RemovesPrivateKey(t *testing.T) {
+	// Simulate a spec as returned by Kubernetes (with webhook-added fields).
+	specWithWebhookFields := map[string]interface{}{
+		"secretName": "test-tls",
+		"issuerRef": map[string]interface{}{
+			"name": "my-issuer",
+			"kind": "ClusterIssuer",
+		},
+		"privateKey": map[string]interface{}{
+			"rotationPolicy": "Always",
+		},
+	}
+
+	// Simulate the desired spec (without webhook fields).
+	desiredSpec := map[string]interface{}{
+		"secretName": "test-tls",
+		"issuerRef": map[string]interface{}{
+			"name": "my-issuer",
+			"kind": "ClusterIssuer",
+		},
+	}
+
+	// Without cleansing, they differ.
+	assert.NotEqual(t, specWithWebhookFields, desiredSpec,
+		"specs should differ before cleansing")
+
+	// After cleansing, they should match.
+	cleanseCertificateSpec(specWithWebhookFields)
+	cleanseCertificateSpec(desiredSpec)
+	assert.Equal(t, specWithWebhookFields, desiredSpec,
+		"specs should match after cleansing webhook-added fields")
+}
+
 // --- ConfigMap Update ---
 
 func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
@@ -260,6 +412,196 @@ func TestReconcile_SetsProvisioningPhase(t *testing.T) {
 	// With fake client, StatefulSet has 0 ready replicas — should be Provisioning.
 	assert.Equal(t, vkov1.ValkeyPhaseProvisioning, v.Status.Phase)
 	assert.Contains(t, v.Status.Message, "ready")
+}
+
+// --- Connectivity Check ---
+
+func TestReconcile_Standalone_OK_WhenConnectivitySucceeds(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all replicas ready by updating StatefulSet status.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 1
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Second reconcile should report OK (mock ping succeeds by default).
+	reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseOK, v.Status.Phase)
+	assert.Equal(t, "All replicas are ready", v.Status.Message)
+	assert.Equal(t, "test-0", v.Status.MasterPod)
+}
+
+func TestReconcile_Standalone_Error_WhenConnectivityFails(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// Inject failing connectivity checker.
+	r.InstanceChecker = &mockInstanceChecker{
+		pingErr: fmt.Errorf("dial tcp: connection refused"),
+	}
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 1
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Second reconcile should detect connectivity failure.
+	result := reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase)
+	assert.Contains(t, v.Status.Message, "unreachable")
+	assert.Contains(t, v.Status.Message, "connection refused")
+
+	// Must requeue so transient errors are retried.
+	assert.NotZero(t, result.RequeueAfter, "Error phase must trigger a requeue")
+}
+
+func TestReconcile_HA_OK_WhenClusterHealthy(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all Valkey replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Simulate all Sentinel replicas ready.
+	sentinelSts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel", Namespace: "default"}, sentinelSts))
+	sentinelSts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sentinelSts))
+
+	// Second reconcile should report OK (mock cluster check succeeds).
+	reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseOK, v.Status.Phase)
+	assert.Contains(t, v.Status.Message, "HA cluster ready")
+	assert.Equal(t, "test-0", v.Status.MasterPod)
+}
+
+func TestReconcile_HA_Error_WhenClusterUnreachable(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	// Inject failing cluster check (simulates network policy blocking).
+	r.InstanceChecker = &mockInstanceChecker{
+		clusterState: &health.ClusterState{
+			Error: fmt.Errorf("no master found among 3 pods"),
+		},
+	}
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all Valkey replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Simulate all Sentinel replicas ready.
+	sentinelSts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel", Namespace: "default"}, sentinelSts))
+	sentinelSts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sentinelSts))
+
+	// Reconcile should detect cluster health check failure.
+	result := reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase)
+	assert.Contains(t, v.Status.Message, "Cluster health check failed")
+	assert.Contains(t, v.Status.Message, "no master found")
+
+	// Must requeue so transient errors are retried.
+	assert.NotZero(t, result.RequeueAfter, "Error phase must trigger a requeue")
+}
+
+func TestReconcile_HA_Syncing_WhenReplicationInProgress(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, c := newTestReconciler(v)
+
+	// Inject cluster state with incomplete replication sync.
+	r.InstanceChecker = &mockInstanceChecker{
+		clusterState: &health.ClusterState{
+			MasterPod:          "test-0",
+			ReadyReplicas:      1,
+			TotalReplicas:      2,
+			AllSynced:          false,
+			SentinelMonitoring: true,
+		},
+	}
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all Valkey replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Simulate all Sentinel replicas ready.
+	sentinelSts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test-sentinel", Namespace: "default"}, sentinelSts))
+	sentinelSts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sentinelSts))
+
+	// Reconcile should report Syncing.
+	result := reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyphaseSyncing, v.Status.Phase)
+	assert.Contains(t, v.Status.Message, "Replication syncing")
+	assert.Equal(t, "test-0", v.Status.MasterPod)
+
+	// Must requeue so the controller retries until sync completes.
+	assert.NotZero(t, result.RequeueAfter, "Syncing phase must trigger a requeue")
 }
 
 // --- Owner References ---

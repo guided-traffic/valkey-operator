@@ -1,12 +1,31 @@
 package valkeyclient
 
 import (
+	"crypto/tls"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-// --- formatRESP ---
+// --- New / NewTLS ---
+
+func TestNewClient(t *testing.T) {
+	c := New("localhost:6379")
+	assert.NotNil(t, c)
+	assert.Equal(t, "localhost:6379", c.addr)
+	assert.Nil(t, c.tlsConfig)
+}
+
+func TestNewTLSClient(t *testing.T) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	c := NewTLS("localhost:16379", tlsConfig)
+	assert.NotNil(t, c)
+	assert.Equal(t, "localhost:16379", c.addr)
+	assert.NotNil(t, c.tlsConfig)
+	assert.Equal(t, uint16(tls.VersionTLS12), c.tlsConfig.MinVersion)
+}
 
 func TestFormatRESP_SingleArg(t *testing.T) {
 	resp := formatRESP([]string{"PING"})
@@ -105,13 +124,6 @@ quorum
 func TestParseSentinelMasterInfo_EmptyInput(t *testing.T) {
 	info := parseSentinelMasterInfo("")
 	assert.Equal(t, "", info.Name)
-}
-
-// --- New ---
-
-func TestNewClient(t *testing.T) {
-	c := New("localhost:6379")
-	assert.Equal(t, "localhost:6379", c.addr)
 }
 
 func TestFormatRESP_WaitCommand(t *testing.T) {

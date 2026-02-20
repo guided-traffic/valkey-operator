@@ -1097,9 +1097,15 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 
 	t.Run("Sentinel knows all replicas", func(t *testing.T) {
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
-		resp := tc.valkeyTLSExec(t, ns, sentinelPod, 26379, "SENTINEL", "replicas", name)
-		assert.NotEmpty(t, resp, "Sentinel should report replicas")
-		t.Logf("Sentinel replicas info: %s", truncateLogs(resp, 500))
+		// Sentinel discovers replicas asynchronously by polling the master's INFO output.
+		// Use Eventually to allow time for the discovery cycle to complete.
+		var lastResp string
+		require.Eventually(t, func() bool {
+			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 26379, "SENTINEL", "replicas", name)
+			lastResp = resp
+			return resp != ""
+		}, 60*time.Second, 2*time.Second, "Sentinel should report replicas within 60s")
+		t.Logf("Sentinel replicas info: %s", truncateLogs(lastResp, 500))
 	})
 
 	t.Run("All Sentinel instances agree on master", func(t *testing.T) {

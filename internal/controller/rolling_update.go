@@ -17,7 +17,6 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
 	"github.com/guided-traffic/valkey-operator/internal/health"
-	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 // Rolling update state machine annotations.
@@ -552,7 +551,7 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 	logger := log.FromContext(ctx)
 
 	masterPod := pods[masterIdx]
-	addr := health.PodAddressForComponent(v, masterPod.name, common.ComponentValkey, builder.ValkeyPort)
+	addr := health.PodAddressForComponent(v, masterPod.name, common.ComponentValkey, int(builder.ServicePort(v)))
 
 	// Count the number of non-master replicas that should acknowledge.
 	numReplicas := 0
@@ -567,7 +566,13 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 		return nil
 	}
 
-	c := valkeyclient.New(addr)
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for WAIT", "error", err)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	c := r.newValkeyClient(addr, tlsConfig)
 	acked, err := c.Wait(numReplicas, waitWriteSyncTimeout)
 	if err != nil {
 		logger.Info("WAIT command failed, will retry", "master", masterPod.name, "error", err)
@@ -748,8 +753,13 @@ func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Va
 			// Verify the new master has data (DBSIZE > 0) if the old master had data.
 			// This is a critical safety check: if the new master is empty but the
 			// old master had data, the failover promoted an empty replica.
-			addr := health.PodAddressForComponent(v, other.name, common.ComponentValkey, builder.ValkeyPort)
-			vc := valkeyclient.New(addr)
+			addr := health.PodAddressForComponent(v, other.name, common.ComponentValkey, int(builder.ServicePort(v)))
+			tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+			if tlsErr != nil {
+				logger.Info("Could not build TLS config for DBSIZE check", "error", tlsErr)
+				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			}
+			vc := r.newValkeyClient(addr, tlsConfig)
 			dbsize, err := vc.DBSize()
 			if err != nil {
 				logger.Info("Cannot check DBSIZE on new master, waiting",
@@ -893,7 +903,13 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
-		c := valkeyclient.New(addr)
+		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
+		if tlsErr != nil {
+			logger.V(1).Info("Could not build TLS config for sentinel reconfig", "error", tlsErr)
+			continue
+		}
+
+		c := r.newValkeyClient(addr, tlsConfig)
 
 		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
 		if err := c.SentinelRemove(monitorName); err != nil {
@@ -939,7 +955,14 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
-		c := valkeyclient.New(addr)
+		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
+		if tlsErr != nil {
+			lastErr = tlsErr
+			logger.V(1).Info("Could not build TLS config for sentinel failover", "error", tlsErr)
+			continue
+		}
+
+		c := r.newValkeyClient(addr, tlsConfig)
 		if err := c.SentinelFailover(monitorName); err != nil {
 			lastErr = err
 			logger.V(1).Info("Sentinel failover attempt failed", "sentinel", podName, "error", err)

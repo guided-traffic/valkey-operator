@@ -147,7 +147,8 @@ func (tc *testClients) waitForValkeyPhase(t *testing.T, namespace, name, expecte
 		if err != nil || !found {
 			return false, nil
 		}
-		t.Logf("Valkey %s phase: %s (want: %s)", name, phase, expectedPhase)
+		msg, _, _ := unstructured.NestedString(valkey.Object, "status", "message")
+		t.Logf("Valkey %s phase: %s (want: %s) message: %s", name, phase, expectedPhase, msg)
 		return phase == expectedPhase, nil
 	})
 	require.NoError(t, err, "Valkey %s/%s did not reach phase %s", namespace, name, expectedPhase)
