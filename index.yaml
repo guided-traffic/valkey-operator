@@ -2,8 +2,30 @@ apiVersion: v1
 entries:
   valkey-operator:
   - apiVersion: v2
+    appVersion: 1.0.1
+    created: "2026-02-20T06:04:19.521119305Z"
+    description: A Kubernetes operator for managing Valkey and Sentinel instances
+    digest: b7e7f773dd188ff3036be95f77fbd8be5f66bbc229c37f4b95a85aeca9dbaf79
+    home: https://github.com/guided-traffic/valkey-operator
+    keywords:
+    - valkey
+    - redis
+    - sentinel
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Guided Traffic
+      url: https://github.com/guided-traffic
+    name: valkey-operator
+    sources:
+    - https://github.com/guided-traffic/valkey-operator
+    type: application
+    urls:
+    - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.0.1.tgz
+    version: 1.0.1
+  - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-02-18T19:12:32.816544943Z"
+    created: "2026-02-20T06:04:19.520621195Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 21945c698c83ffe2dea02424a63a0d94ca2a39e8f957d61f4823e49dc6bd9f63
     home: https://github.com/guided-traffic/valkey-operator
@@ -23,4 +45,4 @@ entries:
     urls:
     - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.0.0.tgz
     version: 1.0.0
-generated: "2026-02-18T19:12:32.815657496Z"
+generated: "2026-02-20T06:04:19.519951011Z"
