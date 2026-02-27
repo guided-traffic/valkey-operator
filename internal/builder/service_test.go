@@ -37,14 +37,14 @@ func TestBuildHeadlessService(t *testing.T) {
 	assert.Equal(t, "valkey", svc.Labels["app.kubernetes.io/component"])
 }
 
-// --- BuildClientService ---
+// --- BuildRWService ---
 
-func TestBuildClientService(t *testing.T) {
+func TestBuildRWService(t *testing.T) {
 	v := newTestValkey("my-valkey")
 
-	svc := BuildClientService(v)
+	svc := BuildRWService(v)
 
-	assert.Equal(t, "my-valkey", svc.Name)
+	assert.Equal(t, "my-valkey-rw", svc.Name)
 	assert.Equal(t, "default", svc.Namespace)
 	assert.NotEqual(t, corev1.ClusterIPNone, svc.Spec.ClusterIP)
 	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
@@ -53,18 +53,62 @@ func TestBuildClientService(t *testing.T) {
 	assert.Len(t, svc.Spec.Ports, 1)
 	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
 
-	// Selector.
+	// Selector must include instanceRole=master.
 	assert.Equal(t, "my-valkey", svc.Spec.Selector["app.kubernetes.io/instance"])
+	assert.Equal(t, "master", svc.Spec.Selector["vko.gtrfc.com/instanceRole"])
 }
 
-func TestBuildClientService_Namespace(t *testing.T) {
+func TestBuildRWService_Namespace(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Namespace = "production"
 	})
 
-	svc := BuildClientService(v)
+	svc := BuildRWService(v)
 
 	assert.Equal(t, "production", svc.Namespace)
+}
+
+// --- BuildAllService ---
+
+func TestBuildAllService(t *testing.T) {
+	v := newTestValkey("my-valkey")
+
+	svc := BuildAllService(v)
+
+	assert.Equal(t, "my-valkey-all", svc.Name)
+	assert.Equal(t, "default", svc.Namespace)
+	assert.NotEqual(t, corev1.ClusterIPNone, svc.Spec.ClusterIP)
+	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+
+	// Ports.
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
+
+	// Selector should be all Valkey pods (no instanceRole filter).
+	assert.Equal(t, "my-valkey", svc.Spec.Selector["app.kubernetes.io/instance"])
+	assert.Equal(t, "valkey", svc.Spec.Selector["app.kubernetes.io/component"])
+	_, hasRole := svc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+	assert.False(t, hasRole, "all-pods service should not filter by role")
+}
+
+// --- BuildReadOnlyService ---
+
+func TestBuildReadOnlyService(t *testing.T) {
+	v := newTestValkey("my-valkey")
+
+	svc := BuildReadOnlyService(v)
+
+	assert.Equal(t, "my-valkey-r", svc.Name)
+	assert.Equal(t, "default", svc.Namespace)
+	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+
+	// Ports.
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
+
+	// Selector must include instanceRole=replica.
+	assert.Equal(t, "my-valkey", svc.Spec.Selector["app.kubernetes.io/instance"])
+	assert.Equal(t, "replica", svc.Spec.Selector["vko.gtrfc.com/instanceRole"])
 }
 
 // --- BuildSentinelHeadlessService ---
@@ -103,16 +147,23 @@ func TestBuildSentinelHeadlessService(t *testing.T) {
 	assert.Equal(t, "sentinel", svc.Labels["app.kubernetes.io/component"])
 }
 
-// --- ClientServiceName ---
+// --- AllServiceName ---
 
-func TestClientServiceName(t *testing.T) {
+func TestAllServiceName(t *testing.T) {
 	v := newTestValkey("my-valkey")
-	assert.Equal(t, "my-valkey", ClientServiceName(v))
+	assert.Equal(t, "my-valkey-all", AllServiceName(v))
 }
 
-// --- ReadServiceName ---
+// --- RWServiceName ---
 
-func TestReadServiceName(t *testing.T) {
+func TestRWServiceName(t *testing.T) {
 	v := newTestValkey("my-valkey")
-	assert.Equal(t, "my-valkey-read", ReadServiceName(v))
+	assert.Equal(t, "my-valkey-rw", RWServiceName(v))
+}
+
+// --- ReadOnlyServiceName ---
+
+func TestReadOnlyServiceName(t *testing.T) {
+	v := newTestValkey("my-valkey")
+	assert.Equal(t, "my-valkey-r", ReadOnlyServiceName(v))
 }

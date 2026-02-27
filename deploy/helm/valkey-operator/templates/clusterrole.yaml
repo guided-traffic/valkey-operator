@@ -38,6 +38,7 @@ rules:
     resources:
       - configmaps
       - services
+      - serviceaccounts
     verbs:
       - create
       - delete
@@ -101,6 +102,20 @@ rules:
       - cert-manager.io
     resources:
       - certificates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  # RBAC resources for per-instance sidecar Role and RoleBinding
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - roles
+      - rolebindings
     verbs:
       - create
       - delete

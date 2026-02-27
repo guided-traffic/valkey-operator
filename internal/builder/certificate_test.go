@@ -136,14 +136,17 @@ func TestBuildValkeyCertificate_Basic(t *testing.T) {
 	assert.Contains(t, dnsNamesList, "test-headless")
 	assert.Contains(t, dnsNamesList, "test-headless.prod.svc.cluster.local")
 
-	// Should contain client service.
-	assert.Contains(t, dnsNamesList, "test")
-	assert.Contains(t, dnsNamesList, "test.prod.svc.cluster.local")
+	// Should contain read-write service.
+	assert.Contains(t, dnsNamesList, "test-rw")
+	assert.Contains(t, dnsNamesList, "test-rw.prod.svc.cluster.local")
 
-	// Should contain read service.
-	assert.Contains(t, dnsNamesList, "test-read")
-	assert.Contains(t, dnsNamesList, "test-read.prod.svc.cluster.local")
+	// Should contain all-pods service.
+	assert.Contains(t, dnsNamesList, "test-all")
+	assert.Contains(t, dnsNamesList, "test-all.prod.svc.cluster.local")
 
+	// Should contain read-only replica service (3 replicas).
+	assert.Contains(t, dnsNamesList, "test-r")
+	assert.Contains(t, dnsNamesList, "test-r.prod.svc.cluster.local")
 	// Should contain localhost.
 	assert.Contains(t, dnsNamesList, "localhost")
 

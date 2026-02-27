@@ -237,6 +237,14 @@ func (tc *testClients) getService(t *testing.T, namespace, name string) *corev1.
 	return svc
 }
 
+// tryGetService attempts to retrieve a Service and returns the service and any error.
+// Unlike getService it does not fail the test on error, allowing callers to assert absence.
+func (tc *testClients) tryGetService(t *testing.T, namespace, name string) (*corev1.Service, error) {
+	t.Helper()
+	ctx := context.Background()
+	return tc.kube.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
 // getConfigMap retrieves a ConfigMap.
 func (tc *testClients) getConfigMap(t *testing.T, namespace, name string) *corev1.ConfigMap {
 	t.Helper()

@@ -49,10 +49,18 @@ func TestE2E_StandaloneCluster(t *testing.T) {
 		svc := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(svc.Spec.ClusterIP))
 
-		// Client-facing service.
-		clientSvc := tc.getService(t, ns, name)
-		assert.NotEmpty(t, clientSvc.Spec.ClusterIP)
-		assert.Equal(t, int32(6379), clientSvc.Spec.Ports[0].Port)
+		// -rw service: routes to the master pod only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, int32(6379), rwSvc.Spec.Ports[0].Port)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// Standalone (replicas=1) must NOT have -all or -r services.
+		_, errAll := tc.tryGetService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.Error(t, errAll, "-all service must not exist for standalone")
+		_, errR := tc.tryGetService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.Error(t, errR, "-r service must not exist for standalone")
 	})
 
 	t.Run("ConfigMap exists with valkey.conf", func(t *testing.T) {
@@ -152,9 +160,23 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 		headless := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(headless.Spec.ClusterIP))
 
-		// Client service.
-		client := tc.getService(t, ns, name)
-		assert.NotEmpty(t, client.Spec.ClusterIP)
+		// -rw service: routes to master only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// -all service: routes to all Valkey pods (no role filter).
+		allSvc := tc.getService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.NotEmpty(t, allSvc.Spec.ClusterIP)
+		_, hasRole := allSvc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+		assert.False(t, hasRole, "-all service must not filter by role")
+
+		// -r service: routes to replica pods only.
+		rSvc := tc.getService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.NotEmpty(t, rSvc.Spec.ClusterIP)
+		assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-r service must select replica pods only")
 	})
 
 	t.Run("Sentinel headless service exists", func(t *testing.T) {

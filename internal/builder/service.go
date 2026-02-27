@@ -11,9 +11,22 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-// ClientServiceName returns the name for the client-facing Service.
-func ClientServiceName(v *vkov1.Valkey) string {
-	return v.Name
+// AllServiceName returns the name for the all-pods Service (<name>-all).
+// This service load-balances across all Valkey pods regardless of role.
+func AllServiceName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-all", v.Name)
+}
+
+// RWServiceName returns the name for the read-write Service (<name>-rw).
+// This service routes only to the master pod.
+func RWServiceName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-rw", v.Name)
+}
+
+// ReadOnlyServiceName returns the name for the read-only replica Service (<name>-r).
+// This service routes only to replica pods.
+func ReadOnlyServiceName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-r", v.Name)
 }
 
 // BuildHeadlessService builds the headless Service for StatefulSet DNS resolution.
@@ -41,23 +54,18 @@ func BuildHeadlessService(v *vkov1.Valkey) *corev1.Service {
 	}
 }
 
-// BuildClientService builds the client-facing Service that points to the master pod.
-// In standalone mode, it simply selects all Valkey pods.
-// In HA mode, it uses selector labels (traffic is distributed across all pods).
-// A dedicated read service can be used for read replicas.
-func BuildClientService(v *vkov1.Valkey) *corev1.Service {
-	labels := common.BaseLabels(v, common.ComponentValkey)
-	selector := common.SelectorLabels(v, common.ComponentValkey)
-
+// BuildRWService builds the read-write Service that routes only to the master pod.
+// The selector requires instanceRole=master, which is managed by the sidecar container.
+func BuildRWService(v *vkov1.Valkey) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ClientServiceName(v),
+			Name:      RWServiceName(v),
 			Namespace: v.Namespace,
-			Labels:    labels,
+			Labels:    common.BaseLabels(v, common.ComponentValkey),
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: selector,
+			Selector: common.MasterSelectorLabels(v),
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "valkey",
@@ -70,21 +78,43 @@ func BuildClientService(v *vkov1.Valkey) *corev1.Service {
 	}
 }
 
-// BuildReadService builds a read-only Service that routes to all Valkey pods (replicas + master).
-// Useful for read-heavy workloads in HA mode.
-func BuildReadService(v *vkov1.Valkey) *corev1.Service {
-	labels := common.BaseLabels(v, common.ComponentValkey)
-	selector := common.SelectorLabels(v, common.ComponentValkey)
-
+// BuildAllService builds the all-pods Service that load-balances across all Valkey pods.
+// Useful for read-heavy workloads where reads from replicas are acceptable.
+func BuildAllService(v *vkov1.Valkey) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ReadServiceName(v),
+			Name:      AllServiceName(v),
 			Namespace: v.Namespace,
-			Labels:    labels,
+			Labels:    common.BaseLabels(v, common.ComponentValkey),
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: selector,
+			Selector: common.SelectorLabels(v, common.ComponentValkey),
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "valkey",
+					Port:       ValkeyPort,
+					TargetPort: intstr.FromString("valkey"),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+// BuildReadOnlyService builds a read-only Service that routes only to replica pods.
+// The selector requires instanceRole=replica, managed by the sidecar container.
+// Only created in multi-replica mode.
+func BuildReadOnlyService(v *vkov1.Valkey) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ReadOnlyServiceName(v),
+			Namespace: v.Namespace,
+			Labels:    common.BaseLabels(v, common.ComponentValkey),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: common.ReplicaSelectorLabels(v),
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "valkey",
@@ -120,9 +150,4 @@ func BuildSentinelHeadlessService(v *vkov1.Valkey) *corev1.Service {
 			},
 		},
 	}
-}
-
-// ReadServiceName returns the name for the read-only (replica) Service.
-func ReadServiceName(v *vkov1.Valkey) string {
-	return fmt.Sprintf("%s-read", v.Name)
 }

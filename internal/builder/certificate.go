@@ -60,10 +60,11 @@ func SentinelTLSSecretName(v *vkov1.Valkey) string {
 }
 
 // valkeyDNSNames generates the DNS names for the Valkey Certificate.
-// This includes individual pod DNS names, the headless service, and the client service.
+// This includes individual pod DNS names, the headless service, and all client services.
 func valkeyDNSNames(v *vkov1.Valkey) []string {
 	headless := common.HeadlessServiceName(v, common.ComponentValkey)
-	clientSvc := ClientServiceName(v)
+	rwSvc := RWServiceName(v)
+	allSvc := AllServiceName(v)
 
 	var dnsNames []string
 
@@ -80,14 +81,20 @@ func valkeyDNSNames(v *vkov1.Valkey) []string {
 	dnsNames = append(dnsNames, headless)
 	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", headless, v.Namespace))
 
-	// Client service DNS.
-	dnsNames = append(dnsNames, clientSvc)
-	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", clientSvc, v.Namespace))
+	// Read-write service DNS.
+	dnsNames = append(dnsNames, rwSvc)
+	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", rwSvc, v.Namespace))
 
-	// Read service DNS (if applicable).
-	readSvc := ReadServiceName(v)
-	dnsNames = append(dnsNames, readSvc)
-	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", readSvc, v.Namespace))
+	// All-pods service DNS.
+	dnsNames = append(dnsNames, allSvc)
+	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", allSvc, v.Namespace))
+
+	// Read-only replica service DNS (multi-replica only).
+	if v.Spec.Replicas > 1 {
+		rSvc := ReadOnlyServiceName(v)
+		dnsNames = append(dnsNames, rSvc)
+		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", rSvc, v.Namespace))
+	}
 
 	// Localhost for local connections.
 	dnsNames = append(dnsNames, "localhost")

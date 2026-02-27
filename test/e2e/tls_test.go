@@ -798,8 +798,21 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 		headless := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(headless.Spec.ClusterIP))
 
-		client := tc.getService(t, ns, name)
-		assert.NotEmpty(t, client.Spec.ClusterIP)
+		// -rw: master-only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// -all: all pods (HA cluster).
+		allSvc := tc.getService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.NotEmpty(t, allSvc.Spec.ClusterIP)
+
+		// -r: replica-only.
+		rSvc := tc.getService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.NotEmpty(t, rSvc.Spec.ClusterIP)
+		assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-r service must select replica pods only")
 	})
 
 	// =========================================================================

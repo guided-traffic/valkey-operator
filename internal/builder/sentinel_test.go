@@ -494,17 +494,8 @@ func TestBuildStatefulSet_StandaloneNoInitContainer(t *testing.T) {
 	assert.NotContains(t, container.Command[1], WritableConfigMountPath)
 }
 
-// --- Read Service ---
+// --- Read-Only Service (see service_test.go for full coverage) ---
 
-func TestBuildReadService(t *testing.T) {
-	v := newTestValkey("test")
-	svc := BuildReadService(v)
-
-	assert.Equal(t, "test-read", svc.Name)
-	assert.Equal(t, "default", svc.Namespace)
-	assert.Len(t, svc.Spec.Ports, 1)
-	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
-}
 
 // --- Sentinel Auth StatefulSet ---
 

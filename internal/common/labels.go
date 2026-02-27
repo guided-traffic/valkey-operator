@@ -37,6 +37,9 @@ const (
 	RoleMaster = "master"
 	// RoleReplica is the role value for a replica instance.
 	RoleReplica = "replica"
+	// RoleDraining is the role value for a pod undergoing graceful failover drain.
+	// When set, the pod is removed from the -rw Service immediately.
+	RoleDraining = "draining"
 
 	// ManagedBy is the constant value for the managed-by label.
 	ManagedBy = "vko.gtrfc.com"
@@ -106,6 +109,22 @@ func SelectorLabels(v *vkov1.Valkey, component string) map[string]string {
 		LabelManagedBy: ManagedBy,
 		LabelComponent: component,
 	}
+}
+
+// MasterSelectorLabels returns selector labels that match only the master pod.
+// Used by the -rw Service.
+func MasterSelectorLabels(v *vkov1.Valkey) map[string]string {
+	labels := SelectorLabels(v, ComponentValkey)
+	labels[LabelInstanceRole] = RoleMaster
+	return labels
+}
+
+// ReplicaSelectorLabels returns selector labels that match only replica pods.
+// Used by the -r Service.
+func ReplicaSelectorLabels(v *vkov1.Valkey) map[string]string {
+	labels := SelectorLabels(v, ComponentValkey)
+	labels[LabelInstanceRole] = RoleReplica
+	return labels
 }
 
 // StatefulSetName returns the name for a Valkey or Sentinel StatefulSet.

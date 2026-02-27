@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -144,7 +145,7 @@ func TestReconcile_CreatesHeadlessService(t *testing.T) {
 	assert.True(t, svc.Spec.PublishNotReadyAddresses)
 }
 
-func TestReconcile_CreatesClientService(t *testing.T) {
+func TestReconcile_CreatesRWService(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, c := newTestReconciler(v)
 
@@ -152,12 +153,14 @@ func TestReconcile_CreatesClientService(t *testing.T) {
 
 	svc := &corev1.Service{}
 	err := c.Get(context.Background(), types.NamespacedName{
-		Name: "test", Namespace: "default",
+		Name: "test-rw", Namespace: "default",
 	}, svc)
 
 	require.NoError(t, err)
 	assert.Len(t, svc.Spec.Ports, 1)
 	assert.Equal(t, int32(6379), svc.Spec.Ports[0].Port)
+	// -rw service must select master pods.
+	assert.Equal(t, "master", svc.Spec.Selector["vko.gtrfc.com/instanceRole"])
 }
 
 func TestReconcile_CreatesStatefulSet(t *testing.T) {
@@ -175,6 +178,217 @@ func TestReconcile_CreatesStatefulSet(t *testing.T) {
 	assert.Equal(t, int32(1), *sts.Spec.Replicas)
 	assert.Equal(t, "valkey/valkey:8.0", sts.Spec.Template.Spec.Containers[0].Image)
 	assert.Equal(t, "test-headless", sts.Spec.ServiceName)
+}
+
+func TestReconcile_MultiReplica_CreatesAllService(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-all", Namespace: "default",
+	}, svc)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(6379), svc.Spec.Ports[0].Port)
+	_, hasRole := svc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+	assert.False(t, hasRole, "-all service must not filter by role")
+}
+
+func TestReconcile_MultiReplica_CreatesReadOnlyService(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-r", Namespace: "default",
+	}, svc)
+
+	require.NoError(t, err)
+	assert.Equal(t, "replica", svc.Spec.Selector["vko.gtrfc.com/instanceRole"])
+}
+
+func TestReconcile_Standalone_DoesNotCreateAllOrReadOnlyService(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	allSvc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-all", Namespace: "default",
+	}, allSvc)
+	assert.True(t, apierrors.IsNotFound(err), "-all service should not exist for standalone")
+
+	rSvc := &corev1.Service{}
+	err = c.Get(context.Background(), types.NamespacedName{
+		Name: "test-r", Namespace: "default",
+	}, rSvc)
+	assert.True(t, apierrors.IsNotFound(err), "-r service should not exist for standalone")
+}
+
+// --- Sidecar RBAC ---
+
+func TestReconcile_CreatesSidecarServiceAccount(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sa := &corev1.ServiceAccount{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, sa)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test-sidecar", sa.Name)
+}
+
+func TestReconcile_CreatesSidecarRole(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	role := &rbacv1.Role{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, role)
+
+	require.NoError(t, err)
+	require.Len(t, role.Rules, 1)
+	assert.Contains(t, role.Rules[0].Verbs, "patch")
+	assert.Contains(t, role.Rules[0].Resources, "pods")
+}
+
+func TestReconcile_CreatesSidecarRoleBinding(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	rb := &rbacv1.RoleBinding{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, rb)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test-sidecar", rb.RoleRef.Name)
+	require.Len(t, rb.Subjects, 1)
+	assert.Equal(t, "test-sidecar", rb.Subjects[0].Name)
+}
+
+func TestReconcile_RBAC_Idempotent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	// Multiple reconciles must not error on RBAC resources.
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+}
+
+// --- Legacy Service Cleanup ---
+
+func TestReconcile_DeletesLegacyClientService(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// Pre-create a legacy service owned by this Valkey instance.
+	legacySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "vko.gtrfc.com/v1",
+					Kind:       "Valkey",
+					Name:       v.Name,
+					UID:        v.UID,
+				},
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 6379}},
+		},
+	}
+	require.NoError(t, c.Create(context.Background(), legacySvc))
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, svc)
+	assert.True(t, apierrors.IsNotFound(err), "legacy service 'test' should be deleted")
+}
+
+func TestReconcile_DeletesLegacyReadService(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// Pre-create a legacy read service owned by this Valkey instance.
+	legacySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-read",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "vko.gtrfc.com/v1",
+					Kind:       "Valkey",
+					Name:       v.Name,
+					UID:        v.UID,
+				},
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 6379}},
+		},
+	}
+	require.NoError(t, c.Create(context.Background(), legacySvc))
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-read", Namespace: "default",
+	}, svc)
+	assert.True(t, apierrors.IsNotFound(err), "legacy service 'test-read' should be deleted")
+}
+
+func TestReconcile_DoesNotDeleteUnownedLegacyService(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// Pre-create a legacy service NOT owned by this Valkey instance.
+	unownedSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 6379}},
+		},
+	}
+	require.NoError(t, c.Create(context.Background(), unownedSvc))
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, svc)
+	assert.NoError(t, err, "unowned service must not be deleted")
 }
 
 // --- Idempotent Reconcile ---
