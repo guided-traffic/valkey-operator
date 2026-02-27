@@ -171,27 +171,43 @@ func (tc *testClients) getValkeyStatus(t *testing.T, namespace, name string) map
 // valkeyExec executes a Valkey command via kubectl exec + valkey-cli inside the pod.
 // This avoids direct TCP connections to Pod IPs which are unreachable from
 // the host on macOS with Kind/Docker Desktop.
+// Retries up to 3 times with a 2-second delay on transient kubectl failures.
 func (tc *testClients) valkeyExec(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
-	cliArgs := []string{
-		"exec", podName,
-		"-n", namespace,
-		"--", "valkey-cli",
-		"--raw",
-		"-p", fmt.Sprintf("%d", port),
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			t.Logf("Retrying valkeyExec on pod %s (attempt %d/3)", podName, attempt)
+			time.Sleep(2 * time.Second)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cliArgs := []string{
+			"exec", podName,
+			"-n", namespace,
+			"--", "valkey-cli",
+			"--raw",
+			"-p", fmt.Sprintf("%d", port),
+		}
+		cliArgs = append(cliArgs, args...)
+
+		cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		cancel()
+
+		if err == nil {
+			return strings.TrimSpace(stdout.String())
+		}
+		lastErr = fmt.Errorf("kubectl exec failed for pod %s: %w (stderr: %s)", podName, err, stderr.String())
 	}
-	cliArgs = append(cliArgs, args...)
 
-	cmd := exec.CommandContext(context.Background(), "kubectl", cliArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	require.NoError(t, err, "kubectl exec failed for pod %s: %s", podName, stderr.String())
-
-	return strings.TrimSpace(stdout.String())
+	require.NoError(t, lastErr, "valkeyExec failed after 3 attempts for pod %s", podName)
+	return "" // unreachable
 }
 
 // waitForPodReady waits until a specific pod is in Ready condition.
@@ -317,6 +333,23 @@ func (tc *testClients) waitForServiceEndpoints(t *testing.T, namespace, name str
 		return false, nil
 	})
 	require.NoError(t, err, "Service %s/%s did not get endpoints", namespace, name)
+}
+
+// waitForConnectedReplicas waits until the master pod has the expected number of
+// connected replicas with replication sync complete.
+// This replaces unreliable time.Sleep for replication readiness.
+func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterPod string, port, expectedReplicas int) {
+	t.Helper()
+	expectedStr := fmt.Sprintf("connected_slaves:%d", expectedReplicas)
+	require.Eventually(t, func() bool {
+		info := tc.valkeyExecAllowError(t, namespace, masterPod, port, "INFO", "replication")
+		if !strings.Contains(info, expectedStr) {
+			return false
+		}
+		// Ensure no sync is in progress.
+		return !strings.Contains(info, "master_sync_in_progress:1")
+	}, 90*time.Second, 2*time.Second, "Master %s should have %d connected replicas", masterPod, expectedReplicas)
+	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
 }
 
 // assertLabelExists checks that a specific label exists on a resource's metadata.

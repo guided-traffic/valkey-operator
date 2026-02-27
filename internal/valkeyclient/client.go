@@ -152,6 +152,18 @@ func (c *Client) Wait(numReplicas int, timeoutMs int) (int, error) {
 	return acked, nil
 }
 
+// ReplicaOf sends REPLICAOF <host> <port> to reconfigure a node
+// as a replica of the given master. This is used to fix cascaded
+// replication chains where a replica points to an intermediate node
+// instead of the actual master.
+func (c *Client) ReplicaOf(host, port string) error {
+	_, err := c.exec("REPLICAOF", host, port)
+	if err != nil {
+		return fmt.Errorf("replicaof %s %s on %s: %w", host, port, c.addr, err)
+	}
+	return nil
+}
+
 // DBSize sends the DBSIZE command and returns the number of keys in the current database.
 func (c *Client) DBSize() (int, error) {
 	resp, err := c.exec("DBSIZE")

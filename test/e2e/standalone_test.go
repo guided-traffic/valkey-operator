@@ -21,6 +21,7 @@ import (
 
 // TestE2E_StandaloneCluster tests a single-node Valkey deployment.
 func TestE2E_StandaloneCluster(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-standalone"
 	cleanup := tc.createNamespace(t, ns)
@@ -116,6 +117,7 @@ func TestE2E_StandaloneCluster(t *testing.T) {
 
 // TestE2E_HAClusterWithSentinel tests a 3-node HA Valkey deployment with Sentinel.
 func TestE2E_HAClusterWithSentinel(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-ha"
 	cleanup := tc.createNamespace(t, ns)
@@ -235,18 +237,26 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Master is identified via INFO replication", func(t *testing.T) {
-		// Pod-0 should be the initial master.
-		info := tc.valkeyExec(t, ns, fmt.Sprintf("%s-0", name), 6379, "INFO", "replication")
-		assert.Contains(t, info, "role:master", "Pod-0 should be master")
+		masterPod := tc.findMasterPod(t, ns, name, 3)
+		info := tc.valkeyExec(t, ns, masterPod, 6379, "INFO", "replication")
+		assert.Contains(t, info, "role:master", "%s should be master", masterPod)
+		t.Logf("Master identified: %s", masterPod)
 	})
 
 	t.Run("Replicas are connected to master", func(t *testing.T) {
-		// Pod-1 and pod-2 should be replicas.
-		for i := 1; i < 3; i++ {
+		// Find the master dynamically, then verify all other pods are replicas.
+		masterPod := tc.findMasterPod(t, ns, name, 3)
+		replicaCount := 0
+		for i := 0; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName == masterPod {
+				continue
+			}
 			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
 			assert.Contains(t, info, "role:slave", "Pod %s should be a replica", podName)
+			replicaCount++
 		}
+		assert.Equal(t, 2, replicaCount, "Should have 2 replicas")
 	})
 
 	t.Run("Sentinel is monitoring the cluster", func(t *testing.T) {
@@ -261,6 +271,7 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 
 // TestE2E_DataReplication tests writing data to master and reading from replicas.
 func TestE2E_DataReplication(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-replication"
 	cleanup := tc.createNamespace(t, ns)
@@ -285,14 +296,10 @@ func TestE2E_DataReplication(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
-	// Give replication a moment to fully establish.
-	t.Log("Waiting for replication to fully establish...")
-	time.Sleep(5 * time.Second)
-
-	// Verify master is pod-0.
-	masterPod := fmt.Sprintf("%s-0", name)
-	info := tc.valkeyExec(t, ns, masterPod, 6379, "INFO", "replication")
-	require.Contains(t, info, "role:master", "Pod-0 should be master")
+	// Find master and wait for replication to fully establish.
+	masterPod := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
+	t.Logf("Master: %s, replication fully established", masterPod)
 
 	t.Run("Write multiple keys to master", func(t *testing.T) {
 		testData := map[string]string{
@@ -372,7 +379,16 @@ func TestE2E_DataReplication(t *testing.T) {
 	})
 
 	t.Run("Replica is read-only", func(t *testing.T) {
-		replicaPod := fmt.Sprintf("%s-1", name)
+		// Find a non-master pod to verify read-only behavior.
+		var replicaPod string
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName != masterPod {
+				replicaPod = podName
+				break
+			}
+		}
+		require.NotEmpty(t, replicaPod, "Should find a replica pod")
 
 		// Attempt to write to a replica should fail.
 		resp := tc.valkeyExecAllowError(t, ns, replicaPod, 6379, "SET", "e2e:readonly-test", "should-fail")
