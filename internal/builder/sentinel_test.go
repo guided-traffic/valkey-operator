@@ -496,7 +496,6 @@ func TestBuildStatefulSet_StandaloneNoInitContainer(t *testing.T) {
 
 // --- Read-Only Service (see service_test.go for full coverage) ---
 
-
 // --- Sentinel Auth StatefulSet ---
 
 func TestBuildSentinelStatefulSet_WithAuth_InitContainerHasEnvVar(t *testing.T) {

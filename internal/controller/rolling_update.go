@@ -259,6 +259,14 @@ func (r *ValkeyReconciler) handleFailoverRetrigger(ctx context.Context, v *vkov1
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 10 * time.Second}
 	}
 
+	// Verify sentinel has actually discovered replicas before retriggering.
+	// The time-based wait above is a minimum; this check confirms readiness.
+	expectedReplicas := int(v.Spec.Replicas) - 1
+	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
+		logger.Info("Sentinel has not rediscovered replicas after reset, waiting")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+	}
+
 	logger.Info("Retriggering sentinel failover after reset")
 
 	if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
@@ -483,6 +491,18 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 		return result
 	}
 
+	// Before triggering failover, verify sentinel has discovered all replicas.
+	// After a recent sentinel reset (e.g., from a prior rolling update's
+	// finalization), sentinel needs time to discover replicas via INFO polling.
+	// Triggering failover before sentinel knows about replicas results in
+	// NOGOODSLAVE, wasting ~75s on the retry cycle.
+	expectedReplicas := len(pods) - 1
+	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
+		logger.Info("Waiting for sentinel to discover replicas before failover",
+			"expectedReplicas", expectedReplicas)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+	}
+
 	// Set state BEFORE triggering failover to prevent concurrent reconciles
 	// from also triggering failover.
 	if err := r.setRollingUpdateState(ctx, v, stateFailoverTriggered); err != nil {
@@ -493,13 +513,6 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 	if err := r.setFailoverTimestamp(ctx, v); err != nil {
 		return &RollingUpdateResult{Error: err}
 	}
-
-	// Optimistic failover: try directly without resetting sentinel first.
-	// In the common case (first rolling update) there is no cooldown and
-	// failover succeeds immediately, preserving HA without interruption.
-	// If sentinel has a cooldown from a previous failover, the failover
-	// will silently fail and the retry path in handlePostFailover will
-	// reset sentinel and retrigger after a delay.
 	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
 
 	if err := r.triggerSentinelFailover(ctx, v); err != nil {
@@ -857,6 +870,52 @@ func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey) bool {
 		return true // Corrupted timestamp — allow to proceed.
 	}
 	return time.Since(ts) >= failoverResetMinWait
+}
+
+// isSentinelAwareOfReplicas queries sentinel to check whether it has discovered the
+// expected number of replicas. This prevents triggering a failover when sentinel
+// hasn't fully built its topology (e.g., after a recent SENTINEL REMOVE + MONITOR).
+//
+// Returns true if at least one sentinel reports enough replicas, or if all sentinels
+// are unreachable (allowing the failover to proceed optimistically in environments
+// like unit tests where no real sentinel exists).
+// Returns false only when a reachable sentinel explicitly reports too few replicas.
+func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vkov1.Valkey, expectedReplicas int) bool {
+	logger := log.FromContext(ctx)
+	monitorName := builder.SentinelMonitorName(v)
+	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
+
+	sentinelReplicas := int32(3)
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
+		sentinelReplicas = v.Spec.Sentinel.Replicas
+	}
+
+	for i := int32(0); i < sentinelReplicas; i++ {
+		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
+
+		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
+		if tlsErr != nil {
+			continue
+		}
+
+		c := r.newValkeyClient(addr, tlsConfig)
+		info, err := c.SentinelMaster(monitorName)
+		if err != nil {
+			continue
+		}
+
+		if info.NumSlaves >= expectedReplicas {
+			return true
+		}
+
+		logger.Info("Sentinel has not discovered all replicas yet",
+			"sentinel", podName, "numSlaves", info.NumSlaves, "expected", expectedReplicas)
+		return false
+	}
+
+	// All sentinels unreachable — proceed optimistically.
+	return true
 }
 
 // resetSentinelState reconfigures all sentinel instances by removing and re-adding

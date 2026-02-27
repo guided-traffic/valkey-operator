@@ -350,8 +350,8 @@ func (r *ValkeyReconciler) reconcileReadOnlyService(ctx context.Context, v *vkov
 func (r *ValkeyReconciler) deleteLegacyServices(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	legacyNames := []string{
-		v.Name,                              // old client service (now replaced by -rw + -all)
-		fmt.Sprintf("%s-read", v.Name),     // old read service (now replaced by -r)
+		v.Name,                         // old client service (now replaced by -rw + -all)
+		fmt.Sprintf("%s-read", v.Name), // old read service (now replaced by -r)
 	}
 	for _, name := range legacyNames {
 		svc := &corev1.Service{}
