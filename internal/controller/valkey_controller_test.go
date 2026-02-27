@@ -894,8 +894,8 @@ func TestReconcile_FullStandaloneSetup(t *testing.T) {
 	headlessSvc := &corev1.Service{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "standalone-headless", Namespace: "default"}, headlessSvc))
 
-	clientSvc := &corev1.Service{}
-	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "standalone", Namespace: "default"}, clientSvc))
+	rwSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "standalone-rw", Namespace: "default"}, rwSvc))
 
 	sts := &appsv1.StatefulSet{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "standalone", Namespace: "default"}, sts))
@@ -1043,7 +1043,9 @@ func TestReconcile_HA_AllResourcesCreated(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-config", Namespace: "default"}, &corev1.ConfigMap{}))
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-replica-config", Namespace: "default"}, &corev1.ConfigMap{}))
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-headless", Namespace: "default"}, &corev1.Service{}))
-	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, &corev1.Service{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-rw", Namespace: "default"}, &corev1.Service{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-all", Namespace: "default"}, &corev1.Service{}))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha-r", Namespace: "default"}, &corev1.Service{}))
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, &appsv1.StatefulSet{}))
 
 	// Sentinel resources.
