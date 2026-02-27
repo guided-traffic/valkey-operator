@@ -109,12 +109,13 @@ func (r *ValkeyReconciler) newValkeyClient(addr string, tlsConfig *tls.Config) *
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;escalate;bind
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile handles a reconciliation request for a Valkey resource.
 func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -193,33 +194,8 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		}
 	}
 
-	// Reconcile headless Service.
-	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
-		return err
-	}
-
-	// Reconcile read-write Service (master only).
-	if err := r.reconcileRWService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -rw Service: %v", err))
-		return err
-	}
-
-	// Reconcile all-pods Service and read-only replica Service (multi-replica only).
-	if valkey.Spec.Replicas > 1 {
-		if err := r.reconcileAllService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -all Service: %v", err))
-			return err
-		}
-		if err := r.reconcileReadOnlyService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -r Service: %v", err))
-			return err
-		}
-	}
-
-	// Delete legacy services that have been replaced by the new naming scheme.
-	if err := r.deleteLegacyServices(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to delete legacy Services: %v", err))
+	// Reconcile all Services (headless, -rw, -all, -r, legacy cleanup).
+	if err := r.reconcileServices(ctx, valkey); err != nil {
 		return err
 	}
 
@@ -249,6 +225,38 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile NetworkPolicies: %v", err))
 			return err
 		}
+	}
+
+	return nil
+}
+
+// reconcileServices reconciles all Service resources: headless, -rw, and (for multi-replica)
+// -all and -r. It also removes legacy services that no longer exist in the new naming scheme.
+func (r *ValkeyReconciler) reconcileServices(ctx context.Context, valkey *vkov1.Valkey) error {
+	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
+		return err
+	}
+
+	if err := r.reconcileRWService(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -rw Service: %v", err))
+		return err
+	}
+
+	if valkey.Spec.Replicas > 1 {
+		if err := r.reconcileAllService(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -all Service: %v", err))
+			return err
+		}
+		if err := r.reconcileReadOnlyService(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -r Service: %v", err))
+			return err
+		}
+	}
+
+	if err := r.deleteLegacyServices(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to delete legacy Services: %v", err))
+		return err
 	}
 
 	return nil
