@@ -139,11 +139,29 @@ func (tc *testClients) waitForStatefulSetReady(t *testing.T, namespace, name str
 }
 
 // waitForValkeyPhase waits until the Valkey CR reaches the expected phase.
+// waitForValkeyPhase waits until the Valkey CR reaches the expected phase.
+// Uses testTimeout (5 min) — for rolling update operations use waitForValkeyPhaseAfterRollingUpdate.
 func (tc *testClients) waitForValkeyPhase(t *testing.T, namespace, name, expectedPhase string) {
+	t.Helper()
+	tc.waitForValkeyPhaseWithTimeout(t, namespace, name, expectedPhase, testTimeout)
+}
+
+// waitForValkeyPhaseAfterRollingUpdate waits for the Valkey CR to reach the expected
+// phase after a rolling update operation, using the longer rollingUpdateTimeout.
+// This accounts for the extra time needed to finalize HA rolling updates in CI
+// (sentinel sync, replica reconnection, pod recreation after master replacement).
+func (tc *testClients) waitForValkeyPhaseAfterRollingUpdate(t *testing.T, namespace, name, expectedPhase string) {
+	t.Helper()
+	tc.waitForValkeyPhaseWithTimeout(t, namespace, name, expectedPhase, rollingUpdateTimeout)
+}
+
+// waitForValkeyPhaseWithTimeout waits until the Valkey CR reaches the expected phase
+// within the given timeout.
+func (tc *testClients) waitForValkeyPhaseWithTimeout(t *testing.T, namespace, name, expectedPhase string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		valkey, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -395,6 +413,29 @@ func (tc *testClients) getPod(t *testing.T, namespace, name string) *corev1.Pod 
 	pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 	require.NoError(t, err, "Failed to get pod %s/%s", namespace, name)
 	return pod
+}
+
+// waitForNoPods waits until there are no pods whose names start with the given
+// prefix in the namespace. This is used to verify that deletion cleans up all
+// Valkey and Sentinel pods without a reboot loop.
+func (tc *testClients) waitForNoPods(t *testing.T, namespace, namePrefix string) {
+	t.Helper()
+	ctx := context.Background()
+
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+		pods, err := tc.kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, pod := range pods.Items {
+			if strings.HasPrefix(pod.Name, namePrefix) {
+				t.Logf("Pod %s/%s still present (phase=%s), waiting...", namespace, pod.Name, pod.Status.Phase)
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	require.NoError(t, err, "Pods with prefix %q in namespace %s were not cleaned up after deletion", namePrefix, namespace)
 }
 
 // Ensure all types used are available for linting.

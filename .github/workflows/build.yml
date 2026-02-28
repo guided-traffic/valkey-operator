@@ -83,8 +83,8 @@ jobs:
           push: true
           tags: ${{ steps.tag_names.outputs.tags }}
           labels: ${{ steps.tag_names.outputs.labels }}
-          # cache-from: type=gha
-          # cache-to: type=gha,mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           # Security features for better Docker Hub score
           provenance: true
           sbom: true
@@ -116,6 +116,8 @@ jobs:
           image: guidedtraffic/valkey-operator:${{ steps.version.outputs.version }}
           sarif-file: scout-report.sarif
           summary: true
+          dockerhub-user: guidedtraffic
+          dockerhub-password: ${{ secrets.DOCKERHUB_PAT }}
 
   release-helm-gh:
     name: Release Helm Chart to GitHub Pages
