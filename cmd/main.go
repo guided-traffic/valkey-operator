@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/cmd/sidecar"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
 
@@ -32,15 +33,26 @@ func init() {
 }
 
 func main() {
+	// Dispatch to sidecar mode if first argument is "sidecar".
+	if len(os.Args) > 1 && os.Args[1] == "sidecar" {
+		// Remove "sidecar" from os.Args so the sidecar's flag.Parse sees its own flags.
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		sidecar.Run()
+		return
+	}
+
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
+	var operatorImage string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&operatorImage, "operator-image", os.Getenv("OPERATOR_IMAGE"),
+		"The operator container image, used for the sidecar. Can also be set via OPERATOR_IMAGE env var.")
 
 	opts := zap.Options{
 		Development: true,
@@ -68,8 +80,9 @@ func main() {
 	}
 
 	if err = (&controller.ValkeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		OperatorImage: operatorImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Valkey")
 		os.Exit(1)

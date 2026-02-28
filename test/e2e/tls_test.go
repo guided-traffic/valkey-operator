@@ -42,31 +42,47 @@ const tlsValkeyPort = 16379
 
 // valkeyTLSExec executes a Valkey command over TLS via kubectl exec + valkey-cli.
 // It adds the necessary --tls, --cert, --key, --cacert flags for encrypted connections.
+// Retries up to 3 times with a 2-second delay on transient kubectl failures.
 func (tc *testClients) valkeyTLSExec(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
-	cliArgs := []string{
-		"exec", podName,
-		"-n", namespace,
-		"--", "valkey-cli",
-		"--raw",
-		"-p", fmt.Sprintf("%d", port),
-		"--tls",
-		"--cert", tlsCertPath,
-		"--key", tlsKeyPath,
-		"--cacert", tlsCACertPath,
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			t.Logf("Retrying valkeyTLSExec on pod %s (attempt %d/3)", podName, attempt)
+			time.Sleep(2 * time.Second)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cliArgs := []string{
+			"exec", podName,
+			"-n", namespace,
+			"--", "valkey-cli",
+			"--raw",
+			"-p", fmt.Sprintf("%d", port),
+			"--tls",
+			"--cert", tlsCertPath,
+			"--key", tlsKeyPath,
+			"--cacert", tlsCACertPath,
+		}
+		cliArgs = append(cliArgs, args...)
+
+		cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		cancel()
+
+		if err == nil {
+			return strings.TrimSpace(stdout.String())
+		}
+		lastErr = fmt.Errorf("kubectl exec (TLS) failed for pod %s: %w (stdout=%s stderr=%s)", podName, err, stdout.String(), stderr.String())
 	}
-	cliArgs = append(cliArgs, args...)
 
-	cmd := exec.CommandContext(context.Background(), "kubectl", cliArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	require.NoError(t, err, "kubectl exec (TLS) failed for pod %s: stdout=%s stderr=%s", podName, stdout.String(), stderr.String())
-
-	return strings.TrimSpace(stdout.String())
+	require.NoError(t, lastErr, "valkeyTLSExec failed after 3 attempts for pod %s", podName)
+	return "" // unreachable
 }
 
 // valkeyTLSExecAllowError executes a TLS Valkey command but does not fail on Valkey-level errors.
@@ -255,6 +271,7 @@ func tlsSpec() map[string]interface{} {
 // - Non-TLS connections are rejected (port 0 disables plaintext)
 // - Pod logs show no TLS errors
 func TestE2E_TLS_Standalone(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-tls-standalone"
 	cleanup := tc.createNamespace(t, ns)
@@ -484,6 +501,7 @@ func TestE2E_TLS_Standalone(t *testing.T) {
 // - Plaintext connections are rejected on all pods
 // - Pod logs are clean of TLS errors
 func TestE2E_TLS_HACluster(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-tls-ha-nosent"
 	cleanup := tc.createNamespace(t, ns)
@@ -798,8 +816,21 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 		headless := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(headless.Spec.ClusterIP))
 
-		client := tc.getService(t, ns, name)
-		assert.NotEmpty(t, client.Spec.ClusterIP)
+		// -rw: master-only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// -all: all pods (HA cluster).
+		allSvc := tc.getService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.NotEmpty(t, allSvc.Spec.ClusterIP)
+
+		// -r: replica-only.
+		rSvc := tc.getService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.NotEmpty(t, rSvc.Spec.ClusterIP)
+		assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-r service must select replica pods only")
 	})
 
 	// =========================================================================
@@ -839,6 +870,7 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 // - Pod logs are free of TLS errors
 // - Non-TLS connections are rejected
 func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-tls-ha"
 	cleanup := tc.createNamespace(t, ns)
@@ -1060,15 +1092,19 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Master is identified via TLS INFO replication", func(t *testing.T) {
-		masterPod := fmt.Sprintf("%s-0", name)
-		info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
-		assert.Contains(t, info, "role:master", "Pod-0 should be master")
-		t.Logf("Master INFO replication:\n%s", truncateLogs(info, 500))
+		mp := tc.findMasterPodTLS(t, ns, name, 3)
+		info := tc.valkeyTLSExec(t, ns, mp, tlsValkeyPort, "INFO", "replication")
+		assert.Contains(t, info, "role:master", "%s should be master", mp)
+		t.Logf("Master %s INFO replication:\n%s", mp, truncateLogs(info, 500))
 	})
 
 	t.Run("Replicas are connected to master over TLS", func(t *testing.T) {
-		for i := 1; i < 3; i++ {
+		mp := tc.findMasterPodTLS(t, ns, name, 3)
+		for i := 0; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName == mp {
+				continue
+			}
 			info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "replication")
 			assert.Contains(t, info, "role:slave", "Pod %s should be a replica", podName)
 			assert.Contains(t, info, "master_link_status:up",
@@ -1077,9 +1113,9 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Master reports 2 connected replicas", func(t *testing.T) {
-		masterPod := fmt.Sprintf("%s-0", name)
+		mp := tc.findMasterPodTLS(t, ns, name, 3)
 		require.Eventually(t, func() bool {
-			info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
+			info := tc.valkeyTLSExec(t, ns, mp, tlsValkeyPort, "INFO", "replication")
 			return strings.Contains(info, "connected_slaves:2")
 		}, 60*time.Second, 2*time.Second, "Master should have 2 connected replicas over TLS")
 	})
@@ -1124,7 +1160,8 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	// Phase 7: Data replication over TLS
 	// =========================================================================
 
-	masterPod := fmt.Sprintf("%s-0", name)
+	masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+	tc.waitForConnectedReplicasTLS(t, ns, masterPod, 2)
 
 	t.Run("Write test data to master over TLS", func(t *testing.T) {
 		testData := map[string]string{
@@ -1239,7 +1276,17 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Replica is read-only over TLS", func(t *testing.T) {
-		replicaPod := fmt.Sprintf("%s-1", name)
+		// Find a non-master pod to verify read-only behavior.
+		mp := tc.findMasterPodTLS(t, ns, name, 3)
+		var replicaPod string
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName != mp {
+				replicaPod = podName
+				break
+			}
+		}
+		require.NotEmpty(t, replicaPod, "Should find a replica pod")
 		resp := tc.valkeyTLSExecAllowError(t, ns, replicaPod, tlsValkeyPort, "SET", "tls-readonly-test", "should-fail")
 		t.Logf("Write to replica over TLS response: %q", resp)
 		// Should be a READONLY error or empty — definitely not OK.
@@ -1446,3 +1493,35 @@ func filterInfoLines(info string, keywords ...string) string {
 
 // valkeyTLSExecAllowError is an alias on testClients for the allow-error variant.
 // Already defined above as a method — this comment is for clarity.
+
+// findMasterPodTLS finds the master pod by querying INFO replication over TLS.
+func (tc *testClients) findMasterPodTLS(t *testing.T, namespace, name string, replicas int) string {
+	t.Helper()
+	var masterPod string
+	require.Eventually(t, func() bool {
+		for i := 0; i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			info := tc.valkeyTLSExecAllowError(t, namespace, podName, tlsValkeyPort, "INFO", "replication")
+			if strings.Contains(info, "role:master") {
+				masterPod = podName
+				return true
+			}
+		}
+		return false
+	}, 60*time.Second, 2*time.Second, "Should find a TLS master pod")
+	return masterPod
+}
+
+// waitForConnectedReplicasTLS waits for connected replicas over TLS.
+func (tc *testClients) waitForConnectedReplicasTLS(t *testing.T, namespace, masterPod string, expectedReplicas int) {
+	t.Helper()
+	expectedStr := fmt.Sprintf("connected_slaves:%d", expectedReplicas)
+	require.Eventually(t, func() bool {
+		info := tc.valkeyTLSExecAllowError(t, namespace, masterPod, tlsValkeyPort, "INFO", "replication")
+		if !strings.Contains(info, expectedStr) {
+			return false
+		}
+		return !strings.Contains(info, "master_sync_in_progress:1")
+	}, 90*time.Second, 2*time.Second, "Master %s should have %d connected replicas over TLS", masterPod, expectedReplicas)
+	t.Logf("TLS replication established: %d replicas connected to %s", expectedReplicas, masterPod)
+}

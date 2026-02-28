@@ -256,3 +256,53 @@ func TestMergeAnnotations_SameAsMergeLabels(t *testing.T) {
 
 	assert.Equal(t, map[string]string{"x": "1", "y": "2"}, result)
 }
+
+// --- RoleDraining ---
+
+func TestRoleDraining_Constant(t *testing.T) {
+	assert.Equal(t, "draining", common.RoleDraining)
+}
+
+// --- MasterSelectorLabels ---
+
+func TestMasterSelectorLabels(t *testing.T) {
+	v := newTestValkey("my-cluster")
+
+	labels := common.MasterSelectorLabels(v)
+
+	expected := map[string]string{
+		common.LabelInstance:     "my-cluster",
+		common.LabelManagedBy:    common.ManagedBy,
+		common.LabelComponent:    "valkey",
+		common.LabelInstanceRole: common.RoleMaster,
+	}
+	assert.Equal(t, expected, labels)
+}
+
+func TestMasterSelectorLabels_DoesNotMutateBase(t *testing.T) {
+	v := newTestValkey("test")
+
+	// Call twice; each call should return an independent map.
+	a := common.MasterSelectorLabels(v)
+	b := common.ReplicaSelectorLabels(v)
+
+	assert.Equal(t, common.RoleMaster, a[common.LabelInstanceRole])
+	assert.Equal(t, common.RoleReplica, b[common.LabelInstanceRole],
+		"replica selector should not be affected by master selector call")
+}
+
+// --- ReplicaSelectorLabels ---
+
+func TestReplicaSelectorLabels(t *testing.T) {
+	v := newTestValkey("my-cluster")
+
+	labels := common.ReplicaSelectorLabels(v)
+
+	expected := map[string]string{
+		common.LabelInstance:     "my-cluster",
+		common.LabelManagedBy:    common.ManagedBy,
+		common.LabelComponent:    "valkey",
+		common.LabelInstanceRole: common.RoleReplica,
+	}
+	assert.Equal(t, expected, labels)
+}

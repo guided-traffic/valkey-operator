@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -11,62 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
-	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
 
 func TestStandaloneMode_Integration(t *testing.T) {
-	log.SetLogger(zap.New(zap.UseDevMode(true)))
-
-	// Start envtest.
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths: []string{"../../config/crd/bases"},
-	}
-
-	cfg, err := testEnv.Start()
-	require.NoError(t, err, "failed to start envtest")
-	defer func() {
-		require.NoError(t, testEnv.Stop())
-	}()
-
-	// Register schemes.
-	require.NoError(t, vkov1.AddToScheme(scheme.Scheme))
-	require.NoError(t, appsv1.AddToScheme(scheme.Scheme))
-
-	// Set up manager and controller.
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
-	})
-	require.NoError(t, err)
-
-	reconciler := &controller.ValkeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}
-	require.NoError(t, reconciler.SetupWithManager(mgr))
-
-	// Start manager in background.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		require.NoError(t, mgr.Start(ctx))
-	}()
-
-	// Wait for cache to sync.
-	require.True(t, mgr.GetCache().WaitForCacheSync(ctx))
-
-	k8sClient := mgr.GetClient()
+	ctx := testCtx
 
 	t.Run("deploy standalone valkey", func(t *testing.T) {
 		v := &vkov1.Valkey{
@@ -103,10 +57,10 @@ func TestStandaloneMode_Integration(t *testing.T) {
 		require.Eventually(t, func() bool {
 			svc := &corev1.Service{}
 			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name: "standalone-test", Namespace: "default",
+				Name: "standalone-test-rw", Namespace: "default",
 			}, svc)
 			return err == nil
-		}, 10*time.Second, 250*time.Millisecond, "Client Service should be created")
+		}, 10*time.Second, 250*time.Millisecond, "-rw Service should be created")
 
 		require.Eventually(t, func() bool {
 			sts := &appsv1.StatefulSet{}
@@ -132,6 +86,43 @@ func TestStandaloneMode_Integration(t *testing.T) {
 		}, cm))
 		assert.Contains(t, cm.Data["valkey.conf"], "bind 0.0.0.0")
 		assert.Contains(t, cm.Data["valkey.conf"], "port 6379")
+
+		// Verify -rw service has master-only selector.
+		rwSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-rw", Namespace: "default",
+		}, rwSvc))
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// Standalone has no -all or -r services (replicas: 1).
+		noService := &corev1.Service{}
+		assert.Error(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-all", Namespace: "default",
+		}, noService), "-all service must not exist for standalone")
+		assert.Error(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-r", Namespace: "default",
+		}, noService), "-r service must not exist for standalone")
+
+		// Verify sidecar RBAC resources are created.
+		sa := &corev1.ServiceAccount{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-sidecar", Namespace: "default",
+		}, sa), "sidecar ServiceAccount should be created")
+
+		role := &rbacv1.Role{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-sidecar", Namespace: "default",
+		}, role), "sidecar Role should be created")
+		require.Len(t, role.Rules, 1)
+		assert.Contains(t, role.Rules[0].Verbs, "patch",
+			"sidecar Role must grant patch on pods")
+
+		rb := &rbacv1.RoleBinding{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "standalone-test-sidecar", Namespace: "default",
+		}, rb), "sidecar RoleBinding should be created")
+		assert.Equal(t, "standalone-test-sidecar", rb.RoleRef.Name)
 
 		// Verify owner references (garbage collection).
 		assert.Len(t, sts.OwnerReferences, 1)
@@ -296,6 +287,46 @@ func TestStandaloneMode_Integration(t *testing.T) {
 		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
 			Name: "ha-test-headless", Namespace: "default",
 		}, headlessSvc))
+
+		// -rw service: selects master only.
+		rwSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-rw", Namespace: "default",
+		}, rwSvc))
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// -all service: selects all Valkey pods (no role filter).
+		allSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-all", Namespace: "default",
+		}, allSvc))
+		_, hasRole := allSvc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+		assert.False(t, hasRole, "-all service must not filter by role")
+
+		// -r service: selects replica pods only.
+		rSvc := &corev1.Service{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-r", Namespace: "default",
+		}, rSvc))
+		assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-r service must select replica pods only")
+
+		// Verify sidecar RBAC resources.
+		haSA := &corev1.ServiceAccount{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sidecar", Namespace: "default",
+		}, haSA), "sidecar ServiceAccount should be created")
+
+		haRole := &rbacv1.Role{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sidecar", Namespace: "default",
+		}, haRole), "sidecar Role should be created")
+
+		haRB := &rbacv1.RoleBinding{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-test-sidecar", Namespace: "default",
+		}, haRB), "sidecar RoleBinding should be created")
 
 		sentinelSvc := &corev1.Service{}
 		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{

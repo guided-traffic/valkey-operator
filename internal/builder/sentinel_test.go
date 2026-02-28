@@ -458,7 +458,7 @@ func TestBuildStatefulSet_HAMode(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	// Should have init container for config selection.
 	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
@@ -483,7 +483,7 @@ func TestBuildStatefulSet_HAMode(t *testing.T) {
 func TestBuildStatefulSet_StandaloneNoInitContainer(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	// Standalone should NOT have init container.
 	assert.Nil(t, sts.Spec.Template.Spec.InitContainers)
@@ -494,17 +494,7 @@ func TestBuildStatefulSet_StandaloneNoInitContainer(t *testing.T) {
 	assert.NotContains(t, container.Command[1], WritableConfigMountPath)
 }
 
-// --- Read Service ---
-
-func TestBuildReadService(t *testing.T) {
-	v := newTestValkey("test")
-	svc := BuildReadService(v)
-
-	assert.Equal(t, "test-read", svc.Name)
-	assert.Equal(t, "default", svc.Namespace)
-	assert.Len(t, svc.Spec.Ports, 1)
-	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
-}
+// --- Read-Only Service (see service_test.go for full coverage) ---
 
 // --- Sentinel Auth StatefulSet ---
 

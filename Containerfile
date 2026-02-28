@@ -58,7 +58,7 @@ WORKDIR /app
 # Copy the binary from builder stage
 COPY --from=builder /app/manager .
 
-# Expose metrics and health probe ports
-EXPOSE 8080 8081
+# Expose metrics, health probe, and sidecar health ports
+EXPOSE 8080 8081 8082
 
 ENTRYPOINT ["./manager"]

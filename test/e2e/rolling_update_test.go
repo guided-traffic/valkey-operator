@@ -18,6 +18,7 @@ import (
 
 // TestE2E_RollingUpdate_Standalone tests a rolling update on a standalone Valkey instance.
 func TestE2E_RollingUpdate_Standalone(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-standalone"
 	cleanup := tc.createNamespace(t, ns)
@@ -87,6 +88,7 @@ func TestE2E_RollingUpdate_Standalone(t *testing.T) {
 
 // TestE2E_RollingUpdate_HA tests a rolling update on a 3-node HA cluster with Sentinel.
 func TestE2E_RollingUpdate_HA(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-ha"
 	cleanup := tc.createNamespace(t, ns)
@@ -114,9 +116,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
-	// Give replication a moment to fully establish.
-	t.Log("Waiting for replication to fully establish...")
-	time.Sleep(10 * time.Second)
+	// Wait for replication to fully establish.
+	initialMasterPod := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, initialMasterPod, 6379, 2)
 
 	t.Run("Initial pods run expected image", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
@@ -126,19 +128,10 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 		}
 	})
 
-	// Identify the initial master.
-	var initialMasterPod string
-	t.Run("Identify initial master", func(t *testing.T) {
-		for i := 0; i < 3; i++ {
-			podName := fmt.Sprintf("%s-%d", name, i)
-			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
-			if strings.Contains(info, "role:master") {
-				initialMasterPod = podName
-				t.Logf("Initial master: %s", podName)
-				break
-			}
-		}
-		require.NotEmpty(t, initialMasterPod, "Should find a master pod")
+	t.Run("Initial master is confirmed", func(t *testing.T) {
+		info := tc.valkeyExec(t, ns, initialMasterPod, 6379, "INFO", "replication")
+		assert.Contains(t, info, "role:master", "%s should be master", initialMasterPod)
+		t.Logf("Initial master: %s", initialMasterPod)
 	})
 
 	// Write test data to master before update.
@@ -264,9 +257,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 		}
 
 		require.Eventually(t, func() bool {
-			info := tc.valkeyExec(t, ns, currentMaster, 6379, "INFO", "replication")
+			info := tc.valkeyExecAllowError(t, ns, currentMaster, 6379, "INFO", "replication")
 			return strings.Contains(info, "connected_slaves:2")
-		}, 60*time.Second, 2*time.Second, "Master should have 2 replicas after rolling update")
+		}, 90*time.Second, 2*time.Second, "Master should have 2 replicas after rolling update")
 
 		// Verify data on replicas.
 		for i := 0; i < 3; i++ {
@@ -275,9 +268,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExec(t, ns, podName, 6379, "GET", "rolling:key1")
+				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
-			}, 30*time.Second, time.Second, "Data should replicate to %s after rolling update", podName)
+			}, 60*time.Second, 2*time.Second, "Data should replicate to %s after rolling update", podName)
 		}
 	})
 
@@ -321,6 +314,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 // TestE2E_RollingUpdate_HA_NoDataLoss is a focused test verifying zero data loss
 // during a rolling update of an HA cluster.
 func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-dataloss"
 	cleanup := tc.createNamespace(t, ns)
@@ -346,10 +340,10 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, name, 3)
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
-	time.Sleep(10 * time.Second)
 
-	// Write a large set of keys to master.
+	// Find master and wait for replication to fully establish.
 	masterPod := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
 	t.Logf("Master pod: %s", masterPod)
 
 	numKeys := 100
@@ -406,6 +400,7 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 // TestE2E_RollingUpdate_HA_Idempotent tests that running the same image update
 // multiple times does not cause issues (idempotency).
 func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-idempotent"
 	cleanup := tc.createNamespace(t, ns)
@@ -431,7 +426,10 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, name, 3)
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
-	time.Sleep(10 * time.Second)
+
+	// Wait for replication to fully establish.
+	idemMaster := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, idemMaster, 6379, 2)
 
 	// First rolling update.
 	t.Run("First rolling update", func(t *testing.T) {
@@ -491,11 +489,13 @@ func (tc *testClients) updateValkeyImage(t *testing.T, namespace, name, newImage
 }
 
 // waitForAllPodsImage waits until all pods in a StatefulSet run the expected image.
+// Uses rollingUpdateTimeout since rolling updates in CI with parallel tests may take
+// significantly longer than standard operations due to resource contention.
 func (tc *testClients) waitForAllPodsImage(t *testing.T, namespace, stsName string, replicas int, expectedImage string) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, rollingUpdateTimeout, true, func(ctx context.Context) (bool, error) {
 		for i := 0; i < replicas; i++ {
 			podName := fmt.Sprintf("%s-%d", stsName, i)
 			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})

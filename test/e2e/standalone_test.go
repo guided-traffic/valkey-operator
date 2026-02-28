@@ -21,6 +21,7 @@ import (
 
 // TestE2E_StandaloneCluster tests a single-node Valkey deployment.
 func TestE2E_StandaloneCluster(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-standalone"
 	cleanup := tc.createNamespace(t, ns)
@@ -49,10 +50,18 @@ func TestE2E_StandaloneCluster(t *testing.T) {
 		svc := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(svc.Spec.ClusterIP))
 
-		// Client-facing service.
-		clientSvc := tc.getService(t, ns, name)
-		assert.NotEmpty(t, clientSvc.Spec.ClusterIP)
-		assert.Equal(t, int32(6379), clientSvc.Spec.Ports[0].Port)
+		// -rw service: routes to the master pod only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, int32(6379), rwSvc.Spec.Ports[0].Port)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// Standalone (replicas=1) must NOT have -all or -r services.
+		_, errAll := tc.tryGetService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.Error(t, errAll, "-all service must not exist for standalone")
+		_, errR := tc.tryGetService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.Error(t, errR, "-r service must not exist for standalone")
 	})
 
 	t.Run("ConfigMap exists with valkey.conf", func(t *testing.T) {
@@ -108,6 +117,7 @@ func TestE2E_StandaloneCluster(t *testing.T) {
 
 // TestE2E_HAClusterWithSentinel tests a 3-node HA Valkey deployment with Sentinel.
 func TestE2E_HAClusterWithSentinel(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-ha"
 	cleanup := tc.createNamespace(t, ns)
@@ -152,9 +162,23 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 		headless := tc.getService(t, ns, fmt.Sprintf("%s-headless", name))
 		assert.Equal(t, "None", string(headless.Spec.ClusterIP))
 
-		// Client service.
-		client := tc.getService(t, ns, name)
-		assert.NotEmpty(t, client.Spec.ClusterIP)
+		// -rw service: routes to master only.
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+		assert.NotEmpty(t, rwSvc.Spec.ClusterIP)
+		assert.Equal(t, "master", rwSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-rw service must select master pods only")
+
+		// -all service: routes to all Valkey pods (no role filter).
+		allSvc := tc.getService(t, ns, fmt.Sprintf("%s-all", name))
+		assert.NotEmpty(t, allSvc.Spec.ClusterIP)
+		_, hasRole := allSvc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+		assert.False(t, hasRole, "-all service must not filter by role")
+
+		// -r service: routes to replica pods only.
+		rSvc := tc.getService(t, ns, fmt.Sprintf("%s-r", name))
+		assert.NotEmpty(t, rSvc.Spec.ClusterIP)
+		assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"],
+			"-r service must select replica pods only")
 	})
 
 	t.Run("Sentinel headless service exists", func(t *testing.T) {
@@ -213,18 +237,26 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Master is identified via INFO replication", func(t *testing.T) {
-		// Pod-0 should be the initial master.
-		info := tc.valkeyExec(t, ns, fmt.Sprintf("%s-0", name), 6379, "INFO", "replication")
-		assert.Contains(t, info, "role:master", "Pod-0 should be master")
+		masterPod := tc.findMasterPod(t, ns, name, 3)
+		info := tc.valkeyExec(t, ns, masterPod, 6379, "INFO", "replication")
+		assert.Contains(t, info, "role:master", "%s should be master", masterPod)
+		t.Logf("Master identified: %s", masterPod)
 	})
 
 	t.Run("Replicas are connected to master", func(t *testing.T) {
-		// Pod-1 and pod-2 should be replicas.
-		for i := 1; i < 3; i++ {
+		// Find the master dynamically, then verify all other pods are replicas.
+		masterPod := tc.findMasterPod(t, ns, name, 3)
+		replicaCount := 0
+		for i := 0; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName == masterPod {
+				continue
+			}
 			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
 			assert.Contains(t, info, "role:slave", "Pod %s should be a replica", podName)
+			replicaCount++
 		}
+		assert.Equal(t, 2, replicaCount, "Should have 2 replicas")
 	})
 
 	t.Run("Sentinel is monitoring the cluster", func(t *testing.T) {
@@ -239,6 +271,7 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 
 // TestE2E_DataReplication tests writing data to master and reading from replicas.
 func TestE2E_DataReplication(t *testing.T) {
+	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-replication"
 	cleanup := tc.createNamespace(t, ns)
@@ -263,14 +296,10 @@ func TestE2E_DataReplication(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
-	// Give replication a moment to fully establish.
-	t.Log("Waiting for replication to fully establish...")
-	time.Sleep(5 * time.Second)
-
-	// Verify master is pod-0.
-	masterPod := fmt.Sprintf("%s-0", name)
-	info := tc.valkeyExec(t, ns, masterPod, 6379, "INFO", "replication")
-	require.Contains(t, info, "role:master", "Pod-0 should be master")
+	// Find master and wait for replication to fully establish.
+	masterPod := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
+	t.Logf("Master: %s, replication fully established", masterPod)
 
 	t.Run("Write multiple keys to master", func(t *testing.T) {
 		testData := map[string]string{
@@ -350,7 +379,16 @@ func TestE2E_DataReplication(t *testing.T) {
 	})
 
 	t.Run("Replica is read-only", func(t *testing.T) {
-		replicaPod := fmt.Sprintf("%s-1", name)
+		// Find a non-master pod to verify read-only behavior.
+		var replicaPod string
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName != masterPod {
+				replicaPod = podName
+				break
+			}
+		}
+		require.NotEmpty(t, replicaPod, "Should find a replica pod")
 
 		// Attempt to write to a replica should fail.
 		resp := tc.valkeyExecAllowError(t, ns, replicaPod, 6379, "SET", "e2e:readonly-test", "should-fail")
@@ -465,26 +503,51 @@ func (tc *testClients) waitForStatefulSetOrDeploymentReady(t *testing.T, namespa
 }
 
 // valkeyExecAllowError executes a command but does not fail on Valkey errors (e.g., READONLY).
+// Retries up to 3 times with backoff on transient kubectl exec failures (e.g., container not found).
 func (tc *testClients) valkeyExecAllowError(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
-	cliArgs := []string{
-		"exec", podName,
-		"-n", namespace,
-		"--", "valkey-cli",
-		"--raw",
-		"-p", fmt.Sprintf("%d", port),
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cliArgs := []string{
+			"exec", podName,
+			"-n", namespace,
+			"--", "valkey-cli",
+			"--raw",
+			"-p", fmt.Sprintf("%d", port),
+		}
+		cliArgs = append(cliArgs, args...)
+
+		cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		cancel()
+
+		if err == nil {
+			return strings.TrimSpace(stdout.String())
+		}
+
+		// If stderr contains "container not found" or similar transient error, retry.
+		stderrStr := stderr.String()
+		if strings.Contains(stderrStr, "container not found") ||
+			strings.Contains(stderrStr, "unable to upgrade connection") ||
+			strings.Contains(stderrStr, "not found") {
+			continue
+		}
+
+		// For non-transient errors (e.g., Valkey READONLY), return the output as-is.
+		return strings.TrimSpace(stdout.String())
 	}
-	cliArgs = append(cliArgs, args...)
 
-	cmd := exec.CommandContext(t.Context(), "kubectl", cliArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	_ = cmd.Run()
-
-	return strings.TrimSpace(stdout.String())
+	return ""
 }
 
 // Helper functions for unstructured nested access.

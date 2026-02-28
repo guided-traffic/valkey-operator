@@ -853,3 +853,32 @@ func TestHasMinWaitElapsed_CorruptedTimestamp(t *testing.T) {
 	assert.True(t, r.hasMinWaitElapsed(v),
 		"Should return true for corrupted timestamp to allow progress")
 }
+
+// --- isSentinelAwareOfReplicas Tests ---
+
+func TestIsSentinelAwareOfReplicas_AllUnreachable(t *testing.T) {
+	// When no real sentinel exists (unit test), all connections fail.
+	// Should return true to proceed optimistically.
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	assert.True(t, r.isSentinelAwareOfReplicas(context.Background(), v, 2),
+		"Should return true when all sentinels are unreachable (optimistic)")
+}
+
+func TestIsSentinelAwareOfReplicas_DefaultSentinelReplicas(t *testing.T) {
+	// When sentinel spec is nil, should use default 3 replicas.
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+
+	assert.True(t, r.isSentinelAwareOfReplicas(context.Background(), v, 2),
+		"Should return true with default sentinel replicas and all unreachable")
+}

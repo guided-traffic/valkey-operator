@@ -13,12 +13,14 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
 
+const testOperatorImage = "ghcr.io/guided-traffic/valkey-operator:test"
+
 // --- BuildStatefulSet ---
 
 func TestBuildStatefulSet_Standalone(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, "test", sts.Name)
 	assert.Equal(t, "default", sts.Namespace)
@@ -36,10 +38,15 @@ func TestBuildStatefulSet_Standalone(t *testing.T) {
 	assert.Equal(t, "8.0", sts.Spec.Template.Labels["app.kubernetes.io/version"])
 
 	// Container.
-	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	require.Len(t, sts.Spec.Template.Spec.Containers, 2)
 	container := sts.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, "valkey", container.Name)
 	assert.Equal(t, "valkey/valkey:8.0", container.Image)
+
+	// Sidecar container.
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+	assert.Equal(t, SidecarContainerName, sidecar.Name)
+	assert.Equal(t, testOperatorImage, sidecar.Image)
 
 	// Command.
 	assert.Equal(t, []string{"valkey-server", "/etc/valkey/valkey.conf"}, container.Command)
@@ -82,7 +89,7 @@ func TestBuildStatefulSet_WithPersistence(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	// Should have PVC template.
 	require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
@@ -108,7 +115,7 @@ func TestBuildStatefulSet_WithPersistence_DefaultStorageClass(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
 	assert.Nil(t, sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName, "empty StorageClass should be nil (default)")
@@ -128,7 +135,7 @@ func TestBuildStatefulSet_WithResources(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, resource.MustParse("500m"), container.Resources.Limits[corev1.ResourceCPU])
@@ -147,7 +154,7 @@ func TestBuildStatefulSet_WithPodLabelsAndAnnotations(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	// User labels merged with operator labels.
 	assert.Equal(t, "custom-value", sts.Spec.Template.Labels["custom-label"])
@@ -162,7 +169,7 @@ func TestBuildStatefulSet_MultipleReplicas(t *testing.T) {
 		v.Spec.Replicas = 3
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, int32(3), *sts.Spec.Replicas)
 }
@@ -170,7 +177,7 @@ func TestBuildStatefulSet_MultipleReplicas(t *testing.T) {
 func TestBuildStatefulSet_ConfigMapReference(t *testing.T) {
 	v := newTestValkey("my-cluster")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	configVol := sts.Spec.Template.Spec.Volumes[0]
 	assert.Equal(t, ConfigVolumeName, configVol.Name)
@@ -182,7 +189,7 @@ func TestBuildStatefulSet_ConfigMapReference(t *testing.T) {
 
 func TestStatefulSetHasChanged_NoChange(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 
 	// Clone as current.
 	current := desired.DeepCopy()
@@ -192,7 +199,7 @@ func TestStatefulSetHasChanged_NoChange(t *testing.T) {
 
 func TestStatefulSetHasChanged_ReplicaChange(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	newReplicas := int32(3)
@@ -203,7 +210,7 @@ func TestStatefulSetHasChanged_ReplicaChange(t *testing.T) {
 
 func TestStatefulSetHasChanged_ImageChange(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	desired.Spec.Template.Spec.Containers[0].Image = "valkey/valkey:9.0"
@@ -213,7 +220,7 @@ func TestStatefulSetHasChanged_ImageChange(t *testing.T) {
 
 func TestStatefulSetHasChanged_LabelChange(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	desired.Spec.Template.Labels["new-label"] = "value"
@@ -225,7 +232,7 @@ func TestStatefulSetHasChanged_AnnotationChange(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.PodAnnotations = map[string]string{"a": "1"}
 	})
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	desired.Spec.Template.Annotations["b"] = "2"
@@ -241,7 +248,7 @@ func TestStatefulSetHasChanged_ResourceChange(t *testing.T) {
 			},
 		}
 	})
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	desired.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = resource.MustParse("1000m")
@@ -283,7 +290,7 @@ func TestProbeCommand_TLS(t *testing.T) {
 func TestBuildStatefulSet_LabelsOnStatefulSetItself(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, "valkey", sts.Labels["app.kubernetes.io/component"])
 	assert.Equal(t, "test", sts.Labels["app.kubernetes.io/instance"])
@@ -298,7 +305,7 @@ func TestBuildStatefulSet_EmptyPodLabels(t *testing.T) {
 		v.Spec.PodLabels = map[string]string{}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	// Should still have operator labels.
 	assert.Equal(t, "valkey", sts.Spec.Template.Labels["app.kubernetes.io/component"])
@@ -326,7 +333,7 @@ func TestBuildVolumeClaimTemplates_DefaultSize(t *testing.T) {
 func TestBuildStatefulSet_SelectorMatchesService(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 	svc := BuildHeadlessService(v)
 
 	// StatefulSet selector must match Service selector for DNS to work.
@@ -340,7 +347,7 @@ func TestBuildStatefulSet_SelectorMatchesService(t *testing.T) {
 func TestBuildStatefulSet_ParallelPodManagement(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, appsv1.ParallelPodManagement, sts.Spec.PodManagementPolicy)
 }
@@ -350,7 +357,7 @@ func TestBuildStatefulSet_ParallelPodManagement(t *testing.T) {
 func TestBuildStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type,
 		"operator manages pod-by-pod rollout, so StatefulSet must use OnDelete strategy")
@@ -411,7 +418,7 @@ func TestBuildStatefulSet_WithAuth(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 
@@ -439,7 +446,7 @@ func TestBuildStatefulSet_WithAuthCustomKey(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 
@@ -451,7 +458,7 @@ func TestBuildStatefulSet_WithAuthCustomKey(t *testing.T) {
 func TestBuildStatefulSet_WithoutAuth_NoEnvVars(t *testing.T) {
 	v := newTestValkey("test")
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 
@@ -471,7 +478,7 @@ func TestBuildStatefulSet_WithAuthAndTLS(t *testing.T) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 
@@ -505,7 +512,7 @@ func TestBuildStatefulSet_WithAuth_HAMode(t *testing.T) {
 		}
 	})
 
-	sts := BuildStatefulSet(v)
+	sts := BuildStatefulSet(v, testOperatorImage)
 
 	container := sts.Spec.Template.Spec.Containers[0]
 
@@ -563,7 +570,7 @@ func TestProbeCommand_AuthWithTLS(t *testing.T) {
 
 func TestStatefulSetHasChanged_EnvVarAdded(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	// Add auth to desired (simulating auth being enabled).
@@ -584,11 +591,192 @@ func TestStatefulSetHasChanged_EnvVarAdded(t *testing.T) {
 
 func TestStatefulSetHasChanged_CommandChanged(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildStatefulSet(v)
+	desired := BuildStatefulSet(v, testOperatorImage)
 	current := desired.DeepCopy()
 
 	// Simulate command change (auth flags added).
 	desired.Spec.Template.Spec.Containers[0].Command = []string{"sh", "-c", "exec valkey-server /etc/valkey/valkey.conf --requirepass \"$VALKEY_PASSWORD\""}
 
 	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+// --- Sidecar Container Tests ---
+
+func TestBuildStatefulSet_SidecarContainer(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 2)
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+
+	assert.Equal(t, SidecarContainerName, sidecar.Name)
+	assert.Equal(t, testOperatorImage, sidecar.Image)
+	assert.Equal(t, []string{"./manager"}, sidecar.Command)
+	assert.Contains(t, sidecar.Args, "sidecar")
+	assert.Contains(t, sidecar.Args, "--poll-interval=1s")
+
+	// Drain-related args: headless service and replicas always present.
+	assert.Contains(t, sidecar.Args, "--headless-svc=test-headless.default.svc.cluster.local")
+	assert.Contains(t, sidecar.Args, "--replicas=1")
+
+	// Sentinel args should NOT be present for standalone.
+	for _, arg := range sidecar.Args {
+		assert.NotContains(t, arg, "--sentinel-enabled")
+		assert.NotContains(t, arg, "--sentinel-monitor")
+		assert.NotContains(t, arg, "--sentinel-addrs")
+	}
+
+	// Ports.
+	require.Len(t, sidecar.Ports, 1)
+	assert.Equal(t, int32(SidecarHealthPort), sidecar.Ports[0].ContainerPort)
+	assert.Equal(t, "health", sidecar.Ports[0].Name)
+
+	// Probes.
+	require.NotNil(t, sidecar.ReadinessProbe)
+	require.NotNil(t, sidecar.ReadinessProbe.HTTPGet)
+	assert.Equal(t, "/readyz", sidecar.ReadinessProbe.HTTPGet.Path)
+	require.NotNil(t, sidecar.LivenessProbe)
+	require.NotNil(t, sidecar.LivenessProbe.HTTPGet)
+	assert.Equal(t, "/healthz", sidecar.LivenessProbe.HTTPGet.Path)
+
+	// Downward API env vars.
+	hasPodName := false
+	hasPodNamespace := false
+	for _, env := range sidecar.Env {
+		if env.Name == "POD_NAME" && env.ValueFrom != nil && env.ValueFrom.FieldRef != nil {
+			hasPodName = true
+			assert.Equal(t, "metadata.name", env.ValueFrom.FieldRef.FieldPath)
+		}
+		if env.Name == "POD_NAMESPACE" && env.ValueFrom != nil && env.ValueFrom.FieldRef != nil {
+			hasPodNamespace = true
+			assert.Equal(t, "metadata.namespace", env.ValueFrom.FieldRef.FieldPath)
+		}
+	}
+	assert.True(t, hasPodName, "sidecar must have POD_NAME from Downward API")
+	assert.True(t, hasPodNamespace, "sidecar must have POD_NAMESPACE from Downward API")
+
+	// No TLS volume mounts in non-TLS mode.
+	assert.Empty(t, sidecar.VolumeMounts)
+}
+
+func TestBuildStatefulSet_SidecarWithTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+	assert.Equal(t, SidecarContainerName, sidecar.Name)
+
+	// Should have TLS flags.
+	assert.Contains(t, sidecar.Args, "--tls-enabled=true")
+	assert.Contains(t, sidecar.Args, "--tls-ca-cert=/tls/ca.crt")
+	assert.Contains(t, sidecar.Args, "--tls-cert=/tls/tls.crt")
+	assert.Contains(t, sidecar.Args, "--tls-key=/tls/tls.key")
+
+	// Should have TLS volume mount.
+	require.Len(t, sidecar.VolumeMounts, 1)
+	assert.Equal(t, TLSVolumeName, sidecar.VolumeMounts[0].Name)
+	assert.Equal(t, TLSMountPath, sidecar.VolumeMounts[0].MountPath)
+	assert.True(t, sidecar.VolumeMounts[0].ReadOnly)
+}
+
+func TestBuildStatefulSet_SidecarWithAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+
+	// Sidecar should have auth env var.
+	hasAuthEnv := false
+	for _, env := range sidecar.Env {
+		if env.Name == AuthSecretEnvName && env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			hasAuthEnv = true
+			assert.Equal(t, "my-secret", env.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, "password", env.ValueFrom.SecretKeyRef.Key)
+		}
+	}
+	assert.True(t, hasAuthEnv, "sidecar must have VALKEY_PASSWORD env var from Secret")
+}
+
+func TestBuildStatefulSet_SidecarImageDefault(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, "")
+
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+	assert.Equal(t, "ghcr.io/guided-traffic/valkey-operator:latest", sidecar.Image,
+		"when operatorImage is empty, should use default image")
+}
+
+func TestBuildStatefulSet_ServiceAccountName(t *testing.T) {
+	v := newTestValkey("my-valkey")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	assert.Equal(t, "my-valkey-sidecar", sts.Spec.Template.Spec.ServiceAccountName)
+}
+
+func TestBuildStatefulSet_TerminationGracePeriod(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotNil(t, sts.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	assert.Equal(t, int64(75), *sts.Spec.Template.Spec.TerminationGracePeriodSeconds)
+}
+
+func TestBuildStatefulSet_SidecarSentinelArgs(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+
+	assert.Contains(t, sidecar.Args, "--sentinel-enabled=true")
+	assert.Contains(t, sidecar.Args, "--sentinel-monitor=test")
+	assert.Contains(t, sidecar.Args, "--replicas=3")
+	assert.Contains(t, sidecar.Args, "--headless-svc=test-headless.default.svc.cluster.local")
+
+	// Verify sentinel addresses are present.
+	hasSentinelAddrs := false
+	for _, arg := range sidecar.Args {
+		if len(arg) > 16 && arg[:16] == "--sentinel-addrs" {
+			hasSentinelAddrs = true
+			assert.Contains(t, arg, "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:26379")
+			assert.Contains(t, arg, "test-sentinel-1.test-sentinel-headless.default.svc.cluster.local:26379")
+			assert.Contains(t, arg, "test-sentinel-2.test-sentinel-headless.default.svc.cluster.local:26379")
+		}
+	}
+	assert.True(t, hasSentinelAddrs, "sidecar must have --sentinel-addrs arg")
+}
+
+func TestBuildSentinelAddrList(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	addrs := buildSentinelAddrList(v)
+
+	expected := "my-cluster-sentinel-0.my-cluster-sentinel-headless.default.svc.cluster.local:26379," +
+		"my-cluster-sentinel-1.my-cluster-sentinel-headless.default.svc.cluster.local:26379," +
+		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:26379"
+	assert.Equal(t, expected, addrs)
 }
