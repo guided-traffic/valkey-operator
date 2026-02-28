@@ -34,7 +34,9 @@ func networkPolicyPrefix(v *vkov1.Valkey) string {
 
 // BuildValkeyNetworkPolicy builds the NetworkPolicy that allows Valkey↔Valkey
 // and Sentinel→Valkey traffic within the cluster.
-// It restricts ingress to the Valkey port from other Valkey pods and Sentinel pods.
+// It restricts ingress to the Valkey port from other Valkey pods and Sentinel pods,
+// and unconditionally allows ingress on the sidecar health port from all sources
+// so that kubelet readiness/liveness probes always succeed.
 func BuildValkeyNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 	labels := common.BaseLabels(v, common.ComponentValkey)
 	valkeySelector := common.SelectorLabels(v, common.ComponentValkey)
@@ -85,6 +87,19 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 			From: ingressPeers,
 		})
 	}
+
+	// Always allow ingress on the sidecar health port from all sources.
+	// Kubelet readiness/liveness probes originate from the node (host network),
+	// which cannot be matched by a pod selector, so no From restriction is applied.
+	healthPort := intstr.FromInt32(SidecarHealthPort)
+	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{
+				Protocol: &tcpProtocol,
+				Port:     &healthPort,
+			},
+		},
+	})
 
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
