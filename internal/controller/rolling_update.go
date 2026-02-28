@@ -5,7 +5,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -373,10 +372,7 @@ type podState struct {
 }
 
 // collectPodStates gathers the current state of all pods in the StatefulSet.
-// When multiple masters are detected (split-brain scenario), it prefers the
-// master with the most connected replicas as the authoritative master.
 func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) ([]podState, int, error) {
-	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	totalPods := int(*currentSts.Spec.Replicas)
@@ -384,7 +380,6 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 
 	pods := make([]podState, totalPods)
 	masterIdx := -1
-	bestConnectedSlaves := -1
 
 	for i := 0; i < totalPods; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -405,25 +400,13 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master.
-			// When multiple masters are found (split-brain, e.g. after an autonomous
-			// sentinel failover during rolling update), prefer the master with more
-			// connected replicas. That is the active master promoted by sentinel;
-			// the stale master has 0 connected replicas and will be replaced.
 			info, infoErr := checker.GetReplicationInfo(ctx, v, podName)
 			if infoErr == nil && info.Role == common.RoleMaster {
 				ps.isMaster = true
-				if masterIdx < 0 || info.ConnectedSlaves > bestConnectedSlaves {
-					masterIdx = i
-					bestConnectedSlaves = info.ConnectedSlaves
-				}
+				masterIdx = i
 			}
 		}
 		pods[i] = ps
-	}
-
-	if bestConnectedSlaves >= 0 {
-		logger.V(1).Info("Master detected", "masterPod", pods[masterIdx].name,
-			"connectedSlaves", bestConnectedSlaves)
 	}
 
 	return pods, masterIdx, nil
@@ -502,26 +485,9 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 		return result
 	}
 
-	// Ensure all replicas are directly connected to the actual master.
-	// After autonomous sentinel failovers, replicas may be configured to
-	// replicate from an intermediate pod instead of the true master,
-	// creating a cascaded chain that causes WAIT to time out.
-	if result := r.ensureDirectReplication(ctx, v, pods, masterIdx); result != nil {
-		return result
-	}
-
 	// Execute WAIT on the master to ensure all pending writes are replicated
 	// before triggering failover. This prevents data loss from async replication.
 	if result := r.waitForWriteSync(ctx, v, pods, masterIdx); result != nil {
-		return result
-	}
-
-	// Ensure sentinel's master pointer agrees with the actual Valkey master.
-	// Between rolling updates, sentinel may have performed an autonomous failover,
-	// causing its master to differ from the Valkey-level master detected by
-	// collectPodStates. If not corrected, isSentinelAwareOfReplicas will report
-	// 0 slaves (because sentinel's master is stale/down) and block indefinitely.
-	if result := r.ensureSentinelMasterAlignment(ctx, v, pods, masterIdx); result != nil {
 		return result
 	}
 
@@ -581,66 +547,6 @@ func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Va
 		if info.MasterSyncInProgress {
 			logger.Info("Replication sync still in progress, waiting", "pod", ps.name)
 			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-		}
-	}
-
-	return nil
-}
-
-// ensureDirectReplication verifies that all replicas are directly connected to the
-// actual master (not via cascaded replication through an intermediate pod). After
-// autonomous sentinel failovers, the replica ConfigMap's replicaof directive may
-// point to a pod that is no longer the master, creating a chain like:
-//
-//	master(pod-2) ← replica(pod-0) ← replica(pod-1)
-//
-// In this scenario, the master only sees 1 connected slave, and WAIT times out
-// waiting for 2 replicas. This method detects such chains and issues REPLICAOF
-// commands to redirect replicas to the actual master.
-func (r *ValkeyReconciler) ensureDirectReplication(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
-	logger := log.FromContext(ctx)
-	checker := health.NewChecker(r.Client)
-
-	masterPod := pods[masterIdx]
-	masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local",
-		masterPod.name,
-		common.HeadlessServiceName(v, common.ComponentValkey),
-		v.Namespace)
-
-	for i, ps := range pods {
-		if i == masterIdx {
-			continue
-		}
-
-		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
-		if err != nil {
-			logger.Info("Cannot check replica master host, waiting", "pod", ps.name, "error", err)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-		}
-
-		// Check if this replica's master_host points to the actual master.
-		if info.MasterHost != "" && !strings.HasPrefix(masterAddr, info.MasterHost) && !strings.HasPrefix(info.MasterHost, masterPod.name+".") {
-			logger.Info("Replica connected to wrong master, issuing REPLICAOF",
-				"pod", ps.name,
-				"currentMasterHost", info.MasterHost,
-				"expectedMasterAddr", masterAddr)
-
-			replicaAddr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, int(builder.ServicePort(v)))
-			tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
-			if err != nil {
-				logger.Info("Could not build TLS config for REPLICAOF", "error", err)
-				return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-
-			c := r.newValkeyClient(replicaAddr, tlsConfig)
-			if err := c.ReplicaOf(masterAddr, fmt.Sprintf("%d", builder.ServicePort(v))); err != nil {
-				logger.Info("REPLICAOF command failed, will retry", "pod", ps.name, "error", err)
-				return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-
-			logger.Info("Replica redirected to correct master",
-				"pod", ps.name, "master", masterAddr)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
 		}
 	}
 
@@ -964,76 +870,6 @@ func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey) bool {
 		return true // Corrupted timestamp — allow to proceed.
 	}
 	return time.Since(ts) >= failoverResetMinWait
-}
-
-// ensureSentinelMasterAlignment queries sentinel to verify its monitored master
-// matches the actual Valkey master (determined by replication INFO). If sentinel
-// points to a different (stale) master — e.g. after an autonomous failover between
-// rolling updates — sentinel is reconfigured (REMOVE + MONITOR) with the correct
-// master address and the reconcile is requeued to allow replica discovery.
-//
-// Returns nil when sentinel already agrees or when all sentinels are unreachable.
-func (r *ValkeyReconciler) ensureSentinelMasterAlignment(
-	ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int,
-) *RollingUpdateResult {
-	logger := log.FromContext(ctx)
-
-	if masterIdx < 0 || !v.IsSentinelEnabled() {
-		return nil
-	}
-
-	masterPodName := pods[masterIdx].name
-	monitorName := builder.SentinelMonitorName(v)
-	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
-
-	sentinelReplicas := int32(3)
-	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
-		sentinelReplicas = v.Spec.Sentinel.Replicas
-	}
-
-	// Query the first reachable sentinel for its master.
-	var sentinelMasterIP string
-	for i := int32(0); i < sentinelReplicas; i++ {
-		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
-
-		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
-		if tlsErr != nil {
-			continue
-		}
-
-		c := r.newValkeyClient(addr, tlsConfig)
-		info, err := c.SentinelMaster(monitorName)
-		if err != nil {
-			continue
-		}
-		sentinelMasterIP = info.IP
-		break
-	}
-
-	if sentinelMasterIP == "" {
-		// All sentinels unreachable — proceed optimistically.
-		return nil
-	}
-
-	// Build the expected hostname prefix for the actual master pod.
-	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
-	expectedPrefix := fmt.Sprintf("%s.%s.%s.svc", masterPodName, headlessName, v.Namespace)
-
-	// Check whether sentinel's master IP/hostname starts with the expected pod name.
-	// Sentinel stores either the full FQDN or just the hostname depending on
-	// resolve-hostnames / announce-hostnames settings.
-	if strings.HasPrefix(sentinelMasterIP, expectedPrefix) || sentinelMasterIP == masterPodName {
-		return nil // Sentinel agrees on the master.
-	}
-
-	// Sentinel's master differs from the actual Valkey master. Reconfigure.
-	masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
-	logger.Info("Sentinel master does not match actual Valkey master, reconfiguring sentinel",
-		"sentinelMaster", sentinelMasterIP, "actualMaster", masterPodName, "masterAddr", masterAddr)
-	r.resetSentinelState(ctx, v, masterAddr)
-
-	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 10 * time.Second}
 }
 
 // isSentinelAwareOfReplicas queries sentinel to check whether it has discovered the

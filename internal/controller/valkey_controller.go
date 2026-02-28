@@ -51,6 +51,7 @@ type ValkeyReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	InstanceChecker InstanceChecker
+	OperatorImage   string
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -471,7 +472,7 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 // reconcileStatefulSet ensures the StatefulSet exists and matches the desired state.
 func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
-	desired := builder.BuildStatefulSet(v)
+	desired := builder.BuildStatefulSet(v, r.OperatorImage)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on StatefulSet: %w", err)

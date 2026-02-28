@@ -39,9 +39,13 @@ spec:
           args:
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
+            - --operator-image={{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             {{- end }}
+          env:
+            - name: OPERATOR_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

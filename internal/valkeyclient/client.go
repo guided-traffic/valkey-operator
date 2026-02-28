@@ -17,6 +17,7 @@ type Client struct {
 	addr      string
 	timeout   time.Duration
 	tlsConfig *tls.Config
+	password  string
 }
 
 // ReplicationInfo holds parsed INFO replication output.
@@ -54,6 +55,26 @@ func NewTLS(addr string, tlsConfig *tls.Config) *Client {
 		addr:      addr,
 		timeout:   5 * time.Second,
 		tlsConfig: tlsConfig,
+	}
+}
+
+// NewWithPassword creates a new Valkey client with password authentication.
+// The AUTH command is sent automatically on each connection.
+func NewWithPassword(addr, password string) *Client {
+	return &Client{
+		addr:     addr,
+		timeout:  5 * time.Second,
+		password: password,
+	}
+}
+
+// NewTLSWithPassword creates a TLS Valkey client with password authentication.
+func NewTLSWithPassword(addr string, tlsConfig *tls.Config, password string) *Client {
+	return &Client{
+		addr:      addr,
+		timeout:   5 * time.Second,
+		tlsConfig: tlsConfig,
+		password:  password,
 	}
 }
 
@@ -195,6 +216,21 @@ func (c *Client) exec(args ...string) (string, error) {
 
 	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		return "", err
+	}
+
+	// Authenticate if password is configured.
+	if c.password != "" {
+		authCmd := formatRESP([]string{"AUTH", c.password})
+		if _, err := conn.Write([]byte(authCmd)); err != nil {
+			return "", fmt.Errorf("sending AUTH: %w", err)
+		}
+		authResp, err := readFullResponse(conn)
+		if err != nil {
+			return "", fmt.Errorf("AUTH failed on %s: %w", c.addr, err)
+		}
+		if !strings.Contains(authResp, "OK") {
+			return "", fmt.Errorf("AUTH failed on %s: %s", c.addr, authResp)
+		}
 	}
 
 	// Send command in RESP format.

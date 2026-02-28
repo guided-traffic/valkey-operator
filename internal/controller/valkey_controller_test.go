@@ -70,6 +70,7 @@ func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client)
 		Client:          fakeClient,
 		Scheme:          s,
 		InstanceChecker: &mockInstanceChecker{},
+		OperatorImage:   "ghcr.io/guided-traffic/valkey-operator:test",
 	}, fakeClient
 }
 

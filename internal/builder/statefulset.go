@@ -17,6 +17,12 @@ const (
 	// ValkeyContainerName is the name of the main Valkey container.
 	ValkeyContainerName = "valkey"
 
+	// SidecarContainerName is the name of the sidecar container that manages role labels.
+	SidecarContainerName = "sidecar"
+
+	// SidecarHealthPort is the port on which the sidecar readiness endpoint listens.
+	SidecarHealthPort = 8082
+
 	// ConfigVolumeName is the name of the volume for the master Valkey configuration (readonly).
 	ConfigVolumeName = "config"
 
@@ -43,7 +49,8 @@ const (
 )
 
 // BuildStatefulSet builds the StatefulSet for Valkey instances.
-func BuildStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
+// operatorImage is the container image of the operator, used for the sidecar container.
+func BuildStatefulSet(v *vkov1.Valkey, operatorImage string) *appsv1.StatefulSet {
 	labels := common.BaseLabels(v, common.ComponentValkey)
 	selectorLabels := common.SelectorLabels(v, common.ComponentValkey)
 	podLabels := common.MergeLabels(labels, v.Spec.PodLabels)
@@ -76,7 +83,7 @@ func BuildStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 					Labels:      podLabels,
 					Annotations: podAnnotations,
 				},
-				Spec: buildPodSpec(v),
+				Spec: buildPodSpec(v, operatorImage),
 			},
 		},
 	}
@@ -90,7 +97,7 @@ func BuildStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 }
 
 // buildPodSpec constructs the PodSpec for Valkey pods.
-func buildPodSpec(v *vkov1.Valkey) corev1.PodSpec {
+func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 	volumes := []corev1.Volume{
 		{
 			Name: ConfigVolumeName,
@@ -239,12 +246,18 @@ fi`,
 	}
 
 	spec := corev1.PodSpec{
-		ServiceAccountName: "default",
+		ServiceAccountName: SidecarServiceAccountName(v),
 		Containers: []corev1.Container{
 			buildValkeyContainer(v),
+			buildSidecarContainer(v, operatorImage),
 		},
 		Volumes: volumes,
 	}
+
+	// Set terminationGracePeriodSeconds to allow time for graceful failover.
+	// 75s = 60s failover timeout + 15s buffer.
+	terminationGrace := int64(75)
+	spec.TerminationGracePeriodSeconds = &terminationGrace
 
 	if len(initContainers) > 0 {
 		spec.InitContainers = initContainers
@@ -372,6 +385,120 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	}
 
 	return container
+}
+
+// buildSidecarContainer builds the sidecar container that polls the local Valkey
+// instance and patches the pod's instanceRole label.
+func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Container {
+	env := []corev1.EnvVar{
+		{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.name",
+				},
+			},
+		},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.namespace",
+				},
+			},
+		},
+	}
+
+	args := []string{
+		"sidecar",
+		"--poll-interval=1s",
+	}
+
+	// Configure Valkey address (use TLS port if TLS is enabled).
+	if v.IsTLSEnabled() {
+		args = append(args, fmt.Sprintf("--valkey-addr=localhost:%d", TLSPort))
+		args = append(args, "--tls-enabled=true")
+		args = append(args, "--tls-ca-cert=/tls/ca.crt")
+		args = append(args, "--tls-cert=/tls/tls.crt")
+		args = append(args, "--tls-key=/tls/tls.key")
+	} else {
+		args = append(args, fmt.Sprintf("--valkey-addr=localhost:%d", ValkeyPort))
+	}
+
+	// Inject auth password if configured.
+	if v.IsAuthEnabled() {
+		env = append(env, corev1.EnvVar{
+			Name: AuthSecretEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: v.Spec.Auth.SecretName,
+					},
+					Key: v.Spec.Auth.SecretPasswordKey,
+				},
+			},
+		})
+	}
+
+	var volumeMounts []corev1.VolumeMount
+
+	// Mount TLS certificates if TLS is enabled.
+	if v.IsTLSEnabled() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
+	}
+
+	sidecarImage := operatorImage
+	if sidecarImage == "" {
+		sidecarImage = "ghcr.io/guided-traffic/valkey-operator:latest"
+	}
+
+	return corev1.Container{
+		Name:    SidecarContainerName,
+		Image:   sidecarImage,
+		Command: []string{"./manager"},
+		Args:    args,
+		Env:     env,
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          "health",
+				ContainerPort: SidecarHealthPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		VolumeMounts: volumeMounts,
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/readyz",
+					Port:   intstr.FromInt32(SidecarHealthPort),
+					Scheme: corev1.URISchemeHTTP,
+				},
+			},
+			InitialDelaySeconds: 3,
+			PeriodSeconds:       3,
+			TimeoutSeconds:      2,
+			SuccessThreshold:    1,
+			FailureThreshold:    3,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/healthz",
+					Port:   intstr.FromInt32(SidecarHealthPort),
+					Scheme: corev1.URISchemeHTTP,
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+			TimeoutSeconds:      2,
+			SuccessThreshold:    1,
+			FailureThreshold:    5,
+		},
+	}
 }
 
 // buildVolumeClaimTemplates creates PVC templates for persistent storage.
