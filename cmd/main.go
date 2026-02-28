@@ -79,10 +79,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	operatorNamespace := os.Getenv("POD_NAMESPACE")
+
 	if err = (&controller.ValkeyReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		OperatorImage: operatorImage,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		OperatorImage:     operatorImage,
+		OperatorNamespace: operatorNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Valkey")
 		os.Exit(1)

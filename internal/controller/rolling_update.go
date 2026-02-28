@@ -602,7 +602,7 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	c := r.newValkeyClient(addr, tlsConfig)
+	c := r.newValkeyClient(addr, r.readValkeyPassword(ctx, v), tlsConfig)
 	acked, err := c.Wait(numReplicas, waitWriteSyncTimeout)
 	if err != nil {
 		logger.Info("WAIT command failed, will retry", "master", masterPod.name, "error", err)
@@ -797,13 +797,14 @@ func (r *ValkeyReconciler) forceReplicaConnections(ctx context.Context, v *vkov1
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
 	portStr := fmt.Sprintf("%d", builder.ServicePort(v))
+	password := r.readValkeyPassword(ctx, v)
 
 	for _, ps := range pods {
 		if ps.name == masterPodName || !ps.exists || !ps.ready {
 			continue
 		}
 		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, int(builder.ServicePort(v)))
-		c := r.newValkeyClient(addr, tlsConfig)
+		c := r.newValkeyClient(addr, password, tlsConfig)
 		if replicaErr := c.ReplicaOf(masterHost, portStr); replicaErr != nil {
 			logger.Info("REPLICAOF command failed (best-effort)", "pod", ps.name, "master", masterHost, "error", replicaErr)
 		} else {
@@ -928,7 +929,7 @@ func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Va
 				logger.Info("Could not build TLS config for DBSIZE check", "error", tlsErr)
 				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 			}
-			vc := r.newValkeyClient(addr, tlsConfig)
+			vc := r.newValkeyClient(addr, r.readValkeyPassword(ctx, v), tlsConfig)
 			dbsize, err := vc.DBSize()
 			if err != nil {
 				logger.Info("Cannot check DBSIZE on new master, waiting",
@@ -1068,6 +1069,7 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
+	password := r.readValkeyPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -1078,7 +1080,7 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 			continue
 		}
 
-		c := r.newValkeyClient(addr, tlsConfig)
+		c := r.newValkeyClient(addr, password, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			continue
@@ -1136,6 +1138,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
+	password := r.readValkeyPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -1147,7 +1150,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 			continue
 		}
 
-		c := r.newValkeyClient(addr, tlsConfig)
+		c := r.newValkeyClient(addr, password, tlsConfig)
 
 		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
 		if err := c.SentinelRemove(monitorName); err != nil {
@@ -1186,6 +1189,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
+	password := r.readValkeyPassword(ctx, v)
 
 	// Try each sentinel until one successfully triggers failover.
 	var lastErr error
@@ -1200,7 +1204,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 			continue
 		}
 
-		c := r.newValkeyClient(addr, tlsConfig)
+		c := r.newValkeyClient(addr, password, tlsConfig)
 		if err := c.SentinelFailover(monitorName); err != nil {
 			lastErr = err
 			logger.V(1).Info("Sentinel failover attempt failed", "sentinel", podName, "error", err)
