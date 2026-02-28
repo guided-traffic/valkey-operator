@@ -882,3 +882,114 @@ func TestIsSentinelAwareOfReplicas_DefaultSentinelReplicas(t *testing.T) {
 	assert.True(t, r.isSentinelAwareOfReplicas(context.Background(), v, 2),
 		"Should return true with default sentinel replicas and all unreachable")
 }
+
+// --- getReconnectResetCount / incrementReconnectResetCount / clearReconnectResetCount ---
+
+func TestGetReconnectResetCount_NoAnnotation(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+	assert.Equal(t, 0, r.getReconnectResetCount(v))
+}
+
+func TestGetReconnectResetCount_NilAnnotations(t *testing.T) {
+	v := newTestValkey("test", "default")
+	v.Annotations = nil
+	r, _ := newTestReconciler(v)
+	assert.Equal(t, 0, r.getReconnectResetCount(v))
+}
+
+func TestGetReconnectResetCount_ValidCount(t *testing.T) {
+	v := newTestValkey("test", "default")
+	v.Annotations = map[string]string{
+		annotationReconnectResetCount: "2",
+	}
+	r, _ := newTestReconciler(v)
+	assert.Equal(t, 2, r.getReconnectResetCount(v))
+}
+
+func TestGetReconnectResetCount_CorruptedAnnotation(t *testing.T) {
+	v := newTestValkey("test", "default")
+	v.Annotations = map[string]string{
+		annotationReconnectResetCount: "not-a-number",
+	}
+	r, _ := newTestReconciler(v)
+	assert.Equal(t, 0, r.getReconnectResetCount(v))
+}
+
+func TestIncrementReconnectResetCount_StoresBothAnnotations(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.incrementReconnectResetCount(context.Background(), v, 1)
+	require.NoError(t, err)
+
+	assert.Equal(t, "1", v.Annotations[annotationReconnectResetCount])
+	assert.NotEmpty(t, v.Annotations[annotationFailoverTimestamp],
+		"incrementReconnectResetCount should also set the failover timestamp")
+}
+
+func TestClearReconnectResetCount_RemovesAnnotation(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationReconnectResetCount: "3",
+	}
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.clearReconnectResetCount(context.Background(), v)
+	require.NoError(t, err)
+	assert.Empty(t, v.Annotations[annotationReconnectResetCount])
+}
+
+func TestClearReconnectResetCount_NoopWhenAbsent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	// Should not error when annotation is already absent.
+	err := r.clearReconnectResetCount(context.Background(), v)
+	assert.NoError(t, err)
+}
+
+func TestClearRollingUpdateState_AlsoClearsResetCount(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState:  stateFailoverTriggered,
+		annotationFailoverTimestamp:   time.Now().UTC().Format(time.RFC3339),
+		annotationReconnectResetCount: "2",
+	}
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.clearRollingUpdateState(context.Background(), v)
+	require.NoError(t, err)
+
+	assert.Empty(t, v.Annotations[annotationRollingUpdateState])
+	assert.Empty(t, v.Annotations[annotationFailoverTimestamp])
+	assert.Empty(t, v.Annotations[annotationReconnectResetCount])
+}
+
+// --- handleMasterWithNoReplicas ---
+
+func TestHandleMasterWithNoReplicas_WaitsWhenNotTimedOut(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, _ := newTestReconciler(v)
+
+	// Set a fresh timestamp so the timeout has NOT elapsed yet.
+	v.Annotations = map[string]string{
+		annotationFailoverTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	ps := podState{name: "test-1"}
+	result := r.handleMasterWithNoReplicas(context.Background(), v, ps, nil)
+
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+}

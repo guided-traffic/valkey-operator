@@ -38,6 +38,16 @@ const (
 	stateReplacingMaster   = "replacing-master"   // Replacing the former master pod.
 )
 
+// annotationReconnectResetCount tracks how many times the sentinel state has been
+// reset while waiting for replicas to connect to the new master. Used to break
+// the infinite loop that occurs when replicas never reconnect via sentinel alone.
+const annotationReconnectResetCount = "vko.gtrfc.com/reconnect-reset-count"
+
+// maxReconnectResets is the maximum number of sentinel resets we perform while
+// waiting for replicas to reconnect. After this many resets we send direct
+// REPLICAOF commands and proceed with the rolling update regardless.
+const maxReconnectResets = 2
+
 // failoverRetryTimeout is the duration after which a sentinel failover is considered
 // stale and will be retried with a sentinel reset. This handles the case where
 // sentinel refuses a failover due to its internal cooldown (failover-timeout).
@@ -706,7 +716,7 @@ func (r *ValkeyReconciler) handleNewMasterFound(ctx context.Context, v *vkov1.Va
 	logger := log.FromContext(ctx)
 
 	if info.ConnectedSlaves == 0 {
-		return r.handleMasterWithNoReplicas(ctx, v, ps)
+		return r.handleMasterWithNoReplicas(ctx, v, ps, freshPods)
 	}
 
 	// New master is ready. Proceed to replace the old master.
@@ -717,19 +727,51 @@ func (r *ValkeyReconciler) handleNewMasterFound(ctx context.Context, v *vkov1.Va
 
 // handleMasterWithNoReplicas handles the case where the new master exists but
 // has no connected replicas. In resource-constrained environments (CI), sentinel
-// may not have properly reconfigured replicas. If the reconnect timeout has
-// elapsed, sentinel state is reset to force replica reconnection.
-func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vkov1.Valkey, ps podState) RollingUpdateResult {
+// may not have properly reconfigured replicas.
+//
+// On each timeout it:
+//  1. Directly commands all non-master pods to REPLICAOF the new master, bypassing
+//     sentinel's potentially-delayed reconfiguration.
+//  2. Resets sentinel state so it rediscovers the topology.
+//  3. Tracks how many resets have occurred via annotationReconnectResetCount.
+//
+// After maxReconnectResets attempts the function proceeds with the rolling update
+// regardless, breaking the infinite retry loop. verifyNewMasterReady will still
+// gate the old-master deletion until replication is confirmed.
+func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vkov1.Valkey, ps podState, allPods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
+	resetCount := r.getReconnectResetCount(v)
+
 	if r.isReplicaReconnectTimedOut(v) {
-		logger.Info("Replicas failed to connect to new master within timeout, resetting sentinel",
-			"newMaster", ps.name)
+		logger.Info("Replicas failed to connect to new master within timeout",
+			"newMaster", ps.name, "resetCount", resetCount)
+
 		headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 		masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
+
+		// Directly tell every non-master pod to replicate from the new master.
+		// This bypasses the sentinel reconfiguration delay that causes the stall.
+		r.forceReplicaConnections(ctx, v, ps.name, allPods)
+
 		r.resetSentinelState(ctx, v, masterAddr)
-		// Update timestamp to restart the wait period.
-		if err := r.setFailoverTimestamp(ctx, v); err != nil {
+
+		if resetCount >= maxReconnectResets {
+			// We have sent REPLICAOF and reset sentinel multiple times.
+			// The replicas should connect imminently. Proceed with the rolling
+			// update — verifyNewMasterReady will block the final deletion until
+			// replication is confirmed, so this is safe.
+			logger.Info("Max reconnect resets reached, proceeding with rolling update",
+				"newMaster", ps.name)
+			if err := r.clearReconnectResetCount(ctx, v); err != nil {
+				return RollingUpdateResult{Error: err}
+			}
+			return r.replaceRemainingPods(ctx, v, allPods)
+		}
+
+		// Persist the incremented reset count and reset the wait timestamp in a
+		// single API call to avoid a double-update race.
+		if err := r.incrementReconnectResetCount(ctx, v, resetCount+1); err != nil {
 			return RollingUpdateResult{Error: err}
 		}
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
@@ -738,6 +780,77 @@ func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vk
 	logger.Info("New master has no connected replicas yet, waiting for sync",
 		"newMaster", ps.name)
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// forceReplicaConnections sends a direct REPLICAOF command to every ready non-master
+// pod, instructing it to replicate from masterPodName. This is a best-effort
+// operation used when sentinel has failed to reconfigure replicas on its own.
+func (r *ValkeyReconciler) forceReplicaConnections(ctx context.Context, v *vkov1.Valkey, masterPodName string, pods []podState) {
+	logger := log.FromContext(ctx)
+
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for REPLICAOF, skipping forced replica connections", "error", err)
+		return
+	}
+
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", builder.ServicePort(v))
+
+	for _, ps := range pods {
+		if ps.name == masterPodName || !ps.exists || !ps.ready {
+			continue
+		}
+		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, int(builder.ServicePort(v)))
+		c := r.newValkeyClient(addr, tlsConfig)
+		if replicaErr := c.ReplicaOf(masterHost, portStr); replicaErr != nil {
+			logger.Info("REPLICAOF command failed (best-effort)", "pod", ps.name, "master", masterHost, "error", replicaErr)
+		} else {
+			logger.Info("Sent REPLICAOF to pod", "pod", ps.name, "master", masterHost)
+		}
+	}
+}
+
+// getReconnectResetCount returns the current sentinel reset counter stored in
+// the Valkey CR annotations, or 0 if the annotation is absent or malformed.
+func (r *ValkeyReconciler) getReconnectResetCount(v *vkov1.Valkey) int {
+	if v.Annotations == nil {
+		return 0
+	}
+	s, ok := v.Annotations[annotationReconnectResetCount]
+	if !ok || s == "" {
+		return 0
+	}
+	var n int
+	if _, scanErr := fmt.Sscanf(s, "%d", &n); scanErr != nil {
+		return 0
+	}
+	return n
+}
+
+// incrementReconnectResetCount persists newCount in the reset-count annotation
+// and simultaneously refreshes the failover timestamp, so the next wait period
+// starts from now. Both are written in a single Update to avoid a double-write race.
+func (r *ValkeyReconciler) incrementReconnectResetCount(ctx context.Context, v *vkov1.Valkey, newCount int) error {
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	v.Annotations[annotationReconnectResetCount] = fmt.Sprintf("%d", newCount)
+	v.Annotations[annotationFailoverTimestamp] = time.Now().UTC().Format(time.RFC3339)
+	return r.Update(ctx, v)
+}
+
+// clearReconnectResetCount removes the reset-count annotation from the Valkey CR.
+func (r *ValkeyReconciler) clearReconnectResetCount(ctx context.Context, v *vkov1.Valkey) error {
+	if v.Annotations == nil {
+		return nil
+	}
+	if _, ok := v.Annotations[annotationReconnectResetCount]; !ok {
+		return nil
+	}
+	delete(v.Annotations, annotationReconnectResetCount)
+	return r.Update(ctx, v)
 }
 
 // handleNoMasterFound handles the case where no new-image master was detected
@@ -855,18 +968,21 @@ func (r *ValkeyReconciler) setRollingUpdateState(ctx context.Context, v *vkov1.V
 	return r.Update(ctx, v)
 }
 
-// clearRollingUpdateState removes the rolling update state and failover timestamp annotations.
+// clearRollingUpdateState removes the rolling update state, failover timestamp, and
+// reconnect reset count annotations.
 func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1.Valkey) error {
 	if v.Annotations == nil {
 		return nil
 	}
 	_, hasState := v.Annotations[annotationRollingUpdateState]
 	_, hasTimestamp := v.Annotations[annotationFailoverTimestamp]
-	if !hasState && !hasTimestamp {
+	_, hasCount := v.Annotations[annotationReconnectResetCount]
+	if !hasState && !hasTimestamp && !hasCount {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
 	delete(v.Annotations, annotationFailoverTimestamp)
+	delete(v.Annotations, annotationReconnectResetCount)
 	return r.Update(ctx, v)
 }
 
