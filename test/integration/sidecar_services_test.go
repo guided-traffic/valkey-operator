@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -17,59 +16,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
-	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
 
 // TestSidecarServicesRouting_Integration verifies that the operator creates
 // the correct role-aware services with proper selectors for sidecar-based routing,
 // legacy service cleanup, sidecar container injection, RBAC, and standalone mode.
 func TestSidecarServicesRouting_Integration(t *testing.T) {
-	log.SetLogger(zap.New(zap.UseDevMode(true)))
-
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths: []string{"../../config/crd/bases"},
-	}
-
-	cfg, err := testEnv.Start()
-	require.NoError(t, err, "failed to start envtest")
-	defer func() {
-		require.NoError(t, testEnv.Stop())
-	}()
-
-	require.NoError(t, vkov1.AddToScheme(scheme.Scheme))
-	require.NoError(t, appsv1.AddToScheme(scheme.Scheme))
-	require.NoError(t, rbacv1.AddToScheme(scheme.Scheme))
-
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
-	})
-	require.NoError(t, err)
-
-	reconciler := &controller.ValkeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}
-	require.NoError(t, reconciler.SetupWithManager(mgr))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		require.NoError(t, mgr.Start(ctx))
-	}()
-
-	require.True(t, mgr.GetCache().WaitForCacheSync(ctx))
-	k8sClient := mgr.GetClient()
+	ctx := testCtx
 
 	// Helper: wait for a service to appear.
 	waitForServiceCreation := func(t *testing.T, name string) {

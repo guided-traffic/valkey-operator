@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -14,61 +13,14 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
-	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
 
 func TestStandaloneMode_Integration(t *testing.T) {
-	log.SetLogger(zap.New(zap.UseDevMode(true)))
-
-	// Start envtest.
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths: []string{"../../config/crd/bases"},
-	}
-
-	cfg, err := testEnv.Start()
-	require.NoError(t, err, "failed to start envtest")
-	defer func() {
-		require.NoError(t, testEnv.Stop())
-	}()
-
-	// Register schemes.
-	require.NoError(t, vkov1.AddToScheme(scheme.Scheme))
-	require.NoError(t, appsv1.AddToScheme(scheme.Scheme))
-	require.NoError(t, rbacv1.AddToScheme(scheme.Scheme))
-
-	// Set up manager and controller.
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
-	})
-	require.NoError(t, err)
-
-	reconciler := &controller.ValkeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}
-	require.NoError(t, reconciler.SetupWithManager(mgr))
-
-	// Start manager in background.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		require.NoError(t, mgr.Start(ctx))
-	}()
-
-	// Wait for cache to sync.
-	require.True(t, mgr.GetCache().WaitForCacheSync(ctx))
-
-	k8sClient := mgr.GetClient()
+	ctx := testCtx
 
 	t.Run("deploy standalone valkey", func(t *testing.T) {
 		v := &vkov1.Valkey{
