@@ -454,6 +454,49 @@ func TestE2E_CertManagerReady(t *testing.T) {
 	})
 }
 
+// TestE2E_DeletionWhileProvisioning verifies that deleting a Valkey resource that
+// has not yet completed provisioning terminates cleanly without a pod reboot loop.
+// This is a regression test for the bug where the controller kept recreating pods
+// after a delete was issued on a partially provisioned (Provisioning phase) cluster.
+func TestE2E_DeletionWhileProvisioning(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-del-provisioning"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "del-while-prov"
+
+	// Build a minimal HA Valkey. We do NOT wait for readiness before deleting.
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    "valkey/valkey:8.0",
+		"sentinel": map[string]interface{}{
+			"enabled":  true,
+			"replicas": int64(3),
+		},
+	})
+
+	t.Log("Creating HA Valkey CR")
+	tc.createValkey(t, ns, valkey)
+
+	// Give the operator a short window to start provisioning so that the object
+	// is in a real "Provisioning" state when we delete it.
+	time.Sleep(3 * time.Second)
+
+	t.Log("Deleting Valkey CR while still provisioning")
+	tc.deleteValkey(t, ns, name)
+
+	// The CR must disappear; if the controller loops and blocks garbage
+	// collection, this will time out and fail the test.
+	t.Log("Waiting for Valkey CR to be fully deleted")
+	tc.waitForDeletion(t, ns, name)
+
+	// After deletion, no Valkey or Sentinel pods should remain running.
+	t.Log("Verifying no pods remain after deletion")
+	tc.waitForNoPods(t, ns, name)
+}
+
 // waitForDeploymentReady waits until a Deployment has the expected number of ready replicas.
 func (tc *testClients) waitForDeploymentReady(t *testing.T, namespace, name string) {
 	t.Helper()

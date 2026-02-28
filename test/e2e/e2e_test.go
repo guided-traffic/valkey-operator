@@ -397,5 +397,28 @@ func (tc *testClients) getPod(t *testing.T, namespace, name string) *corev1.Pod 
 	return pod
 }
 
+// waitForNoPods waits until there are no pods whose names start with the given
+// prefix in the namespace. This is used to verify that deletion cleans up all
+// Valkey and Sentinel pods without a reboot loop.
+func (tc *testClients) waitForNoPods(t *testing.T, namespace, namePrefix string) {
+	t.Helper()
+	ctx := context.Background()
+
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+		pods, err := tc.kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, pod := range pods.Items {
+			if strings.HasPrefix(pod.Name, namePrefix) {
+				t.Logf("Pod %s/%s still present (phase=%s), waiting...", namespace, pod.Name, pod.Status.Phase)
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	require.NoError(t, err, "Pods with prefix %q in namespace %s were not cleaned up after deletion", namePrefix, namespace)
+}
+
 // Ensure all types used are available for linting.
 var _ = types.NamespacedName{}

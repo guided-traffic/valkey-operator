@@ -156,6 +156,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	// If the resource is being deleted, do not reconcile any managed resources.
+	// Kubernetes garbage collection (via owner references) handles child resource cleanup.
+	// This prevents a reboot loop on partially provisioned clusters that are being deleted.
+	if !valkey.DeletionTimestamp.IsZero() {
+		logger.Info("Valkey resource is being deleted, skipping reconciliation")
+		return ctrl.Result{}, nil
+	}
+
 	// Set initial provisioning status if phase is empty.
 	if valkey.Status.Phase == "" {
 		if err := r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseProvisioning, "Setting up Valkey resources"); err != nil {

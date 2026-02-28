@@ -113,6 +113,73 @@ func TestReconcile_ResourceNotFound(t *testing.T) {
 	assert.Equal(t, ctrl.Result{}, result)
 }
 
+// TestReconcile_DeletionTimestamp verifies that no child resources are created or
+// updated when the Valkey resource is being deleted (DeletionTimestamp is set).
+// This prevents a reboot loop on partially provisioned clusters during deletion.
+func TestReconcile_DeletionTimestamp_SkipsReconciliation(t *testing.T) {
+	now := metav1.Now()
+	v := newTestValkey("deleting", "default", func(v *vkov1.Valkey) {
+		v.DeletionTimestamp = &now
+		// A finalizer is required for the object to remain in "terminating" state.
+		v.Finalizers = []string{"foregroundDeletion"}
+	})
+	r, c := newTestReconciler(v)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "deleting", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	// No StatefulSet should have been created.
+	sts := &appsv1.StatefulSet{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "deleting", Namespace: "default"}, sts)
+	assert.True(t, apierrors.IsNotFound(err), "expected no StatefulSet to be created during deletion")
+
+	// No ConfigMap should have been created.
+	cm := &corev1.ConfigMap{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "deleting-config", Namespace: "default"}, cm)
+	assert.True(t, apierrors.IsNotFound(err), "expected no ConfigMap to be created during deletion")
+}
+
+// TestReconcile_DeletionTimestamp_PartiallyProvisioned verifies that a Valkey that
+// was never fully provisioned (phase = Provisioning) does not keep creating pods
+// when it carries a deletionTimestamp.
+func TestReconcile_DeletionTimestamp_PartiallyProvisioned(t *testing.T) {
+	now := metav1.Now()
+	v := newTestValkey("stuck", "default", func(v *vkov1.Valkey) {
+		v.DeletionTimestamp = &now
+		v.Finalizers = []string{"foregroundDeletion"}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Status.Phase = vkov1.ValkeyPhaseProvisioning
+		v.Status.Message = "Waiting for HA cluster pods to become ready"
+	})
+	r, c := newTestReconciler(v)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "stuck", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	// Sentinel StatefulSet must NOT be created.
+	sentinelSts := &appsv1.StatefulSet{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "stuck-sentinel", Namespace: "default"}, sentinelSts)
+	assert.True(t, apierrors.IsNotFound(err), "expected no Sentinel StatefulSet during deletion of partially provisioned cluster")
+
+	// Valkey StatefulSet must NOT be created.
+	sts := &appsv1.StatefulSet{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "stuck", Namespace: "default"}, sts)
+	assert.True(t, apierrors.IsNotFound(err), "expected no Valkey StatefulSet during deletion of partially provisioned cluster")
+
+	// Phase must not have been overwritten.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "stuck", Namespace: "default"}, updated))
+	assert.Equal(t, vkov1.ValkeyPhaseProvisioning, updated.Status.Phase, "phase must remain unchanged during deletion")
+}
+
 func TestReconcile_CreatesConfigMap(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, c := newTestReconciler(v)
