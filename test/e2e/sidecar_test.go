@@ -317,18 +317,35 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 
 	// Verify data survived the failover.
 	t.Run("data survives failover", func(t *testing.T) {
-		newMaster := tc.findMasterPod(t, ns, name, 3)
-
-		// Wait for the new master to be fully ready (container running).
-		tc.waitForPodReady(t, ns, newMaster)
-
-		// Verify DBSIZE is preserved (retry because pod may be starting up).
-		// Use valkeyExecAllowError to tolerate transient kubectl exec failures.
+		// Combine master-detection and data-verification in one retry loop.
+		// The deleted pod restarts fast (no PVC) and may briefly report role:master
+		// before Sentinel reconfigures it as a replica, resulting in a transient master
+		// with DBSIZE=0.  By accepting only the pod that is master AND already holds
+		// the expected data we avoid acting on that transient state.
+		var newMaster string
 		require.Eventually(t, func() bool {
-			dbsizeAfter := tc.valkeyExecAllowError(t, ns, newMaster, 6379, "DBSIZE")
-			t.Logf("DBSIZE after drain: %s (before: %s)", dbsizeAfter, dbsizeBefore)
-			return dbsizeAfter == dbsizeBefore
-		}, 30*time.Second, 2*time.Second, "DBSIZE should be preserved after failover")
+			for i := 0; i < 3; i++ {
+				podName := fmt.Sprintf("%s-%d", name, i)
+				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
+				if !strings.Contains(info, "role:master") {
+					continue
+				}
+				dbsize := tc.valkeyExecAllowError(t, ns, podName, 6379, "DBSIZE")
+				t.Logf("Pod %s: role=master DBSIZE=%s (want %s)", podName, dbsize, dbsizeBefore)
+				if dbsize == dbsizeBefore {
+					newMaster = podName
+					return true
+				}
+			}
+			return false
+		}, 90*time.Second, 3*time.Second,
+			"New master with DBSIZE=%s should be found after failover", dbsizeBefore)
+
+		t.Logf("New master after failover: %s (DBSIZE=%s confirmed)", newMaster, dbsizeBefore)
+
+		// Wait for all replicas to reconnect so the cluster is fully stable before
+		// spot-checking individual keys.
+		tc.waitForConnectedReplicas(t, ns, newMaster, 6379, 2)
 
 		// Spot-check keys exist.
 		for i := 0; i < 50; i += 5 {
