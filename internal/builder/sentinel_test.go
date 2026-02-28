@@ -110,6 +110,77 @@ func TestGenerateSentinelConf_WithoutAuth_NoAuthPass(t *testing.T) {
 
 	assert.NotContains(t, conf, "sentinel auth-pass")
 	assert.NotContains(t, conf, "# Auth")
+	assert.NotContains(t, conf, "requirepass")
+}
+
+// TestGenerateSentinelConf_WithAuth_RequiresRequirepass verifies that when auth is enabled,
+// the Sentinel config contains "requirepass %VALKEY_PASSWORD%" so that the Sentinel process
+// itself requires authentication. Without this directive, Sentinel rejects any AUTH command
+// with "ERR AUTH called without any password configured for the default user" — which causes
+// the operator's health checker to permanently fail Sentinel connectivity checks.
+func TestGenerateSentinelConf_WithAuth_RequiresRequirepass(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Sentinel must have requirepass set so clients (including the operator) can AUTH.
+	assert.Contains(t, conf, "requirepass %VALKEY_PASSWORD%",
+		"sentinel.conf must contain requirepass when auth is enabled")
+	// sentinel auth-pass must also be present (for Sentinel→Valkey auth).
+	assert.Contains(t, conf, "sentinel auth-pass test %VALKEY_PASSWORD%",
+		"sentinel.conf must contain sentinel auth-pass when auth is enabled")
+}
+
+// TestGenerateSentinelConf_WithAuth_TLS_RequiresRequirepass verifies that requirepass is set
+// even when TLS is enabled alongside auth.
+func TestGenerateSentinelConf_WithAuth_TLS_RequiresRequirepass(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "auth-secret",
+			SecretPasswordKey: "pass",
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "requirepass %VALKEY_PASSWORD%",
+		"sentinel.conf must contain requirepass when auth+TLS are enabled")
+	assert.Contains(t, conf, "sentinel auth-pass my-cluster %VALKEY_PASSWORD%")
+	// TLS directives must still be present.
+	assert.Contains(t, conf, "tls-port 26379")
+	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
+}
+
+// TestGenerateSentinelConf_WithoutAuth_NoRequirepass verifies that requirepass is absent
+// when auth is not configured — adding it without a password would lock out all clients.
+func TestGenerateSentinelConf_WithoutAuth_NoRequirepass(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.NotContains(t, conf, "requirepass",
+		"sentinel.conf must not contain requirepass when auth is disabled")
 }
 
 func TestGenerateSentinelConf_MasterAddress(t *testing.T) {

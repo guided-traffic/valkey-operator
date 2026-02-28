@@ -113,10 +113,15 @@ func GenerateSentinelConf(v *vkov1.Valkey) string {
 	)
 
 	// Auth configuration if enabled.
-	// The sentinel init container will replace the placeholder with the actual password.
+	// The sentinel init container will replace %VALKEY_PASSWORD% with the actual password.
+	// requirepass protects the Sentinel process itself — without it, Sentinel rejects any
+	// AUTH command with "ERR AUTH called without any password configured for the default user",
+	// which causes the operator health checker to permanently fail Sentinel connectivity checks.
+	// sentinel auth-pass is the separate credential Sentinel uses to connect to Valkey nodes.
 	if v.IsAuthEnabled() {
 		lines = append(lines,
 			"# Auth",
+			"requirepass %VALKEY_PASSWORD%",
 			fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
 			"",
 		)
