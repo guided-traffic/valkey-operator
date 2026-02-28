@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync/atomic"
+	"time"
 )
 
 // HealthServer exposes a readiness endpoint for the sidecar.
@@ -23,8 +24,9 @@ func NewHealthServer(addr string) *HealthServer {
 	mux.HandleFunc("/healthz", h.handleHealthz)
 
 	h.server = &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	return h
