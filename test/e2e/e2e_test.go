@@ -139,11 +139,29 @@ func (tc *testClients) waitForStatefulSetReady(t *testing.T, namespace, name str
 }
 
 // waitForValkeyPhase waits until the Valkey CR reaches the expected phase.
+// waitForValkeyPhase waits until the Valkey CR reaches the expected phase.
+// Uses testTimeout (5 min) — for rolling update operations use waitForValkeyPhaseAfterRollingUpdate.
 func (tc *testClients) waitForValkeyPhase(t *testing.T, namespace, name, expectedPhase string) {
+	t.Helper()
+	tc.waitForValkeyPhaseWithTimeout(t, namespace, name, expectedPhase, testTimeout)
+}
+
+// waitForValkeyPhaseAfterRollingUpdate waits for the Valkey CR to reach the expected
+// phase after a rolling update operation, using the longer rollingUpdateTimeout.
+// This accounts for the extra time needed to finalize HA rolling updates in CI
+// (sentinel sync, replica reconnection, pod recreation after master replacement).
+func (tc *testClients) waitForValkeyPhaseAfterRollingUpdate(t *testing.T, namespace, name, expectedPhase string) {
+	t.Helper()
+	tc.waitForValkeyPhaseWithTimeout(t, namespace, name, expectedPhase, rollingUpdateTimeout)
+}
+
+// waitForValkeyPhaseWithTimeout waits until the Valkey CR reaches the expected phase
+// within the given timeout.
+func (tc *testClients) waitForValkeyPhaseWithTimeout(t *testing.T, namespace, name, expectedPhase string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		valkey, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err

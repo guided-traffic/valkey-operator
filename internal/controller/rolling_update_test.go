@@ -972,6 +972,81 @@ func TestClearRollingUpdateState_AlsoClearsResetCount(t *testing.T) {
 	assert.Empty(t, v.Annotations[annotationReconnectResetCount])
 }
 
+func TestClearRollingUpdateState_AlsoClearsFinalizationTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState:    stateReplacingMaster,
+		annotationFailoverTimestamp:     time.Now().UTC().Format(time.RFC3339),
+		annotationFinalizationTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.clearRollingUpdateState(context.Background(), v)
+	require.NoError(t, err)
+
+	assert.Empty(t, v.Annotations[annotationRollingUpdateState])
+	assert.Empty(t, v.Annotations[annotationFailoverTimestamp])
+	assert.Empty(t, v.Annotations[annotationFinalizationTimestamp])
+}
+
+func TestIsFinalizationStalled_FalseWhenAnnotationAbsent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	assert.False(t, r.isFinalizationStalled(v))
+}
+
+func TestIsFinalizationStalled_FalseWhenRecent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFinalizationTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	assert.False(t, r.isFinalizationStalled(v))
+}
+
+func TestIsFinalizationStalled_TrueWhenOld(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	old := time.Now().Add(-(finalizationStallTimeout + 10*time.Second))
+	v.Annotations = map[string]string{
+		annotationFinalizationTimestamp: old.UTC().Format(time.RFC3339),
+	}
+
+	assert.True(t, r.isFinalizationStalled(v))
+}
+
+func TestIsFinalizationStalled_TrueWhenCorrupted(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationFinalizationTimestamp: "not-a-timestamp",
+	}
+
+	assert.True(t, r.isFinalizationStalled(v))
+}
+
+func TestEnsureFinalizationTimestamp_SetsOnce(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	// First call must set the annotation.
+	r.ensureFinalizationTimestamp(context.Background(), v)
+	first := v.Annotations[annotationFinalizationTimestamp]
+	assert.NotEmpty(t, first)
+
+	// Second call must not overwrite.
+	r.ensureFinalizationTimestamp(context.Background(), v)
+	second := v.Annotations[annotationFinalizationTimestamp]
+	assert.Equal(t, first, second, "timestamp must not be overwritten on second call")
+}
+
 // --- handleMasterWithNoReplicas ---
 
 func TestHandleMasterWithNoReplicas_WaitsWhenNotTimedOut(t *testing.T) {

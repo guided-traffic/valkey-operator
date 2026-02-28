@@ -60,7 +60,7 @@ func TestE2E_RollingUpdate_Standalone(t *testing.T) {
 
 		// StatefulSet should be ready again.
 		tc.waitForStatefulSetReady(t, ns, name, 1)
-		tc.waitForValkeyPhase(t, ns, name, "OK")
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
 	t.Run("Pod runs new image after update", func(t *testing.T) {
@@ -184,7 +184,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 		tc.waitForStatefulSetReady(t, ns, name, 3)
 
 		// Wait for cluster to settle and reach OK.
-		tc.waitForValkeyPhase(t, ns, name, "OK")
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
 	t.Run("All pods run new image", func(t *testing.T) {
@@ -376,7 +376,7 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 		tc.updateValkeyImage(t, ns, name, updatedImage)
 		tc.waitForAllPodsImage(t, ns, name, 3, updatedImage)
 		tc.waitForStatefulSetReady(t, ns, name, 3)
-		tc.waitForValkeyPhase(t, ns, name, "OK")
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
 	// Verify no data loss.
@@ -436,7 +436,7 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 		tc.updateValkeyImage(t, ns, name, updatedImage)
 		tc.waitForAllPodsImage(t, ns, name, 3, updatedImage)
 		tc.waitForStatefulSetReady(t, ns, name, 3)
-		tc.waitForValkeyPhase(t, ns, name, "OK")
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
 	// "Second" update back to original (tests repeated rolling update).
@@ -444,7 +444,7 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 		tc.updateValkeyImage(t, ns, name, initialImage)
 		tc.waitForAllPodsImage(t, ns, name, 3, initialImage)
 		tc.waitForStatefulSetReady(t, ns, name, 3)
-		tc.waitForValkeyPhase(t, ns, name, "OK")
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
 	t.Run("Cluster healthy after two rolling updates", func(t *testing.T) {
