@@ -35,3 +35,4 @@ go.work.sum
 # Node.js dependencies (for semantic-release)
 node_modules/
 main
+tmp/
