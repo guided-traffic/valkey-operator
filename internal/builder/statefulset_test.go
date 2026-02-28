@@ -616,6 +616,17 @@ func TestBuildStatefulSet_SidecarContainer(t *testing.T) {
 	assert.Contains(t, sidecar.Args, "sidecar")
 	assert.Contains(t, sidecar.Args, "--poll-interval=1s")
 
+	// Drain-related args: headless service and replicas always present.
+	assert.Contains(t, sidecar.Args, "--headless-svc=test-headless.default.svc.cluster.local")
+	assert.Contains(t, sidecar.Args, "--replicas=1")
+
+	// Sentinel args should NOT be present for standalone.
+	for _, arg := range sidecar.Args {
+		assert.NotContains(t, arg, "--sentinel-enabled")
+		assert.NotContains(t, arg, "--sentinel-monitor")
+		assert.NotContains(t, arg, "--sentinel-addrs")
+	}
+
 	// Ports.
 	require.Len(t, sidecar.Ports, 1)
 	assert.Equal(t, int32(SidecarHealthPort), sidecar.Ports[0].ContainerPort)
@@ -721,4 +732,51 @@ func TestBuildStatefulSet_TerminationGracePeriod(t *testing.T) {
 
 	require.NotNil(t, sts.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	assert.Equal(t, int64(75), *sts.Spec.Template.Spec.TerminationGracePeriodSeconds)
+}
+
+func TestBuildStatefulSet_SidecarSentinelArgs(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	sidecar := sts.Spec.Template.Spec.Containers[1]
+
+	assert.Contains(t, sidecar.Args, "--sentinel-enabled=true")
+	assert.Contains(t, sidecar.Args, "--sentinel-monitor=test")
+	assert.Contains(t, sidecar.Args, "--replicas=3")
+	assert.Contains(t, sidecar.Args, "--headless-svc=test-headless.default.svc.cluster.local")
+
+	// Verify sentinel addresses are present.
+	hasSentinelAddrs := false
+	for _, arg := range sidecar.Args {
+		if len(arg) > 16 && arg[:16] == "--sentinel-addrs" {
+			hasSentinelAddrs = true
+			assert.Contains(t, arg, "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:26379")
+			assert.Contains(t, arg, "test-sentinel-1.test-sentinel-headless.default.svc.cluster.local:26379")
+			assert.Contains(t, arg, "test-sentinel-2.test-sentinel-headless.default.svc.cluster.local:26379")
+		}
+	}
+	assert.True(t, hasSentinelAddrs, "sidecar must have --sentinel-addrs arg")
+}
+
+func TestBuildSentinelAddrList(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	addrs := buildSentinelAddrList(v)
+
+	expected := "my-cluster-sentinel-0.my-cluster-sentinel-headless.default.svc.cluster.local:26379," +
+		"my-cluster-sentinel-1.my-cluster-sentinel-headless.default.svc.cluster.local:26379," +
+		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:26379"
+	assert.Equal(t, expected, addrs)
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -50,6 +51,14 @@ func parseFlags() sidecar.Config {
 	flag.StringVar(&cfg.TLSCert, "tls-cert", envString("TLS_CERT", ""), "Path to TLS client certificate")
 	flag.StringVar(&cfg.TLSKey, "tls-key", envString("TLS_KEY", ""), "Path to TLS client key")
 
+	// Drain/failover flags.
+	flag.BoolVar(&cfg.SentinelEnabled, "sentinel-enabled", envBool("SENTINEL_ENABLED"), "Whether Sentinel is used for failover")
+	flag.StringVar(&cfg.SentinelMonitor, "sentinel-monitor", envString("SENTINEL_MONITOR", ""), "Sentinel monitor name")
+	flag.StringVar(&cfg.SentinelAddrs, "sentinel-addrs", envString("SENTINEL_ADDRS", ""), "Comma-separated sentinel addresses")
+	flag.StringVar(&cfg.HeadlessSvc, "headless-svc", envString("HEADLESS_SVC", ""), "Headless service FQDN for DNS-based replica discovery")
+	flag.IntVar(&cfg.Replicas, "replicas", envInt("REPLICAS", 1), "Number of Valkey replicas in the StatefulSet")
+	flag.DurationVar(&cfg.FailoverTimeout, "failover-timeout", envDuration("SIDECAR_FAILOVER_TIMEOUT", 60*time.Second), "Max time to wait for failover completion")
+
 	flag.Parse()
 
 	// Read auth password from environment (same var as the main container).
@@ -70,6 +79,16 @@ func envString(key, def string) string {
 func envBool(key string) bool {
 	v := os.Getenv(key)
 	return v == "true" || v == "1" || v == "yes"
+}
+
+// envInt parses an integer from the environment variable or returns the default.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
 }
 
 // envDuration parses a duration from the environment variable or returns the default.

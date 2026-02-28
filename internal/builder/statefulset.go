@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -425,6 +426,19 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 		args = append(args, fmt.Sprintf("--valkey-addr=localhost:%d", ValkeyPort))
 	}
 
+	// Sentinel/failover settings for graceful drain.
+	if v.IsSentinelEnabled() {
+		args = append(args, "--sentinel-enabled=true")
+		args = append(args, fmt.Sprintf("--sentinel-monitor=%s", SentinelMonitorName(v)))
+		args = append(args, fmt.Sprintf("--sentinel-addrs=%s", buildSentinelAddrList(v)))
+	}
+
+	// Headless service and replica count for drain handler replica discovery.
+	headlessSvc := fmt.Sprintf("%s.%s.svc.cluster.local",
+		common.HeadlessServiceName(v, common.ComponentValkey), v.Namespace)
+	args = append(args, fmt.Sprintf("--headless-svc=%s", headlessSvc))
+	args = append(args, fmt.Sprintf("--replicas=%d", v.Spec.Replicas))
+
 	// Inject auth password if configured.
 	if v.IsAuthEnabled() {
 		env = append(env, corev1.EnvVar{
@@ -499,6 +513,25 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 			FailureThreshold:    5,
 		},
 	}
+}
+
+// buildSentinelAddrList constructs the comma-separated list of sentinel
+// pod addresses for the sidecar's drain handler.
+func buildSentinelAddrList(v *vkov1.Valkey) string {
+	headless := common.HeadlessServiceName(v, common.ComponentSentinel)
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sentinelReplicas := int32(3)
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
+		sentinelReplicas = v.Spec.Sentinel.Replicas
+	}
+
+	addrs := make([]string, 0, sentinelReplicas)
+	for i := int32(0); i < sentinelReplicas; i++ {
+		addr := fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:%d",
+			stsName, i, headless, v.Namespace, SentinelPort)
+		addrs = append(addrs, addr)
+	}
+	return strings.Join(addrs, ",")
 }
 
 // buildVolumeClaimTemplates creates PVC templates for persistent storage.
