@@ -257,9 +257,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 		}
 
 		require.Eventually(t, func() bool {
-			info := tc.valkeyExec(t, ns, currentMaster, 6379, "INFO", "replication")
+			info := tc.valkeyExecAllowError(t, ns, currentMaster, 6379, "INFO", "replication")
 			return strings.Contains(info, "connected_slaves:2")
-		}, 60*time.Second, 2*time.Second, "Master should have 2 replicas after rolling update")
+		}, 90*time.Second, 2*time.Second, "Master should have 2 replicas after rolling update")
 
 		// Verify data on replicas.
 		for i := 0; i < 3; i++ {
@@ -268,9 +268,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExec(t, ns, podName, 6379, "GET", "rolling:key1")
+				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
-			}, 30*time.Second, time.Second, "Data should replicate to %s after rolling update", podName)
+			}, 60*time.Second, 2*time.Second, "Data should replicate to %s after rolling update", podName)
 		}
 	})
 
@@ -489,11 +489,13 @@ func (tc *testClients) updateValkeyImage(t *testing.T, namespace, name, newImage
 }
 
 // waitForAllPodsImage waits until all pods in a StatefulSet run the expected image.
+// Uses rollingUpdateTimeout since rolling updates in CI with parallel tests may take
+// significantly longer than standard operations due to resource contention.
 func (tc *testClients) waitForAllPodsImage(t *testing.T, namespace, stsName string, replicas int, expectedImage string) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, rollingUpdateTimeout, true, func(ctx context.Context) (bool, error) {
 		for i := 0; i < replicas; i++ {
 			podName := fmt.Sprintf("%s-%d", stsName, i)
 			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})

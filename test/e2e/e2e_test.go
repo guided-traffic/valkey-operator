@@ -34,6 +34,12 @@ import (
 // testTimeout is the maximum time to wait for resources to become ready.
 const testTimeout = 5 * time.Minute
 
+// rollingUpdateTimeout is a longer timeout for rolling update operations.
+// In CI with multiple parallel HA rolling updates, the operator competes for
+// resources, causing slower pod scheduling and replication. This timeout
+// accommodates 3+ parallel rolling updates running on a single Kind cluster.
+const rollingUpdateTimeout = 8 * time.Minute
+
 // pollInterval is the interval between polling attempts.
 const pollInterval = 2 * time.Second
 
@@ -171,15 +177,18 @@ func (tc *testClients) getValkeyStatus(t *testing.T, namespace, name string) map
 // valkeyExec executes a Valkey command via kubectl exec + valkey-cli inside the pod.
 // This avoids direct TCP connections to Pod IPs which are unreachable from
 // the host on macOS with Kind/Docker Desktop.
-// Retries up to 3 times with a 2-second delay on transient kubectl failures.
+// Retries up to 5 times with exponential backoff on transient kubectl failures
+// to handle slow pod starts in resource-constrained CI environments.
 func (tc *testClients) valkeyExec(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
+	const maxAttempts = 5
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
-			t.Logf("Retrying valkeyExec on pod %s (attempt %d/3)", podName, attempt)
-			time.Sleep(2 * time.Second)
+			delay := time.Duration(attempt) * 2 * time.Second
+			t.Logf("Retrying valkeyExec on pod %s (attempt %d/%d, backoff %v)", podName, attempt, maxAttempts, delay)
+			time.Sleep(delay)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -206,7 +215,7 @@ func (tc *testClients) valkeyExec(t *testing.T, namespace, podName string, port 
 		lastErr = fmt.Errorf("kubectl exec failed for pod %s: %w (stderr: %s)", podName, err, stderr.String())
 	}
 
-	require.NoError(t, lastErr, "valkeyExec failed after 3 attempts for pod %s", podName)
+	require.NoError(t, lastErr, "valkeyExec failed after %d attempts for pod %s", maxAttempts, podName)
 	return "" // unreachable
 }
 

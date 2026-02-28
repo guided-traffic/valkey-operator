@@ -503,26 +503,51 @@ func (tc *testClients) waitForStatefulSetOrDeploymentReady(t *testing.T, namespa
 }
 
 // valkeyExecAllowError executes a command but does not fail on Valkey errors (e.g., READONLY).
+// Retries up to 3 times with backoff on transient kubectl exec failures (e.g., container not found).
 func (tc *testClients) valkeyExecAllowError(t *testing.T, namespace, podName string, port int, args ...string) string {
 	t.Helper()
 
-	cliArgs := []string{
-		"exec", podName,
-		"-n", namespace,
-		"--", "valkey-cli",
-		"--raw",
-		"-p", fmt.Sprintf("%d", port),
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cliArgs := []string{
+			"exec", podName,
+			"-n", namespace,
+			"--", "valkey-cli",
+			"--raw",
+			"-p", fmt.Sprintf("%d", port),
+		}
+		cliArgs = append(cliArgs, args...)
+
+		cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		cancel()
+
+		if err == nil {
+			return strings.TrimSpace(stdout.String())
+		}
+
+		// If stderr contains "container not found" or similar transient error, retry.
+		stderrStr := stderr.String()
+		if strings.Contains(stderrStr, "container not found") ||
+			strings.Contains(stderrStr, "unable to upgrade connection") ||
+			strings.Contains(stderrStr, "not found") {
+			continue
+		}
+
+		// For non-transient errors (e.g., Valkey READONLY), return the output as-is.
+		return strings.TrimSpace(stdout.String())
 	}
-	cliArgs = append(cliArgs, args...)
 
-	cmd := exec.CommandContext(t.Context(), "kubectl", cliArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	_ = cmd.Run()
-
-	return strings.TrimSpace(stdout.String())
+	return ""
 }
 
 // Helper functions for unstructured nested access.

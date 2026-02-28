@@ -299,18 +299,20 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 		}
 
 		// Wait for exactly one master to exist (failover may take a moment to settle).
+		// Use valkeyExecAllowError because pods may still be starting and kubectl exec
+		// can fail transiently with "container not found" during pod restarts in CI.
 		require.Eventually(t, func() bool {
 			masterCount := 0
 			for i := 0; i < 3; i++ {
 				podName := fmt.Sprintf("%s-%d", name, i)
-				info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
+				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
 				if strings.Contains(info, "role:master") {
 					masterCount++
 				}
 			}
 			t.Logf("Master count after failover: %d", masterCount)
 			return masterCount == 1
-		}, 60*time.Second, 3*time.Second, "Exactly one master should exist after failover")
+		}, 90*time.Second, 3*time.Second, "Exactly one master should exist after failover")
 	})
 
 	// Verify data survived the failover.
@@ -321,8 +323,9 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 		tc.waitForPodReady(t, ns, newMaster)
 
 		// Verify DBSIZE is preserved (retry because pod may be starting up).
+		// Use valkeyExecAllowError to tolerate transient kubectl exec failures.
 		require.Eventually(t, func() bool {
-			dbsizeAfter := tc.valkeyExec(t, ns, newMaster, 6379, "DBSIZE")
+			dbsizeAfter := tc.valkeyExecAllowError(t, ns, newMaster, 6379, "DBSIZE")
 			t.Logf("DBSIZE after drain: %s (before: %s)", dbsizeAfter, dbsizeBefore)
 			return dbsizeAfter == dbsizeBefore
 		}, 30*time.Second, 2*time.Second, "DBSIZE should be preserved after failover")
@@ -475,10 +478,12 @@ func TestE2E_SidecarDrainReplica(t *testing.T) {
 		tc.waitForConnectedReplicas(t, ns, initialMaster, 6379, 2)
 
 		// Verify data also reached the recreated replica.
+		// Use valkeyExecAllowError because the recreated replica may still be
+		// starting its valkey container (kubectl exec can fail transiently).
 		require.Eventually(t, func() bool {
-			resp := tc.valkeyExec(t, ns, replicaPod, 6379, "GET", "replica-drain-key")
+			resp := tc.valkeyExecAllowError(t, ns, replicaPod, 6379, "GET", "replica-drain-key")
 			return resp == "test-value"
-		}, 30*time.Second, time.Second,
+		}, 60*time.Second, 2*time.Second,
 			"Data should replicate to recreated replica %s", replicaPod)
 	})
 

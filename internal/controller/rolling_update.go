@@ -17,6 +17,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
 	"github.com/guided-traffic/valkey-operator/internal/health"
+	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 // Rolling update state machine annotations.
@@ -41,6 +42,12 @@ const (
 // stale and will be retried with a sentinel reset. This handles the case where
 // sentinel refuses a failover due to its internal cooldown (failover-timeout).
 const failoverRetryTimeout = 30 * time.Second
+
+// replicaReconnectTimeout is the duration after which the operator gives up
+// waiting for replicas to connect to the new master and resets sentinel state.
+// In resource-constrained environments (CI), replicas may take longer to reconnect
+// after failover. This timeout prevents the rolling update from stalling indefinitely.
+const replicaReconnectTimeout = 90 * time.Second
 
 // failoverResetMinWait is the minimum time to wait after a SENTINEL RESET
 // before retriggering failover. After a reset, sentinel needs time to
@@ -659,7 +666,6 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 // state and re-triggers the failover to handle sentinel cooldown issues
 // (e.g., during consecutive rolling updates).
 func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valkey, _ []podState, _ int) RollingUpdateResult {
-	logger := log.FromContext(ctx)
 	checker := health.NewChecker(r.Client)
 
 	// Re-collect pod states to get fresh role information.
@@ -685,56 +691,93 @@ func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valk
 			continue
 		}
 		if info.Role == common.RoleMaster {
-			// New master found. Check if it has connected replicas.
-			if info.ConnectedSlaves == 0 {
-				logger.Info("New master has no connected replicas yet, waiting for sync",
-					"newMaster", ps.name)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-
-			// New master is ready. Proceed to replace the old master.
-			logger.Info("New master is ready with connected replicas",
-				"newMaster", ps.name, "connectedSlaves", info.ConnectedSlaves)
-			return r.replaceRemainingPods(ctx, v, freshPods)
+			return r.handleNewMasterFound(ctx, v, ps, info, freshPods)
 		}
 	}
 
-	// No new master found yet. Check if we've exceeded the failover retry timeout.
-	if r.isFailoverTimedOut(v) {
-		logger.Info("Failover timed out, resetting sentinel state and scheduling retry")
+	// No new master found yet. Handle failover timeout or wait.
+	return r.handleNoMasterFound(ctx, v, freshPods)
+}
 
-		// Determine the correct master address from the pods we already know about.
-		// Since handlePostFailover didn't find a new-image master, use the old master
-		// (which has the old image and still reports as master to its local INFO).
-		masterAddr := ""
-		for _, ps := range freshPods {
-			if ps.isMaster {
-				headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
-				masterAddr = fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
-				break
-			}
-		}
+// handleNewMasterFound processes the case where a new-image master has been
+// detected after failover. It checks whether the master has connected replicas
+// and either proceeds with old-master replacement or waits/resets sentinel.
+func (r *ValkeyReconciler) handleNewMasterFound(ctx context.Context, v *vkov1.Valkey, ps podState, info *valkeyclient.ReplicationInfo, freshPods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
 
-		// Reset sentinel with the correct master address.
+	if info.ConnectedSlaves == 0 {
+		return r.handleMasterWithNoReplicas(ctx, v, ps)
+	}
+
+	// New master is ready. Proceed to replace the old master.
+	logger.Info("New master is ready with connected replicas",
+		"newMaster", ps.name, "connectedSlaves", info.ConnectedSlaves)
+	return r.replaceRemainingPods(ctx, v, freshPods)
+}
+
+// handleMasterWithNoReplicas handles the case where the new master exists but
+// has no connected replicas. In resource-constrained environments (CI), sentinel
+// may not have properly reconfigured replicas. If the reconnect timeout has
+// elapsed, sentinel state is reset to force replica reconnection.
+func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vkov1.Valkey, ps podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	if r.isReplicaReconnectTimedOut(v) {
+		logger.Info("Replicas failed to connect to new master within timeout, resetting sentinel",
+			"newMaster", ps.name)
+		headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+		masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
 		r.resetSentinelState(ctx, v, masterAddr)
-
-		// Update the failover timestamp for the retry.
+		// Update timestamp to restart the wait period.
 		if err := r.setFailoverTimestamp(ctx, v); err != nil {
 			return RollingUpdateResult{Error: err}
 		}
-
-		// Transition to failover-reset state. On the next reconcile (after delay),
-		// sentinel will have rediscovered the topology and we can retrigger failover.
-		if err := r.setRollingUpdateState(ctx, v, stateFailoverReset); err != nil {
-			return RollingUpdateResult{Error: err}
-		}
-
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 	}
 
-	// Failover still in progress, wait.
-	logger.Info("Waiting for failover to complete, no new master detected yet")
+	logger.Info("New master has no connected replicas yet, waiting for sync",
+		"newMaster", ps.name)
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// handleNoMasterFound handles the case where no new-image master was detected
+// after failover. If the failover timeout has elapsed, it resets sentinel state
+// and transitions to the failover-reset phase for a retry.
+func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Valkey, freshPods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	if !r.isFailoverTimedOut(v) {
+		logger.Info("Waiting for failover to complete, no new master detected yet")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	logger.Info("Failover timed out, resetting sentinel state and scheduling retry")
+
+	// Determine the correct master address from the pods we already know about.
+	masterAddr := ""
+	for _, ps := range freshPods {
+		if ps.isMaster {
+			headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+			masterAddr = fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
+			break
+		}
+	}
+
+	// Reset sentinel with the correct master address.
+	r.resetSentinelState(ctx, v, masterAddr)
+
+	// Update the failover timestamp for the retry.
+	if err := r.setFailoverTimestamp(ctx, v); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	// Transition to failover-reset state. On the next reconcile (after delay),
+	// sentinel will have rediscovered the topology and we can retrigger failover.
+	if err := r.setRollingUpdateState(ctx, v, stateFailoverReset); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 }
 
 // verifyNewMasterReady verifies that a new-image master exists and has
@@ -852,6 +895,26 @@ func (r *ValkeyReconciler) isFailoverTimedOut(v *vkov1.Valkey) bool {
 		return true // Corrupted timestamp — treat as timed out to recover.
 	}
 	return time.Since(ts) > failoverRetryTimeout
+}
+
+// isReplicaReconnectTimedOut checks whether the failover was triggered more
+// than replicaReconnectTimeout ago, indicating that replicas have failed to
+// connect to the new master and sentinel state needs to be reset. This prevents
+// the rolling update from stalling indefinitely in handlePostFailover when
+// ConnectedSlaves remains 0 (common in resource-constrained CI environments).
+func (r *ValkeyReconciler) isReplicaReconnectTimedOut(v *vkov1.Valkey) bool {
+	if v.Annotations == nil {
+		return false
+	}
+	tsStr, ok := v.Annotations[annotationFailoverTimestamp]
+	if !ok || tsStr == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true // Corrupted timestamp — treat as timed out to recover.
+	}
+	return time.Since(ts) > replicaReconnectTimeout
 }
 
 // hasMinWaitElapsed checks whether at least failoverResetMinWait has elapsed
