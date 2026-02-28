@@ -5,9 +5,11 @@ package valkeyclient
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -38,6 +40,66 @@ type SentinelMasterInfo struct {
 	NumSlaves int
 	Quorum    int
 	Flags     string
+}
+
+// ConnectionError is returned whenever a TCP connection to a Valkey or Sentinel
+// instance cannot be established. It always carries the target address and an
+// actionable hint so that administrators can quickly identify firewall rules or
+// NetworkPolicy misconfigurations that block access.
+type ConnectionError struct {
+	// Addr is the host:port that was dialled.
+	Addr string
+	// Cause is the underlying network error.
+	Cause error
+	// Hint is a short, human-readable explanation of the probable cause and
+	// how to resolve it (e.g. "check firewall rules").
+	Hint string
+}
+
+func (e *ConnectionError) Error() string {
+	return fmt.Sprintf("cannot connect to %s: %s", e.Addr, e.Hint)
+}
+
+// Unwrap preserves the full error chain so errors.Is / errors.As still work.
+func (e *ConnectionError) Unwrap() error {
+	return e.Cause
+}
+
+// connHint inspects a connection error and returns a human-readable description
+// of the probable cause together with a concrete remediation suggestion.
+func connHint(addr string, err error) string {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		return fmt.Sprintf("unexpected error — verify that %s is reachable and that firewall rules allow TCP access", addr)
+	}
+
+	if opErr.Timeout() {
+		return fmt.Sprintf(
+			"connection to %s timed out — a firewall rule or NetworkPolicy is likely blocking TCP access to this port",
+			addr,
+		)
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.ECONNREFUSED:
+			return fmt.Sprintf(
+				"connection to %s refused — the service is not running or is not accepting connections on this port",
+				addr,
+			)
+		case syscall.EHOSTUNREACH, syscall.ENETUNREACH:
+			return fmt.Sprintf(
+				"no route to %s — check routing tables, NetworkPolicy, or whether pod DNS resolves correctly",
+				addr,
+			)
+		}
+	}
+
+	return fmt.Sprintf(
+		"cannot reach %s — verify that the service is running and that firewall rules allow TCP access to this port",
+		addr,
+	)
 }
 
 // New creates a new Valkey client for the given address (host:port).
@@ -210,7 +272,7 @@ func (c *Client) exec(args ...string) (string, error) {
 		conn, err = net.DialTimeout("tcp", c.addr, c.timeout)
 	}
 	if err != nil {
-		return "", err
+		return "", &ConnectionError{Addr: c.addr, Cause: err, Hint: connHint(c.addr, err)}
 	}
 	defer func() { _ = conn.Close() }()
 
