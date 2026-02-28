@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -34,10 +35,12 @@ func networkPolicyPrefix(v *vkov1.Valkey) string {
 
 // BuildValkeyNetworkPolicy builds the NetworkPolicy that allows Valkey↔Valkey
 // and Sentinel→Valkey traffic within the cluster.
-// It restricts ingress to the Valkey port from other Valkey pods and Sentinel pods,
-// and unconditionally allows ingress on the sidecar health port from all sources
+// It restricts ingress to the Valkey port from other Valkey pods, Sentinel pods,
+// and (when operatorNamespace is non-empty) all pods in the operator namespace
+// so the operator can reach Valkey pods for health checks (e.g. INFO replication).
+// It unconditionally allows ingress on the sidecar health port from all sources
 // so that kubelet readiness/liveness probes always succeed.
-func BuildValkeyNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
+func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networkingv1.NetworkPolicy {
 	labels := common.BaseLabels(v, common.ComponentValkey)
 	valkeySelector := common.SelectorLabels(v, common.ComponentValkey)
 
@@ -58,6 +61,19 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
 			PodSelector: &metav1.LabelSelector{
 				MatchLabels: common.SelectorLabels(v, common.ComponentSentinel),
+			},
+		})
+	}
+
+	// Allow ingress from the operator namespace so the operator can reach Valkey
+	// pods for health checks (INFO replication). Uses the standard
+	// kubernetes.io/metadata.name namespace label (available since Kubernetes 1.21).
+	if operatorNamespace != "" {
+		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": operatorNamespace,
+				},
 			},
 		})
 	}
@@ -119,8 +135,10 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 
 // BuildSentinelNetworkPolicy builds the NetworkPolicy that allows Valkey→Sentinel
 // and Sentinel↔Sentinel traffic.
-// It restricts ingress to the Sentinel port from Valkey and Sentinel pods.
-func BuildSentinelNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
+// It restricts ingress to the Sentinel port from Valkey and Sentinel pods, and
+// (when operatorNamespace is non-empty) also from all pods in the operator namespace
+// so the operator can reach Sentinel pods for health checks.
+func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networkingv1.NetworkPolicy {
 	labels := common.BaseLabels(v, common.ComponentSentinel)
 	sentinelSelector := common.SelectorLabels(v, common.ComponentSentinel)
 
@@ -140,6 +158,18 @@ func BuildSentinelNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 				MatchLabels: common.SelectorLabels(v, common.ComponentValkey),
 			},
 		},
+	}
+
+	// Allow ingress from the operator namespace so the operator can reach Sentinel
+	// pods for health checks (SENTINEL MASTER).
+	if operatorNamespace != "" {
+		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": operatorNamespace,
+				},
+			},
+		})
 	}
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
@@ -185,39 +215,11 @@ func BuildSentinelNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
 }
 
 // NetworkPolicyHasChanged returns true if the desired NetworkPolicy differs from the current one.
+// Uses reflect.DeepEqual for ingress rule comparison to correctly handle all peer types
+// (PodSelector, NamespaceSelector, or combined peers).
 func NetworkPolicyHasChanged(desired, current *networkingv1.NetworkPolicy) bool {
 	if desired.Spec.PodSelector.String() != current.Spec.PodSelector.String() {
 		return true
 	}
-
-	if len(desired.Spec.Ingress) != len(current.Spec.Ingress) {
-		return true
-	}
-
-	for i := range desired.Spec.Ingress {
-		if len(desired.Spec.Ingress[i].Ports) != len(current.Spec.Ingress[i].Ports) {
-			return true
-		}
-		if len(desired.Spec.Ingress[i].From) != len(current.Spec.Ingress[i].From) {
-			return true
-		}
-
-		for j := range desired.Spec.Ingress[i].Ports {
-			dp := desired.Spec.Ingress[i].Ports[j]
-			cp := current.Spec.Ingress[i].Ports[j]
-			if dp.Port.String() != cp.Port.String() {
-				return true
-			}
-		}
-
-		for j := range desired.Spec.Ingress[i].From {
-			df := desired.Spec.Ingress[i].From[j]
-			cf := current.Spec.Ingress[i].From[j]
-			if df.PodSelector.String() != cf.PodSelector.String() {
-				return true
-			}
-		}
-	}
-
-	return false
+	return !reflect.DeepEqual(desired.Spec.Ingress, current.Spec.Ingress)
 }

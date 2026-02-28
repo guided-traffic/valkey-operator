@@ -2,6 +2,9 @@ package valkeyclient
 
 import (
 	"crypto/tls"
+	"fmt"
+	"net"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -135,3 +138,102 @@ func TestFormatRESP_SentinelResetCommand(t *testing.T) {
 	resp := formatRESP([]string{"SENTINEL", "RESET", "mymaster"})
 	assert.Equal(t, "*3\r\n$8\r\nSENTINEL\r\n$5\r\nRESET\r\n$8\r\nmymaster\r\n", resp)
 }
+
+// --- ConnectionError ---
+
+func TestConnectionError_ErrorMessage(t *testing.T) {
+	cause := fmt.Errorf("dial tcp 10.0.0.1:6379: i/o timeout")
+	e := &ConnectionError{
+		Addr:  "10.0.0.1:6379",
+		Cause: cause,
+		Hint:  "connection to 10.0.0.1:6379 timed out — a firewall rule or NetworkPolicy is likely blocking TCP access to this port",
+	}
+
+	msg := e.Error()
+	assert.Contains(t, msg, "10.0.0.1:6379")
+	assert.Contains(t, msg, "timed out")
+	assert.Contains(t, msg, "firewall")
+}
+
+func TestConnectionError_Unwrap_PreservesChain(t *testing.T) {
+	sentinel := fmt.Errorf("sentinel cause")
+	e := &ConnectionError{
+		Addr:  "10.0.0.1:6379",
+		Cause: sentinel,
+		Hint:  "some hint",
+	}
+
+	assert.ErrorIs(t, e, sentinel)
+}
+
+func TestConnectionError_ErrorContainsAddr(t *testing.T) {
+	e := &ConnectionError{
+		Addr:  "my-pod.headless.ns.svc.cluster.local:6379",
+		Cause: fmt.Errorf("some err"),
+		Hint:  "verify access",
+	}
+
+	assert.Contains(t, e.Error(), "my-pod.headless.ns.svc.cluster.local:6379")
+}
+
+// --- connHint ---
+
+func TestConnHint_Timeout(t *testing.T) {
+	err := &net.OpError{
+		Op:     "dial",
+		Net:    "tcp",
+		Source: nil,
+		Addr:   nil,
+		Err:    &timeoutError{},
+	}
+
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "timed out")
+	assert.Contains(t, hint, "firewall")
+}
+
+func TestConnHint_ConnectionRefused(t *testing.T) {
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: syscall.ECONNREFUSED,
+	}
+
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "refused")
+}
+
+func TestConnHint_HostUnreachable(t *testing.T) {
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: syscall.EHOSTUNREACH,
+	}
+
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "route")
+}
+
+func TestConnHint_UnknownOpError(t *testing.T) {
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: fmt.Errorf("some obscure error"),
+	}
+
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "10.0.0.1:6379")
+}
+
+func TestConnHint_NonOpError(t *testing.T) {
+	err := fmt.Errorf("generic error")
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "10.0.0.1:6379")
+}
+
+// timeoutError is a net.Error that reports Timeout() == true.
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }

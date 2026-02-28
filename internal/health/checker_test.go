@@ -209,12 +209,12 @@ func TestBuildTLSConfig_TLSEnabled_MissingCACert(t *testing.T) {
 
 func TestNewValkeyClient_PlainTCP(t *testing.T) {
 	checker := NewChecker(nil)
-	c := checker.newValkeyClient("localhost:6379", nil)
+	c := checker.newValkeyClient("localhost:6379", "", nil)
 	assert.NotNil(t, c)
 }
 
 func TestNewValkeyClient_WithTLS(t *testing.T) {
 	checker := NewChecker(nil)
-	c := checker.newValkeyClient("localhost:16379", &tls.Config{MinVersion: tls.VersionTLS12})
+	c := checker.newValkeyClient("localhost:16379", "", &tls.Config{MinVersion: tls.VersionTLS12})
 	assert.NotNil(t, c)
 }

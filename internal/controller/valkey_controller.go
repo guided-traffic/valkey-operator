@@ -49,9 +49,10 @@ type InstanceChecker interface {
 // ValkeyReconciler reconciles a Valkey object.
 type ValkeyReconciler struct {
 	client.Client
-	Scheme          *runtime.Scheme
-	InstanceChecker InstanceChecker
-	OperatorImage   string
+	Scheme            *runtime.Scheme
+	InstanceChecker   InstanceChecker
+	OperatorImage     string
+	OperatorNamespace string
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -96,11 +97,34 @@ func (r *ValkeyReconciler) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, 
 }
 
 // newValkeyClient creates a Valkey RESP client, using TLS if tlsConfig is non-nil.
-func (r *ValkeyReconciler) newValkeyClient(addr string, tlsConfig *tls.Config) *valkeyclient.Client {
+func (r *ValkeyReconciler) newValkeyClient(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if tlsConfig != nil && password != "" {
+		return valkeyclient.NewTLSWithPassword(addr, tlsConfig, password)
+	}
 	if tlsConfig != nil {
 		return valkeyclient.NewTLS(addr, tlsConfig)
 	}
+	if password != "" {
+		return valkeyclient.NewWithPassword(addr, password)
+	}
 	return valkeyclient.New(addr)
+}
+
+// readValkeyPassword reads the Valkey auth password from the configured Secret.
+// Returns empty string if authentication is not configured or if the secret
+// cannot be read (connections are then attempted without auth).
+func (r *ValkeyReconciler) readValkeyPassword(ctx context.Context, v *vkov1.Valkey) string {
+	if !v.IsAuthEnabled() {
+		return ""
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      v.Spec.Auth.SecretName,
+		Namespace: v.Namespace,
+	}, secret); err != nil {
+		return ""
+	}
+	return string(secret.Data[v.Spec.Auth.SecretPasswordKey])
 }
 
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
@@ -670,14 +694,14 @@ func cleanseCertificateSpec(spec map[string]interface{}) {
 // reconcileNetworkPolicies reconciles all NetworkPolicy resources.
 func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov1.Valkey) error {
 	// Valkey NetworkPolicy.
-	desiredValkey := builder.BuildValkeyNetworkPolicy(v)
+	desiredValkey := builder.BuildValkeyNetworkPolicy(v, r.OperatorNamespace)
 	if err := r.reconcileNetworkPolicy(ctx, v, desiredValkey); err != nil {
 		return fmt.Errorf("valkey networkpolicy: %w", err)
 	}
 
 	// Sentinel NetworkPolicy (only if Sentinel is enabled).
 	if v.IsSentinelEnabled() {
-		desiredSentinel := builder.BuildSentinelNetworkPolicy(v)
+		desiredSentinel := builder.BuildSentinelNetworkPolicy(v, r.OperatorNamespace)
 		if err := r.reconcileNetworkPolicy(ctx, v, desiredSentinel); err != nil {
 			return fmt.Errorf("sentinel networkpolicy: %w", err)
 		}
