@@ -366,6 +366,119 @@ func TestReconcile_RBAC_Idempotent(t *testing.T) {
 	reconcileOnce(t, r, "test", "default")
 }
 
+func TestReconcile_UpdatesServiceAccount_OnLabelDrift(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates the ServiceAccount.
+	reconcileOnce(t, r, "test", "default")
+
+	// Manually corrupt the labels to simulate drift.
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, sa))
+	sa.Labels = map[string]string{"stale": "label"}
+	require.NoError(t, c.Update(context.Background(), sa))
+
+	// Second reconcile must restore the labels.
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, updated))
+	assert.Equal(t, "vko.gtrfc.com", updated.Labels["app.kubernetes.io/managed-by"])
+	assert.Equal(t, "test", updated.Labels["app.kubernetes.io/instance"])
+	_, hasStale := updated.Labels["stale"]
+	assert.False(t, hasStale, "stale label should be removed after reconcile")
+}
+
+func TestReconcile_UpdatesRoleBinding_OnSubjectsDrift(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates the RoleBinding.
+	reconcileOnce(t, r, "test", "default")
+
+	// Manually corrupt the subjects to simulate drift.
+	rb := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, rb))
+	rb.Subjects = []rbacv1.Subject{{Kind: "ServiceAccount", Name: "wrong-name", Namespace: "default"}}
+	require.NoError(t, c.Update(context.Background(), rb))
+
+	// Second reconcile must restore the subjects.
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, updated))
+	require.Len(t, updated.Subjects, 1)
+	assert.Equal(t, "test-sidecar", updated.Subjects[0].Name)
+}
+
+func TestReconcile_UpdatesRoleBinding_OnLabelDrift(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates the RoleBinding.
+	reconcileOnce(t, r, "test", "default")
+
+	// Manually corrupt the labels to simulate drift.
+	rb := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, rb))
+	rb.Labels = map[string]string{"stale": "label"}
+	require.NoError(t, c.Update(context.Background(), rb))
+
+	// Second reconcile must restore the labels.
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, updated))
+	assert.Equal(t, "vko.gtrfc.com", updated.Labels["app.kubernetes.io/managed-by"])
+	_, hasStale := updated.Labels["stale"]
+	assert.False(t, hasStale, "stale label should be removed after reconcile")
+}
+
+func TestReconcile_RecreatesRoleBinding_OnRoleRefChange(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates the RoleBinding.
+	reconcileOnce(t, r, "test", "default")
+
+	// Manually corrupt the RoleRef to simulate an operator upgrade that changed it.
+	// RoleRef is immutable, so we delete and recreate with the wrong value using the fake client
+	// by directly applying an object with wrong RoleRef (fake client allows this).
+	rb := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, rb))
+	rb.RoleRef = rbacv1.RoleRef{
+		APIGroup: "rbac.authorization.k8s.io",
+		Kind:     "ClusterRole",
+		Name:     "wrong-role",
+	}
+	require.NoError(t, c.Update(context.Background(), rb))
+
+	// Second reconcile must delete the old RoleBinding and recreate it with the correct RoleRef.
+	reconcileOnce(t, r, "test", "default")
+
+	recreated := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, recreated))
+	assert.Equal(t, "Role", recreated.RoleRef.Kind)
+	assert.Equal(t, "test-sidecar", recreated.RoleRef.Name)
+}
+
 // --- Legacy Service Cleanup ---
 
 func TestReconcile_DeletesLegacyClientService(t *testing.T) {

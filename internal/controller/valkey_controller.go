@@ -425,62 +425,118 @@ func (r *ValkeyReconciler) deleteLegacyServices(ctx context.Context, v *vkov1.Va
 
 // reconcileSidecarRBAC ensures the sidecar ServiceAccount, Role, and RoleBinding exist.
 func (r *ValkeyReconciler) reconcileSidecarRBAC(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
+	if err := r.reconcileSidecarServiceAccount(ctx, v); err != nil {
+		return err
+	}
+	if err := r.reconcileSidecarRole(ctx, v); err != nil {
+		return err
+	}
+	return r.reconcileSidecarRoleBinding(ctx, v)
+}
 
-	// ServiceAccount.
-	desiredSA := builder.BuildSidecarServiceAccount(v)
-	if err := controllerutil.SetControllerReference(v, desiredSA, r.Scheme); err != nil {
+// reconcileSidecarServiceAccount creates or updates the sidecar ServiceAccount.
+func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarServiceAccount(v)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
 	}
-	currentSA := &corev1.ServiceAccount{}
-	err := r.Get(ctx, types.NamespacedName{Name: desiredSA.Name, Namespace: desiredSA.Namespace}, currentSA)
+	current := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar ServiceAccount", "name", desiredSA.Name)
-		if err := r.Create(ctx, desiredSA); err != nil {
+		logger.Info("Creating sidecar ServiceAccount", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar ServiceAccount: %w", err)
 		}
-	} else if err != nil {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
+	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
+		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
+		return nil
+	}
+	logger.Info("Updating sidecar ServiceAccount", "name", desired.Name)
+	current.Labels = desired.Labels
+	current.Annotations = desired.Annotations
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar ServiceAccount: %w", err)
+	}
+	return nil
+}
 
-	// Role.
-	desiredRole := builder.BuildSidecarRole(v)
-	if err := controllerutil.SetControllerReference(v, desiredRole, r.Scheme); err != nil {
+// reconcileSidecarRole creates or updates the sidecar Role.
+func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarRole(v)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar Role: %w", err)
 	}
-	currentRole := &rbacv1.Role{}
-	err = r.Get(ctx, types.NamespacedName{Name: desiredRole.Name, Namespace: desiredRole.Namespace}, currentRole)
+	current := &rbacv1.Role{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar Role", "name", desiredRole.Name)
-		if err := r.Create(ctx, desiredRole); err != nil {
+		logger.Info("Creating sidecar Role", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar Role: %w", err)
 		}
-	} else if err != nil {
-		return err
-	} else if !equality.Semantic.DeepEqual(currentRole.Rules, desiredRole.Rules) {
-		logger.Info("Updating sidecar Role", "name", desiredRole.Name)
-		currentRole.Rules = desiredRole.Rules
-		if err := r.Update(ctx, currentRole); err != nil {
-			return fmt.Errorf("updating sidecar Role: %w", err)
-		}
+		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(current.Rules, desired.Rules) {
+		return nil
+	}
+	logger.Info("Updating sidecar Role", "name", desired.Name)
+	current.Rules = desired.Rules
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar Role: %w", err)
+	}
+	return nil
+}
 
-	// RoleBinding.
-	desiredRB := builder.BuildSidecarRoleBinding(v)
-	if err := controllerutil.SetControllerReference(v, desiredRB, r.Scheme); err != nil {
+// reconcileSidecarRoleBinding creates or updates the sidecar RoleBinding.
+// If the RoleRef changed (immutable field), the RoleBinding is deleted and recreated.
+func (r *ValkeyReconciler) reconcileSidecarRoleBinding(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarRoleBinding(v)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar RoleBinding: %w", err)
 	}
-	currentRB := &rbacv1.RoleBinding{}
-	err = r.Get(ctx, types.NamespacedName{Name: desiredRB.Name, Namespace: desiredRB.Namespace}, currentRB)
+	current := &rbacv1.RoleBinding{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar RoleBinding", "name", desiredRB.Name)
-		if err := r.Create(ctx, desiredRB); err != nil {
+		logger.Info("Creating sidecar RoleBinding", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar RoleBinding: %w", err)
 		}
-	} else if err != nil {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-
+	if !equality.Semantic.DeepEqual(current.RoleRef, desired.RoleRef) {
+		// RoleRef is immutable — delete and recreate.
+		logger.Info("Recreating sidecar RoleBinding (RoleRef changed)", "name", desired.Name)
+		if err := r.Delete(ctx, current); err != nil {
+			return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+		}
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("recreating sidecar RoleBinding: %w", err)
+		}
+		return nil
+	}
+	if equality.Semantic.DeepEqual(current.Subjects, desired.Subjects) &&
+		equality.Semantic.DeepEqual(current.Labels, desired.Labels) {
+		return nil
+	}
+	logger.Info("Updating sidecar RoleBinding", "name", desired.Name)
+	current.Subjects = desired.Subjects
+	current.Labels = desired.Labels
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar RoleBinding: %w", err)
+	}
 	return nil
 }
 
