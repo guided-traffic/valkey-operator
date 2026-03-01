@@ -2,8 +2,30 @@ apiVersion: v1
 entries:
   valkey-operator:
   - apiVersion: v2
+    appVersion: 1.1.7
+    created: "2026-03-01T08:14:28.058350818Z"
+    description: A Kubernetes operator for managing Valkey and Sentinel instances
+    digest: f00b2a64054b046671f52c555bf7ed2e270ffb52c49b879e0e9a2eb21c04d57c
+    home: https://github.com/guided-traffic/valkey-operator
+    keywords:
+    - valkey
+    - redis
+    - sentinel
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Guided Traffic
+      url: https://github.com/guided-traffic
+    name: valkey-operator
+    sources:
+    - https://github.com/guided-traffic/valkey-operator
+    type: application
+    urls:
+    - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.1.7.tgz
+    version: 1.1.7
+  - apiVersion: v2
     appVersion: 1.1.6
-    created: "2026-03-01T06:55:14.692092265Z"
+    created: "2026-03-01T08:14:28.05773643Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: e1e126faaa1c6ada058805c71a49d0a7a41b9d45f1d2534ec487e0d4c04bec24
     home: https://github.com/guided-traffic/valkey-operator
@@ -25,7 +47,7 @@ entries:
     version: 1.1.6
   - apiVersion: v2
     appVersion: 1.1.5
-    created: "2026-03-01T06:55:14.69164424Z"
+    created: "2026-03-01T08:14:28.056846913Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 386c0c9768b936598994f490d82131f67de3e5288502bc3e25289bd8bfe12498
     home: https://github.com/guided-traffic/valkey-operator
@@ -47,7 +69,7 @@ entries:
     version: 1.1.5
   - apiVersion: v2
     appVersion: 1.1.4
-    created: "2026-03-01T06:55:14.691156018Z"
+    created: "2026-03-01T08:14:28.05637269Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: a27dbf036890c7f28198789cab11e00dbd6426bf382c27a0ae9cd121f71273d6
     home: https://github.com/guided-traffic/valkey-operator
@@ -69,7 +91,7 @@ entries:
     version: 1.1.4
   - apiVersion: v2
     appVersion: 1.1.2
-    created: "2026-03-01T06:55:14.690136005Z"
+    created: "2026-03-01T08:14:28.055919355Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 7e856908b70c891b151118ea28be1d2fd9be1773cf6f9e987e8274eb2212a3b0
     home: https://github.com/guided-traffic/valkey-operator
@@ -91,7 +113,7 @@ entries:
     version: 1.1.2
   - apiVersion: v2
     appVersion: 1.1.1
-    created: "2026-03-01T06:55:14.689102264Z"
+    created: "2026-03-01T08:14:28.055487982Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 867fc0cab378eaf47446c074254fb7ebd2a20b719f196307cc32943d4cde9dcb
     home: https://github.com/guided-traffic/valkey-operator
@@ -113,7 +135,7 @@ entries:
     version: 1.1.1
   - apiVersion: v2
     appVersion: 1.1.0
-    created: "2026-03-01T06:55:14.688502443Z"
+    created: "2026-03-01T08:14:28.054912408Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 79e436e15cde0ae0f94590bf52c8abd4090440cdeed3e0eccb89e98a5557fc8f
     home: https://github.com/guided-traffic/valkey-operator
@@ -135,7 +157,7 @@ entries:
     version: 1.1.0
   - apiVersion: v2
     appVersion: 1.0.1
-    created: "2026-03-01T06:55:14.68770567Z"
+    created: "2026-03-01T08:14:28.054250781Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: b7e7f773dd188ff3036be95f77fbd8be5f66bbc229c37f4b95a85aeca9dbaf79
     home: https://github.com/guided-traffic/valkey-operator
@@ -157,7 +179,7 @@ entries:
     version: 1.0.1
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-03-01T06:55:14.687062636Z"
+    created: "2026-03-01T08:14:28.052969827Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 21945c698c83ffe2dea02424a63a0d94ca2a39e8f957d61f4823e49dc6bd9f63
     home: https://github.com/guided-traffic/valkey-operator
@@ -177,4 +199,4 @@ entries:
     urls:
     - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.0.0.tgz
     version: 1.0.0
-generated: "2026-03-01T06:55:14.686188949Z"
+generated: "2026-03-01T08:14:28.052323218Z"
