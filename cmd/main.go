@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/cmd/migrate"
 	"github.com/guided-traffic/valkey-operator/cmd/sidecar"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
@@ -38,6 +39,13 @@ func main() {
 		// Remove "sidecar" from os.Args so the sidecar's flag.Parse sees its own flags.
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		sidecar.Run()
+		return
+	}
+
+	// Dispatch to migrate mode if first argument is "migrate".
+	// Used by the Helm pre-upgrade hook Job to apply field defaults to existing Valkey CRs.
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		migrate.Run()
 		return
 	}
 
