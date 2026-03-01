@@ -35,10 +35,10 @@ import (
 const testTimeout = 5 * time.Minute
 
 // rollingUpdateTimeout is a longer timeout for rolling update operations.
-// In CI with multiple parallel HA rolling updates, the operator competes for
-// resources, causing slower pod scheduling and replication. This timeout
-// accommodates 3+ parallel rolling updates running on a single Kind cluster.
-const rollingUpdateTimeout = 8 * time.Minute
+// Each HA rolling update involves 3 pod replacements + sentinel failover + sentinel
+// sync, which can take several minutes on a loaded single-node Kind cluster.
+// 10 minutes gives enough headroom even when the cluster is moderately loaded.
+const rollingUpdateTimeout = 10 * time.Minute
 
 // pollInterval is the interval between polling attempts.
 const pollInterval = 2 * time.Second
