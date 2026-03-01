@@ -76,9 +76,22 @@ func TestE2E_Upgrade_OperatorVersionAnnotation(t *testing.T) {
 	})
 
 	t.Run("status.operatorVersion is set", func(t *testing.T) {
-		status := tc.getValkeyStatus(t, ns, name)
-		operatorVersion, _, _ := unstructuredNestedString(status, "operatorVersion")
-		assert.NotEmpty(t, operatorVersion, "status.operatorVersion should be set after deployment")
+		// Use Eventually instead of an instant assertion: the operator writes
+		// phase and operatorVersion in the same status update, but under load
+		// a concurrent reconcile can briefly overwrite the status with a phase
+		// update that happens to read the object before the OperatorVersion write
+		// was flushed. Polling here makes the test robust against this race.
+		ctx := context.Background()
+		var operatorVersion string
+		require.Eventually(t, func() bool {
+			v, err := tc.dynamic.Resource(valkeyGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			ov, _, _ := unstructuredNestedString(v.Object, "status", "operatorVersion")
+			operatorVersion = ov
+			return ov != ""
+		}, testTimeout, pollInterval, "status.operatorVersion should be set after deployment")
 		t.Logf("status.operatorVersion=%s", operatorVersion)
 	})
 
