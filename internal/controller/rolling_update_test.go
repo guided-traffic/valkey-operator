@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
@@ -64,27 +65,100 @@ func TestPodNeedsUpdate_NoUpdate(t *testing.T) {
 	pod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
-				{Image: "valkey/valkey:9.0"},
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", ""))
 }
 
 func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
 	pod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
-				{Image: "valkey/valkey:8.0"},
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:8.0"},
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0"))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", ""))
 }
 
 func TestPodNeedsUpdate_EmptyContainers(t *testing.T) {
 	pod := &corev1.Pod{}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", ""))
+}
+
+func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
+	const newSidecar = "ghcr.io/guided-traffic/valkey-operator:v2.0"
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+				{Name: builder.SidecarContainerName, Image: "ghcr.io/guided-traffic/valkey-operator:v1.0"},
+			},
+		},
+	}
+	// Valkey image matches, but sidecar image changed → needs update.
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar))
+}
+
+func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
+	const sidecar = "ghcr.io/guided-traffic/valkey-operator:v2.0"
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+				{Name: builder.SidecarContainerName, Image: sidecar},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar))
+}
+
+func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+				{Name: builder.SidecarContainerName, Image: "ghcr.io/guided-traffic/valkey-operator:v1.0"},
+			},
+		},
+	}
+	// Empty desiredSidecarImage → sidecar check skipped.
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", ""))
+}
+
+// --- sidecarImageFromSts ---
+
+func TestSidecarImageFromSts_Found(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+						{Name: builder.SidecarContainerName, Image: "ghcr.io/guided-traffic/valkey-operator:v2.0"},
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "ghcr.io/guided-traffic/valkey-operator:v2.0", sidecarImageFromSts(sts))
+}
+
+func TestSidecarImageFromSts_NotFound(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "", sidecarImageFromSts(sts))
 }
 
 func TestIsPodReady_Ready(t *testing.T) {

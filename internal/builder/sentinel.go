@@ -431,6 +431,8 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 }
 
 // SentinelStatefulSetHasChanged returns true if the live Sentinel StatefulSet differs from desired.
+// It checks replicas and the full pod template spec (containers, init containers, volumes,
+// ServiceAccountName, TerminationGracePeriodSeconds, labels, and annotations).
 func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 	// Check replicas.
 	if desired.Spec.Replicas != nil && current.Spec.Replicas != nil {
@@ -438,37 +440,5 @@ func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 			return true
 		}
 	}
-
-	// Check container image.
-	if len(desired.Spec.Template.Spec.Containers) > 0 && len(current.Spec.Template.Spec.Containers) > 0 {
-		if desired.Spec.Template.Spec.Containers[0].Image != current.Spec.Template.Spec.Containers[0].Image {
-			return true
-		}
-	}
-
-	// Check labels on pod template.
-	desiredLabels := desired.Spec.Template.Labels
-	currentLabels := current.Spec.Template.Labels
-	if len(desiredLabels) != len(currentLabels) {
-		return true
-	}
-	for k, v := range desiredLabels {
-		if currentLabels[k] != v {
-			return true
-		}
-	}
-
-	// Check annotations on pod template.
-	desiredAnnotations := desired.Spec.Template.Annotations
-	currentAnnotations := current.Spec.Template.Annotations
-	if len(desiredAnnotations) != len(currentAnnotations) {
-		return true
-	}
-	for k, v := range desiredAnnotations {
-		if currentAnnotations[k] != v {
-			return true
-		}
-	}
-
-	return false
+	return podTemplateChanged(desired.Spec.Template, current.Spec.Template)
 }

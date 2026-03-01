@@ -112,6 +112,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 
 	// Check if any pods are running a different image than desired.
 	desiredImage := v.Spec.Image
+	sidecarImg := sidecarImageFromSts(currentSts)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -124,7 +125,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
 			needsRollingUpdate = true
 			break
 		}
@@ -161,12 +162,37 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 	return current.Spec.Template.Spec.Containers[0].Image != desired
 }
 
-// podNeedsUpdate returns true if the pod's container image does not match the desired image.
-func podNeedsUpdate(pod *corev1.Pod, desiredImage string) bool {
+// podNeedsUpdate returns true if the pod needs to be replaced because its
+// valkey or sidecar container image differs from the desired image.
+// Pass an empty desiredSidecarImage to skip the sidecar check.
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
-	return pod.Spec.Containers[0].Image != desiredImage
+	for _, c := range pod.Spec.Containers {
+		switch c.Name {
+		case builder.ValkeyContainerName:
+			if desiredValkeyImage != "" && c.Image != desiredValkeyImage {
+				return true
+			}
+		case builder.SidecarContainerName:
+			if desiredSidecarImage != "" && c.Image != desiredSidecarImage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sidecarImageFromSts returns the sidecar container image from a StatefulSet's
+// pod template, or empty string when no sidecar container is present.
+func sidecarImageFromSts(sts *appsv1.StatefulSet) string {
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name == builder.SidecarContainerName {
+			return c.Image
+		}
+	}
+	return ""
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -504,7 +530,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage)
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts))
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -1323,6 +1349,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
+	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -1338,7 +1365,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
 			if !isPodReady(pod) {
 				logger.Info("Pod not ready, waiting", "pod", podName)
 				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}

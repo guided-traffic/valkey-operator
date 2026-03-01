@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
@@ -426,6 +427,92 @@ func TestSentinelStatefulSetHasChanged_LabelChange(t *testing.T) {
 	current.Spec.Template.Labels["extra"] = "label"
 
 	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_AnnotationChange(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:        true,
+			Replicas:       3,
+			PodAnnotations: map[string]string{"existing": "value"},
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+	current.Spec.Template.Annotations["extra"] = "annotation"
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_VolumeAdded(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Simulate a new volume added by a newer operator version.
+	desired.Spec.Template.Spec.Volumes = append(desired.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: "new-volume",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_VolumeConfigMapChanged(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	for i, vol := range current.Spec.Template.Spec.Volumes {
+		if vol.VolumeSource.ConfigMap != nil {
+			current.Spec.Template.Spec.Volumes[i].VolumeSource.ConfigMap.Name = "old-sentinel-config"
+			break
+		}
+	}
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_ContainerCommandChanged(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	current.Spec.Template.Spec.Containers[0].Command = []string{"old-entrypoint"}
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_NoChange_FullSpec(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:        true,
+			Replicas:       3,
+			PodLabels:      map[string]string{"app": "sentinel"},
+			PodAnnotations: map[string]string{"example.com/role": "sentinel"},
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
 }
 
 // --- MasterAddress ---
