@@ -1345,12 +1345,19 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 }
 
 // handleStandaloneRollingUpdate handles rolling update for standalone (non-HA) mode.
-// For standalone, we simply delete the pod and let StatefulSet recreate it with the new template.
+//
+// When the valkey image changes, the pod is deleted so the StatefulSet recreates it
+// with the new template. When only the sidecar image changed (operator upgrade),
+// the pod is NOT automatically restarted to avoid disrupting single-instance clusters
+// without redundancy. Instead, a SidecarUpdatePending condition is set and the
+// update is deferred to the next natural pod restart (manual delete, eviction, or
+// valkey image change).
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	sidecarPending := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -1366,6 +1373,15 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		}
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
+			// For sidecar-only changes in standalone mode, defer the update to the
+			// next natural pod restart rather than auto-deleting the pod.
+			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
+				logger.Info("Standalone pod has outdated sidecar; update deferred to next pod restart",
+					"pod", podName)
+				sidecarPending = true
+				continue
+			}
+
 			if !isPodReady(pod) {
 				logger.Info("Pod not ready, waiting", "pod", podName)
 				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -1387,8 +1403,132 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		}
 	}
 
+	// Reflect sidecar-pending state in the CR status conditions.
+	r.setSidecarUpdatePendingCondition(ctx, v, sidecarPending)
+
+	if sidecarPending {
+		// The sidecar update is deferred — no active rolling update in progress.
+		// Return empty result so the reconciler does not requeue but the condition
+		// remains set until the next natural pod restart clears it.
+		return RollingUpdateResult{}
+	}
+
 	// All pods updated and ready.
 	return RollingUpdateResult{Completed: true}
+}
+
+// isSidecarOnlyChange returns true when the pod needs replacing exclusively
+// because the sidecar image has drifted while the main valkey image is current.
+// Returns false when the valkey image also changed, when no sidecar is present,
+// or when desiredSidecarImage is empty (sidecar-less deployment).
+func isSidecarOnlyChange(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
+	if len(pod.Spec.Containers) == 0 || desiredSidecarImage == "" {
+		return false
+	}
+	valkeyUpToDate := true
+	sidecarOutdated := false
+	sidecarFound := false
+	for _, c := range pod.Spec.Containers {
+		switch c.Name {
+		case builder.ValkeyContainerName:
+			if desiredValkeyImage != "" && c.Image != desiredValkeyImage {
+				valkeyUpToDate = false
+			}
+		case builder.SidecarContainerName:
+			sidecarFound = true
+			if c.Image != desiredSidecarImage {
+				sidecarOutdated = true
+			}
+		}
+	}
+	return valkeyUpToDate && sidecarFound && sidecarOutdated
+}
+
+// sentinelPodNeedsUpdate returns true when the running pod's container images
+// differ from what the sentinel StatefulSet template specifies.
+func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	desired := make(map[string]string, len(desiredTemplate.Spec.Containers))
+	for _, c := range desiredTemplate.Spec.Containers {
+		desired[c.Name] = c.Image
+	}
+	for _, c := range pod.Spec.Containers {
+		if want, ok := desired[c.Name]; ok && c.Image != want {
+			return true
+		}
+	}
+	return false
+}
+
+// checkAndHandleSentinelRollingUpdate detects sentinel pods running outdated container
+// images and replaces them one at a time while verifying sentinel quorum is maintained.
+//
+// Because the sentinel StatefulSet uses OnDelete, Kubernetes will not automatically
+// restart pods after a spec update. The operator must coordinate pod deletion here.
+//
+// Strategy:
+//  1. Identify sentinel pods whose container images differ from the current template.
+//  2. Before deleting any pod, check that the remaining ready sentinels (after
+//     deletion) will still meet quorum (readyCount - 1 >= quorum).
+//  3. Delete the first outdated pod and requeue so the next reconcile
+//     waits for the replacement to become ready before moving on.
+func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	sentinelSts := &appsv1.StatefulSet{}
+	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
+	if err := r.Get(ctx, types.NamespacedName{Name: sentinelStsName, Namespace: v.Namespace}, sentinelSts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return RollingUpdateResult{}
+		}
+		return RollingUpdateResult{Error: fmt.Errorf("getting sentinel StatefulSet: %w", err)}
+	}
+
+	totalSentinels := int(*sentinelSts.Spec.Replicas)
+	quorum := totalSentinels/2 + 1
+	desiredTemplate := sentinelSts.Spec.Template
+
+	readyCount := 0
+	var firstOutdatedPod *corev1.Pod
+
+	for i := 0; i < totalSentinels; i++ {
+		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Pod does not exist yet (initial deployment) or is being recreated
+				// after a recent deletion. In both cases, skip it — it neither counts
+				// toward readyCount nor can be an outdated pod to delete.
+				// The quorum guard below will naturally prevent triggering another
+				// deletion while a pod is missing (reducing effectiveReadyCount).
+				continue
+			}
+			return RollingUpdateResult{Error: fmt.Errorf("getting sentinel pod %s: %w", podName, err)}
+		}
+		if isPodReady(pod) {
+			readyCount++
+		}
+		if firstOutdatedPod == nil && sentinelPodNeedsUpdate(pod, desiredTemplate) {
+			firstOutdatedPod = pod
+		}
+	}
+
+	if firstOutdatedPod == nil {
+		// All sentinel pods are running the desired image.
+		return RollingUpdateResult{}
+	}
+
+	// Guard quorum: after deleting one pod we need at least `quorum` sentinels left.
+	if readyCount-1 < quorum {
+		logger.Info("Waiting for sentinel quorum before updating sentinel pod",
+			"pod", firstOutdatedPod.Name, "readyCount", readyCount, "quorum", quorum)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	logger.Info("Deleting sentinel pod for rolling update", "pod", firstOutdatedPod.Name)
+	if err := r.Delete(ctx, firstOutdatedPod); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", firstOutdatedPod.Name, err)}
+	}
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
 
 // ValkeyPhase is a type alias to allow constructing rolling update phase strings.

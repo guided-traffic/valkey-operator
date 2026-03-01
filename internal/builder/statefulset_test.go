@@ -684,8 +684,8 @@ func TestStatefulSetHasChanged_VolumeConfigMapChanged(t *testing.T) {
 
 	// Simulate the ConfigMap backing a volume being renamed between operator versions.
 	for i, vol := range current.Spec.Template.Spec.Volumes {
-		if vol.VolumeSource.ConfigMap != nil {
-			current.Spec.Template.Spec.Volumes[i].VolumeSource.ConfigMap.Name = "old-configmap-name"
+		if vol.ConfigMap != nil {
+			current.Spec.Template.Spec.Volumes[i].ConfigMap.Name = "old-configmap-name"
 			break
 		}
 	}

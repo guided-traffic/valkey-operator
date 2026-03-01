@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
@@ -349,7 +350,7 @@ func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
 	assert.Nil(t, sts.Spec.Template.Annotations)
 }
 
-func TestBuildSentinelStatefulSet_RollingUpdateStrategy(t *testing.T) {
+func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
 			Enabled:  true,
@@ -359,8 +360,9 @@ func TestBuildSentinelStatefulSet_RollingUpdateStrategy(t *testing.T) {
 
 	sts := BuildSentinelStatefulSet(v)
 
-	// Sentinel uses standard rolling update (unlike Valkey which uses OnDelete).
-	assert.Equal(t, "RollingUpdate", string(sts.Spec.UpdateStrategy.Type))
+	// Sentinel uses OnDelete — the operator controls pod-by-pod rollout
+	// with sentinel quorum verification before each deletion.
+	assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type)
 }
 
 // --- SentinelStatefulSetHasChanged ---
@@ -473,8 +475,8 @@ func TestSentinelStatefulSetHasChanged_VolumeConfigMapChanged(t *testing.T) {
 	current := desired.DeepCopy()
 
 	for i, vol := range current.Spec.Template.Spec.Volumes {
-		if vol.VolumeSource.ConfigMap != nil {
-			current.Spec.Template.Spec.Volumes[i].VolumeSource.ConfigMap.Name = "old-sentinel-config"
+		if vol.ConfigMap != nil {
+			current.Spec.Template.Spec.Volumes[i].ConfigMap.Name = "old-sentinel-config"
 			break
 		}
 	}

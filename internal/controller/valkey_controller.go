@@ -186,6 +186,20 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: rollingResult.RequeueAfter}, nil
 	}
 
+	// Check for sentinel pod updates (only when no Valkey rolling update is active).
+	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
+	// while verifying sentinel quorum before each deletion.
+	if valkey.IsSentinelEnabled() {
+		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, valkey)
+		if sentinelResult.Error != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
+			return ctrl.Result{}, sentinelResult.Error
+		}
+		if sentinelResult.NeedsRequeue {
+			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, nil
+		}
+	}
+
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
 		return ctrl.Result{}, err
@@ -986,6 +1000,41 @@ func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, pha
 	v.Status.Phase = phase
 	v.Status.Message = message
 	return r.Status().Update(ctx, v)
+}
+
+// setStatusCondition sets a named status condition on the Valkey CR.
+// It refreshes the object from the API server before writing to avoid conflicts.
+func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
+	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
+		return
+	}
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
+	_ = r.Status().Update(ctx, v)
+}
+
+// setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
+// When pending is true the condition is set to True, indicating that a standalone pod
+// has an outdated sidecar image that will be updated on the next natural pod restart.
+func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pending bool) {
+	if pending {
+		r.setStatusCondition(ctx, v,
+			vkov1.ConditionTypeSidecarUpdatePending,
+			metav1.ConditionTrue,
+			"SidecarImageDrift",
+			"Standalone pod has an outdated sidecar image; update will occur on the next pod restart")
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeSidecarUpdatePending,
+		metav1.ConditionFalse,
+		"SidecarUpToDate",
+		"All sidecar containers are running the desired image")
 }
 
 // verifyValkeyConnectivity pings all Valkey pods to verify operator connectivity.

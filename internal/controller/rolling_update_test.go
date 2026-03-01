@@ -1142,3 +1142,414 @@ func TestHandleMasterWithNoReplicas_WaitsWhenNotTimedOut(t *testing.T) {
 	assert.Nil(t, result.Error)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
 }
+
+// ============================================================
+// Phase 2: Graceful Sidecar Rolling Update — New Tests
+// ============================================================
+
+// --- isSidecarOnlyChange ---
+
+func TestIsSidecarOnlyChange_OnlySidecarChanged(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+		{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+	}}}
+	assert.True(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+func TestIsSidecarOnlyChange_BothImagesChanged(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:8.0"},
+		{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+	}}}
+	// Valkey image also changed → not sidecar-only.
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+func TestIsSidecarOnlyChange_OnlyValkeyChanged(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:8.0"},
+		{Name: builder.SidecarContainerName, Image: "operator:v2.0"},
+	}}}
+	// Only valkey changed, sidecar is already up to date → not sidecar-only.
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+func TestIsSidecarOnlyChange_EmptySidecarImage(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+		{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+	}}}
+	// Empty desiredSidecarImage → sidecar check is skipped entirely.
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", ""))
+}
+
+func TestIsSidecarOnlyChange_NoSidecarContainer(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+	}}}
+	// No sidecar container → cannot be a sidecar-only change.
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+func TestIsSidecarOnlyChange_EmptyPod(t *testing.T) {
+	pod := &corev1.Pod{}
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+func TestIsSidecarOnlyChange_NothingChanged(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+		{Name: builder.SidecarContainerName, Image: "operator:v2.0"},
+	}}}
+	// Both images are already at desired versions.
+	assert.False(t, isSidecarOnlyChange(pod, "valkey/valkey:9.0", "operator:v2.0"))
+}
+
+// --- handleStandaloneRollingUpdate — sidecar-only deferred update ---
+
+func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *testing.T) {
+	// When only the sidecar image changed, the pod must NOT be deleted.
+	// The update is deferred to the next natural pod restart.
+	const newSidecar = "operator:v2.0"
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Image = "valkey/valkey:9.0"
+	})
+	// Pod runs the correct valkey image but an outdated sidecar.
+	pod0 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	r, c := newTestReconciler(v, pod0)
+	reconcileOnce(t, r, "test", "default")
+
+	// Retrieve the created StatefulSet and patch its sidecar image to simulate an
+	// operator upgrade that bumped the desired sidecar to v2.0.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	for i, cont := range sts.Spec.Template.Spec.Containers {
+		if cont.Name == builder.SidecarContainerName {
+			sts.Spec.Template.Spec.Containers[i].Image = newSidecar
+		}
+	}
+
+	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
+
+	// Deferred: no requeue, not completed (pending).
+	assert.False(t, result.NeedsRequeue, "Sidecar-only change must not trigger requeue")
+	assert.False(t, result.Completed, "Not completed while sidecar update is pending")
+	assert.Nil(t, result.Error)
+
+	// Pod must NOT have been deleted.
+	existingPod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test-0", Namespace: "default"}, existingPod)
+	assert.NoError(t, err, "Pod must NOT be deleted for a sidecar-only change in standalone mode")
+}
+
+func TestHandleStandaloneRollingUpdate_ValkeyImageChange_StillDeletesPod(t *testing.T) {
+	// When the valkey image changes, the pod must still be deleted (existing behaviour).
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Image = "valkey/valkey:9.0"
+	})
+	pod0 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:8.0"}, // outdated
+			{Name: builder.SidecarContainerName, Image: "operator:v2.0"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	r, c := newTestReconciler(v, pod0)
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+
+	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
+
+	assert.True(t, result.NeedsRequeue, "Valkey image change must trigger requeue")
+	assert.Nil(t, result.Error)
+
+	// Pod should have been deleted.
+	pod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test-0", Namespace: "default"}, pod)
+	assert.Error(t, err, "Pod should be deleted when valkey image changes")
+}
+
+// --- sentinelPodNeedsUpdate ---
+
+func TestSentinelPodNeedsUpdate_Outdated(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:8.0"},
+	}}}
+	template := corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+	}}}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_UpToDate(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+	}}}
+	template := corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+	}}}
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_EmptyPod(t *testing.T) {
+	pod := &corev1.Pod{}
+	template := corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+	}}}
+	// Pod has no containers — no mismatch possible.
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_EmptyTemplate(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: builder.SentinelContainerName, Image: "valkey/valkey:8.0"},
+	}}}
+	template := corev1.PodTemplateSpec{}
+	// Template has no containers — nothing to compare against.
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+// --- checkAndHandleSentinelRollingUpdate ---
+
+// createSentinelPod builds a synthetic sentinel pod for use in unit tests.
+func createSentinelPod(v *vkov1.Valkey, ordinal int, image string, ready bool) *corev1.Pod {
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	conditions := []corev1.PodCondition{}
+	if ready {
+		conditions = append(conditions, corev1.PodCondition{
+			Type:   corev1.PodReady,
+			Status: corev1.ConditionTrue,
+		})
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%d", stsName, ordinal),
+			Namespace: v.Namespace,
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: image},
+		}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: conditions},
+	}
+}
+
+// buildTestSentinelSts creates a minimal sentinel StatefulSet whose desired container
+// image is sentinelTestNewImage. Used by sentinel rolling update unit tests.
+const sentinelTestNewImage = "valkey/valkey:9.0"
+
+func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	replicas := v.Spec.Sentinel.Replicas
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: v.Namespace},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: builder.SentinelContainerName, Image: sentinelTestNewImage},
+				}},
+			},
+		},
+	}
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_AllUpToDate(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const img = "valkey/valkey:9.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, img, true)
+	p1 := createSentinelPod(v, 1, img, true)
+	p2 := createSentinelPod(v, 2, img, true)
+
+	r, _ := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.False(t, result.NeedsRequeue, "No requeue when all sentinel pods are up to date")
+	assert.Nil(t, result.Error)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_StsNotFound(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, _ := newTestReconciler(v)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.False(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_DeletesOutdatedPod(t *testing.T) {
+	// All 3 sentinel pods are ready and outdated (old image). Quorum is 2.
+	// readyCount=3, readyCount-1=2 >= quorum=2 → delete first outdated pod.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+
+	// Exactly one sentinel pod should have been deleted.
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	deleted := 0
+	for i := 0; i < 3; i++ {
+		pod := &corev1.Pod{}
+		err := c.Get(context.Background(), types.NamespacedName{
+			Name: fmt.Sprintf("%s-%d", stsName, i), Namespace: "default",
+		}, pod)
+		if err != nil {
+			deleted++
+		}
+	}
+	assert.Equal(t, 1, deleted, "Exactly one sentinel pod should be deleted per step")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_WaitsWhenQuorumWouldBeLost(t *testing.T) {
+	// quorum=2, readyCount=2, readyCount-1=1 < 2 → must wait to avoid quorum loss.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, false) // not ready — reduces readyCount to 2
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.True(t, result.NeedsRequeue, "Must requeue while waiting to maintain quorum")
+	assert.Nil(t, result.Error)
+
+	// No pod should have been deleted.
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	for i := 0; i < 3; i++ {
+		pod := &corev1.Pod{}
+		err := c.Get(context.Background(), types.NamespacedName{
+			Name: fmt.Sprintf("%s-%d", stsName, i), Namespace: "default",
+		}, pod)
+		assert.NoError(t, err, "Pod %d must not be deleted when quorum would break", i)
+	}
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_WaitsForMissingPod(t *testing.T) {
+	// Pod-0 was just deleted (being recreated). p1 and p2 are outdated.
+	// readyCount = 2 (only p1 and p2), quorum = 2, readyCount-1 = 1 < 2 → must wait.
+	// The missing p0 naturally reduces effective readyCount, preventing another deletion.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	// p0 intentionally absent (simulates pod being recreated after deletion).
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	// readyCount=2, firstOutdatedPod=p1, readyCount-1=1 < quorum=2 → wait.
+	assert.True(t, result.NeedsRequeue, "Must requeue: quorum would be lost if we delete another pod while p0 is absent")
+	assert.Nil(t, result.Error)
+
+	// p1 and p2 must NOT have been deleted.
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	for _, i := range []int{1, 2} {
+		pod := &corev1.Pod{}
+		err := c.Get(context.Background(), types.NamespacedName{
+			Name: fmt.Sprintf("%s-%d", stsName, i), Namespace: "default",
+		}, pod)
+		assert.NoError(t, err, "Pod %d must not be deleted while missing pod is being recreated", i)
+	}
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_NoActionWhenNoPodsExist(t *testing.T) {
+	// No pods created yet (initial deployment). Should return empty result — no action.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	sts := buildTestSentinelSts(v)
+	// No pods registered in fake client.
+	r, _ := newTestReconciler(v, sts)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.False(t, result.NeedsRequeue, "No action needed when no sentinel pods exist yet")
+	assert.Nil(t, result.Error)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *testing.T) {
+	// p0 already updated (new image, ready), p1 and p2 outdated.
+	// readyCount=3 (all ready), readyCount-1=2 >= quorum=2 → delete p1.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	const newImg = "valkey/valkey:9.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, newImg, true) // already updated
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+
+	// p1 (first outdated pod) should have been deleted.
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	pod1 := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: fmt.Sprintf("%s-1", stsName), Namespace: "default",
+	}, pod1)
+	assert.Error(t, err, "First outdated sentinel pod should be deleted")
+
+	// p0 and p2 should still exist.
+	pod0 := &corev1.Pod{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: fmt.Sprintf("%s-0", stsName), Namespace: "default",
+	}, pod0))
+	pod2 := &corev1.Pod{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: fmt.Sprintf("%s-2", stsName), Namespace: "default",
+	}, pod2))
+}

@@ -19,6 +19,17 @@ const (
 	PersistenceModeBoth PersistenceMode = "both"
 )
 
+// ConditionType is the type identifier for a status condition.
+type ConditionType = string
+
+const (
+	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
+	// the sidecar container image has drifted from the desired version.
+	// Standalone pods are not automatically restarted for sidecar-only changes;
+	// the update will occur on the next pod restart (manual delete or image change).
+	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
+)
+
 // ValkeyPhase describes the current phase of the Valkey instance.
 type ValkeyPhase string
 

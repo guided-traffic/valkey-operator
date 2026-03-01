@@ -182,7 +182,9 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 				MatchLabels: selectorLabels,
 			},
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
-				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				// Use OnDelete so the operator controls pod-by-pod rollout
+				// with sentinel quorum verification before each deletion.
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
