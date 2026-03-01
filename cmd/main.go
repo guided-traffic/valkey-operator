@@ -86,6 +86,7 @@ func main() {
 		Scheme:            mgr.GetScheme(),
 		OperatorImage:     operatorImage,
 		OperatorNamespace: operatorNamespace,
+		OperatorVersion:   version,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Valkey")
 		os.Exit(1)

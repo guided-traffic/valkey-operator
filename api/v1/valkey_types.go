@@ -228,6 +228,10 @@ type ValkeyStatus struct {
 	// +optional
 	Message string `json:"message,omitempty"`
 
+	// OperatorVersion is the version of the operator that last reconciled this resource.
+	// +optional
+	OperatorVersion string `json:"operatorVersion,omitempty"`
+
 	// Conditions represent the latest available observations of the Valkey state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
@@ -241,6 +245,7 @@ type ValkeyStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Current phase"
 // +kubebuilder:printcolumn:name="Master",type="string",JSONPath=".status.masterPod",description="Current master pod"
 // +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".spec.image",description="Valkey image",priority=1
+// +kubebuilder:printcolumn:name="OperatorVersion",type="string",JSONPath=".status.operatorVersion",description="Operator version that last reconciled",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Valkey is the Schema for the valkeys API.

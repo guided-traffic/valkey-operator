@@ -1745,3 +1745,208 @@ func TestReconcile_NetworkPolicy_NoSentinelPolicyWithoutSentinel(t *testing.T) {
 
 	assert.True(t, apierrors.IsNotFound(err), "Sentinel NetworkPolicy should not exist without Sentinel")
 }
+
+// --- Operator Version Annotation ---
+
+// newTestReconcilerWithVersion creates a test reconciler with a specific operator version.
+func newTestReconcilerWithVersion(version string, objs ...client.Object) (*ValkeyReconciler, client.Client) {
+	r, c := newTestReconciler(objs...)
+	r.OperatorVersion = version
+	return r, c
+}
+
+func TestReconcile_SetsOperatorVersionAnnotation_OnConfigMap(t *testing.T) {
+	const version = "1.2.3"
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(version, v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ConfigMapName(v), Namespace: "default",
+	}, cm))
+	assert.Equal(t, version, cm.Annotations[builder.AnnotationOperatorVersion],
+		"ConfigMap should carry the operator-version annotation")
+}
+
+func TestReconcile_SetsOperatorVersionAnnotation_OnStatefulSet(t *testing.T) {
+	const version = "1.2.3"
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(version, v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts))
+	assert.Equal(t, version, sts.Annotations[builder.AnnotationOperatorVersion],
+		"StatefulSet should carry the operator-version annotation")
+}
+
+func TestReconcile_SetsOperatorVersionAnnotation_OnService(t *testing.T) {
+	const version = "1.2.3"
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(version, v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-rw", Namespace: "default",
+	}, svc))
+	assert.Equal(t, version, svc.Annotations[builder.AnnotationOperatorVersion],
+		"Service should carry the operator-version annotation")
+}
+
+func TestReconcile_SetsOperatorVersionAnnotation_OnRBAC(t *testing.T) {
+	const version = "1.2.3"
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(version, v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, sa))
+	assert.Equal(t, version, sa.Annotations[builder.AnnotationOperatorVersion],
+		"ServiceAccount should carry the operator-version annotation")
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, role))
+	assert.Equal(t, version, role.Annotations[builder.AnnotationOperatorVersion],
+		"Role should carry the operator-version annotation")
+
+	rb := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sidecar", Namespace: "default",
+	}, rb))
+	assert.Equal(t, version, rb.Annotations[builder.AnnotationOperatorVersion],
+		"RoleBinding should carry the operator-version annotation")
+}
+
+func TestReconcile_UpdatesOperatorVersionAnnotation_OnConfigMapDrift(t *testing.T) {
+	const oldVersion = "1.0.0"
+	const newVersion = "1.1.0"
+
+	v := newTestValkey("test", "default")
+
+	// Pre-create the ConfigMap with the old operator version annotation.
+	cm := builder.BuildConfigMap(v)
+	builder.ApplyOperatorVersion(cm, oldVersion)
+	r, c := newTestReconcilerWithVersion(newVersion, v, cm)
+
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ConfigMapName(v), Namespace: "default",
+	}, updated))
+	assert.Equal(t, newVersion, updated.Annotations[builder.AnnotationOperatorVersion],
+		"ConfigMap annotation should be updated to the new operator version")
+}
+
+func TestReconcile_UpdatesOperatorVersionAnnotation_OnStatefulSetDrift(t *testing.T) {
+	const oldVersion = "1.0.0"
+	const newVersion = "1.1.0"
+
+	v := newTestValkey("test", "default")
+
+	// Pre-create the StatefulSet with the old operator version annotation via initial reconcile.
+	r, c := newTestReconcilerWithVersion(oldVersion, v)
+	reconcileOnce(t, r, "test", "default")
+
+	// Upgrade the reconciler to the new version and reconcile again.
+	r.OperatorVersion = newVersion
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts))
+	assert.Equal(t, newVersion, sts.Annotations[builder.AnnotationOperatorVersion],
+		"StatefulSet annotation should be updated to the new operator version")
+}
+
+func TestReconcile_UpdatesOperatorVersionAnnotation_OnServiceDrift(t *testing.T) {
+	const oldVersion = "1.0.0"
+	const newVersion = "1.1.0"
+
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(oldVersion, v)
+	reconcileOnce(t, r, "test", "default")
+
+	r.OperatorVersion = newVersion
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-rw", Namespace: "default",
+	}, svc))
+	assert.Equal(t, newVersion, svc.Annotations[builder.AnnotationOperatorVersion],
+		"Service annotation should be updated to the new operator version")
+}
+
+func TestReconcile_SetsStatusOperatorVersion(t *testing.T) {
+	const version = "2.0.0"
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(version, v)
+
+	// Reconcile creates all resources, then updateStatus populates status.operatorVersion.
+	// We need the StatefulSet to be "ready" so status proceeds past Provisioning.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate a ready StatefulSet so status.operatorVersion gets written.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts))
+	sts.Status.ReadyReplicas = 1
+	sts.Status.Replicas = 1
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, updated))
+	assert.Equal(t, version, updated.Status.OperatorVersion,
+		"status.operatorVersion must reflect the current operator version")
+}
+
+func TestReconcile_StatusOperatorVersion_UpdatedOnVersionChange(t *testing.T) {
+	const oldVersion = "1.0.0"
+	const newVersion = "2.0.0"
+
+	v := newTestValkey("test", "default")
+	r, c := newTestReconcilerWithVersion(oldVersion, v)
+
+	// First reconcile with old version.
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, sts))
+	sts.Status.ReadyReplicas = 1
+	sts.Status.Replicas = 1
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Upgrade operator version and reconcile again.
+	r.OperatorVersion = newVersion
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test", Namespace: "default",
+	}, updated))
+	assert.Equal(t, newVersion, updated.Status.OperatorVersion,
+		"status.operatorVersion must be updated when the operator version changes")
+}
