@@ -98,6 +98,11 @@ test-e2e: ## Run E2E tests against a running Kind cluster.
 	@echo "Running E2E tests..."
 	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m ./test/e2e/...
 
+.PHONY: test-e2e-helm
+test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind cluster with operator).
+	@echo "Running Helm migration E2E test..."
+	MANAGER_BINARY=./bin/manager $(GOTEST) -v -tags=e2e,e2e_helm -count=1 -timeout=10m -run TestE2E_Migrate ./test/e2e/...
+
 .PHONY: kind-create
 kind-create: ## Create a Kind cluster for local testing.
 	@echo "Creating Kind cluster..."
