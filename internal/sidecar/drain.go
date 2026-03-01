@@ -191,6 +191,8 @@ func (d *DrainHandler) reconfigureReplicas(newMasterHost, newMasterAddr string, 
 }
 
 // waitForRoleChange polls the local Valkey until this pod is no longer the master.
+// If Valkey becomes unreachable (connection refused), the failover is considered
+// complete — the process is already shutting down.
 func (d *DrainHandler) waitForRoleChange(ctx context.Context, log drainLog) error {
 	log.Info("waiting for local role to change from master")
 	ticker := time.NewTicker(1 * time.Second)
@@ -203,6 +205,10 @@ func (d *DrainHandler) waitForRoleChange(ctx context.Context, log drainLog) erro
 		case <-ticker.C:
 			role, err := d.detector.DetectRole()
 			if err != nil {
+				if isConnectionRefused(err) {
+					log.Info("local Valkey unreachable, assuming failover complete")
+					return nil
+				}
 				log.Error(err, "role detection failed during wait")
 				continue
 			}
@@ -212,6 +218,18 @@ func (d *DrainHandler) waitForRoleChange(ctx context.Context, log drainLog) erro
 			}
 		}
 	}
+}
+
+// isConnectionRefused returns true when the error indicates that the target
+// is not accepting connections — i.e. the local Valkey process has already
+// shut down.  Both the standard Go net error ("connection refused") and the
+// custom valkey-client message ("… refused …") are matched.
+func isConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") || strings.Contains(msg, "refused")
 }
 
 // buildReplicaAddrs constructs the FQDN addresses for all Valkey pods

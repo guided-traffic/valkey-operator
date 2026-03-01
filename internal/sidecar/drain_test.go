@@ -36,6 +36,12 @@ func (d *changingRoleDetector) SetRole(role string) {
 	d.role = role
 }
 
+func (d *changingRoleDetector) SetError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.err = err
+}
+
 // mockValkeyCommander implements ValkeyCommander for testing.
 type mockValkeyCommander struct {
 	mu                  sync.Mutex
@@ -448,6 +454,118 @@ func TestDrainHandler_ManualFailoverReplicaQueryErrors(t *testing.T) {
 	assert.Equal(t, "NO", replicaClient2.replicaOfCalls[0].host)
 }
 
+func TestDrainHandler_WaitForRoleChange_ConnectionRefused_Sentinel(t *testing.T) {
+	// Valkey is initially master but becomes unreachable after sentinel failover.
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+
+	sentinelClient := &mockValkeyCommander{}
+
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"sentinel-0:26379": sentinelClient,
+		},
+	}
+
+	handler := newTestDrainHandler(detector, patcher, factory, func(h *DrainHandler) {
+		h.sentinelEnabled = true
+		h.sentinelMonitor = "test"
+		h.sentinelAddrs = []string{"sentinel-0:26379"}
+	})
+
+	// Simulate Valkey process dying (connection refused) after sentinel trigger.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetError(fmt.Errorf(
+			"info replication localhost:16379: cannot connect to localhost:16379: " +
+				"connection to localhost:16379 refused — the service is not running",
+		))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := handler.Handle(ctx)
+
+	assert.NoError(t, err, "connection refused during wait should be treated as success")
+	require.Len(t, sentinelClient.failoverCalls, 1)
+}
+
+func TestDrainHandler_WaitForRoleChange_ConnectionRefused_Manual(t *testing.T) {
+	// Valkey is initially master but becomes unreachable after manual failover.
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+
+	replicaClient := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{
+			Role:             "slave",
+			MasterLinkStatus: "up",
+		},
+	}
+
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"test-1.test-headless.default.svc.cluster.local:6379": replicaClient,
+			"test-2.test-headless.default.svc.cluster.local:6379": replicaClient,
+		},
+	}
+
+	handler := newTestDrainHandler(detector, patcher, factory)
+
+	// Simulate Valkey process dying (standard Go net error) after manual failover.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetError(fmt.Errorf(
+			"dial tcp 127.0.0.1:6379: connect: connection refused",
+		))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := handler.Handle(ctx)
+
+	assert.NoError(t, err, "connection refused during wait should be treated as success")
+	// replica was promoted
+	require.GreaterOrEqual(t, len(replicaClient.replicaOfCalls), 1)
+}
+
+func TestDrainHandler_WaitForRoleChange_TransientError_NotConnectionRefused(t *testing.T) {
+	// A transient non-connection-refused error should be retried, not cause early exit.
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+
+	sentinelClient := &mockValkeyCommander{}
+
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"sentinel-0:26379": sentinelClient,
+		},
+	}
+
+	handler := newTestDrainHandler(detector, patcher, factory, func(h *DrainHandler) {
+		h.sentinelEnabled = true
+		h.sentinelMonitor = "test"
+		h.sentinelAddrs = []string{"sentinel-0:26379"}
+	})
+
+	// Briefly return a transient error, then switch to replica role.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		detector.SetError(fmt.Errorf("timeout reading response"))
+		time.Sleep(200 * time.Millisecond)
+		detector.SetError(nil)
+		detector.SetRole(common.RoleReplica)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := handler.Handle(ctx)
+
+	assert.NoError(t, err, "should recover from transient error and succeed when role changes")
+}
+
 // --- Unit tests for helper functions ---
 
 func TestPodBaseName(t *testing.T) {
@@ -525,6 +643,48 @@ func TestBuildReplicaAddrs_SingleReplica(t *testing.T) {
 	addrs := handler.buildReplicaAddrs()
 
 	assert.Empty(t, addrs)
+}
+
+func TestIsConnectionRefused(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "standard Go net error",
+			err:      fmt.Errorf("dial tcp 127.0.0.1:6379: connect: connection refused"),
+			expected: true,
+		},
+		{
+			name: "valkey client custom error",
+			err: fmt.Errorf(
+				"info replication localhost:16379: cannot connect to localhost:16379: " +
+					"connection to localhost:16379 refused \u2014 the service is not running",
+			),
+			expected: true,
+		},
+		{
+			name:     "unrelated error",
+			err:      fmt.Errorf("timeout reading response"),
+			expected: false,
+		},
+		{
+			name:     "auth error",
+			err:      fmt.Errorf("NOAUTH Authentication required"),
+			expected: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, isConnectionRefused(tc.err))
+		})
+	}
 }
 
 func TestIsSyncedReplica(t *testing.T) {
