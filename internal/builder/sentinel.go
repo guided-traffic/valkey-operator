@@ -296,6 +296,46 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 	}
 }
 
+// SentinelProbeCommand returns the exec probe command for a Sentinel container,
+// accounting for TLS and auth configuration.
+//
+// When TLS is enabled the probe uses valkey-cli with TLS flags. The Sentinel
+// TLS config uses tls-auth-clients optional, so no client certificate is
+// required — only the CA cert is needed for server verification.
+// When auth is enabled, the password is read from the VALKEY_PASSWORD env var
+// that is injected into the Sentinel container.
+func SentinelProbeCommand(v *vkov1.Valkey) []string {
+	port := fmt.Sprintf("%d", SentinelPort)
+
+	if v.IsAuthEnabled() {
+		var cmdStr string
+		if v.IsTLSEnabled() {
+			cmdStr = fmt.Sprintf(
+				"valkey-cli --tls --cacert %s/ca.crt -p %s -a \"$%s\" ping",
+				TLSMountPath, port, AuthSecretEnvName,
+			)
+		} else {
+			cmdStr = fmt.Sprintf(
+				"valkey-cli -p %s -a \"$%s\" ping",
+				port, AuthSecretEnvName,
+			)
+		}
+		return []string{"sh", "-c", cmdStr}
+	}
+
+	if v.IsTLSEnabled() {
+		return []string{
+			"valkey-cli",
+			"--tls",
+			"--cacert", TLSMountPath + "/ca.crt",
+			"-p", port,
+			"ping",
+		}
+	}
+
+	return []string{"valkey-cli", "-p", port, "ping"}
+}
+
 // buildSentinelContainer builds the Sentinel container spec.
 func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 	volumeMounts := []corev1.VolumeMount{
@@ -318,7 +358,27 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 		})
 	}
 
-	return corev1.Container{
+	// Build probe handler. When TLS or auth is enabled, use an exec probe with
+	// valkey-cli so that the probe speaks the correct protocol. A bare tcpSocket
+	// probe against a TLS-only port causes the Sentinel to log continuous
+	// "SSL routines::unexpected eof while reading" errors because kubelet
+	// opens the TCP connection without performing a TLS handshake.
+	var probeHandler corev1.ProbeHandler
+	if v.IsTLSEnabled() || v.IsAuthEnabled() {
+		probeHandler = corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: SentinelProbeCommand(v),
+			},
+		}
+	} else {
+		probeHandler = corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt32(SentinelPort),
+			},
+		}
+	}
+
+	container := corev1.Container{
 		Name:  SentinelContainerName,
 		Image: v.Spec.Image,
 		Command: []string{
@@ -334,11 +394,7 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 		},
 		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{
-					Port: intstr.FromInt32(SentinelPort),
-				},
-			},
+			ProbeHandler:        probeHandler,
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       5,
 			TimeoutSeconds:      3,
@@ -346,11 +402,7 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 			FailureThreshold:    3,
 		},
 		LivenessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{
-					Port: intstr.FromInt32(SentinelPort),
-				},
-			},
+			ProbeHandler:        probeHandler,
 			InitialDelaySeconds: 15,
 			PeriodSeconds:       10,
 			TimeoutSeconds:      5,
@@ -358,6 +410,24 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 			FailureThreshold:    5,
 		},
 	}
+
+	// Inject auth password env var into the main Sentinel container when auth
+	// is enabled, so the probe command can reference $VALKEY_PASSWORD.
+	if v.IsAuthEnabled() {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name: AuthSecretEnvName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: v.Spec.Auth.SecretName,
+					},
+					Key: v.Spec.Auth.SecretPasswordKey,
+				},
+			},
+		})
+	}
+
+	return container
 }
 
 // SentinelStatefulSetHasChanged returns true if the live Sentinel StatefulSet differs from desired.

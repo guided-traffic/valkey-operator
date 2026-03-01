@@ -669,3 +669,224 @@ func TestBuildSentinelStatefulSet_WithAuthAndTLS(t *testing.T) {
 	assert.Contains(t, cm.Data[SentinelConfigKey], "tls-port")
 	assert.Contains(t, cm.Data[SentinelConfigKey], "sentinel auth-pass")
 }
+
+// --- SentinelProbeCommand ---
+// Regression tests for Issue #1: Sentinel TLS-only port generating SSL EOF errors
+// from tcpSocket probes. When TLS or auth is enabled, probes must use valkey-cli exec
+// commands so that the probe speaks the correct protocol.
+
+func TestSentinelProbeCommand_NoTLSNoAuth(t *testing.T) {
+	v := newTestValkey("test")
+
+	cmd := SentinelProbeCommand(v)
+
+	// Plain valkey-cli ping — no TLS, no auth flags.
+	require.Equal(t, []string{"valkey-cli", "-p", "26379", "ping"}, cmd)
+}
+
+func TestSentinelProbeCommand_TLSOnly(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	cmd := SentinelProbeCommand(v)
+
+	// Must use TLS flags but no auth.  Sentinel uses tls-auth-clients optional
+	// so only the CA cert is required (no --cert/--key for the probe client).
+	require.Equal(t, []string{
+		"valkey-cli",
+		"--tls",
+		"--cacert", TLSMountPath + "/ca.crt",
+		"-p", "26379",
+		"ping",
+	}, cmd)
+}
+
+func TestSentinelProbeCommand_AuthOnly(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := SentinelProbeCommand(v)
+
+	// Shell form to expand env var, no TLS.
+	require.Len(t, cmd, 3)
+	assert.Equal(t, "sh", cmd[0])
+	assert.Equal(t, "-c", cmd[1])
+	assert.Contains(t, cmd[2], "valkey-cli")
+	assert.Contains(t, cmd[2], "-p 26379")
+	assert.Contains(t, cmd[2], AuthSecretEnvName)
+	assert.NotContains(t, cmd[2], "--tls")
+	assert.NotContains(t, cmd[2], "--cacert")
+}
+
+func TestSentinelProbeCommand_TLSAndAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := SentinelProbeCommand(v)
+
+	// Shell form to expand env var, with TLS flags.
+	require.Len(t, cmd, 3)
+	assert.Equal(t, "sh", cmd[0])
+	assert.Equal(t, "-c", cmd[1])
+	assert.Contains(t, cmd[2], "--tls")
+	assert.Contains(t, cmd[2], "--cacert")
+	assert.Contains(t, cmd[2], "-p 26379")
+	assert.Contains(t, cmd[2], AuthSecretEnvName)
+	// Must NOT include client cert/key (tls-auth-clients optional).
+	assert.NotContains(t, cmd[2], "--cert")
+	assert.NotContains(t, cmd[2], "--key")
+}
+
+// --- buildSentinelContainer probe type ---
+
+// TestBuildSentinelContainer_NoTLSNoAuth_UsesTCPSocketProbe verifies that the
+// no-TLS/no-auth case keeps the lightweight tcpSocket probe.
+func TestBuildSentinelContainer_NoTLSNoAuth_UsesTCPSocketProbe(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.NotNil(t, c.ReadinessProbe.TCPSocket, "readiness probe should be tcpSocket when no TLS/auth")
+	require.NotNil(t, c.LivenessProbe.TCPSocket, "liveness probe should be tcpSocket when no TLS/auth")
+	assert.Nil(t, c.ReadinessProbe.Exec)
+	assert.Nil(t, c.LivenessProbe.Exec)
+}
+
+// TestBuildSentinelContainer_TLSOnly_UsesExecProbe is the primary regression
+// test for Issue #1: tcpSocket against a TLS-only port must never be used.
+func TestBuildSentinelContainer_TLSOnly_UsesExecProbe(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.NotNil(t, c.ReadinessProbe.Exec, "readiness probe must be exec when TLS is enabled")
+	require.NotNil(t, c.LivenessProbe.Exec, "liveness probe must be exec when TLS is enabled")
+	assert.Nil(t, c.ReadinessProbe.TCPSocket, "tcpSocket probe must NOT be used when TLS is enabled")
+	assert.Nil(t, c.LivenessProbe.TCPSocket, "tcpSocket probe must NOT be used when TLS is enabled")
+
+	cmd := c.ReadinessProbe.Exec.Command
+	assert.Contains(t, cmd, "--tls", "probe command must include --tls flag")
+	assert.Contains(t, cmd, "--cacert", "probe command must include --cacert flag")
+}
+
+// TestBuildSentinelContainer_AuthOnly_UsesExecProbe verifies exec probe for auth-only.
+func TestBuildSentinelContainer_AuthOnly_UsesExecProbe(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.NotNil(t, c.ReadinessProbe.Exec, "readiness probe must be exec when auth is enabled")
+	require.NotNil(t, c.LivenessProbe.Exec, "liveness probe must be exec when auth is enabled")
+	assert.Nil(t, c.ReadinessProbe.TCPSocket)
+	assert.Nil(t, c.LivenessProbe.TCPSocket)
+}
+
+// TestBuildSentinelContainer_TLSAndAuth_UsesExecProbe verifies exec probe for TLS+auth.
+func TestBuildSentinelContainer_TLSAndAuth_UsesExecProbe(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.NotNil(t, c.ReadinessProbe.Exec)
+	require.NotNil(t, c.LivenessProbe.Exec)
+	assert.Nil(t, c.ReadinessProbe.TCPSocket)
+	assert.Nil(t, c.LivenessProbe.TCPSocket)
+
+	cmd := c.ReadinessProbe.Exec.Command
+	cmdStr := cmd[len(cmd)-1]
+	assert.Contains(t, cmdStr, "--tls")
+	assert.Contains(t, cmdStr, "--cacert")
+	assert.Contains(t, cmdStr, AuthSecretEnvName)
+}
+
+// TestBuildSentinelContainer_TLS_HasPasswordEnvVar verifies that the auth env
+// var is injected into the MAIN Sentinel container (not only the init container)
+// so that the exec probe command can expand $VALKEY_PASSWORD.
+func TestBuildSentinelContainer_TLS_HasPasswordEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "pass",
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Env, 1, "main Sentinel container must have exactly one env var (auth password)")
+	assert.Equal(t, AuthSecretEnvName, c.Env[0].Name)
+	require.NotNil(t, c.Env[0].ValueFrom)
+	require.NotNil(t, c.Env[0].ValueFrom.SecretKeyRef)
+	assert.Equal(t, "my-secret", c.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "pass", c.Env[0].ValueFrom.SecretKeyRef.Key)
+}
+
+// TestBuildSentinelContainer_NoAuth_NoPasswordEnvVar verifies that no env var
+// is injected when auth is not configured.
+func TestBuildSentinelContainer_NoAuth_NoPasswordEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	c := buildSentinelContainer(v)
+
+	assert.Empty(t, c.Env, "no env vars should be set on the Sentinel container when auth is disabled")
+}
+
+// TestBuildSentinelStatefulSet_TLSOnly_NoTCPSocketProbes is an integration-level
+// regression test: constructing the full StatefulSet must yield exec probes for
+// all sentinel containers when TLS is enabled.
+func TestBuildSentinelStatefulSet_TLSOnly_NoTCPSocketProbes(t *testing.T) {
+	v := newTestValkey("gitlab-valkey", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "valkey-password",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	// Regression: tcpSocket probes against TLS-only ports cause
+	// "SSL routines::unexpected eof while reading" log spam (Issue #1).
+	assert.Nil(t, c.ReadinessProbe.TCPSocket,
+		"tcpSocket readiness probe must not be used when Sentinel is TLS-only")
+	assert.Nil(t, c.LivenessProbe.TCPSocket,
+		"tcpSocket liveness probe must not be used when Sentinel is TLS-only")
+	require.NotNil(t, c.ReadinessProbe.Exec)
+	require.NotNil(t, c.LivenessProbe.Exec)
+}
