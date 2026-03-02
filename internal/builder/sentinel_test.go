@@ -5,6 +5,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
@@ -198,6 +200,80 @@ func TestGenerateSentinelConf_MasterAddress(t *testing.T) {
 	assert.Contains(t, conf, "test-0.test-headless.prod.svc.cluster.local")
 }
 
+// TestGenerateSentinelConf_KnownMasterAnnotation verifies that when the
+// AnnotationKnownMaster annotation is present on the Valkey CR, GenerateSentinelConf
+// uses that address instead of the default pod-0 DNS address. This is the core
+// mechanism that prevents sentinel pods from reconnecting to a stale pod-0 replica
+// after a rolling-update failover promoted a different pod to master.
+func TestGenerateSentinelConf_KnownMasterAnnotation(t *testing.T) {
+	const overrideMaster = "roll-ha-1.roll-ha-headless.e2e-test.svc.cluster.local"
+	v := newTestValkey("roll-ha", func(v *vkov1.Valkey) {
+		v.Namespace = "e2e-test"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// The annotation-provided address must be used instead of pod-0.
+	assert.Contains(t, conf, overrideMaster,
+		"sentinel.conf must use the AnnotationKnownMaster address when the annotation is set")
+	assert.NotContains(t, conf, "roll-ha-0.roll-ha-headless.e2e-test.svc.cluster.local",
+		"sentinel.conf must NOT contain the default pod-0 address when AnnotationKnownMaster overrides it")
+}
+
+// TestGenerateSentinelConf_KnownMasterAnnotation_EmptyFallsBackToDefault ensures
+// that an empty annotation value is treated as absent and the default pod-0 address
+// is used instead of the empty string.
+func TestGenerateSentinelConf_KnownMasterAnnotation_EmptyFallsBackToDefault(t *testing.T) {
+	v := newTestValkey("myvalkey", func(v *vkov1.Valkey) {
+		v.Namespace = "default"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Empty annotation → fall back to default pod-0.
+	assert.Contains(t, conf, "myvalkey-0.myvalkey-headless.default.svc.cluster.local")
+}
+
+// TestBuildSentinelConfigMap_KnownMasterAnnotation_PropagatesToConfigData ensures that
+// the ConfigMap data reflects the AnnotationKnownMaster override. This is an
+// integration-level check confirming that the full build pipeline (annotation →
+// GenerateSentinelConf → ConfigMap data) works end-to-end.
+func TestBuildSentinelConfigMap_KnownMasterAnnotation_PropagatesToConfigData(t *testing.T) {
+	const overrideMaster = "roll-ha-2.roll-ha-headless.prod.svc.cluster.local"
+	v := newTestValkey("roll-ha", func(v *vkov1.Valkey) {
+		v.Namespace = "prod"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	cm := BuildSentinelConfigMap(v)
+
+	require.Contains(t, cm.Data, SentinelConfigKey)
+	assert.Contains(t, cm.Data[SentinelConfigKey], overrideMaster,
+		"ConfigMap data must embed the AnnotationKnownMaster address")
+	assert.NotContains(t, cm.Data[SentinelConfigKey], "roll-ha-0.",
+		"ConfigMap must not reference the stale pod-0 address when AnnotationKnownMaster is set")
+}
+
 // --- BuildSentinelConfigMap ---
 
 func TestBuildSentinelConfigMap(t *testing.T) {
@@ -348,7 +424,7 @@ func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
 	assert.Nil(t, sts.Spec.Template.Annotations)
 }
 
-func TestBuildSentinelStatefulSet_RollingUpdateStrategy(t *testing.T) {
+func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
 			Enabled:  true,
@@ -358,8 +434,9 @@ func TestBuildSentinelStatefulSet_RollingUpdateStrategy(t *testing.T) {
 
 	sts := BuildSentinelStatefulSet(v)
 
-	// Sentinel uses standard rolling update (unlike Valkey which uses OnDelete).
-	assert.Equal(t, "RollingUpdate", string(sts.Spec.UpdateStrategy.Type))
+	// Sentinel uses OnDelete — the operator controls pod-by-pod rollout
+	// with sentinel quorum verification before each deletion.
+	assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type)
 }
 
 // --- SentinelStatefulSetHasChanged ---
@@ -426,6 +503,92 @@ func TestSentinelStatefulSetHasChanged_LabelChange(t *testing.T) {
 	current.Spec.Template.Labels["extra"] = "label"
 
 	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_AnnotationChange(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:        true,
+			Replicas:       3,
+			PodAnnotations: map[string]string{"existing": "value"},
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+	current.Spec.Template.Annotations["extra"] = "annotation"
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_VolumeAdded(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Simulate a new volume added by a newer operator version.
+	desired.Spec.Template.Spec.Volumes = append(desired.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: "new-volume",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_VolumeConfigMapChanged(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	for i, vol := range current.Spec.Template.Spec.Volumes {
+		if vol.ConfigMap != nil {
+			current.Spec.Template.Spec.Volumes[i].ConfigMap.Name = "old-sentinel-config"
+			break
+		}
+	}
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_ContainerCommandChanged(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	current.Spec.Template.Spec.Containers[0].Command = []string{"old-entrypoint"}
+
+	assert.True(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_NoChange_FullSpec(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:        true,
+			Replicas:       3,
+			PodLabels:      map[string]string{"app": "sentinel"},
+			PodAnnotations: map[string]string{"example.com/role": "sentinel"},
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
 }
 
 // --- MasterAddress ---

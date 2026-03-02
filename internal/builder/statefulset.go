@@ -568,7 +568,7 @@ func buildVolumeClaimTemplates(v *vkov1.Valkey) []corev1.PersistentVolumeClaim {
 }
 
 // StatefulSetHasChanged returns true if the live StatefulSet differs from the desired spec
-// in ways that require an update (image, replicas, resources, config).
+// in ways that require an update (replicas, pod template spec).
 func StatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 	// Check replicas.
 	if desired.Spec.Replicas != nil && current.Spec.Replicas != nil {
@@ -576,42 +576,138 @@ func StatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 			return true
 		}
 	}
+	return podTemplateChanged(desired.Spec.Template, current.Spec.Template)
+}
 
-	// Check container image.
-	if len(desired.Spec.Template.Spec.Containers) > 0 && len(current.Spec.Template.Spec.Containers) > 0 {
-		if desired.Spec.Template.Spec.Containers[0].Image != current.Spec.Template.Spec.Containers[0].Image {
-			return true
-		}
-	}
-
-	// Check labels and annotations on pod template.
-	if stringMapChanged(desired.Spec.Template.Labels, current.Spec.Template.Labels) {
+// podTemplateChanged returns true if the pod template spec has changed in ways
+// that require a rolling update (labels, annotations, or pod spec).
+func podTemplateChanged(desired, current corev1.PodTemplateSpec) bool {
+	if stringMapChanged(desired.Labels, current.Labels) {
 		return true
 	}
-	if stringMapChanged(desired.Spec.Template.Annotations, current.Spec.Template.Annotations) {
+	if stringMapChanged(desired.Annotations, current.Annotations) {
 		return true
 	}
+	return podSpecChanged(desired.Spec, current.Spec)
+}
 
-	// Check resource requirements.
-	if len(desired.Spec.Template.Spec.Containers) > 0 && len(current.Spec.Template.Spec.Containers) > 0 {
-		dRes := desired.Spec.Template.Spec.Containers[0].Resources
-		cRes := current.Spec.Template.Spec.Containers[0].Resources
+// podSpecChanged returns true if two PodSpecs differ in rolling-update-relevant ways.
+// It covers all containers (including sidecar), init containers, volumes,
+// ServiceAccountName, and TerminationGracePeriodSeconds.
+func podSpecChanged(desired, current corev1.PodSpec) bool {
+	if desired.ServiceAccountName != current.ServiceAccountName {
+		return true
+	}
+	if !terminationGracePeriodEqual(desired.TerminationGracePeriodSeconds, current.TerminationGracePeriodSeconds) {
+		return true
+	}
+	if containersChanged(desired.Containers, current.Containers) {
+		return true
+	}
+	if containersChanged(desired.InitContainers, current.InitContainers) {
+		return true
+	}
+	return volumesChanged(desired.Volumes, current.Volumes)
+}
 
-		if resourceListChanged(dRes.Requests, cRes.Requests) || resourceListChanged(dRes.Limits, cRes.Limits) {
-			return true
-		}
+// terminationGracePeriodEqual returns true if both pointers refer to equal values
+// (or are both nil).
+func terminationGracePeriodEqual(a, b *int64) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	return *a == *b
+}
 
-		// Check environment variables (e.g., auth Secret reference changes).
-		if !envVarsEqual(desired.Spec.Template.Spec.Containers[0].Env, current.Spec.Template.Spec.Containers[0].Env) {
-			return true
-		}
-
-		// Check command changes (e.g., auth flags added/removed).
-		if !stringSliceEqual(desired.Spec.Template.Spec.Containers[0].Command, current.Spec.Template.Spec.Containers[0].Command) {
+// containersChanged returns true if the container lists differ in count or in any
+// container's name, image, command, args, env, volume mounts, or resource requirements.
+func containersChanged(desired, current []corev1.Container) bool {
+	if len(desired) != len(current) {
+		return true
+	}
+	for i := range desired {
+		if containerChanged(desired[i], current[i]) {
 			return true
 		}
 	}
+	return false
+}
 
+// containerChanged returns true if two containers differ in rolling-update-relevant fields.
+func containerChanged(desired, current corev1.Container) bool {
+	if desired.Name != current.Name || desired.Image != current.Image {
+		return true
+	}
+	if !stringSliceEqual(desired.Command, current.Command) || !stringSliceEqual(desired.Args, current.Args) {
+		return true
+	}
+	if !envVarsEqual(desired.Env, current.Env) {
+		return true
+	}
+	if !volumeMountsEqual(desired.VolumeMounts, current.VolumeMounts) {
+		return true
+	}
+	dRes := desired.Resources
+	cRes := current.Resources
+	return resourceListChanged(dRes.Requests, cRes.Requests) || resourceListChanged(dRes.Limits, cRes.Limits)
+}
+
+// volumeMountsEqual returns true if two volume mount slices are equal in name,
+// mount path, and read-only flag.
+func volumeMountsEqual(a, b []corev1.VolumeMount) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].MountPath != b[i].MountPath || a[i].ReadOnly != b[i].ReadOnly {
+			return false
+		}
+	}
+	return true
+}
+
+// volumesChanged returns true if the volume configurations differ in count, names,
+// or source (ConfigMap/Secret names).
+func volumesChanged(desired, current []corev1.Volume) bool {
+	if len(desired) != len(current) {
+		return true
+	}
+	currentMap := make(map[string]corev1.Volume, len(current))
+	for _, v := range current {
+		currentMap[v.Name] = v
+	}
+	for _, d := range desired {
+		c, ok := currentMap[d.Name]
+		if !ok {
+			return true
+		}
+		if volumeSourceChanged(d.VolumeSource, c.VolumeSource) {
+			return true
+		}
+	}
+	return false
+}
+
+// volumeSourceChanged returns true if two VolumeSource values differ in
+// ConfigMap name or Secret name — the most common changes between operator versions.
+func volumeSourceChanged(desired, current corev1.VolumeSource) bool {
+	dCM, cCM := desired.ConfigMap, current.ConfigMap
+	if (dCM == nil) != (cCM == nil) {
+		return true
+	}
+	if dCM != nil && dCM.Name != cCM.Name {
+		return true
+	}
+	dSec, cSec := desired.Secret, current.Secret
+	if (dSec == nil) != (cSec == nil) {
+		return true
+	}
+	if dSec != nil && dSec.SecretName != cSec.SecretName {
+		return true
+	}
 	return false
 }
 

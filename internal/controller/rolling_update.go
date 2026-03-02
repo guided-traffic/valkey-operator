@@ -49,11 +49,25 @@ const annotationReconnectResetCount = "vko.gtrfc.com/reconnect-reset-count"
 // allow the rolling update to complete despite incomplete topology information.
 const annotationFinalizationTimestamp = "vko.gtrfc.com/finalization-started"
 
+// annotationSentinelAwarenessStarted records when we first started waiting for
+// sentinel to discover the expected number of replicas before triggering a
+// failover. Used to detect when this wait has stalled and we should proceed
+// regardless (triggering the failover and letting the NOGOODSLAVE retry cycle
+// recover, rather than blocking indefinitely before even attempting failover).
+const annotationSentinelAwarenessStarted = "vko.gtrfc.com/sentinel-awareness-started"
+
 // finalizationStallTimeout is the duration after which finalizeRollingUpdate
 // will proceed with best-effort sentinel sync even if topology checks are still
 // uncertain. This prevents the rolling update from stalling indefinitely in
 // resource-constrained environments where GetReplicationInfo calls are flaky.
 const finalizationStallTimeout = 2 * time.Minute
+
+// sentinelAwarenessTimeout is the maximum time to wait for sentinel to report
+// the expected number of replicas before proceeding with the failover regardless.
+// After a sentinel REMOVE+MONITOR (e.g., from a prior rolling update finalization),
+// sentinel normally re-discovers replicas within 10–30 s. Waiting up to 90 s gives
+// ample margin while preventing an indefinite stall when sentinel is stuck.
+const sentinelAwarenessTimeout = 90 * time.Second
 
 // maxReconnectResets is the maximum number of sentinel resets we perform while
 // waiting for replicas to reconnect. After this many resets we send direct
@@ -112,6 +126,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 
 	// Check if any pods are running a different image than desired.
 	desiredImage := v.Spec.Image
+	sidecarImg := sidecarImageFromSts(currentSts)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -124,7 +139,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
 			needsRollingUpdate = true
 			break
 		}
@@ -161,12 +176,37 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 	return current.Spec.Template.Spec.Containers[0].Image != desired
 }
 
-// podNeedsUpdate returns true if the pod's container image does not match the desired image.
-func podNeedsUpdate(pod *corev1.Pod, desiredImage string) bool {
+// podNeedsUpdate returns true if the pod needs to be replaced because its
+// valkey or sidecar container image differs from the desired image.
+// Pass an empty desiredSidecarImage to skip the sidecar check.
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
-	return pod.Spec.Containers[0].Image != desiredImage
+	for _, c := range pod.Spec.Containers {
+		switch c.Name {
+		case builder.ValkeyContainerName:
+			if desiredValkeyImage != "" && c.Image != desiredValkeyImage {
+				return true
+			}
+		case builder.SidecarContainerName:
+			if desiredSidecarImage != "" && c.Image != desiredSidecarImage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sidecarImageFromSts returns the sidecar container image from a StatefulSet's
+// pod template, or empty string when no sidecar container is present.
+func sidecarImageFromSts(sts *appsv1.StatefulSet) string {
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name == builder.SidecarContainerName {
+			return c.Image
+		}
+	}
+	return ""
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -290,10 +330,18 @@ func (r *ValkeyReconciler) handleFailoverRetrigger(ctx context.Context, v *vkov1
 
 	// Verify sentinel has actually discovered replicas before retriggering.
 	// The time-based wait above is a minimum; this check confirms readiness.
+	// Apply the same sentinelAwarenessTimeout cap here to avoid an indefinite
+	// stall in the retrigger path (same root cause as in handleMasterFailover).
 	expectedReplicas := int(v.Spec.Replicas) - 1
 	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
-		logger.Info("Sentinel has not rediscovered replicas after reset, waiting")
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		r.ensureSentinelAwarenessTimestamp(ctx, v)
+		if r.isSentinelAwarenessStalled(v) {
+			logger.Info("Sentinel awareness stalled in retrigger, proceeding with failover regardless",
+				"expectedReplicas", expectedReplicas)
+		} else {
+			logger.Info("Sentinel has not rediscovered replicas after reset, waiting")
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		}
 	}
 
 	logger.Info("Retriggering sentinel failover after reset")
@@ -361,7 +409,7 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 	}
 
 	// Master found — wait for all replicas to be connected, then sync sentinel.
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 	expectedReplicas := len(pods) - 1
 	for _, ps := range pods {
 		if !ps.isMaster {
@@ -377,7 +425,7 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 // all replicas are connected, performs a sentinel state reset to synchronise
 // sentinel with the current master address.
 // Returns nil to proceed, or a non-nil requeue result when we need to wait.
-func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.Valkey, masterPS podState, expectedReplicas int, checker *health.Checker, stalled bool) *RollingUpdateResult {
+func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.Valkey, masterPS podState, expectedReplicas int, checker InstanceChecker, stalled bool) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
 	info, err := checker.GetReplicationInfo(ctx, v, masterPS.name)
@@ -412,8 +460,34 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 	logger.Info("Syncing sentinel with current master before finalization",
 		"master", masterPS.name, "masterAddr", masterAddr,
 		"connectedSlaves", info.ConnectedSlaves)
+	// Persist the confirmed master address as a CR annotation so that the sentinel
+	// ConfigMap is regenerated with the correct master address on the next reconcile.
+	// This guarantees that sentinel pods which restart after the rolling update
+	// (e.g., due to a StatefulSet conflict resolution) connect to the actual
+	// post-failover master rather than falling back to the stale pod-0 default.
+	r.persistKnownMaster(ctx, v, masterAddr)
 	r.resetSentinelState(ctx, v, masterAddr)
 	return nil
+}
+
+// persistKnownMaster stores the post-failover master address as a Valkey CR
+// annotation (builder.AnnotationKnownMaster). The builder package reads this
+// annotation when generating the sentinel ConfigMap, so any sentinel pod that
+// restarts after a failover starts monitoring the correct master from the outset.
+// Best-effort: annotation write errors are logged but not returned.
+func (r *ValkeyReconciler) persistKnownMaster(ctx context.Context, v *vkov1.Valkey, masterAddr string) {
+	logger := log.FromContext(ctx)
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	if v.Annotations[builder.AnnotationKnownMaster] == masterAddr {
+		return // already up-to-date — no API call needed
+	}
+	v.Annotations[builder.AnnotationKnownMaster] = masterAddr
+	if err := r.Update(ctx, v); err != nil {
+		logger.V(1).Info("Failed to persist known-master annotation",
+			"masterAddr", masterAddr, "error", err)
+	}
 }
 
 // ensureFinalizationTimestamp sets the finalization-started annotation if it is
@@ -428,6 +502,39 @@ func (r *ValkeyReconciler) ensureFinalizationTimestamp(ctx context.Context, v *v
 	}
 	v.Annotations[annotationFinalizationTimestamp] = time.Now().UTC().Format(time.RFC3339)
 	_ = r.Update(ctx, v)
+}
+
+// ensureSentinelAwarenessTimestamp sets the sentinel-awareness-started annotation
+// if it is not already present. The timestamp is used by isSentinelAwarenessStalled
+// to detect when we have been waiting too long for sentinel to discover replicas.
+func (r *ValkeyReconciler) ensureSentinelAwarenessTimestamp(ctx context.Context, v *vkov1.Valkey) {
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	if _, ok := v.Annotations[annotationSentinelAwarenessStarted]; ok {
+		return // already set
+	}
+	v.Annotations[annotationSentinelAwarenessStarted] = time.Now().UTC().Format(time.RFC3339)
+	_ = r.Update(ctx, v)
+}
+
+// isSentinelAwarenessStalled returns true if we have been waiting for sentinel
+// to discover the expected replicas longer than sentinelAwarenessTimeout.
+// When stalled, callers should proceed with the failover rather than waiting
+// indefinitely; the existing NOGOODSLAVE retry cycle will handle recovery.
+func (r *ValkeyReconciler) isSentinelAwarenessStalled(v *vkov1.Valkey) bool {
+	if v.Annotations == nil {
+		return false
+	}
+	tsStr, ok := v.Annotations[annotationSentinelAwarenessStarted]
+	if !ok || tsStr == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true // corrupted timestamp — treat as stalled to recover
+	}
+	return time.Since(ts) > sentinelAwarenessTimeout
 }
 
 // isFinalizationStalled returns true if the finalizeRollingUpdate function has
@@ -484,7 +591,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 	desiredImage := v.Spec.Image
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	totalPods := int(*currentSts.Spec.Replicas)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	pods := make([]podState, totalPods)
 	masterIdx := -1
@@ -504,7 +611,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage)
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts))
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -611,11 +718,19 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 	// finalization), sentinel needs time to discover replicas via INFO polling.
 	// Triggering failover before sentinel knows about replicas results in
 	// NOGOODSLAVE, wasting ~75s on the retry cycle.
+	// A sentinelAwarenessTimeout cap prevents an indefinite stall when sentinel
+	// is stuck with 0 slaves (e.g., in a resource-constrained CI environment).
 	expectedReplicas := len(pods) - 1
 	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
-		logger.Info("Waiting for sentinel to discover replicas before failover",
-			"expectedReplicas", expectedReplicas)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		r.ensureSentinelAwarenessTimestamp(ctx, v)
+		if r.isSentinelAwarenessStalled(v) {
+			logger.Info("Sentinel awareness stalled, proceeding with failover regardless",
+				"expectedReplicas", expectedReplicas)
+		} else {
+			logger.Info("Waiting for sentinel to discover replicas before failover",
+				"expectedReplicas", expectedReplicas)
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		}
 	}
 
 	// Set state BEFORE triggering failover to prevent concurrent reconciles
@@ -643,7 +758,7 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 // replication sync. Returns a requeue result if any replica is not ready.
 func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	for i, ps := range pods {
 		if i == masterIdx {
@@ -723,7 +838,7 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 // has completed replication sync, and has actual data (DBSIZE > 0) to prevent data loss.
 func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	for _, ps := range pods {
 		if !ps.needsUpdate {
@@ -774,7 +889,7 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 // state and re-triggers the failover to handle sentinel cooldown issues
 // (e.g., during consecutive rolling updates).
 func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valkey, _ []podState, _ int) RollingUpdateResult {
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	// Re-collect pod states to get fresh role information.
 	// After a failover, roles change and we must not rely on stale data.
@@ -929,14 +1044,18 @@ func (r *ValkeyReconciler) getReconnectResetCount(v *vkov1.Valkey) int {
 }
 
 // incrementReconnectResetCount persists newCount in the reset-count annotation
-// and simultaneously refreshes the failover timestamp, so the next wait period
-// starts from now. Both are written in a single Update to avoid a double-write race.
+// and simultaneously refreshes the failover timestamp and clears the sentinel-
+// awareness timestamp, so the next wait period starts from now.
+// All three are written in a single Update to avoid multiple API calls.
 func (r *ValkeyReconciler) incrementReconnectResetCount(ctx context.Context, v *vkov1.Valkey, newCount int) error {
 	if v.Annotations == nil {
 		v.Annotations = make(map[string]string)
 	}
 	v.Annotations[annotationReconnectResetCount] = fmt.Sprintf("%d", newCount)
 	v.Annotations[annotationFailoverTimestamp] = time.Now().UTC().Format(time.RFC3339)
+	// Also clear the sentinel-awareness timestamp so the next failover attempt's
+	// stall-detection starts from a fresh baseline after this sentinel reset.
+	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	return r.Update(ctx, v)
 }
 
@@ -950,6 +1069,16 @@ func (r *ValkeyReconciler) clearReconnectResetCount(ctx context.Context, v *vkov
 	}
 	delete(v.Annotations, annotationReconnectResetCount)
 	return r.Update(ctx, v)
+}
+
+// clearSentinelAwarenessTimestamp removes the sentinel-awareness-started annotation
+// from the Valkey CR. This must be called whenever sentinel is reset so that the
+// next failover attempt's stall-detection starts from a fresh baseline, not from a
+// timestamp that predates the most recent SENTINEL REMOVE+MONITOR.
+func (r *ValkeyReconciler) clearSentinelAwarenessTimestamp(v *vkov1.Valkey) {
+	if v.Annotations != nil {
+		delete(v.Annotations, annotationSentinelAwarenessStarted)
+	}
 }
 
 // handleNoMasterFound handles the case where no new-image master was detected
@@ -978,6 +1107,10 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 	// Reset sentinel with the correct master address.
 	r.resetSentinelState(ctx, v, masterAddr)
 
+	// Clear the sentinel-awareness timestamp so the next failover attempt's
+	// stall-detection starts from a fresh baseline after this sentinel reset.
+	r.clearSentinelAwarenessTimestamp(v)
+
 	// Update the failover timestamp for the retry.
 	if err := r.setFailoverTimestamp(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -995,7 +1128,7 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 // verifyNewMasterReady verifies that a new-image master exists and has
 // connected replicas before we delete the old master pod.
 // Returns (true, _) if verified, (false, result) if we need to wait.
-func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker *health.Checker) (bool, RollingUpdateResult) {
+func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker InstanceChecker) (bool, RollingUpdateResult) {
 	logger := log.FromContext(ctx)
 	for _, other := range pods {
 		if other.needsUpdate || !other.ready {
@@ -1077,13 +1210,15 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasTimestamp := v.Annotations[annotationFailoverTimestamp]
 	_, hasCount := v.Annotations[annotationReconnectResetCount]
 	_, hasFinalization := v.Annotations[annotationFinalizationTimestamp]
-	if !hasState && !hasTimestamp && !hasCount && !hasFinalization {
+	_, hasSentinelAwareness := v.Annotations[annotationSentinelAwarenessStarted]
+	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
 	delete(v.Annotations, annotationFailoverTimestamp)
 	delete(v.Annotations, annotationReconnectResetCount)
 	delete(v.Annotations, annotationFinalizationTimestamp)
+	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	return r.Update(ctx, v)
 }
 
@@ -1319,11 +1454,19 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 }
 
 // handleStandaloneRollingUpdate handles rolling update for standalone (non-HA) mode.
-// For standalone, we simply delete the pod and let StatefulSet recreate it with the new template.
+//
+// When the valkey image changes, the pod is deleted so the StatefulSet recreates it
+// with the new template. When only the sidecar image changed (operator upgrade),
+// the pod is NOT automatically restarted to avoid disrupting single-instance clusters
+// without redundancy. Instead, a SidecarUpdatePending condition is set and the
+// update is deferred to the next natural pod restart (manual delete, eviction, or
+// valkey image change).
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
+	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	sidecarPending := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -1338,7 +1481,16 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
+			// For sidecar-only changes in standalone mode, defer the update to the
+			// next natural pod restart rather than auto-deleting the pod.
+			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
+				logger.Info("Standalone pod has outdated sidecar; update deferred to next pod restart",
+					"pod", podName)
+				sidecarPending = true
+				continue
+			}
+
 			if !isPodReady(pod) {
 				logger.Info("Pod not ready, waiting", "pod", podName)
 				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -1360,8 +1512,132 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		}
 	}
 
+	// Reflect sidecar-pending state in the CR status conditions.
+	r.setSidecarUpdatePendingCondition(ctx, v, sidecarPending)
+
+	if sidecarPending {
+		// The sidecar update is deferred — no active rolling update in progress.
+		// Return empty result so the reconciler does not requeue but the condition
+		// remains set until the next natural pod restart clears it.
+		return RollingUpdateResult{}
+	}
+
 	// All pods updated and ready.
 	return RollingUpdateResult{Completed: true}
+}
+
+// isSidecarOnlyChange returns true when the pod needs replacing exclusively
+// because the sidecar image has drifted while the main valkey image is current.
+// Returns false when the valkey image also changed, when no sidecar is present,
+// or when desiredSidecarImage is empty (sidecar-less deployment).
+func isSidecarOnlyChange(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
+	if len(pod.Spec.Containers) == 0 || desiredSidecarImage == "" {
+		return false
+	}
+	valkeyUpToDate := true
+	sidecarOutdated := false
+	sidecarFound := false
+	for _, c := range pod.Spec.Containers {
+		switch c.Name {
+		case builder.ValkeyContainerName:
+			if desiredValkeyImage != "" && c.Image != desiredValkeyImage {
+				valkeyUpToDate = false
+			}
+		case builder.SidecarContainerName:
+			sidecarFound = true
+			if c.Image != desiredSidecarImage {
+				sidecarOutdated = true
+			}
+		}
+	}
+	return valkeyUpToDate && sidecarFound && sidecarOutdated
+}
+
+// sentinelPodNeedsUpdate returns true when the running pod's container images
+// differ from what the sentinel StatefulSet template specifies.
+func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	desired := make(map[string]string, len(desiredTemplate.Spec.Containers))
+	for _, c := range desiredTemplate.Spec.Containers {
+		desired[c.Name] = c.Image
+	}
+	for _, c := range pod.Spec.Containers {
+		if want, ok := desired[c.Name]; ok && c.Image != want {
+			return true
+		}
+	}
+	return false
+}
+
+// checkAndHandleSentinelRollingUpdate detects sentinel pods running outdated container
+// images and replaces them one at a time while verifying sentinel quorum is maintained.
+//
+// Because the sentinel StatefulSet uses OnDelete, Kubernetes will not automatically
+// restart pods after a spec update. The operator must coordinate pod deletion here.
+//
+// Strategy:
+//  1. Identify sentinel pods whose container images differ from the current template.
+//  2. Before deleting any pod, check that the remaining ready sentinels (after
+//     deletion) will still meet quorum (readyCount - 1 >= quorum).
+//  3. Delete the first outdated pod and requeue so the next reconcile
+//     waits for the replacement to become ready before moving on.
+func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	sentinelSts := &appsv1.StatefulSet{}
+	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
+	if err := r.Get(ctx, types.NamespacedName{Name: sentinelStsName, Namespace: v.Namespace}, sentinelSts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return RollingUpdateResult{}
+		}
+		return RollingUpdateResult{Error: fmt.Errorf("getting sentinel StatefulSet: %w", err)}
+	}
+
+	totalSentinels := int(*sentinelSts.Spec.Replicas)
+	quorum := totalSentinels/2 + 1
+	desiredTemplate := sentinelSts.Spec.Template
+
+	readyCount := 0
+	var firstOutdatedPod *corev1.Pod
+
+	for i := 0; i < totalSentinels; i++ {
+		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Pod does not exist yet (initial deployment) or is being recreated
+				// after a recent deletion. In both cases, skip it — it neither counts
+				// toward readyCount nor can be an outdated pod to delete.
+				// The quorum guard below will naturally prevent triggering another
+				// deletion while a pod is missing (reducing effectiveReadyCount).
+				continue
+			}
+			return RollingUpdateResult{Error: fmt.Errorf("getting sentinel pod %s: %w", podName, err)}
+		}
+		if isPodReady(pod) {
+			readyCount++
+		}
+		if firstOutdatedPod == nil && sentinelPodNeedsUpdate(pod, desiredTemplate) {
+			firstOutdatedPod = pod
+		}
+	}
+
+	if firstOutdatedPod == nil {
+		// All sentinel pods are running the desired image.
+		return RollingUpdateResult{}
+	}
+
+	// Guard quorum: after deleting one pod we need at least `quorum` sentinels left.
+	if readyCount-1 < quorum {
+		logger.Info("Waiting for sentinel quorum before updating sentinel pod",
+			"pod", firstOutdatedPod.Name, "readyCount", readyCount, "quorum", quorum)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	logger.Info("Deleting sentinel pod for rolling update", "pod", firstOutdatedPod.Name)
+	if err := r.Delete(ctx, firstOutdatedPod); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", firstOutdatedPod.Name, err)}
+	}
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
 
 // ValkeyPhase is a type alias to allow constructing rolling update phase strings.

@@ -39,11 +39,13 @@ import (
 )
 
 // InstanceChecker verifies connectivity and health of Valkey instances.
-// Implementations must provide PingPod for basic connectivity checks and
-// CheckCluster for full HA cluster health verification.
+// Implementations must provide PingPod for basic connectivity checks,
+// CheckCluster for full HA cluster health verification, and GetReplicationInfo
+// to query per-pod replication state during rolling updates.
 type InstanceChecker interface {
 	PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error
 	CheckCluster(ctx context.Context, v *vkov1.Valkey) *health.ClusterState
+	GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error)
 }
 
 // ValkeyReconciler reconciles a Valkey object.
@@ -53,6 +55,7 @@ type ValkeyReconciler struct {
 	InstanceChecker   InstanceChecker
 	OperatorImage     string
 	OperatorNamespace string
+	OperatorVersion   string
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -186,6 +189,20 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: rollingResult.RequeueAfter}, nil
 	}
 
+	// Check for sentinel pod updates (only when no Valkey rolling update is active).
+	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
+	// while verifying sentinel quorum before each deletion.
+	if valkey.IsSentinelEnabled() {
+		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, valkey)
+		if sentinelResult.Error != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
+			return ctrl.Result{}, sentinelResult.Error
+		}
+		if sentinelResult.NeedsRequeue {
+			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, nil
+		}
+	}
+
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
 		return ctrl.Result{}, err
@@ -299,6 +316,7 @@ func (r *ValkeyReconciler) reconcileServices(ctx context.Context, valkey *vkov1.
 func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildConfigMap(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on ConfigMap: %w", err)
@@ -314,11 +332,13 @@ func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valk
 		return err
 	}
 
-	// Update if config content has changed.
-	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
+	// Update if config content or operator version annotation has changed.
+	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating ConfigMap", "name", desired.Name)
 		current.Data = desired.Data
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -329,6 +349,7 @@ func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valk
 func (r *ValkeyReconciler) reconcileReplicaConfigMap(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildReplicaConfigMap(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on replica ConfigMap: %w", err)
@@ -344,10 +365,12 @@ func (r *ValkeyReconciler) reconcileReplicaConfigMap(ctx context.Context, v *vko
 		return err
 	}
 
-	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
+	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating replica ConfigMap", "name", desired.Name)
 		current.Data = desired.Data
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -411,68 +434,132 @@ func (r *ValkeyReconciler) deleteLegacyServices(ctx context.Context, v *vkov1.Va
 
 // reconcileSidecarRBAC ensures the sidecar ServiceAccount, Role, and RoleBinding exist.
 func (r *ValkeyReconciler) reconcileSidecarRBAC(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
+	if err := r.reconcileSidecarServiceAccount(ctx, v); err != nil {
+		return err
+	}
+	if err := r.reconcileSidecarRole(ctx, v); err != nil {
+		return err
+	}
+	return r.reconcileSidecarRoleBinding(ctx, v)
+}
 
-	// ServiceAccount.
-	desiredSA := builder.BuildSidecarServiceAccount(v)
-	if err := controllerutil.SetControllerReference(v, desiredSA, r.Scheme); err != nil {
+// reconcileSidecarServiceAccount creates or updates the sidecar ServiceAccount.
+func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarServiceAccount(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
 	}
-	currentSA := &corev1.ServiceAccount{}
-	err := r.Get(ctx, types.NamespacedName{Name: desiredSA.Name, Namespace: desiredSA.Namespace}, currentSA)
+	current := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar ServiceAccount", "name", desiredSA.Name)
-		if err := r.Create(ctx, desiredSA); err != nil {
+		logger.Info("Creating sidecar ServiceAccount", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar ServiceAccount: %w", err)
 		}
-	} else if err != nil {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
+	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
+		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
+		return nil
+	}
+	logger.Info("Updating sidecar ServiceAccount", "name", desired.Name)
+	current.Labels = desired.Labels
+	current.Annotations = desired.Annotations
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar ServiceAccount: %w", err)
+	}
+	return nil
+}
 
-	// Role.
-	desiredRole := builder.BuildSidecarRole(v)
-	if err := controllerutil.SetControllerReference(v, desiredRole, r.Scheme); err != nil {
+// reconcileSidecarRole creates or updates the sidecar Role.
+func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarRole(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar Role: %w", err)
 	}
-	currentRole := &rbacv1.Role{}
-	err = r.Get(ctx, types.NamespacedName{Name: desiredRole.Name, Namespace: desiredRole.Namespace}, currentRole)
+	current := &rbacv1.Role{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar Role", "name", desiredRole.Name)
-		if err := r.Create(ctx, desiredRole); err != nil {
+		logger.Info("Creating sidecar Role", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar Role: %w", err)
 		}
-	} else if err != nil {
-		return err
-	} else if !equality.Semantic.DeepEqual(currentRole.Rules, desiredRole.Rules) {
-		logger.Info("Updating sidecar Role", "name", desiredRole.Name)
-		currentRole.Rules = desiredRole.Rules
-		if err := r.Update(ctx, currentRole); err != nil {
-			return fmt.Errorf("updating sidecar Role: %w", err)
-		}
+		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(current.Rules, desired.Rules) &&
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		return nil
+	}
+	logger.Info("Updating sidecar Role", "name", desired.Name)
+	current.Rules = desired.Rules
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar Role: %w", err)
+	}
+	return nil
+}
 
-	// RoleBinding.
-	desiredRB := builder.BuildSidecarRoleBinding(v)
-	if err := controllerutil.SetControllerReference(v, desiredRB, r.Scheme); err != nil {
+// reconcileSidecarRoleBinding creates or updates the sidecar RoleBinding.
+// If the RoleRef changed (immutable field), the RoleBinding is deleted and recreated.
+func (r *ValkeyReconciler) reconcileSidecarRoleBinding(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildSidecarRoleBinding(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar RoleBinding: %w", err)
 	}
-	currentRB := &rbacv1.RoleBinding{}
-	err = r.Get(ctx, types.NamespacedName{Name: desiredRB.Name, Namespace: desiredRB.Namespace}, currentRB)
+	current := &rbacv1.RoleBinding{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating sidecar RoleBinding", "name", desiredRB.Name)
-		if err := r.Create(ctx, desiredRB); err != nil {
+		logger.Info("Creating sidecar RoleBinding", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("creating sidecar RoleBinding: %w", err)
 		}
-	} else if err != nil {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-
+	if !equality.Semantic.DeepEqual(current.RoleRef, desired.RoleRef) {
+		// RoleRef is immutable — delete and recreate.
+		logger.Info("Recreating sidecar RoleBinding (RoleRef changed)", "name", desired.Name)
+		if err := r.Delete(ctx, current); err != nil {
+			return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+		}
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("recreating sidecar RoleBinding: %w", err)
+		}
+		return nil
+	}
+	if equality.Semantic.DeepEqual(current.Subjects, desired.Subjects) &&
+		equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		return nil
+	}
+	logger.Info("Updating sidecar RoleBinding", "name", desired.Name)
+	current.Subjects = desired.Subjects
+	current.Labels = desired.Labels
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating sidecar RoleBinding: %w", err)
+	}
 	return nil
 }
 
 // reconcileService is a generic service reconciler.
 func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey, desired *corev1.Service) error {
 	logger := log.FromContext(ctx)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Service %s: %w", desired.Name, err)
@@ -488,13 +575,15 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 		return err
 	}
 
-	// Update ports, selector, labels if they changed.
+	// Update ports, selector, labels, or operator version annotation if they changed.
 	if !equality.Semantic.DeepEqual(current.Spec.Ports, desired.Spec.Ports) ||
-		!equality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) {
+		!equality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Service", "name", desired.Name)
 		current.Spec.Ports = desired.Spec.Ports
 		current.Spec.Selector = desired.Spec.Selector
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -505,6 +594,7 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on StatefulSet: %w", err)
@@ -521,11 +611,12 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	}
 
 	// Detect drift and update.
-	if builder.StatefulSetHasChanged(desired, current) {
+	if builder.StatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating StatefulSet", "name", desired.Name)
 		current.Spec.Replicas = desired.Spec.Replicas
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -556,6 +647,7 @@ func (r *ValkeyReconciler) reconcileSentinelResources(ctx context.Context, v *vk
 func (r *ValkeyReconciler) reconcileSentinelConfigMap(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelConfigMap(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Sentinel ConfigMap: %w", err)
@@ -571,10 +663,12 @@ func (r *ValkeyReconciler) reconcileSentinelConfigMap(ctx context.Context, v *vk
 		return err
 	}
 
-	if !equality.Semantic.DeepEqual(current.Data, desired.Data) {
+	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Sentinel ConfigMap", "name", desired.Name)
 		current.Data = desired.Data
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -591,6 +685,7 @@ func (r *ValkeyReconciler) reconcileSentinelHeadlessService(ctx context.Context,
 func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelStatefulSet(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Sentinel StatefulSet: %w", err)
@@ -606,11 +701,12 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 		return err
 	}
 
-	if builder.SentinelStatefulSetHasChanged(desired, current) {
+	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Sentinel StatefulSet", "name", desired.Name)
 		current.Spec.Replicas = desired.Spec.Replicas
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -648,6 +744,9 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 	ownerRef.Controller = &isController
 	desired.SetOwnerReferences([]metav1.OwnerReference{ownerRef})
 
+	// Apply operator version annotation to the certificate resource.
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "cert-manager.io",
@@ -675,11 +774,13 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 	cleanseCertificateSpec(desiredSpec)
 	cleanseCertificateSpec(currentSpec)
 
-	if !equality.Semantic.DeepEqual(desiredSpec, currentSpec) {
+	if !equality.Semantic.DeepEqual(desiredSpec, currentSpec) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Certificate", "name", name)
 		current.Object["spec"] = desired.Object["spec"]
 		current.SetLabels(desired.GetLabels())
 		current.SetOwnerReferences(desired.GetOwnerReferences())
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -721,6 +822,7 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 // reconcileNetworkPolicy ensures a single NetworkPolicy matches the desired state.
 func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.Valkey, desired *networkingv1.NetworkPolicy) error {
 	logger := log.FromContext(ctx)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on NetworkPolicy %s: %w", desired.Name, err)
@@ -736,10 +838,11 @@ func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.
 		return err
 	}
 
-	if builder.NetworkPolicyHasChanged(desired, current) {
+	if builder.NetworkPolicyHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating NetworkPolicy", "name", desired.Name)
 		current.Spec = desired.Spec
 		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
 	}
 
@@ -765,6 +868,10 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
 		return err
 	}
+
+	// Always record which operator version last reconciled this resource.
+	// NOTE: v.Status.OperatorVersion is set inside the sub-functions (after prevStatus capture)
+	// so that a version change is detected by statusUnchanged.
 
 	readyReplicas := sts.Status.ReadyReplicas
 	v.Status.ReadyReplicas = readyReplicas
@@ -839,6 +946,8 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 	}
 
 	// Only update if status actually changed to prevent infinite reconcile loops.
+	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
+	v.Status.OperatorVersion = r.OperatorVersion
 	if statusUnchanged(prevStatus, &v.Status) {
 		return nil
 	}
@@ -942,6 +1051,8 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 	}
 
 	// Only update if status actually changed to prevent infinite reconcile loops.
+	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
+	v.Status.OperatorVersion = r.OperatorVersion
 	if statusUnchanged(prevStatus, &v.Status) {
 		return nil
 	}
@@ -950,7 +1061,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 }
 
 // statusUnchanged compares the key fields of two ValkeyStatus values.
-// It returns true if phase, message, readyReplicas, masterPod, and conditions
+// It returns true if phase, message, readyReplicas, masterPod, operatorVersion, and conditions
 // are all equal, meaning no status update is necessary.
 func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 	if prev.Phase != curr.Phase {
@@ -963,6 +1074,9 @@ func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 		return false
 	}
 	if prev.MasterPod != curr.MasterPod {
+		return false
+	}
+	if prev.OperatorVersion != curr.OperatorVersion {
 		return false
 	}
 	if !reflect.DeepEqual(prev.Conditions, curr.Conditions) {
@@ -986,6 +1100,41 @@ func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, pha
 	v.Status.Phase = phase
 	v.Status.Message = message
 	return r.Status().Update(ctx, v)
+}
+
+// setStatusCondition sets a named status condition on the Valkey CR.
+// It refreshes the object from the API server before writing to avoid conflicts.
+func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
+	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
+		return
+	}
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
+	_ = r.Status().Update(ctx, v)
+}
+
+// setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
+// When pending is true the condition is set to True, indicating that a standalone pod
+// has an outdated sidecar image that will be updated on the next natural pod restart.
+func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pending bool) {
+	if pending {
+		r.setStatusCondition(ctx, v,
+			vkov1.ConditionTypeSidecarUpdatePending,
+			metav1.ConditionTrue,
+			"SidecarImageDrift",
+			"Standalone pod has an outdated sidecar image; update will occur on the next pod restart")
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeSidecarUpdatePending,
+		metav1.ConditionFalse,
+		"SidecarUpToDate",
+		"All sidecar containers are running the desired image")
 }
 
 // verifyValkeyConnectivity pings all Valkey pods to verify operator connectivity.

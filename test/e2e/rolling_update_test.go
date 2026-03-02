@@ -399,8 +399,14 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 
 // TestE2E_RollingUpdate_HA_Idempotent tests that running the same image update
 // multiple times does not cause issues (idempotency).
+//
+// NOTE: This test deliberately does NOT call t.Parallel(). It performs two
+// consecutive HA rolling updates (the most resource-intensive operation in the
+// suite) which would cause severe resource contention on the single-node Kind
+// cluster when run alongside other parallel HA tests. Running it sequentially
+// (before the parallel phase starts) gives it an uncontested cluster and makes
+// the result deterministic.
 func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
-	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-idempotent"
 	cleanup := tc.createNamespace(t, ns)
@@ -438,6 +444,19 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 		tc.waitForStatefulSetReady(t, ns, name, 3)
 		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
+
+	// Ensure the cluster has fully settled before triggering the second rolling
+	// update. The finalizeRollingUpdate phase performs a SENTINEL REMOVE+MONITOR
+	// reset; sentinel needs a few seconds to rediscover replicas afterward.
+	// waitForConnectedReplicas verifies that Valkey replication is live.
+	// waitForSentinelSlaves additionally confirms that sentinel has re-discovered
+	// the topology (NUM-SLAVES == 2), making the start conditions for the second
+	// rolling update fully deterministic and preventing a stall in the operator's
+	// isSentinelAwareOfReplicas guard.
+	settledMaster := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, settledMaster, 6379, 2)
+	tc.waitForSentinelSlaves(t, ns, name, 2)
+	t.Logf("Cluster fully settled after first rolling update, master: %s", settledMaster)
 
 	// "Second" update back to original (tests repeated rolling update).
 	t.Run("Second rolling update (revert)", func(t *testing.T) {

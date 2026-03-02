@@ -39,3 +39,18 @@ affinity: {}
 # Leader election ensures only one operator instance is active at a time.
 leaderElection:
   enabled: true
+
+# preUpgradeHook configures the Helm pre-upgrade hook Job that migrates existing
+# Valkey CRs to the field defaults of the current operator version.
+# The hook runs before the operator Deployment is updated, ensuring the CRD schema
+# and CR defaults are in place before the new operator starts reconciling.
+preUpgradeHook:
+  # enabled controls whether the pre-upgrade Job and its RBAC resources are rendered.
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi

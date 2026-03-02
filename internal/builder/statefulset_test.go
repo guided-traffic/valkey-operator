@@ -600,6 +600,134 @@ func TestStatefulSetHasChanged_CommandChanged(t *testing.T) {
 	assert.True(t, StatefulSetHasChanged(desired, current))
 }
 
+func TestStatefulSetHasChanged_SidecarImageChange(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate operator upgrade: sidecar image in current pod spec is old.
+	current.Spec.Template.Spec.Containers[1].Image = "ghcr.io/guided-traffic/valkey-operator:v0.9"
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_SidecarImageNoChange(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	assert.False(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_SidecarArgsChange(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate sidecar args change (e.g., new flag added in newer operator).
+	current.Spec.Template.Spec.Containers[1].Args = []string{"sidecar", "--obsolete-flag"}
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_InitContainerImageChange(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	if len(desired.Spec.Template.Spec.InitContainers) == 0 {
+		t.Skip("no init containers in this configuration")
+	}
+
+	// Simulate init container image change between operator versions.
+	current.Spec.Template.Spec.InitContainers[0].Image = "old-operator:v0.1"
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_ExtraInitContainer(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate an init container being added in the new desired spec.
+	desired.Spec.Template.Spec.InitContainers = []corev1.Container{
+		{Name: "init-extra", Image: "busybox:latest"},
+	}
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_VolumeAdded(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate a new volume added by a newer operator version.
+	desired.Spec.Template.Spec.Volumes = append(desired.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: "new-volume",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_VolumeConfigMapChanged(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate the ConfigMap backing a volume being renamed between operator versions.
+	for i, vol := range current.Spec.Template.Spec.Volumes {
+		if vol.ConfigMap != nil {
+			current.Spec.Template.Spec.Volumes[i].ConfigMap.Name = "old-configmap-name"
+			break
+		}
+	}
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_ServiceAccountNameChange(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	current.Spec.Template.Spec.ServiceAccountName = "old-service-account"
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_TerminationGracePeriodChange(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	oldGrace := int64(30)
+	current.Spec.Template.Spec.TerminationGracePeriodSeconds = &oldGrace
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
+func TestStatefulSetHasChanged_VolumeMountAdded(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildStatefulSet(v, testOperatorImage)
+	current := desired.DeepCopy()
+
+	// Simulate a new volume mount added to the sidecar in a newer operator version.
+	desired.Spec.Template.Spec.Containers[1].VolumeMounts = append(
+		desired.Spec.Template.Spec.Containers[1].VolumeMounts,
+		corev1.VolumeMount{Name: "new-mount", MountPath: "/new"},
+	)
+
+	assert.True(t, StatefulSetHasChanged(desired, current))
+}
+
 // --- Sidecar Container Tests ---
 
 func TestBuildStatefulSet_SidecarContainer(t *testing.T) {

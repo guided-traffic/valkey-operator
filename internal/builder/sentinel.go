@@ -20,6 +20,13 @@ const (
 	// SentinelConfigKey is the key used in the ConfigMap for sentinel configuration.
 	SentinelConfigKey = "sentinel.conf"
 
+	// AnnotationKnownMaster is the annotation key used to persist the post-failover
+	// master address on the Valkey CR. When present, GenerateSentinelConf uses this
+	// address instead of the default pod-0 address. This ensures that if a sentinel
+	// pod restarts after a failover, it reads the correct master from the ConfigMap
+	// rather than falling back to the stale pod-0 default.
+	AnnotationKnownMaster = "vko.gtrfc.com/known-master"
+
 	// SentinelContainerName is the name of the Sentinel container.
 	SentinelContainerName = "sentinel"
 
@@ -56,10 +63,20 @@ func SentinelMonitorName(v *vkov1.Valkey) string {
 }
 
 // GenerateSentinelConf generates the sentinel.conf content based on the CRD spec.
+// If the Valkey CR carries the AnnotationKnownMaster annotation (set by the
+// operator after a successful sentinel failover), that address is used as the
+// sentinel monitor target instead of the default pod-0 DNS address. This ensures
+// that sentinel pods which restart after a rolling-update failover immediately
+// connect to the actual current master rather than a stale pod-0 replica.
 func GenerateSentinelConf(v *vkov1.Valkey) string {
 	var lines []string
 
 	masterAddr := MasterAddress(v)
+	if v.Annotations != nil {
+		if override, ok := v.Annotations[AnnotationKnownMaster]; ok && override != "" {
+			masterAddr = override
+		}
+	}
 	monitorName := SentinelMonitorName(v)
 
 	// Calculate quorum: majority of sentinel replicas.
@@ -182,7 +199,9 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 				MatchLabels: selectorLabels,
 			},
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
-				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				// Use OnDelete so the operator controls pod-by-pod rollout
+				// with sentinel quorum verification before each deletion.
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -431,6 +450,8 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 }
 
 // SentinelStatefulSetHasChanged returns true if the live Sentinel StatefulSet differs from desired.
+// It checks replicas and the full pod template spec (containers, init containers, volumes,
+// ServiceAccountName, TerminationGracePeriodSeconds, labels, and annotations).
 func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 	// Check replicas.
 	if desired.Spec.Replicas != nil && current.Spec.Replicas != nil {
@@ -438,37 +459,5 @@ func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 			return true
 		}
 	}
-
-	// Check container image.
-	if len(desired.Spec.Template.Spec.Containers) > 0 && len(current.Spec.Template.Spec.Containers) > 0 {
-		if desired.Spec.Template.Spec.Containers[0].Image != current.Spec.Template.Spec.Containers[0].Image {
-			return true
-		}
-	}
-
-	// Check labels on pod template.
-	desiredLabels := desired.Spec.Template.Labels
-	currentLabels := current.Spec.Template.Labels
-	if len(desiredLabels) != len(currentLabels) {
-		return true
-	}
-	for k, v := range desiredLabels {
-		if currentLabels[k] != v {
-			return true
-		}
-	}
-
-	// Check annotations on pod template.
-	desiredAnnotations := desired.Spec.Template.Annotations
-	currentAnnotations := current.Spec.Template.Annotations
-	if len(desiredAnnotations) != len(currentAnnotations) {
-		return true
-	}
-	for k, v := range desiredAnnotations {
-		if currentAnnotations[k] != v {
-			return true
-		}
-	}
-
-	return false
+	return podTemplateChanged(desired.Spec.Template, current.Spec.Template)
 }
