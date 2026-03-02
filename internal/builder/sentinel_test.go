@@ -200,6 +200,80 @@ func TestGenerateSentinelConf_MasterAddress(t *testing.T) {
 	assert.Contains(t, conf, "test-0.test-headless.prod.svc.cluster.local")
 }
 
+// TestGenerateSentinelConf_KnownMasterAnnotation verifies that when the
+// AnnotationKnownMaster annotation is present on the Valkey CR, GenerateSentinelConf
+// uses that address instead of the default pod-0 DNS address. This is the core
+// mechanism that prevents sentinel pods from reconnecting to a stale pod-0 replica
+// after a rolling-update failover promoted a different pod to master.
+func TestGenerateSentinelConf_KnownMasterAnnotation(t *testing.T) {
+	const overrideMaster = "roll-ha-1.roll-ha-headless.e2e-test.svc.cluster.local"
+	v := newTestValkey("roll-ha", func(v *vkov1.Valkey) {
+		v.Namespace = "e2e-test"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// The annotation-provided address must be used instead of pod-0.
+	assert.Contains(t, conf, overrideMaster,
+		"sentinel.conf must use the AnnotationKnownMaster address when the annotation is set")
+	assert.NotContains(t, conf, "roll-ha-0.roll-ha-headless.e2e-test.svc.cluster.local",
+		"sentinel.conf must NOT contain the default pod-0 address when AnnotationKnownMaster overrides it")
+}
+
+// TestGenerateSentinelConf_KnownMasterAnnotation_EmptyFallsBackToDefault ensures
+// that an empty annotation value is treated as absent and the default pod-0 address
+// is used instead of the empty string.
+func TestGenerateSentinelConf_KnownMasterAnnotation_EmptyFallsBackToDefault(t *testing.T) {
+	v := newTestValkey("myvalkey", func(v *vkov1.Valkey) {
+		v.Namespace = "default"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Empty annotation → fall back to default pod-0.
+	assert.Contains(t, conf, "myvalkey-0.myvalkey-headless.default.svc.cluster.local")
+}
+
+// TestBuildSentinelConfigMap_KnownMasterAnnotation_PropagatesToConfigData ensures that
+// the ConfigMap data reflects the AnnotationKnownMaster override. This is an
+// integration-level check confirming that the full build pipeline (annotation →
+// GenerateSentinelConf → ConfigMap data) works end-to-end.
+func TestBuildSentinelConfigMap_KnownMasterAnnotation_PropagatesToConfigData(t *testing.T) {
+	const overrideMaster = "roll-ha-2.roll-ha-headless.prod.svc.cluster.local"
+	v := newTestValkey("roll-ha", func(v *vkov1.Valkey) {
+		v.Namespace = "prod"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	cm := BuildSentinelConfigMap(v)
+
+	require.Contains(t, cm.Data, SentinelConfigKey)
+	assert.Contains(t, cm.Data[SentinelConfigKey], overrideMaster,
+		"ConfigMap data must embed the AnnotationKnownMaster address")
+	assert.NotContains(t, cm.Data[SentinelConfigKey], "roll-ha-0.",
+		"ConfigMap must not reference the stale pod-0 address when AnnotationKnownMaster is set")
+}
+
 // --- BuildSentinelConfigMap ---
 
 func TestBuildSentinelConfigMap(t *testing.T) {

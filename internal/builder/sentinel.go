@@ -20,6 +20,13 @@ const (
 	// SentinelConfigKey is the key used in the ConfigMap for sentinel configuration.
 	SentinelConfigKey = "sentinel.conf"
 
+	// AnnotationKnownMaster is the annotation key used to persist the post-failover
+	// master address on the Valkey CR. When present, GenerateSentinelConf uses this
+	// address instead of the default pod-0 address. This ensures that if a sentinel
+	// pod restarts after a failover, it reads the correct master from the ConfigMap
+	// rather than falling back to the stale pod-0 default.
+	AnnotationKnownMaster = "vko.gtrfc.com/known-master"
+
 	// SentinelContainerName is the name of the Sentinel container.
 	SentinelContainerName = "sentinel"
 
@@ -56,10 +63,20 @@ func SentinelMonitorName(v *vkov1.Valkey) string {
 }
 
 // GenerateSentinelConf generates the sentinel.conf content based on the CRD spec.
+// If the Valkey CR carries the AnnotationKnownMaster annotation (set by the
+// operator after a successful sentinel failover), that address is used as the
+// sentinel monitor target instead of the default pod-0 DNS address. This ensures
+// that sentinel pods which restart after a rolling-update failover immediately
+// connect to the actual current master rather than a stale pod-0 replica.
 func GenerateSentinelConf(v *vkov1.Valkey) string {
 	var lines []string
 
 	masterAddr := MasterAddress(v)
+	if v.Annotations != nil {
+		if override, ok := v.Annotations[AnnotationKnownMaster]; ok && override != "" {
+			masterAddr = override
+		}
+	}
 	monitorName := SentinelMonitorName(v)
 
 	// Calculate quorum: majority of sentinel replicas.

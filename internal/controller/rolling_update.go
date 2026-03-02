@@ -460,8 +460,34 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 	logger.Info("Syncing sentinel with current master before finalization",
 		"master", masterPS.name, "masterAddr", masterAddr,
 		"connectedSlaves", info.ConnectedSlaves)
+	// Persist the confirmed master address as a CR annotation so that the sentinel
+	// ConfigMap is regenerated with the correct master address on the next reconcile.
+	// This guarantees that sentinel pods which restart after the rolling update
+	// (e.g., due to a StatefulSet conflict resolution) connect to the actual
+	// post-failover master rather than falling back to the stale pod-0 default.
+	r.persistKnownMaster(ctx, v, masterAddr)
 	r.resetSentinelState(ctx, v, masterAddr)
 	return nil
+}
+
+// persistKnownMaster stores the post-failover master address as a Valkey CR
+// annotation (builder.AnnotationKnownMaster). The builder package reads this
+// annotation when generating the sentinel ConfigMap, so any sentinel pod that
+// restarts after a failover starts monitoring the correct master from the outset.
+// Best-effort: annotation write errors are logged but not returned.
+func (r *ValkeyReconciler) persistKnownMaster(ctx context.Context, v *vkov1.Valkey, masterAddr string) {
+	logger := log.FromContext(ctx)
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	if v.Annotations[builder.AnnotationKnownMaster] == masterAddr {
+		return // already up-to-date — no API call needed
+	}
+	v.Annotations[builder.AnnotationKnownMaster] = masterAddr
+	if err := r.Update(ctx, v); err != nil {
+		logger.V(1).Info("Failed to persist known-master annotation",
+			"masterAddr", masterAddr, "error", err)
+	}
 }
 
 // ensureFinalizationTimestamp sets the finalization-started annotation if it is

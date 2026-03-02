@@ -1646,3 +1646,72 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 		Name: fmt.Sprintf("%s-2", stsName), Namespace: "default",
 	}, pod2))
 }
+
+// --- persistKnownMaster ---
+
+// TestPersistKnownMaster_SetsAnnotation verifies that persistKnownMaster writes the
+// master address as the AnnotationKnownMaster annotation on the Valkey CR, which is
+// later read by builder.GenerateSentinelConf so that any restarted sentinel pod
+// immediately monitors the correct post-failover master instead of the default pod-0.
+func TestPersistKnownMaster_SetsAnnotation(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	r, c := newTestReconciler(v)
+	const masterAddr = "ha-1.ha-headless.default.svc.cluster.local"
+
+	r.persistKnownMaster(context.Background(), v, masterAddr)
+
+	// The in-memory object must carry the annotation.
+	assert.Equal(t, masterAddr, v.Annotations[builder.AnnotationKnownMaster])
+
+	// The persisted CR must also carry the annotation.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, updated))
+	assert.Equal(t, masterAddr, updated.Annotations[builder.AnnotationKnownMaster])
+}
+
+// TestPersistKnownMaster_UpdatesAnnotation verifies that a second call with a new
+// master address overwrites the previous value (e.g. after a second rolling update).
+func TestPersistKnownMaster_UpdatesAnnotation(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			builder.AnnotationKnownMaster: "ha-1.ha-headless.default.svc.cluster.local",
+		}
+	})
+
+	r, c := newTestReconciler(v)
+	const newMaster = "ha-2.ha-headless.default.svc.cluster.local"
+
+	r.persistKnownMaster(context.Background(), v, newMaster)
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, updated))
+	assert.Equal(t, newMaster, updated.Annotations[builder.AnnotationKnownMaster],
+		"annotation must be updated to the new master address")
+}
+
+// TestPersistKnownMaster_NoOpIfUnchanged verifies that when the annotation already
+// holds the correct master address, persistKnownMaster does not issue an API update.
+// This is a best-effort check: we confirm the annotation is unchanged and no error occurs.
+func TestPersistKnownMaster_NoOpIfUnchanged(t *testing.T) {
+	const masterAddr = "ha-1.ha-headless.default.svc.cluster.local"
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			builder.AnnotationKnownMaster: masterAddr,
+		}
+	})
+
+	r, c := newTestReconciler(v)
+
+	// Call with the same address → should be a no-op.
+	r.persistKnownMaster(context.Background(), v, masterAddr)
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, updated))
+	assert.Equal(t, masterAddr, updated.Annotations[builder.AnnotationKnownMaster],
+		"annotation must remain unchanged when persistKnownMaster is called with the same address")
+}
