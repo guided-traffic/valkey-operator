@@ -66,6 +66,12 @@ type SentinelSpec struct {
 	// PodAnnotations are additional annotations applied to Sentinel pods.
 	// +optional
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
+
+	// AllowUnencrypted keeps the plaintext Sentinel port (26379) open alongside the TLS port (36379).
+	// Only effective when spec.tls.enabled is true. Default: false.
+	// +kubebuilder:default=false
+	// +optional
+	AllowUnencrypted bool `json:"allowUnencrypted,omitempty"`
 }
 
 // AuthSpec defines authentication configuration for Valkey.
@@ -122,6 +128,12 @@ type TLSSpec struct {
 	// Mutually exclusive with CertManager.
 	// +optional
 	SecretName string `json:"secretName,omitempty"`
+
+	// AllowUnencrypted keeps the plaintext Valkey port (6379) open alongside the TLS port (16379).
+	// Internal replication always uses TLS. Default: false (plaintext port disabled when TLS is active).
+	// +kubebuilder:default=false
+	// +optional
+	AllowUnencrypted bool `json:"allowUnencrypted,omitempty"`
 }
 
 // MetricsSpec defines metrics/exporter configuration.
@@ -304,6 +316,19 @@ func (v *Valkey) IsNetworkPolicyEnabled() bool {
 // IsPersistenceEnabled returns true if persistence is configured and enabled.
 func (v *Valkey) IsPersistenceEnabled() bool {
 	return v.Spec.Persistence != nil && v.Spec.Persistence.Enabled
+}
+
+// IsValkeyUnencryptedAllowed returns true when TLS is enabled but the plaintext Valkey port (6379)
+// should remain open alongside the TLS port (16379).
+func (v *Valkey) IsValkeyUnencryptedAllowed() bool {
+	return v.IsTLSEnabled() && v.Spec.TLS.AllowUnencrypted
+}
+
+// IsSentinelUnencryptedAllowed returns true when TLS is enabled but the plaintext Sentinel port (26379)
+// should remain open alongside the TLS port (36379).
+func (v *Valkey) IsSentinelUnencryptedAllowed() bool {
+	return v.IsTLSEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel != nil && v.Spec.Sentinel.AllowUnencrypted
 }
 
 func init() {

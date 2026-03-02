@@ -327,6 +327,100 @@ func TestIsPersistenceEnabled(t *testing.T) {
 	}
 }
 
+func TestIsValkeyUnencryptedAllowed(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      *TLSSpec
+		expected bool
+	}{
+		{
+			name:     "nil TLS spec",
+			tls:      nil,
+			expected: false,
+		},
+		{
+			name:     "TLS disabled with allowUnencrypted true",
+			tls:      &TLSSpec{Enabled: false, AllowUnencrypted: true},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled, allowUnencrypted false",
+			tls:      &TLSSpec{Enabled: true, AllowUnencrypted: false},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled, allowUnencrypted true",
+			tls:      &TLSSpec{Enabled: true, AllowUnencrypted: true},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.TLS = tt.tls
+			})
+			assert.Equal(t, tt.expected, v.IsValkeyUnencryptedAllowed())
+		})
+	}
+}
+
+func TestIsSentinelUnencryptedAllowed(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      *TLSSpec
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{
+			name:     "nil TLS, nil Sentinel",
+			tls:      nil,
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "TLS disabled",
+			tls:      &TLSSpec{Enabled: false},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: true},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled, Sentinel disabled",
+			tls:      &TLSSpec{Enabled: true},
+			sentinel: &SentinelSpec{Enabled: false, AllowUnencrypted: true},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled, Sentinel enabled, allowUnencrypted false",
+			tls:      &TLSSpec{Enabled: true},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: false},
+			expected: false,
+		},
+		{
+			name:     "TLS enabled, Sentinel enabled, allowUnencrypted true",
+			tls:      &TLSSpec{Enabled: true},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: true},
+			expected: true,
+		},
+		{
+			name:     "TLS enabled, nil Sentinel",
+			tls:      &TLSSpec{Enabled: true},
+			sentinel: nil,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.TLS = tt.tls
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expected, v.IsSentinelUnencryptedAllowed())
+		})
+	}
+}
+
 // --- Full CRD Struct Construction ---
 
 func TestValkeySpec_FullConfiguration(t *testing.T) {

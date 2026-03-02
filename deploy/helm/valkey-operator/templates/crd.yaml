@@ -219,6 +219,12 @@ spec:
               sentinel:
                 description: Sentinel configures Sentinel-based HA mode.
                 properties:
+                  allowUnencrypted:
+                    default: false
+                    description: |-
+                      AllowUnencrypted keeps the plaintext Sentinel port (26379) open alongside the TLS port (36379).
+                      Only effective when spec.tls.enabled is true. Default: false.
+                    type: boolean
                   enabled:
                     default: false
                     description: Enabled activates Sentinel-based HA mode.
@@ -245,6 +251,12 @@ spec:
               tls:
                 description: TLS configures TLS encryption.
                 properties:
+                  allowUnencrypted:
+                    default: false
+                    description: |-
+                      AllowUnencrypted keeps the plaintext Valkey port (6379) open alongside the TLS port (16379).
+                      Internal replication always uses TLS. Default: false (plaintext port disabled when TLS is active).
+                    type: boolean
                   certManager:
                     description: |-
                       CertManager configures cert-manager integration for automatic certificate management.
