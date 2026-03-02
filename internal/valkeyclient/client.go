@@ -140,6 +140,13 @@ func NewTLSWithPassword(addr string, tlsConfig *tls.Config, password string) *Cl
 	}
 }
 
+// SetTimeout overrides the default connection/read/write timeout.
+// This is useful for blocking commands like WAIT, where the server-side
+// timeout may approach or exceed the default client timeout.
+func (c *Client) SetTimeout(d time.Duration) {
+	c.timeout = d
+}
+
 // Ping sends a PING command and returns nil if the response is PONG.
 func (c *Client) Ping() error {
 	resp, err := c.exec("PING")

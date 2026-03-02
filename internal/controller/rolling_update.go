@@ -787,9 +787,19 @@ func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Va
 // Replicas should already be synced at this point, so 5 seconds is generous.
 const waitWriteSyncTimeout = 5000
 
+// waitWriteSyncClientOverhead is additional time added to the client deadline on
+// top of the WAIT command timeout. This covers TLS handshake +  AUTH round trip
+// so the client never times out before the server finishes the blocking WAIT.
+const waitWriteSyncClientOverhead = 5 * time.Second
+
 // waitForWriteSync sends a WAIT command to the master to ensure all pending writes
 // have been acknowledged by all replicas before failover. This prevents data loss
 // that can occur during async replication when a failover happens.
+//
+// If WAIT returns fewer acknowledgements than expected (e.g. due to cascaded
+// replication chains where not all replicas connect directly to the master),
+// the method accepts the partial result rather than retrying forever, because
+// waitForReplicasReady has already confirmed that every replica is synced.
 func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -816,6 +826,11 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 	}
 
 	c := r.newValkeyClient(addr, r.readValkeyPassword(ctx, v), tlsConfig)
+	// The WAIT command blocks server-side for up to waitWriteSyncTimeout ms.
+	// Set the client timeout to cover that plus TLS/AUTH overhead so we never
+	// hit a client-side i/o timeout before the server responds.
+	c.SetTimeout(time.Duration(waitWriteSyncTimeout)*time.Millisecond + waitWriteSyncClientOverhead)
+
 	acked, err := c.Wait(numReplicas, waitWriteSyncTimeout)
 	if err != nil {
 		logger.Info("WAIT command failed, will retry", "master", masterPod.name, "error", err)
@@ -823,9 +838,13 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 	}
 
 	if acked < numReplicas {
-		logger.Info("Not all replicas acknowledged writes, will retry",
+		// This typically happens when replicas form a cascaded replication chain
+		// (replica → replica → master) instead of all connecting directly to the
+		// master. Since waitForReplicasReady already confirmed every replica is
+		// synced, accept the partial acknowledgement and proceed with failover.
+		logger.Info("Partial WAIT acknowledgement accepted (possible cascaded replication)",
 			"master", masterPod.name, "expected", numReplicas, "acked", acked)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		return nil
 	}
 
 	logger.Info("All replicas acknowledged pending writes",
