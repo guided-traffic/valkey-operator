@@ -379,6 +379,39 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
 }
 
+// waitForSentinelSlaves waits until a sentinel instance reports knowing about the
+// expected number of slaves for the given Valkey cluster. This must be called after
+// waitForConnectedReplicas to ensure sentinel has also re-discovered the topology
+// following a sentinel REMOVE+MONITOR reset (which happens at the end of every HA
+// rolling update finalization). Without this check, the next rolling update may
+// start before sentinel is fully ready, causing a stall in the failover phase.
+func (tc *testClients) waitForSentinelSlaves(t *testing.T, namespace, valkeyName string, expectedSlaves int) {
+	t.Helper()
+	sentinelPod := fmt.Sprintf("%s-sentinel-0", valkeyName)
+	require.Eventually(t, func() bool {
+		raw := tc.valkeyExecAllowError(t, namespace, sentinelPod, 26379,
+			"SENTINEL", "MASTER", valkeyName)
+		// SENTINEL MASTER returns alternating key/value lines with --raw.
+		// Find "num-slaves" and read the following line as the count.
+		lines := strings.Split(raw, "\n")
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "num-slaves" && i+1 < len(lines) {
+				var count int
+				_, err := fmt.Sscanf(strings.TrimSpace(lines[i+1]), "%d", &count)
+				if err == nil {
+					t.Logf("Sentinel %s reports %d slaves for %s (want %d)",
+						sentinelPod, count, valkeyName, expectedSlaves)
+					return count >= expectedSlaves
+				}
+			}
+		}
+		t.Logf("Could not parse num-slaves from sentinel output for %s/%s", namespace, valkeyName)
+		return false
+	}, 2*time.Minute, 5*time.Second,
+		"Sentinel should know about %d slaves for %s/%s", expectedSlaves, namespace, valkeyName)
+	t.Logf("Sentinel topology confirmed: %d slaves known for %s", expectedSlaves, valkeyName)
+}
+
 // assertLabelExists checks that a specific label exists on a resource's metadata.
 func assertLabelExists(t *testing.T, labels map[string]string, key, expectedValue string) {
 	t.Helper()

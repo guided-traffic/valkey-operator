@@ -49,11 +49,25 @@ const annotationReconnectResetCount = "vko.gtrfc.com/reconnect-reset-count"
 // allow the rolling update to complete despite incomplete topology information.
 const annotationFinalizationTimestamp = "vko.gtrfc.com/finalization-started"
 
+// annotationSentinelAwarenessStarted records when we first started waiting for
+// sentinel to discover the expected number of replicas before triggering a
+// failover. Used to detect when this wait has stalled and we should proceed
+// regardless (triggering the failover and letting the NOGOODSLAVE retry cycle
+// recover, rather than blocking indefinitely before even attempting failover).
+const annotationSentinelAwarenessStarted = "vko.gtrfc.com/sentinel-awareness-started"
+
 // finalizationStallTimeout is the duration after which finalizeRollingUpdate
 // will proceed with best-effort sentinel sync even if topology checks are still
 // uncertain. This prevents the rolling update from stalling indefinitely in
 // resource-constrained environments where GetReplicationInfo calls are flaky.
 const finalizationStallTimeout = 2 * time.Minute
+
+// sentinelAwarenessTimeout is the maximum time to wait for sentinel to report
+// the expected number of replicas before proceeding with the failover regardless.
+// After a sentinel REMOVE+MONITOR (e.g., from a prior rolling update finalization),
+// sentinel normally re-discovers replicas within 10–30 s. Waiting up to 90 s gives
+// ample margin while preventing an indefinite stall when sentinel is stuck.
+const sentinelAwarenessTimeout = 90 * time.Second
 
 // maxReconnectResets is the maximum number of sentinel resets we perform while
 // waiting for replicas to reconnect. After this many resets we send direct
@@ -316,10 +330,18 @@ func (r *ValkeyReconciler) handleFailoverRetrigger(ctx context.Context, v *vkov1
 
 	// Verify sentinel has actually discovered replicas before retriggering.
 	// The time-based wait above is a minimum; this check confirms readiness.
+	// Apply the same sentinelAwarenessTimeout cap here to avoid an indefinite
+	// stall in the retrigger path (same root cause as in handleMasterFailover).
 	expectedReplicas := int(v.Spec.Replicas) - 1
 	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
-		logger.Info("Sentinel has not rediscovered replicas after reset, waiting")
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		r.ensureSentinelAwarenessTimestamp(ctx, v)
+		if r.isSentinelAwarenessStalled(v) {
+			logger.Info("Sentinel awareness stalled in retrigger, proceeding with failover regardless",
+				"expectedReplicas", expectedReplicas)
+		} else {
+			logger.Info("Sentinel has not rediscovered replicas after reset, waiting")
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		}
 	}
 
 	logger.Info("Retriggering sentinel failover after reset")
@@ -454,6 +476,39 @@ func (r *ValkeyReconciler) ensureFinalizationTimestamp(ctx context.Context, v *v
 	}
 	v.Annotations[annotationFinalizationTimestamp] = time.Now().UTC().Format(time.RFC3339)
 	_ = r.Update(ctx, v)
+}
+
+// ensureSentinelAwarenessTimestamp sets the sentinel-awareness-started annotation
+// if it is not already present. The timestamp is used by isSentinelAwarenessStalled
+// to detect when we have been waiting too long for sentinel to discover replicas.
+func (r *ValkeyReconciler) ensureSentinelAwarenessTimestamp(ctx context.Context, v *vkov1.Valkey) {
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	if _, ok := v.Annotations[annotationSentinelAwarenessStarted]; ok {
+		return // already set
+	}
+	v.Annotations[annotationSentinelAwarenessStarted] = time.Now().UTC().Format(time.RFC3339)
+	_ = r.Update(ctx, v)
+}
+
+// isSentinelAwarenessStalled returns true if we have been waiting for sentinel
+// to discover the expected replicas longer than sentinelAwarenessTimeout.
+// When stalled, callers should proceed with the failover rather than waiting
+// indefinitely; the existing NOGOODSLAVE retry cycle will handle recovery.
+func (r *ValkeyReconciler) isSentinelAwarenessStalled(v *vkov1.Valkey) bool {
+	if v.Annotations == nil {
+		return false
+	}
+	tsStr, ok := v.Annotations[annotationSentinelAwarenessStarted]
+	if !ok || tsStr == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true // corrupted timestamp — treat as stalled to recover
+	}
+	return time.Since(ts) > sentinelAwarenessTimeout
 }
 
 // isFinalizationStalled returns true if the finalizeRollingUpdate function has
@@ -637,11 +692,19 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 	// finalization), sentinel needs time to discover replicas via INFO polling.
 	// Triggering failover before sentinel knows about replicas results in
 	// NOGOODSLAVE, wasting ~75s on the retry cycle.
+	// A sentinelAwarenessTimeout cap prevents an indefinite stall when sentinel
+	// is stuck with 0 slaves (e.g., in a resource-constrained CI environment).
 	expectedReplicas := len(pods) - 1
 	if !r.isSentinelAwareOfReplicas(ctx, v, expectedReplicas) {
-		logger.Info("Waiting for sentinel to discover replicas before failover",
-			"expectedReplicas", expectedReplicas)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		r.ensureSentinelAwarenessTimestamp(ctx, v)
+		if r.isSentinelAwarenessStalled(v) {
+			logger.Info("Sentinel awareness stalled, proceeding with failover regardless",
+				"expectedReplicas", expectedReplicas)
+		} else {
+			logger.Info("Waiting for sentinel to discover replicas before failover",
+				"expectedReplicas", expectedReplicas)
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 5 * time.Second}
+		}
 	}
 
 	// Set state BEFORE triggering failover to prevent concurrent reconciles
@@ -955,14 +1018,18 @@ func (r *ValkeyReconciler) getReconnectResetCount(v *vkov1.Valkey) int {
 }
 
 // incrementReconnectResetCount persists newCount in the reset-count annotation
-// and simultaneously refreshes the failover timestamp, so the next wait period
-// starts from now. Both are written in a single Update to avoid a double-write race.
+// and simultaneously refreshes the failover timestamp and clears the sentinel-
+// awareness timestamp, so the next wait period starts from now.
+// All three are written in a single Update to avoid multiple API calls.
 func (r *ValkeyReconciler) incrementReconnectResetCount(ctx context.Context, v *vkov1.Valkey, newCount int) error {
 	if v.Annotations == nil {
 		v.Annotations = make(map[string]string)
 	}
 	v.Annotations[annotationReconnectResetCount] = fmt.Sprintf("%d", newCount)
 	v.Annotations[annotationFailoverTimestamp] = time.Now().UTC().Format(time.RFC3339)
+	// Also clear the sentinel-awareness timestamp so the next failover attempt's
+	// stall-detection starts from a fresh baseline after this sentinel reset.
+	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	return r.Update(ctx, v)
 }
 
@@ -976,6 +1043,16 @@ func (r *ValkeyReconciler) clearReconnectResetCount(ctx context.Context, v *vkov
 	}
 	delete(v.Annotations, annotationReconnectResetCount)
 	return r.Update(ctx, v)
+}
+
+// clearSentinelAwarenessTimestamp removes the sentinel-awareness-started annotation
+// from the Valkey CR. This must be called whenever sentinel is reset so that the
+// next failover attempt's stall-detection starts from a fresh baseline, not from a
+// timestamp that predates the most recent SENTINEL REMOVE+MONITOR.
+func (r *ValkeyReconciler) clearSentinelAwarenessTimestamp(v *vkov1.Valkey) {
+	if v.Annotations != nil {
+		delete(v.Annotations, annotationSentinelAwarenessStarted)
+	}
 }
 
 // handleNoMasterFound handles the case where no new-image master was detected
@@ -1003,6 +1080,10 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 
 	// Reset sentinel with the correct master address.
 	r.resetSentinelState(ctx, v, masterAddr)
+
+	// Clear the sentinel-awareness timestamp so the next failover attempt's
+	// stall-detection starts from a fresh baseline after this sentinel reset.
+	r.clearSentinelAwarenessTimestamp(v)
 
 	// Update the failover timestamp for the retry.
 	if err := r.setFailoverTimestamp(ctx, v); err != nil {
@@ -1103,13 +1184,15 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasTimestamp := v.Annotations[annotationFailoverTimestamp]
 	_, hasCount := v.Annotations[annotationReconnectResetCount]
 	_, hasFinalization := v.Annotations[annotationFinalizationTimestamp]
-	if !hasState && !hasTimestamp && !hasCount && !hasFinalization {
+	_, hasSentinelAwareness := v.Annotations[annotationSentinelAwarenessStarted]
+	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
 	delete(v.Annotations, annotationFailoverTimestamp)
 	delete(v.Annotations, annotationReconnectResetCount)
 	delete(v.Annotations, annotationFinalizationTimestamp)
+	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	return r.Update(ctx, v)
 }
 

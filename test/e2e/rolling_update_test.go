@@ -448,11 +448,14 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 	// Ensure the cluster has fully settled before triggering the second rolling
 	// update. The finalizeRollingUpdate phase performs a SENTINEL REMOVE+MONITOR
 	// reset; sentinel needs a few seconds to rediscover replicas afterward.
-	// waitForConnectedReplicas verifies that Valkey replication is live AND
-	// provides enough time for sentinel to complete its INFO-poll rediscovery,
-	// making the start conditions for the second rolling update deterministic.
+	// waitForConnectedReplicas verifies that Valkey replication is live.
+	// waitForSentinelSlaves additionally confirms that sentinel has re-discovered
+	// the topology (NUM-SLAVES == 2), making the start conditions for the second
+	// rolling update fully deterministic and preventing a stall in the operator's
+	// isSentinelAwareOfReplicas guard.
 	settledMaster := tc.findMasterPod(t, ns, name, 3)
 	tc.waitForConnectedReplicas(t, ns, settledMaster, 6379, 2)
+	tc.waitForSentinelSlaves(t, ns, name, 2)
 	t.Logf("Cluster fully settled after first rolling update, master: %s", settledMaster)
 
 	// "Second" update back to original (tests repeated rolling update).

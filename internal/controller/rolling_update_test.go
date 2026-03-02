@@ -1121,6 +1121,99 @@ func TestEnsureFinalizationTimestamp_SetsOnce(t *testing.T) {
 	assert.Equal(t, first, second, "timestamp must not be overwritten on second call")
 }
 
+// --- sentinel awareness stall detection ---
+
+func TestIsSentinelAwarenessStalled_FalseWhenAnnotationAbsent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	assert.False(t, r.isSentinelAwarenessStalled(v))
+}
+
+func TestIsSentinelAwarenessStalled_FalseWhenRecent(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationSentinelAwarenessStarted: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	assert.False(t, r.isSentinelAwarenessStalled(v))
+}
+
+func TestIsSentinelAwarenessStalled_TrueWhenOld(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	old := time.Now().Add(-(sentinelAwarenessTimeout + 10*time.Second))
+	v.Annotations = map[string]string{
+		annotationSentinelAwarenessStarted: old.UTC().Format(time.RFC3339),
+	}
+
+	assert.True(t, r.isSentinelAwarenessStalled(v))
+}
+
+func TestIsSentinelAwarenessStalled_TrueWhenCorrupted(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationSentinelAwarenessStarted: "not-a-valid-timestamp",
+	}
+
+	assert.True(t, r.isSentinelAwarenessStalled(v))
+}
+
+func TestEnsureSentinelAwarenessTimestamp_SetsOnce(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	// First call must set the annotation.
+	r.ensureSentinelAwarenessTimestamp(context.Background(), v)
+	first := v.Annotations[annotationSentinelAwarenessStarted]
+	assert.NotEmpty(t, first)
+
+	// Second call must not overwrite.
+	r.ensureSentinelAwarenessTimestamp(context.Background(), v)
+	second := v.Annotations[annotationSentinelAwarenessStarted]
+	assert.Equal(t, first, second, "timestamp must not be overwritten on second call")
+}
+
+func TestClearSentinelAwarenessTimestamp_RemovesAnnotation(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationSentinelAwarenessStarted: time.Now().UTC().Format(time.RFC3339),
+		annotationRollingUpdateState:       stateFailoverTriggered,
+	}
+
+	r.clearSentinelAwarenessTimestamp(v)
+
+	assert.Empty(t, v.Annotations[annotationSentinelAwarenessStarted])
+	// Other annotations must remain.
+	assert.Equal(t, stateFailoverTriggered, v.Annotations[annotationRollingUpdateState])
+}
+
+func TestClearRollingUpdateState_AlsoClearsSentinelAwarenessTimestamp(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState:        stateFailoverTriggered,
+		annotationFailoverTimestamp:         time.Now().UTC().Format(time.RFC3339),
+		annotationSentinelAwarenessStarted:  time.Now().UTC().Format(time.RFC3339),
+	}
+	require.NoError(t, r.Update(context.Background(), v))
+
+	err := r.clearRollingUpdateState(context.Background(), v)
+	require.NoError(t, err)
+
+	assert.Empty(t, v.Annotations[annotationRollingUpdateState])
+	assert.Empty(t, v.Annotations[annotationFailoverTimestamp])
+	assert.Empty(t, v.Annotations[annotationSentinelAwarenessStarted])
+}
+
 // --- handleMasterWithNoReplicas ---
 
 func TestHandleMasterWithNoReplicas_WaitsWhenNotTimedOut(t *testing.T) {
