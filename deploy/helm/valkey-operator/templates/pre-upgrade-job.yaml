@@ -18,6 +18,9 @@ spec:
       labels:
         {{- include "valkey-operator.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pre-upgrade-hook
+        {{- with .Values.preUpgradeHook.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "valkey-operator.fullname" . }}-upgrade
       restartPolicy: Never

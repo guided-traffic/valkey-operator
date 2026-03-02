@@ -47,6 +47,10 @@ leaderElection:
 preUpgradeHook:
   # enabled controls whether the pre-upgrade Job and its RBAC resources are rendered.
   enabled: true
+  # podLabels are extra labels added to the pre-upgrade pod (in addition to the
+  # standard selector labels). Useful for network policies, monitoring scrapers,
+  # or any admission webhook that matches on pod labels.
+  podLabels: {}
   resources:
     requests:
       cpu: 50m
