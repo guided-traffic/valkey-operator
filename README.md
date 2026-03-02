@@ -10,6 +10,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 
 - **Standalone & HA modes** — single-node or multi-node with automatic Sentinel deployment
 - **TLS encryption** — full TLS for Valkey, replication, and Sentinel via cert-manager or user-provided Secrets
+- **Dual-port mode** — optional `allowUnencrypted` flag keeps plaintext ports open alongside TLS for gradual migration
 - **Persistence** — RDB, AOF, or both with configurable PVCs
 - **Authentication** — password from Kubernetes Secret
 - **Observability** — CRD status visible in `kubectl` and Lens, Kubernetes Events
@@ -121,7 +122,30 @@ spec:
         name: my-ca-issuer
 ```
 
-> **Note:** When TLS is enabled, the plaintext port (`6379`) is disabled. Valkey listens on TLS port `16379`.
+> **Note:** When TLS is enabled, the plaintext port (`6379`) is disabled by default. Valkey listens on TLS port `16379`. Set `spec.tls.allowUnencrypted: true` to keep port `6379` open alongside `16379` (dual-port mode).
+
+### Standalone — With TLS + Dual Port
+
+Keep the plaintext port open while TLS is active — useful for migration or clients that do not support TLS.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: tls-dualport
+spec:
+  replicas: 1
+  image: valkey/valkey:8.0
+  tls:
+    enabled: true
+    allowUnencrypted: true    # Valkey listens on both 6379 (plain) and 16379 (TLS)
+    certManager:
+      issuer:
+        kind: ClusterIssuer
+        name: my-ca-issuer
+```
+
+> **Security note:** `allowUnencrypted` defaults to `false`. Enable it only when you need temporary plaintext access; disable it once all clients are migrated to TLS.
 
 ### Standalone — With TLS (User-Provided Secret)
 
@@ -280,6 +304,7 @@ spec:
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Enable Sentinel HA mode |
 | `replicas` | `int32` | `3` | Number of Sentinel instances |
+| `allowUnencrypted` | `bool` | `false` | Keep plaintext Sentinel port (`26379`) open alongside TLS port (`36379`). Only effective when `spec.tls.enabled: true`. |
 | `podLabels` | `map[string]string` | — | Additional labels for Sentinel pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Sentinel pods |
 
@@ -288,6 +313,7 @@ spec:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Enable TLS encryption |
+| `allowUnencrypted` | `bool` | `false` | Keep plaintext Valkey port (`6379`) open alongside TLS port (`16379`). Replication always uses TLS. |
 | `certManager` | `CertManagerSpec` | — | cert-manager integration (mutually exclusive with `secretName`) |
 | `secretName` | `string` | — | Name of existing TLS Secret (must contain `tls.crt`, `tls.key`, `ca.crt`) |
 
@@ -365,11 +391,39 @@ vko.gtrfc.com/instanceRole: master | replica
 
 When TLS is enabled (`spec.tls.enabled: true`):
 
-- The plaintext port `6379` is disabled (`port 0`)
+- The plaintext port `6379` is disabled (`port 0`) — set `spec.tls.allowUnencrypted: true` to keep it open (dual-port mode)
 - Valkey listens on TLS port `16379`
-- Sentinel listens on TLS port `26379`
-- All replication traffic is encrypted (`tls-replication yes`)
+- Sentinel listens on TLS port `36379` (= 26379 + 10000, following Valkey's `+10000` convention)
+- All replication traffic is encrypted (`tls-replication yes`) regardless of `allowUnencrypted`
 - Probes use `valkey-cli --tls` with the mounted certificates
+
+### Port Summary
+
+| Component | No TLS | TLS only | TLS + `allowUnencrypted` |
+|-----------|--------|----------|--------------------------|
+| Valkey | `6379` | `16379` | `16379` + `6379` |
+| Sentinel | `26379` | `36379` | `36379` + `26379` |
+
+### Dual-Port Mode (`allowUnencrypted`)
+
+Set `spec.tls.allowUnencrypted: true` and/or `spec.sentinel.allowUnencrypted: true` to keep the corresponding plaintext port open alongside the TLS port. This is useful for:
+
+- **Gradual TLS rollout** — migrate clients one by one without downtime
+- **Mixed environments** — some workloads use TLS, others cannot
+- **Debugging** — plaintext access with simple tools during development
+
+When `allowUnencrypted` is true, the existing services expose an additional port alongside the TLS port:
+
+| Service | TLS port | Plain port (added) |
+|---------|----------|--------------------|
+| `<name>-rw` | `16379` (`valkey`) | `6379` (`valkey-plain`) |
+| `<name>-all` | `16379` (`valkey`) | `6379` (`valkey-plain`) |
+| `<name>-r` | `16379` (`valkey`) | `6379` (`valkey-plain`) |
+| `<name>-sentinel-headless` | `36379` (`sentinel`) | `26379` (`sentinel-plain`) |
+
+No new services are created — the same service names are used for both TLS and plaintext access.
+
+> **Note on Sentinel discovery:** When a client connects to Sentinel on the plaintext port (`26379`) and calls `SENTINEL get-master-addr-by-name`, Sentinel always returns the TLS port (`16379`). This is by design — use the unencrypted Valkey services directly if the client cannot handle TLS data connections.
 
 **Connecting to a TLS-enabled instance from within the cluster:**
 
