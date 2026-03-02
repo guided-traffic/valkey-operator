@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -243,4 +244,24 @@ func BuildReplicaConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 			ValkeyConfigKey: GenerateValkeyConf(v, true),
 		},
 	}
+}
+
+// ComputeConfigHash returns a short hex digest representing the generated Valkey
+// (and Sentinel, if applicable) configuration content. It is embedded in the
+// StatefulSet pod template annotations so that config changes — such as toggling
+// allowUnencrypted — cause the pod template annotation to change. The operator's
+// rolling update logic detects the annotation mismatch on running pods and
+// triggers a controlled rolling restart.
+//
+// Only pods that already carry the AnnotationConfigHash annotation are checked;
+// pods created by an older operator version (without the annotation) are not
+// forced to restart until they are replaced for another reason.
+func ComputeConfigHash(v *vkov1.Valkey) string {
+	h := fnv.New32a()
+	fmt.Fprint(h, GenerateValkeyConf(v, false))
+	fmt.Fprint(h, GenerateValkeyConf(v, true))
+	if v.IsSentinelEnabled() {
+		fmt.Fprint(h, GenerateSentinelConf(v))
+	}
+	return fmt.Sprintf("%08x", h.Sum32())
 }

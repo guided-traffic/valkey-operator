@@ -908,3 +908,177 @@ func TestBuildSentinelAddrList(t *testing.T) {
 		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:26379"
 	assert.Equal(t, expected, addrs)
 }
+
+// --- containerPortsEqual ---
+
+func TestContainerPortsEqual_SamePorts(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.True(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_Empty(t *testing.T) {
+	assert.True(t, containerPortsEqual(nil, nil))
+	assert.True(t, containerPortsEqual([]corev1.ContainerPort{}, []corev1.ContainerPort{}))
+}
+
+func TestContainerPortsEqual_DifferentCount(t *testing.T) {
+	a := []corev1.ContainerPort{
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+	}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_DifferentPortNumber(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_DifferentName(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_OrderIndependent(t *testing.T) {
+	a := []corev1.ContainerPort{
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+	}
+	b := []corev1.ContainerPort{
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+	}
+	assert.True(t, containerPortsEqual(a, b))
+}
+
+// --- containerChanged: port detection ---
+
+func TestContainerChanged_PortChangeTriggersDiff(t *testing.T) {
+	desired := corev1.Container{
+		Name:  "valkey",
+		Image: "valkey/valkey:8.0",
+		Ports: []corev1.ContainerPort{
+			{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+			{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+		},
+	}
+	current := corev1.Container{
+		Name:  "valkey",
+		Image: "valkey/valkey:8.0",
+		Ports: []corev1.ContainerPort{
+			{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		},
+	}
+	assert.True(t, containerChanged(desired, current), "adding a plaintext port must be detected as a change")
+}
+
+func TestContainerChanged_SamePortsNoChange(t *testing.T) {
+	ports := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	c := corev1.Container{Name: "valkey", Image: "valkey/valkey:8.0", Ports: ports}
+	assert.False(t, containerChanged(c, c))
+}
+
+// --- StatefulSetHasChanged: port change detection ---
+
+func TestStatefulSetHasChanged_PortChange(t *testing.T) {
+	replicas := int32(3)
+	desired := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "valkey",
+							Image: "valkey/valkey:8.0",
+							Ports: []corev1.ContainerPort{
+								{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+								{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	current := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "valkey",
+							Image: "valkey/valkey:8.0",
+							Ports: []corev1.ContainerPort{
+								{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, StatefulSetHasChanged(desired, current), "adding valkey-plain port must be detected")
+}
+
+func TestStatefulSetHasChanged_NoPortChange(t *testing.T) {
+	replicas := int32(1)
+	ports := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	spec := appsv1.StatefulSetSpec{
+		Replicas: &replicas,
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "valkey", Image: "valkey/valkey:8.0", Ports: ports}},
+			},
+		},
+	}
+	sts := &appsv1.StatefulSet{Spec: spec}
+	assert.False(t, StatefulSetHasChanged(sts, sts))
+}
+
+// --- BuildStatefulSet: config hash annotation ---
+
+func TestBuildStatefulSet_InjectsConfigHashAnnotation(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	hash, ok := sts.Spec.Template.Annotations[AnnotationConfigHash]
+	assert.True(t, ok, "pod template must carry the config hash annotation")
+	assert.NotEmpty(t, hash, "config hash must not be empty")
+}
+
+func TestBuildStatefulSet_ConfigHashAnnotationChangesWithSpec(t *testing.T) {
+	// Without TLS.
+	v1 := newTestValkey("test")
+	sts1 := BuildStatefulSet(v1, testOperatorImage)
+
+	// With TLS → different config → different hash.
+	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			SecretName: "tls-secret",
+		}
+	})
+	sts2 := BuildStatefulSet(v2, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationConfigHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationConfigHash]
+	assert.NotEqual(t, hash1, hash2, "config hash must differ when TLS is toggled")
+}
+
+func TestBuildStatefulSet_PreservesUserAnnotationsAlongsideConfigHash(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.PodAnnotations = map[string]string{"custom/ann": "value"}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	assert.Equal(t, "value", sts.Spec.Template.Annotations["custom/ann"])
+	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
+}

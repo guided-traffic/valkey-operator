@@ -472,7 +472,9 @@ func TestBuildSentinelStatefulSet_CustomPodAnnotations(t *testing.T) {
 	assert.Equal(t, "true", sts.Spec.Template.Annotations["example.com/sentinel"])
 }
 
-func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
+func TestBuildSentinelStatefulSet_AlwaysHasConfigHashAnnotation(t *testing.T) {
+	// Even when no user-defined pod annotations are set, the pod template must
+	// carry the config hash annotation (used for rolling update detection).
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
 			Enabled:  true,
@@ -482,7 +484,8 @@ func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
 
 	sts := BuildSentinelStatefulSet(v)
 
-	assert.Nil(t, sts.Spec.Template.Annotations)
+	require.NotNil(t, sts.Spec.Template.Annotations)
+	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
 }
 
 func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {

@@ -124,9 +124,10 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		return RollingUpdateResult{Error: fmt.Errorf("getting StatefulSet: %w", err)}
 	}
 
-	// Check if any pods are running a different image than desired.
+	// Check if any pods are running a different image or config than desired.
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
+	desiredConfigHash := builder.ComputeConfigHash(v)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -139,7 +140,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash) {
 			needsRollingUpdate = true
 			break
 		}
@@ -177,9 +178,14 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 }
 
 // podNeedsUpdate returns true if the pod needs to be replaced because its
-// valkey or sidecar container image differs from the desired image.
-// Pass an empty desiredSidecarImage to skip the sidecar check.
-func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
+// valkey or sidecar container image differs from the desired image, or because
+// its config hash annotation (AnnotationConfigHash) differs from the desired hash.
+// Pass empty strings to skip the respective checks.
+//
+// Config hash check: only pods that already carry the annotation are compared —
+// pods created by an older operator version (without the annotation) are left
+// untouched until they restart for another reason and receive the annotation.
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash string) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
@@ -193,6 +199,14 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage str
 			if desiredSidecarImage != "" && c.Image != desiredSidecarImage {
 				return true
 			}
+		}
+	}
+	// Config hash check: trigger rolling update when the pod carries a hash that
+	// no longer matches the desired config. Pods without the annotation (created
+	// before this feature was introduced) are skipped to avoid spurious restarts.
+	if desiredConfigHash != "" {
+		if podHash := pod.Annotations[builder.AnnotationConfigHash]; podHash != "" && podHash != desiredConfigHash {
+			return true
 		}
 	}
 	return false
@@ -611,7 +625,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts))
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v))
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -1507,7 +1521,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v)) {
 			// For sidecar-only changes in standalone mode, defer the update to the
 			// next natural pod restart rather than auto-deleting the pod.
 			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {

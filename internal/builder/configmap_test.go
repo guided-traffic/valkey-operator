@@ -274,3 +274,49 @@ func TestBuildConfigMap_DifferentNamespaces(t *testing.T) {
 
 	assert.Equal(t, "custom-ns", cm.Namespace)
 }
+
+// --- ComputeConfigHash ---
+
+func TestComputeConfigHash_Deterministic(t *testing.T) {
+	v := newTestValkey("test")
+	// Same input must always yield the same hash.
+	assert.Equal(t, ComputeConfigHash(v), ComputeConfigHash(v))
+}
+
+func TestComputeConfigHash_NotEmpty(t *testing.T) {
+	v := newTestValkey("test")
+	assert.NotEmpty(t, ComputeConfigHash(v))
+}
+
+func TestComputeConfigHash_ChangesWhenAllowUnencryptedToggled(t *testing.T) {
+	// TLS enabled, allowUnencrypted = false.
+	v1 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, SecretName: "tls-secret"}
+	})
+
+	// TLS enabled, allowUnencrypted = true → different config → different hash.
+	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, SecretName: "tls-secret", AllowUnencrypted: true}
+	})
+
+	assert.NotEqual(t, ComputeConfigHash(v1), ComputeConfigHash(v2),
+		"hash must differ when allowUnencrypted is toggled")
+}
+
+func TestComputeConfigHash_ChangesWhenTLSToggled(t *testing.T) {
+	vNoTLS := newTestValkey("test")
+	vTLS := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, SecretName: "tls-secret"}
+	})
+	assert.NotEqual(t, ComputeConfigHash(vNoTLS), ComputeConfigHash(vTLS))
+}
+
+func TestComputeConfigHash_IncludesSentinelConfig(t *testing.T) {
+	// Standalone hash must differ from HA hash even if Valkey config is the same.
+	vStandalone := newTestValkey("test")
+	vHA := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	assert.NotEqual(t, ComputeConfigHash(vStandalone), ComputeConfigHash(vHA))
+}

@@ -62,6 +62,13 @@ func BuildStatefulSet(v *vkov1.Valkey, operatorImage string) *appsv1.StatefulSet
 		podAnnotations = common.MergeAnnotations(v.Spec.PodAnnotations)
 	}
 
+	// Always inject the config hash annotation so that config changes
+	// (e.g. allowUnencrypted toggle) are visible to the rolling update logic.
+	if podAnnotations == nil {
+		podAnnotations = make(map[string]string)
+	}
+	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.StatefulSetName(v, common.ComponentValkey),
@@ -650,9 +657,35 @@ func containerChanged(desired, current corev1.Container) bool {
 	if !volumeMountsEqual(desired.VolumeMounts, current.VolumeMounts) {
 		return true
 	}
+	if !containerPortsEqual(desired.Ports, current.Ports) {
+		return true
+	}
 	dRes := desired.Resources
 	cRes := current.Resources
 	return resourceListChanged(dRes.Requests, cRes.Requests) || resourceListChanged(dRes.Limits, cRes.Limits)
+}
+
+// containerPortsEqual returns true when both port slices expose the same set of
+// named container ports (matching on Name, ContainerPort, and Protocol).
+// Order does not matter.
+func containerPortsEqual(a, b []corev1.ContainerPort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	bMap := make(map[string]corev1.ContainerPort, len(b))
+	for _, p := range b {
+		bMap[p.Name] = p
+	}
+	for _, pa := range a {
+		pb, ok := bMap[pa.Name]
+		if !ok {
+			return false
+		}
+		if pa.ContainerPort != pb.ContainerPort || pa.Protocol != pb.Protocol {
+			return false
+		}
+	}
+	return true
 }
 
 // volumeMountsEqual returns true if two volume mount slices are equal in name,

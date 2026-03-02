@@ -187,6 +187,13 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 		podAnnotations = common.MergeAnnotations(v.Spec.Sentinel.PodAnnotations)
 	}
 
+	// Always inject the config hash annotation so that config changes
+	// (e.g. allowUnencrypted toggle) are visible to the rolling update logic.
+	if podAnnotations == nil {
+		podAnnotations = make(map[string]string)
+	}
+	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+
 	replicas := int32(3)
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		replicas = v.Spec.Sentinel.Replicas
