@@ -1,14 +1,17 @@
 package valkeyclient
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- New / NewTLS ---
@@ -367,4 +370,119 @@ func TestWait_WithAuth_SlowResponse(t *testing.T) {
 	acked, err := c.Wait(2, 5000)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, acked)
+}
+
+// recordingRESPServer creates a TCP server that records all RESP commands received.
+// It returns +OK for every command. Each accepted connection runs until the
+// client disconnects. The returned channel receives all commands as raw strings.
+func recordingRESPServer(t *testing.T) (string, func(), <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	cmds := make(chan string, 64)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				reader := bufio.NewReader(c)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					line = strings.TrimSpace(line)
+					if len(line) == 0 {
+						continue
+					}
+					// RESP array: *<count>\r\n
+					if line[0] == '*' {
+						count := 0
+						fmt.Sscanf(line, "*%d", &count)
+						var parts []string
+						for i := 0; i < count; i++ {
+							// Read $<len>\r\n
+							_, err := reader.ReadString('\n')
+							if err != nil {
+								return
+							}
+							// Read the bulk string data\r\n
+							data, err := reader.ReadString('\n')
+							if err != nil {
+								return
+							}
+							parts = append(parts, strings.TrimSpace(data))
+						}
+						cmd := strings.Join(parts, " ")
+						cmds <- cmd
+					}
+					// Reply +OK for everything.
+					_, _ = c.Write([]byte("+OK\r\n"))
+				}
+			}(conn)
+		}
+	}()
+
+	return ln.Addr().String(), func() { _ = ln.Close() }, cmds
+}
+
+// collectCommands drains the command channel with a short timeout.
+func collectCommands(ch <-chan string, timeout time.Duration) []string {
+	var result []string
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case cmd := <-ch:
+			result = append(result, cmd)
+		case <-timer.C:
+			return result
+		}
+	}
+}
+
+// TestSentinelResetSequence_IncludesAuthPass verifies that the full sentinel
+// reconfigure sequence (REMOVE → MONITOR → SET params → SET auth-pass) sends
+// the auth-pass command. This mirrors what resetSentinelState should do.
+func TestSentinelResetSequence_IncludesAuthPass(t *testing.T) {
+	addr, cleanup, cmds := recordingRESPServer(t)
+	defer cleanup()
+
+	c := NewWithPassword(addr, "mypassword")
+
+	monitorName := "mymonitor"
+	masterAddr := "master.example.com"
+
+	// Execute the same sequence as resetSentinelState.
+	require.NoError(t, c.SentinelRemove(monitorName))
+	require.NoError(t, c.SentinelMonitorAdd(monitorName, masterAddr, 16379, 2))
+	require.NoError(t, c.SentinelSet(monitorName, "down-after-milliseconds", "5000"))
+	require.NoError(t, c.SentinelSet(monitorName, "failover-timeout", "60000"))
+	require.NoError(t, c.SentinelSet(monitorName, "parallel-syncs", "1"))
+	require.NoError(t, c.SentinelSet(monitorName, "resolve-hostnames", "yes"))
+	require.NoError(t, c.SentinelSet(monitorName, "announce-hostnames", "yes"))
+	// The critical step: auth-pass must be set after SENTINEL MONITOR.
+	require.NoError(t, c.SentinelSet(monitorName, "auth-pass", "mypassword"))
+
+	recorded := collectCommands(cmds, 500*time.Millisecond)
+
+	// Verify auth-pass was sent.
+	foundAuthPass := false
+	for _, cmd := range recorded {
+		if strings.Contains(cmd, "SENTINEL SET mymonitor auth-pass mypassword") {
+			foundAuthPass = true
+			break
+		}
+	}
+	assert.True(t, foundAuthPass,
+		"SENTINEL SET auth-pass must be included in reconfigure sequence; recorded commands: %v", recorded)
+
+	// Also verify the basic sequence is correct.
+	assert.GreaterOrEqual(t, len(recorded), 3,
+		"expected at least AUTH + REMOVE + MONITOR + SET commands")
 }

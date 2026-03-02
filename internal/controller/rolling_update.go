@@ -1429,6 +1429,13 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		_ = c.SentinelSet(monitorName, "resolve-hostnames", "yes")
 		_ = c.SentinelSet(monitorName, "announce-hostnames", "yes")
 
+		// Restore auth-pass so sentinel can authenticate to the monitored Valkey master.
+		// Without this, sentinel marks the master as s_down/disconnected and cannot
+		// discover replicas, causing NOGOODSLAVE on failover attempts.
+		if password != "" {
+			_ = c.SentinelSet(monitorName, "auth-pass", password)
+		}
+
 		logger.Info("Sentinel reconfigured successfully", "sentinel", podName, "masterAddr", masterAddr)
 	}
 }
