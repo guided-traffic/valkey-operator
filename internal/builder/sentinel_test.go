@@ -165,7 +165,7 @@ func TestGenerateSentinelConf_WithAuth_TLS_RequiresRequirepass(t *testing.T) {
 		"sentinel.conf must contain requirepass when auth+TLS are enabled")
 	assert.Contains(t, conf, "sentinel auth-pass my-cluster %VALKEY_PASSWORD%")
 	// TLS directives must still be present.
-	assert.Contains(t, conf, "tls-port 26379")
+	assert.Contains(t, conf, "tls-port 36379")
 	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
 }
 
@@ -183,6 +183,67 @@ func TestGenerateSentinelConf_WithoutAuth_NoRequirepass(t *testing.T) {
 
 	assert.NotContains(t, conf, "requirepass",
 		"sentinel.conf must not contain requirepass when auth is disabled")
+}
+
+// TestGenerateSentinelConf_TLSOnly_UsesTLSPort36379 verifies that when TLS is enabled
+// (without allowUnencrypted), the sentinel config uses tls-port 36379 (= 26379 + 10000)
+// and disables the plaintext port (port 0). This is the corrected +10000 convention.
+func TestGenerateSentinelConf_TLSOnly_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "tls-port 36379", "Sentinel TLS port must be 36379 (26379 + 10000)")
+	assert.Contains(t, conf, "port 0", "plaintext port must be disabled when TLS only")
+	assert.NotContains(t, conf, "tls-port 26379", "old incorrect TLS port must not appear")
+	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
+	assert.Contains(t, conf, "tls-replication yes")
+}
+
+// TestGenerateSentinelConf_TLS_AllowUnencrypted verifies that when TLS is enabled
+// and allowUnencrypted is true on the sentinel spec, both the plaintext port (26379)
+// and the TLS port (36379) are active in the sentinel config.
+func TestGenerateSentinelConf_TLS_AllowUnencrypted(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Both TLS and plaintext ports must be present.
+	assert.Contains(t, conf, "tls-port 36379", "Sentinel TLS port must be 36379")
+	assert.Contains(t, conf, "port 26379", "plaintext sentinel port must be open when allowUnencrypted")
+	assert.NotContains(t, conf, "port 0", "port must not be disabled when allowUnencrypted")
+	assert.Contains(t, conf, "tls-replication yes")
+}
+
+// TestGenerateSentinelConf_NoTLS_AllowUnencryptedIgnored verifies that the
+// allowUnencrypted flag has no effect when TLS is not enabled — the normal
+// plaintext port (26379) is always open without TLS.
+func TestGenerateSentinelConf_NoTLS_AllowUnencryptedIgnored(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true, // ignored without TLS
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "port 26379")
+	assert.NotContains(t, conf, "tls-port")
 }
 
 func TestGenerateSentinelConf_MasterAddress(t *testing.T) {
@@ -856,11 +917,12 @@ func TestSentinelProbeCommand_TLSOnly(t *testing.T) {
 
 	// Must use TLS flags but no auth.  Sentinel uses tls-auth-clients optional
 	// so only the CA cert is required (no --cert/--key for the probe client).
+	// Port must be the TLS port (SentinelTLSPort = 36379), not the plaintext port.
 	require.Equal(t, []string{
 		"valkey-cli",
 		"--tls",
 		"--cacert", TLSMountPath + "/ca.crt",
-		"-p", "26379",
+		"-p", "36379",
 		"ping",
 	}, cmd)
 }
@@ -875,7 +937,7 @@ func TestSentinelProbeCommand_AuthOnly(t *testing.T) {
 
 	cmd := SentinelProbeCommand(v)
 
-	// Shell form to expand env var, no TLS.
+	// Shell form to expand env var, no TLS — uses plaintext port 26379.
 	require.Len(t, cmd, 3)
 	assert.Equal(t, "sh", cmd[0])
 	assert.Equal(t, "-c", cmd[1])
@@ -898,12 +960,13 @@ func TestSentinelProbeCommand_TLSAndAuth(t *testing.T) {
 	cmd := SentinelProbeCommand(v)
 
 	// Shell form to expand env var, with TLS flags.
+	// Port must be SentinelTLSPort (36379) when TLS is enabled.
 	require.Len(t, cmd, 3)
 	assert.Equal(t, "sh", cmd[0])
 	assert.Equal(t, "-c", cmd[1])
 	assert.Contains(t, cmd[2], "--tls")
 	assert.Contains(t, cmd[2], "--cacert")
-	assert.Contains(t, cmd[2], "-p 26379")
+	assert.Contains(t, cmd[2], "-p 36379")
 	assert.Contains(t, cmd[2], AuthSecretEnvName)
 	// Must NOT include client cert/key (tls-auth-clients optional).
 	assert.NotContains(t, cmd[2], "--cert")

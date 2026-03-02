@@ -93,10 +93,17 @@ func GenerateSentinelConf(v *vkov1.Valkey) string {
 
 	// Sentinel port configuration.
 	if v.IsTLSEnabled() {
+		// Sentinel TLS port is always SentinelTLSPort (36379 = SentinelPort + 10000).
+		// When allowUnencrypted is true, keep the plaintext port open alongside TLS.
+		// Otherwise disable plaintext entirely (port 0).
+		plaintextPort := "port 0"
+		if v.IsSentinelUnencryptedAllowed() {
+			plaintextPort = fmt.Sprintf("port %d", SentinelPort)
+		}
 		lines = append(lines,
 			"# Sentinel configuration",
-			"port 0",
-			fmt.Sprintf("tls-port %d", SentinelPort),
+			plaintextPort,
+			fmt.Sprintf("tls-port %d", SentinelTLSPort),
 			fmt.Sprintf("dir %s", SentinelDataDir),
 			"",
 			"# TLS configuration",
@@ -324,7 +331,13 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 // When auth is enabled, the password is read from the VALKEY_PASSWORD env var
 // that is injected into the Sentinel container.
 func SentinelProbeCommand(v *vkov1.Valkey) []string {
-	port := fmt.Sprintf("%d", SentinelPort)
+	// Use the TLS port (36379) when TLS is enabled — Sentinel listens on tls-port SentinelTLSPort.
+	var port string
+	if v.IsTLSEnabled() {
+		port = fmt.Sprintf("%d", SentinelTLSPort)
+	} else {
+		port = fmt.Sprintf("%d", SentinelPort)
+	}
 
 	if v.IsAuthEnabled() {
 		var cmdStr string

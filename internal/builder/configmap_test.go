@@ -127,6 +127,47 @@ func TestGenerateValkeyConf_TLSEnabled(t *testing.T) {
 	assert.Contains(t, conf, "tls-replication yes")
 }
 
+// TestGenerateValkeyConf_TLS_AllowUnencrypted verifies that when TLS is enabled
+// and allowUnencrypted is true, the plaintext port (6379) is kept open alongside
+// the TLS port (16379). Internal replication always uses TLS (tls-replication yes).
+func TestGenerateValkeyConf_TLS_AllowUnencrypted(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled:          true,
+			AllowUnencrypted: true,
+		}
+	})
+
+	conf := GenerateValkeyConf(v, false)
+
+	// Both TLS and plaintext ports must be present.
+	assert.Contains(t, conf, "tls-port 16379", "TLS port must be present")
+	assert.Contains(t, conf, "port 6379", "plaintext port must be kept open when allowUnencrypted")
+	assert.NotContains(t, conf, "port 0", "port must not be disabled when allowUnencrypted")
+	// Replication must still be TLS regardless of allowUnencrypted.
+	assert.Contains(t, conf, "tls-replication yes")
+	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
+}
+
+// TestGenerateValkeyConf_TLSOnly_PlaintextPortDisabled verifies that without
+// allowUnencrypted, the TLS block emits "port 0" to disable the plaintext port.
+// Note: the network section always emits "port 6379" first; the subsequent "port 0"
+// in the TLS block overrides it (Valkey uses the last occurrence).
+func TestGenerateValkeyConf_TLSOnly_PlaintextPortDisabled(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled:          true,
+			AllowUnencrypted: false,
+		}
+	})
+
+	conf := GenerateValkeyConf(v, false)
+
+	// The TLS block must emit "port 0" to override the network section's "port 6379".
+	assert.Contains(t, conf, "port 0")
+	assert.Contains(t, conf, "tls-port 16379")
+}
+
 func TestGenerateValkeyConf_AuthEnabled(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Auth = &vkov1.AuthSpec{

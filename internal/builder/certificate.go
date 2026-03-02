@@ -22,6 +22,9 @@ const (
 	// TLSPort is the TLS-enabled Valkey port.
 	TLSPort = 16379
 
+	// SentinelTLSPort is the TLS-enabled Sentinel port (SentinelPort + 10000).
+	SentinelTLSPort = 36379
+
 	// CertManagerAPIVersion is the API version for cert-manager Certificate resources.
 	CertManagerAPIVersion = "cert-manager.io/v1"
 

@@ -54,12 +54,18 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 		"",
 	)
 
-	// TLS configuration placeholder (applied in Phase 5).
+	// TLS configuration.
 	if v.IsTLSEnabled() {
+		// When allowUnencrypted is true, keep the plaintext port open alongside TLS.
+		// Otherwise disable plaintext entirely (port 0).
+		plaintextPort := "port 0"
+		if v.IsValkeyUnencryptedAllowed() {
+			plaintextPort = fmt.Sprintf("port %d", ValkeyPort)
+		}
 		lines = append(lines,
 			"# TLS (configured by operator)",
-			fmt.Sprintf("tls-port %d", ValkeyPort+10000),
-			"port 0",
+			fmt.Sprintf("tls-port %d", TLSPort),
+			plaintextPort,
 			"tls-cert-file /tls/tls.crt",
 			"tls-key-file /tls/tls.key",
 			"tls-ca-cert-file /tls/ca.crt",
