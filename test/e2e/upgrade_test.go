@@ -171,27 +171,37 @@ func TestE2E_Upgrade_RBACDrift(t *testing.T) {
 	t.Run("Operator recreates Role after deletion", func(t *testing.T) {
 		ctx := context.Background()
 
-		err := tc.kube.RbacV1().Roles(ns).Delete(ctx, roleName, metav1.DeleteOptions{})
+		// Record the UID of the current Role so we can detect a true recreation
+		// (new object with different UID) rather than a simple existence check.
+		originalRole, err := tc.kube.RbacV1().Roles(ns).Get(ctx, roleName, metav1.GetOptions{})
+		require.NoError(t, err, "Role %s should exist before deletion", roleName)
+		originalUID := originalRole.UID
+
+		err = tc.kube.RbacV1().Roles(ns).Delete(ctx, roleName, metav1.DeleteOptions{})
 		require.NoError(t, err, "Should be able to delete Role %s", roleName)
 
-		// Verify it is gone.
-		_, err = tc.kube.RbacV1().Roles(ns).Get(ctx, roleName, metav1.GetOptions{})
-		require.True(t, apierrors.IsNotFound(err), "Role should be absent immediately after deletion")
-
-		// Trigger reconcile.
-		tc.triggerReconcile(t, ns, name)
-
-		// Operator discovers the missing Role and recreates it.
+		// The operator watches owned Roles and may recreate the Role very quickly.
+		// We therefore wait until a Role with a *different* UID exists, which
+		// proves recreation regardless of how fast the controller reacts.
 		require.Eventually(t, func() bool {
-			_, err := tc.kube.RbacV1().Roles(ns).Get(ctx, roleName, metav1.GetOptions{})
-			return err == nil
-		}, testTimeout, pollInterval, "Operator should recreate Role %s", roleName)
+			role, err := tc.kube.RbacV1().Roles(ns).Get(ctx, roleName, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				// Role is still absent — reconcile not yet complete.
+				return false
+			}
+			if err != nil {
+				return false
+			}
+			// A different UID means this is a newly created object.
+			return role.UID != originalUID
+		}, testTimeout, pollInterval, "Operator should recreate Role %s with a new UID", roleName)
 
 		// Newly created Role must have rules.
 		role, err := tc.kube.RbacV1().Roles(ns).Get(ctx, roleName, metav1.GetOptions{})
 		require.NoError(t, err)
 		assert.NotEmpty(t, role.Rules, "Recreated Role should have rules")
-		t.Logf("Role %s recreated with %d rules", roleName, len(role.Rules))
+		t.Logf("Role %s recreated with %d rules (original UID: %s, new UID: %s)",
+			roleName, len(role.Rules), originalUID, role.UID)
 	})
 }
 
