@@ -24,6 +24,7 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/health"
+	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 func testScheme() *runtime.Scheme {
@@ -56,6 +57,11 @@ func (m *mockInstanceChecker) CheckCluster(_ context.Context, v *vkov1.Valkey) *
 		AllSynced:          true,
 		SentinelMonitoring: v.IsSentinelEnabled(),
 	}
+}
+
+func (m *mockInstanceChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valkey, _ string) (*valkeyclient.ReplicationInfo, error) {
+	// Return an error: no real Valkey is running in unit tests.
+	return nil, fmt.Errorf("mock: no Valkey instance available")
 }
 
 func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client) {

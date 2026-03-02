@@ -39,11 +39,13 @@ import (
 )
 
 // InstanceChecker verifies connectivity and health of Valkey instances.
-// Implementations must provide PingPod for basic connectivity checks and
-// CheckCluster for full HA cluster health verification.
+// Implementations must provide PingPod for basic connectivity checks,
+// CheckCluster for full HA cluster health verification, and GetReplicationInfo
+// to query per-pod replication state during rolling updates.
 type InstanceChecker interface {
 	PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error
 	CheckCluster(ctx context.Context, v *vkov1.Valkey) *health.ClusterState
+	GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error)
 }
 
 // ValkeyReconciler reconciles a Valkey object.

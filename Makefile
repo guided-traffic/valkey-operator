@@ -241,8 +241,11 @@ build: fmt vet ## Build manager binary.
 run: fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go --zap-log-level=debug
 
+.PHONY: generate-all
+generate-all: manifests generate sync-helm-crd ## Regenerate CRD, DeepCopy code, and sync Helm chart. Run this after any api/v1/ type change.
+
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: generate-all ## Build docker image with the manager (regenerates CRD and DeepCopy first).
 	docker build -f Containerfile -t ${IMG} .
 
 .PHONY: docker-push

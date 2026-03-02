@@ -409,7 +409,7 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 	}
 
 	// Master found — wait for all replicas to be connected, then sync sentinel.
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 	expectedReplicas := len(pods) - 1
 	for _, ps := range pods {
 		if !ps.isMaster {
@@ -425,7 +425,7 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 // all replicas are connected, performs a sentinel state reset to synchronise
 // sentinel with the current master address.
 // Returns nil to proceed, or a non-nil requeue result when we need to wait.
-func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.Valkey, masterPS podState, expectedReplicas int, checker *health.Checker, stalled bool) *RollingUpdateResult {
+func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.Valkey, masterPS podState, expectedReplicas int, checker InstanceChecker, stalled bool) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
 	info, err := checker.GetReplicationInfo(ctx, v, masterPS.name)
@@ -565,7 +565,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 	desiredImage := v.Spec.Image
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	totalPods := int(*currentSts.Spec.Replicas)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	pods := make([]podState, totalPods)
 	masterIdx := -1
@@ -732,7 +732,7 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 // replication sync. Returns a requeue result if any replica is not ready.
 func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	for i, ps := range pods {
 		if i == masterIdx {
@@ -812,7 +812,7 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 // has completed replication sync, and has actual data (DBSIZE > 0) to prevent data loss.
 func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	for _, ps := range pods {
 		if !ps.needsUpdate {
@@ -863,7 +863,7 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 // state and re-triggers the failover to handle sentinel cooldown issues
 // (e.g., during consecutive rolling updates).
 func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valkey, _ []podState, _ int) RollingUpdateResult {
-	checker := health.NewChecker(r.Client)
+	checker := r.getInstanceChecker()
 
 	// Re-collect pod states to get fresh role information.
 	// After a failover, roles change and we must not rely on stale data.
@@ -1102,7 +1102,7 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 // verifyNewMasterReady verifies that a new-image master exists and has
 // connected replicas before we delete the old master pod.
 // Returns (true, _) if verified, (false, result) if we need to wait.
-func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker *health.Checker) (bool, RollingUpdateResult) {
+func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker InstanceChecker) (bool, RollingUpdateResult) {
 	logger := log.FromContext(ctx)
 	for _, other := range pods {
 		if other.needsUpdate || !other.ready {

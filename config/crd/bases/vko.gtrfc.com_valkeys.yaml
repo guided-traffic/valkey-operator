@@ -38,6 +38,11 @@ spec:
       name: Image
       priority: 1
       type: string
+    - description: Operator version that last reconciled
+      jsonPath: .status.operatorVersion
+      name: OperatorVersion
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -357,6 +362,10 @@ spec:
               message:
                 description: Message is a human-readable description of the current
                   state.
+                type: string
+              operatorVersion:
+                description: OperatorVersion is the version of the operator that last
+                  reconciled this resource.
                 type: string
               phase:
                 description: Phase describes the current lifecycle phase of the Valkey
