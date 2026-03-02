@@ -6,6 +6,7 @@ import (
 	"net"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -237,3 +238,133 @@ type timeoutError struct{}
 func (e *timeoutError) Error() string   { return "i/o timeout" }
 func (e *timeoutError) Timeout() bool   { return true }
 func (e *timeoutError) Temporary() bool { return true }
+
+// --- SetTimeout ---
+
+func TestSetTimeout(t *testing.T) {
+	c := New("localhost:6379")
+	assert.Equal(t, 5*time.Second, c.timeout)
+
+	c.SetTimeout(15 * time.Second)
+	assert.Equal(t, 15*time.Second, c.timeout)
+}
+
+func TestSetTimeout_TLSClient(t *testing.T) {
+	c := NewTLSWithPassword("localhost:16379", &tls.Config{MinVersion: tls.VersionTLS12}, "secret")
+	assert.Equal(t, 5*time.Second, c.timeout)
+
+	c.SetTimeout(10 * time.Second)
+	assert.Equal(t, 10*time.Second, c.timeout)
+}
+
+// --- WAIT with fake RESP server ---
+
+// fakeRESPServer starts a TCP listener that accepts one connection,
+// expects a WAIT command, and responds with the given integer reply.
+// It returns the listener address and a cleanup function.
+func fakeRESPServer(t *testing.T, reply int, delay time.Duration) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start fake server: %v", err)
+	}
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		// Read and discard the incoming WAIT command.
+		buf := make([]byte, 4096)
+		_, _ = conn.Read(buf)
+
+		// Simulate server-side WAIT delay.
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		// Respond with the integer reply.
+		resp := fmt.Sprintf(":%d\r\n", reply)
+		_, _ = conn.Write([]byte(resp))
+	}()
+
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func TestWait_PartialAck(t *testing.T) {
+	// Server responds with 1 ack (out of 2 requested), simulating cascaded replication.
+	addr, cleanup := fakeRESPServer(t, 1, 0)
+	defer cleanup()
+
+	c := New(addr)
+	acked, err := c.Wait(2, 1000)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, acked,
+		"WAIT must return the actual ack count, not fail when fewer than requested")
+}
+
+func TestWait_FullAck(t *testing.T) {
+	addr, cleanup := fakeRESPServer(t, 2, 0)
+	defer cleanup()
+
+	c := New(addr)
+	acked, err := c.Wait(2, 1000)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, acked)
+}
+
+func TestWait_TimeoutRace_DefaultClient(t *testing.T) {
+	// Simulate a server that delays 4s (close to the 5s default timeout).
+	// With TLS/AUTH overhead, the default 5s timeout could race.
+	// Using SetTimeout avoids this.
+	addr, cleanup := fakeRESPServer(t, 1, 100*time.Millisecond)
+	defer cleanup()
+
+	c := New(addr)
+	c.SetTimeout(2 * time.Second) // Plenty of room for 100ms delay.
+
+	acked, err := c.Wait(2, 5000)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, acked)
+}
+
+func TestWait_WithAuth_SlowResponse(t *testing.T) {
+	// Simulate a server that requires AUTH and responds slowly to WAIT.
+	// This reproduces the production scenario where TLS+AUTH overhead
+	// combined with a blocking WAIT command exceeds the client timeout.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start fake server: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+
+		// Read AUTH command.
+		_, _ = conn.Read(buf)
+		// Respond OK to AUTH.
+		_, _ = conn.Write([]byte("+OK\r\n"))
+
+		// Read WAIT command.
+		_, _ = conn.Read(buf)
+		// Simulate server-side WAIT blocking for 200ms.
+		time.Sleep(200 * time.Millisecond)
+		// Return partial ack.
+		_, _ = conn.Write([]byte(":1\r\n"))
+	}()
+
+	c := NewWithPassword(ln.Addr().String(), "secret")
+	c.SetTimeout(2 * time.Second)
+
+	acked, err := c.Wait(2, 5000)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, acked)
+}

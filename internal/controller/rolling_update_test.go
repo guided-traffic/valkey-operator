@@ -666,6 +666,62 @@ func TestClearRollingUpdateState_NothingToClean(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// --- waitForWriteSync ---
+
+func TestWaitWriteSyncClientOverhead_LargerThanWAITTimeout(t *testing.T) {
+	// The client timeout must be strictly larger than the WAIT timeout
+	// to avoid a race between client deadline and server-side WAIT blocking.
+	waitDuration := time.Duration(waitWriteSyncTimeout) * time.Millisecond
+	clientTimeout := waitDuration + waitWriteSyncClientOverhead
+	assert.Greater(t, clientTimeout, waitDuration,
+		"client timeout must exceed server-side WAIT timeout to prevent i/o timeout race")
+}
+
+func TestWaitForWriteSync_NoReplicas_ReturnsNil(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	r, _ := newTestReconciler(v)
+
+	// Master is pod 2, replicas are not ready or still need update → numReplicas == 0.
+	pods := []podState{
+		{name: "ha-0", needsUpdate: true, ready: false},
+		{name: "ha-1", needsUpdate: true, ready: false},
+		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+	}
+	masterIdx := 2
+
+	result := r.waitForWriteSync(context.Background(), v, pods, masterIdx)
+	assert.Nil(t, result, "Should return nil when no replicas need to acknowledge writes")
+}
+
+func TestWaitForWriteSync_ConnectionFails_Requeues(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	r, _ := newTestReconciler(v)
+
+	// Two replicas are ready and updated, master is pod 2.
+	pods := []podState{
+		{name: "ha-0", needsUpdate: false, ready: true},
+		{name: "ha-1", needsUpdate: false, ready: true},
+		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+	}
+	masterIdx := 2
+
+	result := r.waitForWriteSync(context.Background(), v, pods, masterIdx)
+	// Connection will fail (no real Valkey server), so it should requeue.
+	assert.NotNil(t, result)
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+}
+
 func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 	v := newTestValkey("ha-post", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
