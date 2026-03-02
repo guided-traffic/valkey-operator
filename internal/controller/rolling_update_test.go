@@ -1200,9 +1200,9 @@ func TestClearRollingUpdateState_AlsoClearsSentinelAwarenessTimestamp(t *testing
 	r, _ := newTestReconciler(v)
 
 	v.Annotations = map[string]string{
-		annotationRollingUpdateState:        stateFailoverTriggered,
-		annotationFailoverTimestamp:         time.Now().UTC().Format(time.RFC3339),
-		annotationSentinelAwarenessStarted:  time.Now().UTC().Format(time.RFC3339),
+		annotationRollingUpdateState:       stateFailoverTriggered,
+		annotationFailoverTimestamp:        time.Now().UTC().Format(time.RFC3339),
+		annotationSentinelAwarenessStarted: time.Now().UTC().Format(time.RFC3339),
 	}
 	require.NoError(t, r.Update(context.Background(), v))
 
