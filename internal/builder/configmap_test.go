@@ -320,3 +320,26 @@ func TestComputeConfigHash_IncludesSentinelConfig(t *testing.T) {
 	})
 	assert.NotEqual(t, ComputeConfigHash(vStandalone), ComputeConfigHash(vHA))
 }
+
+// TestComputeConfigHash_StableWhenKnownMasterChanges verifies that the config
+// hash does NOT change when the AnnotationKnownMaster annotation is updated.
+// This annotation is set by persistKnownMaster after a rolling-update failover.
+// If the hash changed, all Valkey pods would appear outdated immediately after
+// each failover, causing an infinite rolling-restart loop.
+func TestComputeConfigHash_StableWhenKnownMasterChanges(t *testing.T) {
+	vBefore := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	vAfter := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		if v.Annotations == nil {
+			v.Annotations = make(map[string]string)
+		}
+		// Simulate what persistKnownMaster does after a failover.
+		v.Annotations[AnnotationKnownMaster] = "test-2.test-headless.default.svc.cluster.local"
+	})
+	assert.Equal(t, ComputeConfigHash(vBefore), ComputeConfigHash(vAfter),
+		"hash must remain stable when AnnotationKnownMaster changes (post-failover)")
+}

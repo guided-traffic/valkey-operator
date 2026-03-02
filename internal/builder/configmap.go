@@ -258,10 +258,13 @@ func BuildReplicaConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 // forced to restart until they are replaced for another reason.
 func ComputeConfigHash(v *vkov1.Valkey) string {
 	h := fnv.New32a()
-	fmt.Fprint(h, GenerateValkeyConf(v, false))
-	fmt.Fprint(h, GenerateValkeyConf(v, true))
+	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, false))
+	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, true))
 	if v.IsSentinelEnabled() {
-		fmt.Fprint(h, GenerateSentinelConf(v))
+		// Use GenerateSentinelConfForHash (no AnnotationKnownMaster) so that a
+		// post-failover master-address change does not alter the hash and trigger
+		// an unwanted rolling restart of all Valkey pods.
+		_, _ = fmt.Fprint(h, GenerateSentinelConfForHash(v))
 	}
 	return fmt.Sprintf("%08x", h.Sum32())
 }

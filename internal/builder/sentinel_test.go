@@ -1119,3 +1119,61 @@ func TestBuildSentinelStatefulSet_TLSOnly_NoTCPSocketProbes(t *testing.T) {
 	require.NotNil(t, c.ReadinessProbe.Exec)
 	require.NotNil(t, c.LivenessProbe.Exec)
 }
+
+// TestBuildSentinelContainer_NoTLS_SinglePort26379 verifies that without TLS
+// the only container port is 26379 named "sentinel".
+func TestBuildSentinelContainer_NoTLS_SinglePort26379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 1, "no-TLS sentinel should have exactly one port")
+	assert.Equal(t, "sentinel", c.Ports[0].Name)
+	assert.Equal(t, int32(SentinelPort), c.Ports[0].ContainerPort,
+		"no-TLS sentinel container port must be 26379")
+}
+
+// TestBuildSentinelContainer_TLSOnly_UsesTLSPort36379 verifies that when TLS is
+// enabled the primary named container port is 36379 (SentinelTLSPort), not 26379.
+func TestBuildSentinelContainer_TLSOnly_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 1, "TLS-only sentinel should have exactly one port")
+	assert.Equal(t, "sentinel", c.Ports[0].Name)
+	assert.Equal(t, int32(SentinelTLSPort), c.Ports[0].ContainerPort,
+		"TLS sentinel container port must be 36379 (SentinelPort + 10000 convention)")
+}
+
+// TestBuildSentinelContainer_TLSAndAllowUnencrypted_DualPorts verifies dual port
+// exposure when both TLS and allowUnencrypted are enabled on the Sentinel.
+func TestBuildSentinelContainer_TLSAndAllowUnencrypted_DualPorts(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true,
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 2, "TLS+allowUnencrypted sentinel should expose two ports")
+
+	portsByName := make(map[string]int32)
+	for _, p := range c.Ports {
+		portsByName[p.Name] = p.ContainerPort
+	}
+
+	assert.Equal(t, int32(SentinelTLSPort), portsByName["sentinel"],
+		"Named port 'sentinel' must be TLS port 36379")
+	assert.Equal(t, int32(SentinelPort), portsByName["sentinel-plain"],
+		"Named port 'sentinel-plain' must be plaintext port 26379")
+}

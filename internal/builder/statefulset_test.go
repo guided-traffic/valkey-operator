@@ -1061,7 +1061,7 @@ func TestBuildStatefulSet_ConfigHashAnnotationChangesWithSpec(t *testing.T) {
 	// With TLS → different config → different hash.
 	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.TLS = &vkov1.TLSSpec{
-			Enabled: true,
+			Enabled:    true,
 			SecretName: "tls-secret",
 		}
 	})
@@ -1081,4 +1081,144 @@ func TestBuildStatefulSet_PreservesUserAnnotationsAlongsideConfigHash(t *testing
 
 	assert.Equal(t, "value", sts.Spec.Template.Annotations["custom/ann"])
 	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
+}
+
+// --- Valkey container ports ---
+
+// TestBuildStatefulSet_TLSOnly_SinglePort16379 verifies that when TLS is enabled
+// the Valkey container exposes only the TLS port (16379) named "valkey".
+func TestBuildStatefulSet_TLSOnly_SinglePort16379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	require.Len(t, c.Ports, 1, "TLS-only should expose exactly one port")
+	assert.Equal(t, "valkey", c.Ports[0].Name)
+	assert.Equal(t, int32(TLSPort), c.Ports[0].ContainerPort,
+		"TLS port must be 16379")
+}
+
+// TestBuildStatefulSet_TLSAndAllowUnencrypted_DualPorts verifies that when both
+// TLS and allowUnencrypted are enabled, the Valkey container exposes two named
+// ports: "valkey" (16379) and "valkey-plain" (6379).
+func TestBuildStatefulSet_TLSAndAllowUnencrypted_DualPorts(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	require.Len(t, c.Ports, 2, "TLS+allowUnencrypted should expose two ports")
+
+	portsByName := make(map[string]int32)
+	for _, p := range c.Ports {
+		portsByName[p.Name] = p.ContainerPort
+	}
+
+	assert.Equal(t, int32(TLSPort), portsByName["valkey"],
+		"Named port 'valkey' must be TLS port 16379")
+	assert.Equal(t, int32(ValkeyPort), portsByName["valkey-plain"],
+		"Named port 'valkey-plain' must be plaintext port 6379")
+}
+
+// --- buildSentinelAddrList with TLS ---
+
+// TestBuildSentinelAddrList_TLS_UsesTLSPort36379 verifies that when TLS is
+// enabled, the sentinel addr list uses port 36379 (SentinelTLSPort) so that
+// the sidecar drain handler connects to Sentinel over TLS.
+func TestBuildSentinelAddrList_TLS_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	addrs := buildSentinelAddrList(v)
+
+	expected := "my-cluster-sentinel-0.my-cluster-sentinel-headless.default.svc.cluster.local:36379," +
+		"my-cluster-sentinel-1.my-cluster-sentinel-headless.default.svc.cluster.local:36379," +
+		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:36379"
+	assert.Equal(t, expected, addrs,
+		"With TLS enabled, sentinel addr list must target port 36379 (SentinelTLSPort)")
+}
+
+// --- Init container Sentinel port ---
+
+// TestBuildStatefulSet_HA_InitContainer_TLS_UsesTLSPort36379 verifies that the
+// HA init container queries Sentinel over TLS using port 36379 when TLS is enabled.
+func TestBuildStatefulSet_HA_InitContainer_TLS_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	initCmd := sts.Spec.Template.Spec.InitContainers[0].Command
+	require.Len(t, initCmd, 3, "init container command should be [sh -c ...]")
+
+	script := initCmd[2]
+	assert.Contains(t, script, "36379",
+		"Init container script must query Sentinel on TLS port 36379 when TLS is enabled")
+	assert.Contains(t, script, "--tls",
+		"Init container script must use --tls flag when TLS is enabled")
+	assert.Contains(t, script, "--cacert",
+		"Init container script must use --cacert flag when TLS is enabled")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379 verifies that
+// without TLS the init container queries Sentinel on plain port 26379.
+func TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "26379",
+		"Init container script must query Sentinel on plain port 26379 when no TLS")
+	assert.NotContains(t, script, "--tls",
+		"Init container script must NOT use --tls flag when TLS is disabled")
+}
+
+// TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume verifies that the init
+// container mounts the TLS secret volume when TLS is enabled.
+func TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	mounts := buildInitContainerVolumeMounts(v)
+
+	mountNames := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		mountNames = append(mountNames, m.Name)
+	}
+	assert.Contains(t, mountNames, TLSVolumeName,
+		"Init container mounts must include TLS volume when TLS is enabled")
+}
+
+// TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount verifies that without TLS
+// the init container does not mount a TLS volume.
+func TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount(t *testing.T) {
+	v := newTestValkey("test")
+
+	mounts := buildInitContainerVolumeMounts(v)
+
+	for _, m := range mounts {
+		assert.NotEqual(t, TLSVolumeName, m.Name,
+			"Init container must not mount TLS volume when TLS is disabled")
+	}
 }

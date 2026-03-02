@@ -205,8 +205,12 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 		return false
 	}
 
-	// Sentinel port: always 26379 (TLS or not — sentinel uses tls-port 26379).
+	// Sentinel port: use TLS port (36379) when TLS is enabled, plaintext (26379) otherwise.
+	// With TLS enabled, Sentinel listens on SentinelTLSPort (tls-port directive).
 	port := builder.SentinelPort
+	if v.IsTLSEnabled() {
+		port = builder.SentinelTLSPort
+	}
 
 	agreeing := 0
 	for i := int32(0); i < sentinelReplicas; i++ {
