@@ -578,6 +578,166 @@ func TestReconcile_DoesNotDeleteUnownedLegacyService(t *testing.T) {
 	assert.NoError(t, err, "unowned service must not be deleted")
 }
 
+// --- Multi-port Services (TLS + allowUnencrypted) ---
+
+func TestReconcile_TLS_RWServiceUsesPort16379(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.RWServiceName(v), Namespace: "default",
+	}, svc))
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(builder.TLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].TargetPort.String())
+}
+
+func TestReconcile_AllowUnencrypted_ExtraPortOnExistingServices(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// -rw: two ports — TLS primary, plain secondary.
+	rwSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.RWServiceName(v), Namespace: "default",
+	}, rwSvc))
+	assert.Len(t, rwSvc.Spec.Ports, 2)
+	assert.Equal(t, int32(builder.TLSPort), rwSvc.Spec.Ports[0].Port)
+	assert.Equal(t, "valkey-plain", rwSvc.Spec.Ports[1].Name)
+	assert.Equal(t, int32(builder.ValkeyPort), rwSvc.Spec.Ports[1].Port)
+
+	// -all: same.
+	allSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.AllServiceName(v), Namespace: "default",
+	}, allSvc))
+	assert.Len(t, allSvc.Spec.Ports, 2)
+	_, hasRole := allSvc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+	assert.False(t, hasRole, "-all service must not filter by role")
+
+	// -r: same.
+	rSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ReadOnlyServiceName(v), Namespace: "default",
+	}, rSvc))
+	assert.Len(t, rSvc.Spec.Ports, 2)
+	assert.Equal(t, "replica", rSvc.Spec.Selector["vko.gtrfc.com/instanceRole"])
+}
+
+func TestReconcile_AllowUnencrypted_RemovedPort_WhenFlagDisabled(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Verify two ports after first reconcile.
+	rwSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.RWServiceName(v), Namespace: "default",
+	}, rwSvc))
+	assert.Len(t, rwSvc.Spec.Ports, 2, "-rw service must have 2 ports when allowUnencrypted")
+
+	// Disable the flag.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v))
+	v.Spec.TLS.AllowUnencrypted = false
+	require.NoError(t, c.Update(context.Background(), v))
+
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.RWServiceName(v), Namespace: "default",
+	}, updated))
+	assert.Len(t, updated.Spec.Ports, 1, "-rw service must have only 1 port after flag removed")
+	assert.Equal(t, int32(builder.TLSPort), updated.Spec.Ports[0].Port)
+}
+
+func TestReconcile_NoTLS_ServiceUsesSinglePort6379(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	svc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.RWServiceName(v), Namespace: "default",
+	}, svc))
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(builder.ValkeyPort), svc.Spec.Ports[0].Port)
+}
+
+func TestReconcile_SentinelTLS_HeadlessServiceUsesPort36379(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sentinelSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-headless", Namespace: "default",
+	}, sentinelSvc))
+	assert.Len(t, sentinelSvc.Spec.Ports, 1)
+	assert.Equal(t, int32(builder.SentinelTLSPort), sentinelSvc.Spec.Ports[0].Port)
+}
+
+func TestReconcile_SentinelAllowUnencrypted_ExtraPortOnHeadlessService(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sentinelSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-headless", Namespace: "default",
+	}, sentinelSvc))
+	assert.Len(t, sentinelSvc.Spec.Ports, 2)
+	assert.Equal(t, int32(builder.SentinelTLSPort), sentinelSvc.Spec.Ports[0].Port)
+	assert.Equal(t, "sentinel-plain", sentinelSvc.Spec.Ports[1].Name)
+	assert.Equal(t, int32(builder.SentinelPort), sentinelSvc.Spec.Ports[1].Port)
+}
+
+func TestReconcile_Sentinel_TLSOnly_NoExtraPortOnHeadlessService(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: false}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	sentinelSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: "test-sentinel-headless", Namespace: "default",
+	}, sentinelSvc))
+	assert.Len(t, sentinelSvc.Spec.Ports, 1, "sentinel headless must have only TLS port when allowUnencrypted=false")
+	assert.Equal(t, int32(builder.SentinelTLSPort), sentinelSvc.Spec.Ports[0].Port)
+}
+
 // --- Idempotent Reconcile ---
 
 func TestReconcile_Idempotent(t *testing.T) {

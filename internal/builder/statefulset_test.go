@@ -908,3 +908,317 @@ func TestBuildSentinelAddrList(t *testing.T) {
 		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:26379"
 	assert.Equal(t, expected, addrs)
 }
+
+// --- containerPortsEqual ---
+
+func TestContainerPortsEqual_SamePorts(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.True(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_Empty(t *testing.T) {
+	assert.True(t, containerPortsEqual(nil, nil))
+	assert.True(t, containerPortsEqual([]corev1.ContainerPort{}, []corev1.ContainerPort{}))
+}
+
+func TestContainerPortsEqual_DifferentCount(t *testing.T) {
+	a := []corev1.ContainerPort{
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+	}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_DifferentPortNumber(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_DifferentName(t *testing.T) {
+	a := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	b := []corev1.ContainerPort{{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	assert.False(t, containerPortsEqual(a, b))
+}
+
+func TestContainerPortsEqual_OrderIndependent(t *testing.T) {
+	a := []corev1.ContainerPort{
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+	}
+	b := []corev1.ContainerPort{
+		{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+		{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+	}
+	assert.True(t, containerPortsEqual(a, b))
+}
+
+// --- containerChanged: port detection ---
+
+func TestContainerChanged_PortChangeTriggersDiff(t *testing.T) {
+	desired := corev1.Container{
+		Name:  "valkey",
+		Image: "valkey/valkey:8.0",
+		Ports: []corev1.ContainerPort{
+			{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+			{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+		},
+	}
+	current := corev1.Container{
+		Name:  "valkey",
+		Image: "valkey/valkey:8.0",
+		Ports: []corev1.ContainerPort{
+			{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+		},
+	}
+	assert.True(t, containerChanged(desired, current), "adding a plaintext port must be detected as a change")
+}
+
+func TestContainerChanged_SamePortsNoChange(t *testing.T) {
+	ports := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	c := corev1.Container{Name: "valkey", Image: "valkey/valkey:8.0", Ports: ports}
+	assert.False(t, containerChanged(c, c))
+}
+
+// --- StatefulSetHasChanged: port change detection ---
+
+func TestStatefulSetHasChanged_PortChange(t *testing.T) {
+	replicas := int32(3)
+	desired := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "valkey",
+							Image: "valkey/valkey:8.0",
+							Ports: []corev1.ContainerPort{
+								{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+								{Name: "valkey-plain", ContainerPort: 6379, Protocol: corev1.ProtocolTCP},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	current := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "valkey",
+							Image: "valkey/valkey:8.0",
+							Ports: []corev1.ContainerPort{
+								{Name: "valkey", ContainerPort: 16379, Protocol: corev1.ProtocolTCP},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, StatefulSetHasChanged(desired, current), "adding valkey-plain port must be detected")
+}
+
+func TestStatefulSetHasChanged_NoPortChange(t *testing.T) {
+	replicas := int32(1)
+	ports := []corev1.ContainerPort{{Name: "valkey", ContainerPort: 6379, Protocol: corev1.ProtocolTCP}}
+	spec := appsv1.StatefulSetSpec{
+		Replicas: &replicas,
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "valkey", Image: "valkey/valkey:8.0", Ports: ports}},
+			},
+		},
+	}
+	sts := &appsv1.StatefulSet{Spec: spec}
+	assert.False(t, StatefulSetHasChanged(sts, sts))
+}
+
+// --- BuildStatefulSet: config hash annotation ---
+
+func TestBuildStatefulSet_InjectsConfigHashAnnotation(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	hash, ok := sts.Spec.Template.Annotations[AnnotationConfigHash]
+	assert.True(t, ok, "pod template must carry the config hash annotation")
+	assert.NotEmpty(t, hash, "config hash must not be empty")
+}
+
+func TestBuildStatefulSet_ConfigHashAnnotationChangesWithSpec(t *testing.T) {
+	// Without TLS.
+	v1 := newTestValkey("test")
+	sts1 := BuildStatefulSet(v1, testOperatorImage)
+
+	// With TLS → different config → different hash.
+	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled:    true,
+			SecretName: "tls-secret",
+		}
+	})
+	sts2 := BuildStatefulSet(v2, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationConfigHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationConfigHash]
+	assert.NotEqual(t, hash1, hash2, "config hash must differ when TLS is toggled")
+}
+
+func TestBuildStatefulSet_PreservesUserAnnotationsAlongsideConfigHash(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.PodAnnotations = map[string]string{"custom/ann": "value"}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	assert.Equal(t, "value", sts.Spec.Template.Annotations["custom/ann"])
+	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
+}
+
+// --- Valkey container ports ---
+
+// TestBuildStatefulSet_TLSOnly_SinglePort16379 verifies that when TLS is enabled
+// the Valkey container exposes only the TLS port (16379) named "valkey".
+func TestBuildStatefulSet_TLSOnly_SinglePort16379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	require.Len(t, c.Ports, 1, "TLS-only should expose exactly one port")
+	assert.Equal(t, "valkey", c.Ports[0].Name)
+	assert.Equal(t, int32(TLSPort), c.Ports[0].ContainerPort,
+		"TLS port must be 16379")
+}
+
+// TestBuildStatefulSet_TLSAndAllowUnencrypted_DualPorts verifies that when both
+// TLS and allowUnencrypted are enabled, the Valkey container exposes two named
+// ports: "valkey" (16379) and "valkey-plain" (6379).
+func TestBuildStatefulSet_TLSAndAllowUnencrypted_DualPorts(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	require.Len(t, c.Ports, 2, "TLS+allowUnencrypted should expose two ports")
+
+	portsByName := make(map[string]int32)
+	for _, p := range c.Ports {
+		portsByName[p.Name] = p.ContainerPort
+	}
+
+	assert.Equal(t, int32(TLSPort), portsByName["valkey"],
+		"Named port 'valkey' must be TLS port 16379")
+	assert.Equal(t, int32(ValkeyPort), portsByName["valkey-plain"],
+		"Named port 'valkey-plain' must be plaintext port 6379")
+}
+
+// --- buildSentinelAddrList with TLS ---
+
+// TestBuildSentinelAddrList_TLS_UsesTLSPort36379 verifies that when TLS is
+// enabled, the sentinel addr list uses port 36379 (SentinelTLSPort) so that
+// the sidecar drain handler connects to Sentinel over TLS.
+func TestBuildSentinelAddrList_TLS_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("my-cluster", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	addrs := buildSentinelAddrList(v)
+
+	expected := "my-cluster-sentinel-0.my-cluster-sentinel-headless.default.svc.cluster.local:36379," +
+		"my-cluster-sentinel-1.my-cluster-sentinel-headless.default.svc.cluster.local:36379," +
+		"my-cluster-sentinel-2.my-cluster-sentinel-headless.default.svc.cluster.local:36379"
+	assert.Equal(t, expected, addrs,
+		"With TLS enabled, sentinel addr list must target port 36379 (SentinelTLSPort)")
+}
+
+// --- Init container Sentinel port ---
+
+// TestBuildStatefulSet_HA_InitContainer_TLS_UsesTLSPort36379 verifies that the
+// HA init container queries Sentinel over TLS using port 36379 when TLS is enabled.
+func TestBuildStatefulSet_HA_InitContainer_TLS_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	initCmd := sts.Spec.Template.Spec.InitContainers[0].Command
+	require.Len(t, initCmd, 3, "init container command should be [sh -c ...]")
+
+	script := initCmd[2]
+	assert.Contains(t, script, "36379",
+		"Init container script must query Sentinel on TLS port 36379 when TLS is enabled")
+	assert.Contains(t, script, "--tls",
+		"Init container script must use --tls flag when TLS is enabled")
+	assert.Contains(t, script, "--cacert",
+		"Init container script must use --cacert flag when TLS is enabled")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379 verifies that
+// without TLS the init container queries Sentinel on plain port 26379.
+func TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "26379",
+		"Init container script must query Sentinel on plain port 26379 when no TLS")
+	assert.NotContains(t, script, "--tls",
+		"Init container script must NOT use --tls flag when TLS is disabled")
+}
+
+// TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume verifies that the init
+// container mounts the TLS secret volume when TLS is enabled.
+func TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	mounts := buildInitContainerVolumeMounts(v)
+
+	mountNames := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		mountNames = append(mountNames, m.Name)
+	}
+	assert.Contains(t, mountNames, TLSVolumeName,
+		"Init container mounts must include TLS volume when TLS is enabled")
+}
+
+// TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount verifies that without TLS
+// the init container does not mount a TLS volume.
+func TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount(t *testing.T) {
+	v := newTestValkey("test")
+
+	mounts := buildInitContainerVolumeMounts(v)
+
+	for _, m := range mounts {
+		assert.NotEqual(t, TLSVolumeName, m.Name,
+			"Init container must not mount TLS volume when TLS is disabled")
+	}
+}

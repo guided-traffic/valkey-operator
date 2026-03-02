@@ -69,10 +69,26 @@ func SentinelMonitorName(v *vkov1.Valkey) string {
 // that sentinel pods which restart after a rolling-update failover immediately
 // connect to the actual current master rather than a stale pod-0 replica.
 func GenerateSentinelConf(v *vkov1.Valkey) string {
+	return generateSentinelConf(v, true)
+}
+
+// GenerateSentinelConfForHash generates sentinel.conf without the AnnotationKnownMaster
+// override. Use this when computing the config hash for pod update detection.
+// The AnnotationKnownMaster changes during rolling-update failovers (it is set by
+// persistKnownMaster) and must NOT affect the hash — including it would cause all
+// pods to appear outdated immediately after a failover, triggering an infinite
+// restart loop.
+func GenerateSentinelConfForHash(v *vkov1.Valkey) string {
+	return generateSentinelConf(v, false)
+}
+
+// generateSentinelConf is the internal implementation shared by GenerateSentinelConf
+// and GenerateSentinelConfForHash.
+func generateSentinelConf(v *vkov1.Valkey, useKnownMaster bool) string {
 	var lines []string
 
 	masterAddr := MasterAddress(v)
-	if v.Annotations != nil {
+	if useKnownMaster && v.Annotations != nil {
 		if override, ok := v.Annotations[AnnotationKnownMaster]; ok && override != "" {
 			masterAddr = override
 		}
@@ -93,10 +109,17 @@ func GenerateSentinelConf(v *vkov1.Valkey) string {
 
 	// Sentinel port configuration.
 	if v.IsTLSEnabled() {
+		// Sentinel TLS port is always SentinelTLSPort (36379 = SentinelPort + 10000).
+		// When allowUnencrypted is true, keep the plaintext port open alongside TLS.
+		// Otherwise disable plaintext entirely (port 0).
+		plaintextPort := "port 0"
+		if v.IsSentinelUnencryptedAllowed() {
+			plaintextPort = fmt.Sprintf("port %d", SentinelPort)
+		}
 		lines = append(lines,
 			"# Sentinel configuration",
-			"port 0",
-			fmt.Sprintf("tls-port %d", SentinelPort),
+			plaintextPort,
+			fmt.Sprintf("tls-port %d", SentinelTLSPort),
 			fmt.Sprintf("dir %s", SentinelDataDir),
 			"",
 			"# TLS configuration",
@@ -179,6 +202,13 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 	if v.Spec.Sentinel != nil && len(v.Spec.Sentinel.PodAnnotations) > 0 {
 		podAnnotations = common.MergeAnnotations(v.Spec.Sentinel.PodAnnotations)
 	}
+
+	// Always inject the config hash annotation so that config changes
+	// (e.g. allowUnencrypted toggle) are visible to the rolling update logic.
+	if podAnnotations == nil {
+		podAnnotations = make(map[string]string)
+	}
+	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
 
 	replicas := int32(3)
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
@@ -324,7 +354,13 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 // When auth is enabled, the password is read from the VALKEY_PASSWORD env var
 // that is injected into the Sentinel container.
 func SentinelProbeCommand(v *vkov1.Valkey) []string {
-	port := fmt.Sprintf("%d", SentinelPort)
+	// Use the TLS port (36379) when TLS is enabled — Sentinel listens on tls-port SentinelTLSPort.
+	var port string
+	if v.IsTLSEnabled() {
+		port = fmt.Sprintf("%d", SentinelTLSPort)
+	} else {
+		port = fmt.Sprintf("%d", SentinelPort)
+	}
 
 	if v.IsAuthEnabled() {
 		var cmdStr string
@@ -397,6 +433,29 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 		}
 	}
 
+	// Determine the container ports.
+	// When TLS is enabled, the primary named port is the TLS port (36379).
+	// When allowUnencrypted is also set, a second named port (sentinel-plain)
+	// is exposed for services and network policies that target plaintext clients.
+	sentinelContainerPort := int32(SentinelPort)
+	if v.IsTLSEnabled() {
+		sentinelContainerPort = SentinelTLSPort
+	}
+	sentinelContainerPorts := []corev1.ContainerPort{
+		{
+			Name:          "sentinel",
+			ContainerPort: sentinelContainerPort,
+			Protocol:      corev1.ProtocolTCP,
+		},
+	}
+	if v.IsSentinelUnencryptedAllowed() {
+		sentinelContainerPorts = append(sentinelContainerPorts, corev1.ContainerPort{
+			Name:          "sentinel-plain",
+			ContainerPort: SentinelPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+
 	container := corev1.Container{
 		Name:  SentinelContainerName,
 		Image: v.Spec.Image,
@@ -404,13 +463,7 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 			"valkey-sentinel",
 			SentinelConfigMountPath + "/" + SentinelConfigKey,
 		},
-		Ports: []corev1.ContainerPort{
-			{
-				Name:          "sentinel",
-				ContainerPort: SentinelPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
+		Ports:        sentinelContainerPorts,
 		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler:        probeHandler,

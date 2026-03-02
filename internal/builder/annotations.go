@@ -8,6 +8,13 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // detection of resources not yet reconciled by the current version.
 const AnnotationOperatorVersion = "vko.gtrfc.com/operator-version"
 
+// AnnotationConfigHash is the annotation key used to store a hash of the
+// generated Valkey / Sentinel configuration content. It is embedded in the
+// StatefulSet pod template so that config changes (e.g. toggling
+// allowUnencrypted) are propagated as a pod template annotation change, which
+// the operator's rolling update logic then detects and acts upon.
+const AnnotationConfigHash = "vko.gtrfc.com/config-hash"
+
 // ApplyOperatorVersion sets the operator-version annotation on a Kubernetes object.
 // If version is empty the annotation is left unchanged.
 func ApplyOperatorVersion(obj metav1.Object, version string) {

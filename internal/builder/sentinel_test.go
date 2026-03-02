@@ -165,7 +165,7 @@ func TestGenerateSentinelConf_WithAuth_TLS_RequiresRequirepass(t *testing.T) {
 		"sentinel.conf must contain requirepass when auth+TLS are enabled")
 	assert.Contains(t, conf, "sentinel auth-pass my-cluster %VALKEY_PASSWORD%")
 	// TLS directives must still be present.
-	assert.Contains(t, conf, "tls-port 26379")
+	assert.Contains(t, conf, "tls-port 36379")
 	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
 }
 
@@ -183,6 +183,67 @@ func TestGenerateSentinelConf_WithoutAuth_NoRequirepass(t *testing.T) {
 
 	assert.NotContains(t, conf, "requirepass",
 		"sentinel.conf must not contain requirepass when auth is disabled")
+}
+
+// TestGenerateSentinelConf_TLSOnly_UsesTLSPort36379 verifies that when TLS is enabled
+// (without allowUnencrypted), the sentinel config uses tls-port 36379 (= 26379 + 10000)
+// and disables the plaintext port (port 0). This is the corrected +10000 convention.
+func TestGenerateSentinelConf_TLSOnly_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "tls-port 36379", "Sentinel TLS port must be 36379 (26379 + 10000)")
+	assert.Contains(t, conf, "port 0", "plaintext port must be disabled when TLS only")
+	assert.NotContains(t, conf, "tls-port 26379", "old incorrect TLS port must not appear")
+	assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
+	assert.Contains(t, conf, "tls-replication yes")
+}
+
+// TestGenerateSentinelConf_TLS_AllowUnencrypted verifies that when TLS is enabled
+// and allowUnencrypted is true on the sentinel spec, both the plaintext port (26379)
+// and the TLS port (36379) are active in the sentinel config.
+func TestGenerateSentinelConf_TLS_AllowUnencrypted(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	// Both TLS and plaintext ports must be present.
+	assert.Contains(t, conf, "tls-port 36379", "Sentinel TLS port must be 36379")
+	assert.Contains(t, conf, "port 26379", "plaintext sentinel port must be open when allowUnencrypted")
+	assert.NotContains(t, conf, "port 0", "port must not be disabled when allowUnencrypted")
+	assert.Contains(t, conf, "tls-replication yes")
+}
+
+// TestGenerateSentinelConf_NoTLS_AllowUnencryptedIgnored verifies that the
+// allowUnencrypted flag has no effect when TLS is not enabled — the normal
+// plaintext port (26379) is always open without TLS.
+func TestGenerateSentinelConf_NoTLS_AllowUnencryptedIgnored(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true, // ignored without TLS
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "port 26379")
+	assert.NotContains(t, conf, "tls-port")
 }
 
 func TestGenerateSentinelConf_MasterAddress(t *testing.T) {
@@ -411,7 +472,9 @@ func TestBuildSentinelStatefulSet_CustomPodAnnotations(t *testing.T) {
 	assert.Equal(t, "true", sts.Spec.Template.Annotations["example.com/sentinel"])
 }
 
-func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
+func TestBuildSentinelStatefulSet_AlwaysHasConfigHashAnnotation(t *testing.T) {
+	// Even when no user-defined pod annotations are set, the pod template must
+	// carry the config hash annotation (used for rolling update detection).
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
 			Enabled:  true,
@@ -421,7 +484,8 @@ func TestBuildSentinelStatefulSet_NilAnnotationsWhenEmpty(t *testing.T) {
 
 	sts := BuildSentinelStatefulSet(v)
 
-	assert.Nil(t, sts.Spec.Template.Annotations)
+	require.NotNil(t, sts.Spec.Template.Annotations)
+	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
 }
 
 func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
@@ -856,11 +920,12 @@ func TestSentinelProbeCommand_TLSOnly(t *testing.T) {
 
 	// Must use TLS flags but no auth.  Sentinel uses tls-auth-clients optional
 	// so only the CA cert is required (no --cert/--key for the probe client).
+	// Port must be the TLS port (SentinelTLSPort = 36379), not the plaintext port.
 	require.Equal(t, []string{
 		"valkey-cli",
 		"--tls",
 		"--cacert", TLSMountPath + "/ca.crt",
-		"-p", "26379",
+		"-p", "36379",
 		"ping",
 	}, cmd)
 }
@@ -875,7 +940,7 @@ func TestSentinelProbeCommand_AuthOnly(t *testing.T) {
 
 	cmd := SentinelProbeCommand(v)
 
-	// Shell form to expand env var, no TLS.
+	// Shell form to expand env var, no TLS — uses plaintext port 26379.
 	require.Len(t, cmd, 3)
 	assert.Equal(t, "sh", cmd[0])
 	assert.Equal(t, "-c", cmd[1])
@@ -898,12 +963,13 @@ func TestSentinelProbeCommand_TLSAndAuth(t *testing.T) {
 	cmd := SentinelProbeCommand(v)
 
 	// Shell form to expand env var, with TLS flags.
+	// Port must be SentinelTLSPort (36379) when TLS is enabled.
 	require.Len(t, cmd, 3)
 	assert.Equal(t, "sh", cmd[0])
 	assert.Equal(t, "-c", cmd[1])
 	assert.Contains(t, cmd[2], "--tls")
 	assert.Contains(t, cmd[2], "--cacert")
-	assert.Contains(t, cmd[2], "-p 26379")
+	assert.Contains(t, cmd[2], "-p 36379")
 	assert.Contains(t, cmd[2], AuthSecretEnvName)
 	// Must NOT include client cert/key (tls-auth-clients optional).
 	assert.NotContains(t, cmd[2], "--cert")
@@ -1052,4 +1118,62 @@ func TestBuildSentinelStatefulSet_TLSOnly_NoTCPSocketProbes(t *testing.T) {
 		"tcpSocket liveness probe must not be used when Sentinel is TLS-only")
 	require.NotNil(t, c.ReadinessProbe.Exec)
 	require.NotNil(t, c.LivenessProbe.Exec)
+}
+
+// TestBuildSentinelContainer_NoTLS_SinglePort26379 verifies that without TLS
+// the only container port is 26379 named "sentinel".
+func TestBuildSentinelContainer_NoTLS_SinglePort26379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 1, "no-TLS sentinel should have exactly one port")
+	assert.Equal(t, "sentinel", c.Ports[0].Name)
+	assert.Equal(t, int32(SentinelPort), c.Ports[0].ContainerPort,
+		"no-TLS sentinel container port must be 26379")
+}
+
+// TestBuildSentinelContainer_TLSOnly_UsesTLSPort36379 verifies that when TLS is
+// enabled the primary named container port is 36379 (SentinelTLSPort), not 26379.
+func TestBuildSentinelContainer_TLSOnly_UsesTLSPort36379(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 1, "TLS-only sentinel should have exactly one port")
+	assert.Equal(t, "sentinel", c.Ports[0].Name)
+	assert.Equal(t, int32(SentinelTLSPort), c.Ports[0].ContainerPort,
+		"TLS sentinel container port must be 36379 (SentinelPort + 10000 convention)")
+}
+
+// TestBuildSentinelContainer_TLSAndAllowUnencrypted_DualPorts verifies dual port
+// exposure when both TLS and allowUnencrypted are enabled on the Sentinel.
+func TestBuildSentinelContainer_TLSAndAllowUnencrypted_DualPorts(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:          true,
+			Replicas:         3,
+			AllowUnencrypted: true,
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.Len(t, c.Ports, 2, "TLS+allowUnencrypted sentinel should expose two ports")
+
+	portsByName := make(map[string]int32)
+	for _, p := range c.Ports {
+		portsByName[p.Name] = p.ContainerPort
+	}
+
+	assert.Equal(t, int32(SentinelTLSPort), portsByName["sentinel"],
+		"Named port 'sentinel' must be TLS port 36379")
+	assert.Equal(t, int32(SentinelPort), portsByName["sentinel-plain"],
+		"Named port 'sentinel-plain' must be plaintext port 26379")
 }

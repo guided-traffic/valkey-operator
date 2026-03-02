@@ -1007,7 +1007,7 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 		cm := tc.getConfigMap(t, ns, fmt.Sprintf("%s-sentinel-config", name))
 		conf := cm.Data["sentinel.conf"]
 
-		assert.Contains(t, conf, "tls-port 26379", "Sentinel should use TLS port")
+		assert.Contains(t, conf, "tls-port 36379", "Sentinel should use TLS port 36379")
 		assert.Contains(t, conf, "port 0", "Sentinel should disable plaintext port")
 		assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
 		assert.Contains(t, conf, "tls-key-file /tls/tls.key")
@@ -1126,7 +1126,7 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 
 	t.Run("Sentinel monitors master over TLS", func(t *testing.T) {
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
-		resp := tc.valkeyTLSExec(t, ns, sentinelPod, 26379, "SENTINEL", "master", name)
+		resp := tc.valkeyTLSExec(t, ns, sentinelPod, 36379, "SENTINEL", "master", name)
 		assert.NotEmpty(t, resp, "Sentinel should return master info over TLS")
 		t.Logf("Sentinel master info: %s", truncateLogs(resp, 500))
 	})
@@ -1137,7 +1137,7 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 		// Use Eventually to allow time for the discovery cycle to complete.
 		var lastResp string
 		require.Eventually(t, func() bool {
-			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 26379, "SENTINEL", "replicas", name)
+			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "replicas", name)
 			lastResp = resp
 			return resp != ""
 		}, 60*time.Second, 2*time.Second, "Sentinel should report replicas within 60s")
@@ -1148,7 +1148,7 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 		// Query SENTINEL CKQUORUM from each sentinel to verify quorum over TLS.
 		for i := 0; i < 3; i++ {
 			sentinelPod := fmt.Sprintf("%s-sentinel-%d", name, i)
-			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 26379, "SENTINEL", "ckquorum", name)
+			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "ckquorum", name)
 			t.Logf("Sentinel-%d ckquorum: %s", i, resp)
 			// Should contain OK or indicate quorum is reachable.
 			assert.Contains(t, resp, "OK",
@@ -1524,4 +1524,355 @@ func (tc *testClients) waitForConnectedReplicasTLS(t *testing.T, namespace, mast
 		return !strings.Contains(info, "master_sync_in_progress:1")
 	}, 90*time.Second, 2*time.Second, "Master %s should have %d connected replicas over TLS", masterPod, expectedReplicas)
 	t.Logf("TLS replication established: %d replicas connected to %s", expectedReplicas, masterPod)
+}
+
+// tlsAllowUnencryptedSpec returns a TLS spec with allowUnencrypted enabled.
+func tlsAllowUnencryptedSpec() map[string]interface{} {
+	spec := tlsSpec()
+	spec["allowUnencrypted"] = true
+	return spec
+}
+
+// tlsSentinelAllowUnencryptedSpec returns a Sentinel spec with allowUnencrypted enabled.
+func tlsSentinelAllowUnencryptedSpec(replicas int64) map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":          true,
+		"replicas":         replicas,
+		"allowUnencrypted": true,
+	}
+}
+
+// TestE2E_TLS_AllowUnencrypted_Standalone verifies dual-port mode on a standalone Valkey instance.
+//
+// When tls.allowUnencrypted is true:
+//   - The ConfigMap keeps both `port 6379` and `tls-port 16379`
+//   - The StatefulSet exposes two named container ports: `valkey` (16379) and `valkey-plain` (6379)
+//   - The RW/All/ReadOnly services carry both ports
+//   - Clients can connect via TLS on port 16379
+//   - Clients can connect via plaintext on port 6379
+//   - Data written over TLS is readable over plaintext (same storage)
+func TestE2E_TLS_AllowUnencrypted_Standalone(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-tls-dual-standalone"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "tls-dual-standalone"
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(1),
+		"image":    "valkey/valkey:8.0",
+		"tls":      tlsAllowUnencryptedSpec(),
+	})
+
+	t.Log("Creating standalone Valkey CR with TLS + allowUnencrypted")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for certificate and pod readiness.
+	t.Run("Certificate is created and ready", func(t *testing.T) {
+		tc.waitForCertificateReady(t, ns, fmt.Sprintf("%s-tls", name))
+	})
+
+	t.Run("Pod is running and ready", func(t *testing.T) {
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-0", name))
+	})
+
+	// =========================================================================
+	// Phase 1: ConfigMap — dual port
+	// =========================================================================
+
+	t.Run("ConfigMap has both plaintext and TLS port", func(t *testing.T) {
+		tc.waitForConfigMap(t, ns, fmt.Sprintf("%s-config", name))
+		cm := tc.getConfigMap(t, ns, fmt.Sprintf("%s-config", name))
+		conf := cm.Data["valkey.conf"]
+
+		assert.Contains(t, conf, "port 6379", "Should keep plaintext port 6379 when allowUnencrypted")
+		assert.NotContains(t, conf, "port 0", "Should NOT disable plaintext port when allowUnencrypted")
+		assert.Contains(t, conf, "tls-port 16379", "Should still have TLS port 16379")
+		assert.Contains(t, conf, "tls-replication yes", "TLS replication must remain enabled")
+	})
+
+	// =========================================================================
+	// Phase 2: StatefulSet — dual container ports
+	// =========================================================================
+
+	t.Run("StatefulSet exposes both valkey and valkey-plain ports", func(t *testing.T) {
+		sts := tc.getStatefulSet(t, ns, name)
+		valkeyContainer := sts.Spec.Template.Spec.Containers[0]
+
+		portsByName := make(map[string]int32)
+		for _, p := range valkeyContainer.Ports {
+			portsByName[p.Name] = p.ContainerPort
+		}
+
+		assert.Equal(t, int32(16379), portsByName["valkey"],
+			"Named port 'valkey' should be TLS port 16379")
+		assert.Equal(t, int32(6379), portsByName["valkey-plain"],
+			"Named port 'valkey-plain' should be plaintext port 6379")
+	})
+
+	// =========================================================================
+	// Phase 3: Services — dual port
+	// =========================================================================
+
+	t.Run("RW service has both TLS and plaintext ports", func(t *testing.T) {
+		rwSvc := tc.getService(t, ns, fmt.Sprintf("%s-rw", name))
+
+		svcPorts := make(map[int32]string)
+		for _, p := range rwSvc.Spec.Ports {
+			svcPorts[p.Port] = p.TargetPort.String()
+		}
+
+		assert.Contains(t, svcPorts, int32(16379), "RW service must include TLS port 16379")
+		assert.Contains(t, svcPorts, int32(6379), "RW service must include plaintext port 6379")
+	})
+
+	// =========================================================================
+	// Phase 4: TLS connectivity
+	// =========================================================================
+
+	t.Run("Valkey responds to PING over TLS port 16379", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+		response := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "PING")
+		assert.Equal(t, "PONG", response)
+	})
+
+	// =========================================================================
+	// Phase 5: Plaintext connectivity
+	// =========================================================================
+
+	t.Run("Valkey responds to PING over plaintext port 6379", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+		response := tc.valkeyExec(t, ns, podName, 6379, "PING")
+		assert.Equal(t, "PONG", response, "Plaintext PING on port 6379 should return PONG when allowUnencrypted")
+	})
+
+	// =========================================================================
+	// Phase 6: Cross-protocol data consistency
+	// =========================================================================
+
+	t.Run("Data written over TLS is readable over plaintext", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+
+		// Write via TLS.
+		setResp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "SET", "dual-port-key", "dual-port-value")
+		assert.Equal(t, "OK", setResp, "SET over TLS should succeed")
+
+		// Read via plaintext.
+		getResp := tc.valkeyExec(t, ns, podName, 6379, "GET", "dual-port-key")
+		assert.Equal(t, "dual-port-value", getResp, "GET over plaintext must return value written over TLS")
+	})
+
+	t.Run("Data written over plaintext is readable over TLS", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+
+		// Write via plaintext.
+		setResp := tc.valkeyExec(t, ns, podName, 6379, "SET", "plain-to-tls-key", "plain-to-tls-value")
+		assert.Equal(t, "OK", setResp, "SET over plaintext should succeed")
+
+		// Read via TLS.
+		getResp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "GET", "plain-to-tls-key")
+		assert.Equal(t, "plain-to-tls-value", getResp, "GET over TLS must return value written over plaintext")
+	})
+
+	// =========================================================================
+	// Phase 7: CONFIG report
+	// =========================================================================
+
+	t.Run("CONFIG GET port returns 6379 (plaintext port active)", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+		resp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "CONFIG", "GET", "port")
+		assert.Contains(t, resp, "6379", "CONFIG GET port should report 6379 when allowUnencrypted is set")
+	})
+
+	// =========================================================================
+	// Phase 8: CRD status
+	// =========================================================================
+
+	t.Run("CRD status shows OK", func(t *testing.T) {
+		tc.waitForValkeyPhase(t, ns, name, "OK")
+	})
+
+	// =========================================================================
+	// Phase 9: Pod logs
+	// =========================================================================
+
+	t.Run("Pod logs show no TLS errors", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-0", name)
+		logs := tc.getPodLogs(t, ns, podName, "valkey")
+		assertNoErrorsInLogs(t, logs, podName)
+	})
+
+	// =========================================================================
+	// Phase 10: Cleanup
+	// =========================================================================
+
+	t.Run("Cleanup dual-port standalone", func(t *testing.T) {
+		tc.deleteValkey(t, ns, name)
+		tc.waitForDeletion(t, ns, name)
+	})
+}
+
+// TestE2E_TLS_AllowUnencrypted_HA verifies dual-port mode on a 3-replica HA cluster
+// with Sentinel, both Valkey and Sentinel having allowUnencrypted enabled.
+//
+// Key invariants:
+//   - Valkey listens on both 6379 (plain) and 16379 (TLS)
+//   - Sentinel listens on both 26379 (plain) and 36379 (TLS)
+//   - Valkey replication still uses TLS internally (tls-replication yes)
+//   - Clients can discover master via Sentinel plaintext port (26379)
+//   - Clients can connect to master via either port
+func TestE2E_TLS_AllowUnencrypted_HA(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-tls-dual-ha"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "tls-dual-ha"
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    "valkey/valkey:8.0",
+		"tls":      tlsAllowUnencryptedSpec(),
+		"sentinel": tlsSentinelAllowUnencryptedSpec(3),
+	})
+
+	t.Log("Creating 3-replica HA Valkey CR with TLS + allowUnencrypted (Valkey + Sentinel)")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for everything to be ready.
+	t.Run("Valkey and Sentinel pods are ready", func(t *testing.T) {
+		tc.waitForStatefulSetReady(t, ns, name, 3)
+		tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
+	})
+
+	// =========================================================================
+	// Phase 1: Valkey ConfigMap — dual port
+	// =========================================================================
+
+	t.Run("Valkey ConfigMap has plaintext and TLS port", func(t *testing.T) {
+		tc.waitForConfigMap(t, ns, fmt.Sprintf("%s-config", name))
+		cm := tc.getConfigMap(t, ns, fmt.Sprintf("%s-config", name))
+		conf := cm.Data["valkey.conf"]
+
+		assert.Contains(t, conf, "port 6379", "Should keep plaintext port 6379")
+		assert.NotContains(t, conf, "port 0", "Should NOT disable plaintext port")
+		assert.Contains(t, conf, "tls-port 16379", "Should have TLS port 16379")
+		assert.Contains(t, conf, "tls-replication yes", "Internal replication must remain TLS")
+	})
+
+	// =========================================================================
+	// Phase 2: Sentinel ConfigMap — dual port with corrected TLS port
+	// =========================================================================
+
+	t.Run("Sentinel ConfigMap uses port 26379 and tls-port 36379", func(t *testing.T) {
+		sentinelCMName := fmt.Sprintf("%s-sentinel-config", name)
+		tc.waitForConfigMap(t, ns, sentinelCMName)
+		cm := tc.getConfigMap(t, ns, sentinelCMName)
+		conf := cm.Data["sentinel.conf"]
+
+		assert.Contains(t, conf, "port 26379", "Sentinel plaintext port must be 26379 when allowUnencrypted")
+		assert.NotContains(t, conf, "port 0", "Sentinel should NOT disable plaintext port when allowUnencrypted")
+		assert.Contains(t, conf, "tls-port 36379", "Sentinel TLS port must be 36379 (26379 + 10000 convention)")
+	})
+
+	// =========================================================================
+	// Phase 3: Sentinel container port
+	// =========================================================================
+
+	t.Run("Sentinel StatefulSet exposes both sentinel and sentinel-plain ports", func(t *testing.T) {
+		sentinelSts := tc.getStatefulSet(t, ns, fmt.Sprintf("%s-sentinel", name))
+		sentinelContainer := sentinelSts.Spec.Template.Spec.Containers[0]
+
+		portsByName := make(map[string]int32)
+		for _, p := range sentinelContainer.Ports {
+			portsByName[p.Name] = p.ContainerPort
+		}
+
+		assert.Equal(t, int32(36379), portsByName["sentinel"],
+			"Named port 'sentinel' should be TLS port 36379")
+		assert.Equal(t, int32(26379), portsByName["sentinel-plain"],
+			"Named port 'sentinel-plain' should be plaintext port 26379")
+	})
+
+	// =========================================================================
+	// Phase 4: Sentinel headless service — dual port
+	// =========================================================================
+
+	t.Run("Sentinel headless service has both TLS and plaintext ports", func(t *testing.T) {
+		svc := tc.getService(t, ns, fmt.Sprintf("%s-sentinel-headless", name))
+
+		svcPorts := make(map[int32]bool)
+		for _, p := range svc.Spec.Ports {
+			svcPorts[p.Port] = true
+		}
+
+		assert.True(t, svcPorts[36379], "Sentinel headless service must include TLS port 36379")
+		assert.True(t, svcPorts[26379], "Sentinel headless service must include plaintext port 26379")
+	})
+
+	// =========================================================================
+	// Phase 5: Plaintext Sentinel connectivity
+	// =========================================================================
+
+	t.Run("Sentinel responds to PING on plaintext port 26379", func(t *testing.T) {
+		podName := fmt.Sprintf("%s-sentinel-0", name)
+		resp := tc.valkeyExec(t, ns, podName, 26379, "PING")
+		assert.Equal(t, "PONG", resp, "Sentinel plaintext port 26379 should respond PONG")
+	})
+
+	// =========================================================================
+	// Phase 6: Plaintext Valkey connectivity
+	// =========================================================================
+
+	t.Run("Valkey pods respond on plaintext port 6379", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			resp := tc.valkeyExec(t, ns, podName, 6379, "PING")
+			assert.Equal(t, "PONG", resp, "Pod %s plaintext port 6379 should respond PONG", podName)
+		}
+	})
+
+	// =========================================================================
+	// Phase 7: TLS replication still active
+	// =========================================================================
+
+	t.Run("Cluster has TLS replication active (connected_slaves >= 1)", func(t *testing.T) {
+		masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+		t.Logf("Master pod: %s", masterPod)
+		tc.waitForConnectedReplicasTLS(t, ns, masterPod, 2)
+	})
+
+	// =========================================================================
+	// Phase 8: Cross-protocol data consistency
+	// =========================================================================
+
+	t.Run("Data written over TLS is readable over plaintext", func(t *testing.T) {
+		masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+
+		setResp := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "SET", "ha-dual-key", "ha-dual-value")
+		assert.Equal(t, "OK", setResp)
+
+		getResp := tc.valkeyExec(t, ns, masterPod, 6379, "GET", "ha-dual-key")
+		assert.Equal(t, "ha-dual-value", getResp, "Plaintext GET should return TLS-written value")
+	})
+
+	// =========================================================================
+	// Phase 9: CRD status
+	// =========================================================================
+
+	t.Run("CRD status shows OK", func(t *testing.T) {
+		tc.waitForValkeyPhase(t, ns, name, "OK")
+	})
+
+	// =========================================================================
+	// Phase 10: Cleanup
+	// =========================================================================
+
+	t.Run("Cleanup HA dual-port cluster", func(t *testing.T) {
+		tc.deleteValkey(t, ns, name)
+		tc.waitForDeletion(t, ns, name)
+	})
 }

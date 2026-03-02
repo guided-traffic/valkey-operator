@@ -154,6 +154,123 @@ func TestAllServiceName(t *testing.T) {
 	assert.Equal(t, "my-valkey-all", AllServiceName(v))
 }
 
+// --- BuildRWService multi-port (TLS + allowUnencrypted) ---
+
+func TestBuildRWService_TLS_Port16379(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	svc := BuildRWService(v)
+
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].Name)
+	assert.Equal(t, int32(TLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].TargetPort.String())
+}
+
+func TestBuildRWService_TLSAndAllowUnencrypted_TwoPorts(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+
+	svc := BuildRWService(v)
+
+	assert.Len(t, svc.Spec.Ports, 2)
+	// Primary: TLS port.
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].Name)
+	assert.Equal(t, int32(TLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].TargetPort.String())
+	// Secondary: plaintext port.
+	assert.Equal(t, "valkey-plain", svc.Spec.Ports[1].Name)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[1].Port)
+	assert.Equal(t, "valkey-plain", svc.Spec.Ports[1].TargetPort.String())
+}
+
+func TestBuildRWService_NoTLS_SinglePort6379(t *testing.T) {
+	v := newTestValkey("my-valkey")
+
+	svc := BuildRWService(v)
+
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, "valkey", svc.Spec.Ports[0].Name)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[0].Port)
+}
+
+// --- BuildAllService multi-port (TLS + allowUnencrypted) ---
+
+func TestBuildAllService_TLSAndAllowUnencrypted_TwoPorts(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+
+	svc := BuildAllService(v)
+
+	assert.Len(t, svc.Spec.Ports, 2)
+	assert.Equal(t, int32(TLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[1].Port)
+	assert.Equal(t, "valkey-plain", svc.Spec.Ports[1].TargetPort.String())
+
+	// Selector: all Valkey pods — no instanceRole filter.
+	_, hasRole := svc.Spec.Selector["vko.gtrfc.com/instanceRole"]
+	assert.False(t, hasRole, "all-pods service should not filter by role")
+}
+
+// --- BuildReadOnlyService multi-port (TLS + allowUnencrypted) ---
+
+func TestBuildReadOnlyService_TLSAndAllowUnencrypted_TwoPorts(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+	})
+
+	svc := BuildReadOnlyService(v)
+
+	assert.Len(t, svc.Spec.Ports, 2)
+	assert.Equal(t, int32(TLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, int32(ValkeyPort), svc.Spec.Ports[1].Port)
+	assert.Equal(t, "valkey-plain", svc.Spec.Ports[1].TargetPort.String())
+
+	// Selector: replica pods.
+	assert.Equal(t, "replica", svc.Spec.Selector["vko.gtrfc.com/instanceRole"])
+}
+
+// --- BuildSentinelHeadlessService multi-port ---
+
+func TestBuildSentinelHeadlessService_TLS_Port36379(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	svc := BuildSentinelHeadlessService(v)
+
+	assert.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, "sentinel", svc.Spec.Ports[0].Name)
+	assert.Equal(t, int32(SentinelTLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, "sentinel", svc.Spec.Ports[0].TargetPort.String())
+}
+
+func TestBuildSentinelHeadlessService_TLSAndAllowUnencrypted_TwoPorts(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, AllowUnencrypted: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3, AllowUnencrypted: true}
+	})
+
+	svc := BuildSentinelHeadlessService(v)
+
+	assert.Len(t, svc.Spec.Ports, 2)
+	// Primary: TLS port.
+	assert.Equal(t, "sentinel", svc.Spec.Ports[0].Name)
+	assert.Equal(t, int32(SentinelTLSPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, "sentinel", svc.Spec.Ports[0].TargetPort.String())
+	// Secondary: plaintext port.
+	assert.Equal(t, "sentinel-plain", svc.Spec.Ports[1].Name)
+	assert.Equal(t, int32(SentinelPort), svc.Spec.Ports[1].Port)
+	assert.Equal(t, "sentinel-plain", svc.Spec.Ports[1].TargetPort.String())
+}
+
 // --- RWServiceName ---
 
 func TestRWServiceName(t *testing.T) {

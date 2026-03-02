@@ -62,6 +62,13 @@ func BuildStatefulSet(v *vkov1.Valkey, operatorImage string) *appsv1.StatefulSet
 		podAnnotations = common.MergeAnnotations(v.Spec.PodAnnotations)
 	}
 
+	// Always inject the config hash annotation so that config changes
+	// (e.g. allowUnencrypted toggle) are visible to the rolling update logic.
+	if podAnnotations == nil {
+		podAnnotations = make(map[string]string)
+	}
+	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.StatefulSetName(v, common.ComponentValkey),
@@ -146,6 +153,16 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			replicationPort = TLSPort
 		}
 
+		// Determine sentinel query port and optional TLS flags for valkey-cli.
+		// When TLS is enabled, Sentinel listens on SentinelTLSPort (36379) and
+		// the init container must use TLS flags to connect.
+		sentinelQueryPort := SentinelPort
+		cliTLSFlags := ""
+		if v.IsTLSEnabled() {
+			sentinelQueryPort = SentinelTLSPort
+			cliTLSFlags = fmt.Sprintf("--tls --cacert %s/ca.crt", TLSMountPath)
+		}
+
 		initContainers = append(initContainers, corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
@@ -162,7 +179,7 @@ MASTER_ADDR=""
 # Try each sentinel pod to get the master address.
 for i in 0 1 2; do
   SHOST="%[5]s-${i}.${SENTINEL_HOST}"
-  RESULT=$(timeout 3 valkey-cli -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
+  RESULT=$(timeout 3 valkey-cli %[12]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
   if [ -n "$RESULT" ]; then
     MASTER_ADDR=$(echo "$RESULT" | head -1)
     echo "Sentinel returned master: $MASTER_ADDR"
@@ -197,30 +214,16 @@ fi`,
 					monitorName,      // 3: sentinel monitor name
 					common.HeadlessServiceName(v, common.ComponentValkey), // 4: valkey headless service
 					common.StatefulSetName(v, common.ComponentSentinel),   // 5: sentinel statefulset name
-					SentinelPort,            // 6: sentinel port
+					sentinelQueryPort,       // 6: sentinel port (TLS-aware)
 					ConfigMountPath,         // 7: master config mount
 					ValkeyConfigKey,         // 8: config file name
 					WritableConfigMountPath, // 9: writable config mount
 					replicationPort,         // 10: replication port
 					ReplicaConfigMountPath,  // 11: replica config mount
+					cliTLSFlags,             // 12: optional TLS flags for valkey-cli
 				),
 			},
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      ConfigVolumeName,
-					MountPath: ConfigMountPath,
-					ReadOnly:  true,
-				},
-				{
-					Name:      ReplicaConfigVolumeName,
-					MountPath: ReplicaConfigMountPath,
-					ReadOnly:  true,
-				},
-				{
-					Name:      WritableConfigVolumeName,
-					MountPath: WritableConfigMountPath,
-				},
-			},
+			VolumeMounts: buildInitContainerVolumeMounts(v),
 		})
 	}
 
@@ -311,10 +314,27 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		})
 	}
 
-	// Determine the container port.
+	// Determine the container ports.
+	// When TLS is enabled the primary named port is the TLS port (16379).
+	// When allowUnencrypted is also set, a second named port (valkey-plain) is
+	// exposed so that services and network policies can target it by name.
 	containerPort := int32(ValkeyPort)
 	if v.IsTLSEnabled() {
 		containerPort = TLSPort
+	}
+	valkeyContainerPorts := []corev1.ContainerPort{
+		{
+			Name:          "valkey",
+			ContainerPort: containerPort,
+			Protocol:      corev1.ProtocolTCP,
+		},
+	}
+	if v.IsValkeyUnencryptedAllowed() {
+		valkeyContainerPorts = append(valkeyContainerPorts, corev1.ContainerPort{
+			Name:          "valkey-plain",
+			ContainerPort: ValkeyPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
 	}
 
 	// Build command with optional auth arguments.
@@ -332,16 +352,10 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	}
 
 	container := corev1.Container{
-		Name:    ValkeyContainerName,
-		Image:   v.Spec.Image,
-		Command: cmd,
-		Ports: []corev1.ContainerPort{
-			{
-				Name:          "valkey",
-				ContainerPort: containerPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
+		Name:         ValkeyContainerName,
+		Image:        v.Spec.Image,
+		Command:      cmd,
+		Ports:        valkeyContainerPorts,
 		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -515,8 +529,40 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 	}
 }
 
+// buildInitContainerVolumeMounts returns the volume mounts for the HA init
+// container. When TLS is enabled, the TLS secret volume is included so that
+// valkey-cli can connect to Sentinel using TLS.
+func buildInitContainerVolumeMounts(v *vkov1.Valkey) []corev1.VolumeMount {
+	mounts := []corev1.VolumeMount{
+		{
+			Name:      ConfigVolumeName,
+			MountPath: ConfigMountPath,
+			ReadOnly:  true,
+		},
+		{
+			Name:      ReplicaConfigVolumeName,
+			MountPath: ReplicaConfigMountPath,
+			ReadOnly:  true,
+		},
+		{
+			Name:      WritableConfigVolumeName,
+			MountPath: WritableConfigMountPath,
+		},
+	}
+	if v.IsTLSEnabled() {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
+	}
+	return mounts
+}
+
 // buildSentinelAddrList constructs the comma-separated list of sentinel
 // pod addresses for the sidecar's drain handler.
+// When TLS is enabled, the TLS port (SentinelTLSPort = 36379) is used so that
+// the sidecar connects to Sentinel over TLS.
 func buildSentinelAddrList(v *vkov1.Valkey) string {
 	headless := common.HeadlessServiceName(v, common.ComponentSentinel)
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
@@ -525,10 +571,15 @@ func buildSentinelAddrList(v *vkov1.Valkey) string {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
 
+	sentinelPort := SentinelPort
+	if v.IsTLSEnabled() {
+		sentinelPort = SentinelTLSPort
+	}
+
 	addrs := make([]string, 0, sentinelReplicas)
 	for i := int32(0); i < sentinelReplicas; i++ {
 		addr := fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:%d",
-			stsName, i, headless, v.Namespace, SentinelPort)
+			stsName, i, headless, v.Namespace, sentinelPort)
 		addrs = append(addrs, addr)
 	}
 	return strings.Join(addrs, ",")
@@ -650,9 +701,35 @@ func containerChanged(desired, current corev1.Container) bool {
 	if !volumeMountsEqual(desired.VolumeMounts, current.VolumeMounts) {
 		return true
 	}
+	if !containerPortsEqual(desired.Ports, current.Ports) {
+		return true
+	}
 	dRes := desired.Resources
 	cRes := current.Resources
 	return resourceListChanged(dRes.Requests, cRes.Requests) || resourceListChanged(dRes.Limits, cRes.Limits)
+}
+
+// containerPortsEqual returns true when both port slices expose the same set of
+// named container ports (matching on Name, ContainerPort, and Protocol).
+// Order does not matter.
+func containerPortsEqual(a, b []corev1.ContainerPort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	bMap := make(map[string]corev1.ContainerPort, len(b))
+	for _, p := range b {
+		bMap[p.Name] = p
+	}
+	for _, pa := range a {
+		pb, ok := bMap[pa.Name]
+		if !ok {
+			return false
+		}
+		if pa.ContainerPort != pb.ContainerPort || pa.Protocol != pb.Protocol {
+			return false
+		}
+	}
+	return true
 }
 
 // volumeMountsEqual returns true if two volume mount slices are equal in name,

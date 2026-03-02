@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,12 +55,18 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 		"",
 	)
 
-	// TLS configuration placeholder (applied in Phase 5).
+	// TLS configuration.
 	if v.IsTLSEnabled() {
+		// When allowUnencrypted is true, keep the plaintext port open alongside TLS.
+		// Otherwise disable plaintext entirely (port 0).
+		plaintextPort := "port 0"
+		if v.IsValkeyUnencryptedAllowed() {
+			plaintextPort = fmt.Sprintf("port %d", ValkeyPort)
+		}
 		lines = append(lines,
 			"# TLS (configured by operator)",
-			fmt.Sprintf("tls-port %d", ValkeyPort+10000),
-			"port 0",
+			fmt.Sprintf("tls-port %d", TLSPort),
+			plaintextPort,
 			"tls-cert-file /tls/tls.crt",
 			"tls-key-file /tls/tls.key",
 			"tls-ca-cert-file /tls/ca.crt",
@@ -237,4 +244,27 @@ func BuildReplicaConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 			ValkeyConfigKey: GenerateValkeyConf(v, true),
 		},
 	}
+}
+
+// ComputeConfigHash returns a short hex digest representing the generated Valkey
+// (and Sentinel, if applicable) configuration content. It is embedded in the
+// StatefulSet pod template annotations so that config changes — such as toggling
+// allowUnencrypted — cause the pod template annotation to change. The operator's
+// rolling update logic detects the annotation mismatch on running pods and
+// triggers a controlled rolling restart.
+//
+// Only pods that already carry the AnnotationConfigHash annotation are checked;
+// pods created by an older operator version (without the annotation) are not
+// forced to restart until they are replaced for another reason.
+func ComputeConfigHash(v *vkov1.Valkey) string {
+	h := fnv.New32a()
+	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, false))
+	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, true))
+	if v.IsSentinelEnabled() {
+		// Use GenerateSentinelConfForHash (no AnnotationKnownMaster) so that a
+		// post-failover master-address change does not alter the hash and trigger
+		// an unwanted rolling restart of all Valkey pods.
+		_, _ = fmt.Fprint(h, GenerateSentinelConfForHash(v))
+	}
+	return fmt.Sprintf("%08x", h.Sum32())
 }
