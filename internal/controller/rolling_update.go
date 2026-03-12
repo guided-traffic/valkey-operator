@@ -1341,12 +1341,16 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
@@ -1410,13 +1414,17 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			logger.V(1).Info("Could not build TLS config for sentinel reconfig", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 
@@ -1470,7 +1478,6 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	var lastErr error
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
@@ -1478,6 +1485,11 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 			logger.V(1).Info("Could not build TLS config for sentinel failover", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		if err := c.SentinelFailover(monitorName); err != nil {

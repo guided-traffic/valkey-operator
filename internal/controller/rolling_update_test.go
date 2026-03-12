@@ -1836,3 +1836,82 @@ func TestPersistKnownMaster_NoOpIfUnchanged(t *testing.T) {
 	assert.Equal(t, masterAddr, updated.Annotations[builder.AnnotationKnownMaster],
 		"annotation must remain unchanged when persistKnownMaster is called with the same address")
 }
+
+// rollingUpdateTestCACert is a self-signed CA certificate for testing TLS config
+// in rolling-update sentinel port-selection tests.
+const rollingUpdateTestCACert = `-----BEGIN CERTIFICATE-----
+MIIBejCCAR+gAwIBAgIUS2/Z6nko0KrjmZ0isXIKpnW9gaMwCgYIKoZIzj0EAwIw
+EjEQMA4GA1UECgwHQWNtZSBDbzAeFw0yNjAyMTkxNTI1NThaFw0zNjAyMTcxNTI1
+NThaMBIxEDAOBgNVBAoMB0FjbWUgQ28wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
+AARIjEAmZv4pCmau7ruKl2JZHwl2MjolHJYy7lxhkLw7TWfj8iX7Fxnhlz0BXZqP
+oF7ek0Fxvw7p60NYXxWjwkxZo1MwUTAdBgNVHQ4EFgQU48l9XI8AgN3399I9KLB1
+D7y4XccwHwYDVR0jBBgwFoAU48l9XI8AgN3399I9KLB1D7y4XccwDwYDVR0TAQH/
+BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEA/M1Mw9nDZg7HKX8NxL+GZy8KSvOp
+HZpATeWHjH8TsQ0CIQCkTrqAe9DpBTdPlF6f9kyUkVLtXiMjb6KTTH9m8x3Zzg==
+-----END CERTIFICATE-----`
+
+// newTestSentinelTLSSecret builds a fake TLS secret with a valid CA certificate
+// so that buildTLSConfig returns a non-nil *tls.Config for sentinel connections.
+func newTestSentinelTLSSecret(secretName, ns string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: ns,
+		},
+		Data: map[string][]byte{
+			"ca.crt": []byte(rollingUpdateTestCACert),
+		},
+	}
+}
+
+// TestTriggerSentinelFailover_TLS_UsesTLSPort verifies that when TLS is enabled for
+// the Valkey cluster, triggerSentinelFailover connects to the sentinel TLS port
+// (36379) instead of the plain-text port (26379).
+//
+// Regression test for: operator stuck in failover-reset loop because TLS client
+// was dialing the plain port (26379), causing TLS handshake failures reported as
+// "unexpected error" rather than connection refused/timeout.
+func TestTriggerSentinelFailover_TLS_UsesTLSPort(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 1}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "test-issuer"},
+			},
+		}
+	})
+
+	secretName := builder.SentinelTLSSecretName(v)
+	tlsSecret := newTestSentinelTLSSecret(secretName, "default")
+	r, _ := newTestReconciler(v, tlsSecret)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	// The function must fail (no real sentinel running), but the error must
+	// reference the TLS port 36379, proving the correct port was selected.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelTLSPort),
+		"sentinel failover with TLS enabled must target the TLS port (%d)", builder.SentinelTLSPort)
+	assert.NotContains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
+		"sentinel failover with TLS enabled must NOT target the plain-text port (%d)", builder.SentinelPort)
+}
+
+// TestTriggerSentinelFailover_NoTLS_UsesPlainPort verifies that when TLS is disabled,
+// triggerSentinelFailover targets the plain-text sentinel port (26379).
+func TestTriggerSentinelFailover_NoTLS_UsesPlainPort(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 1}
+		// No TLS spec → plain-text mode.
+	})
+
+	r, _ := newTestReconciler(v)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
+		"sentinel failover without TLS must target the plain-text port (%d)", builder.SentinelPort)
+}
