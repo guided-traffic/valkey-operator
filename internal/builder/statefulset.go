@@ -163,7 +163,16 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			cliTLSFlags = fmt.Sprintf("--tls --cacert %s/ca.crt", TLSMountPath)
 		}
 
-		initContainers = append(initContainers, corev1.Container{
+		// When auth is enabled, Sentinel also requires a password (requirepass).
+		// The init container must authenticate before issuing SENTINEL commands,
+		// otherwise Sentinel returns "NOAUTH Authentication required." which gets
+		// mistakenly written as the replicaof hostname, causing Valkey to crash.
+		cliAuthFlags := ""
+		if v.IsAuthEnabled() {
+			cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
+		}
+
+		initContainer := corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
 			Command: []string{
@@ -179,9 +188,16 @@ MASTER_ADDR=""
 # Try each sentinel pod to get the master address.
 for i in 0 1 2; do
   SHOST="%[5]s-${i}.${SENTINEL_HOST}"
-  RESULT=$(timeout 3 valkey-cli %[12]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
+  RESULT=$(timeout 3 valkey-cli %[12]s %[13]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
   if [ -n "$RESULT" ]; then
-    MASTER_ADDR=$(echo "$RESULT" | head -1)
+    CANDIDATE=$(echo "$RESULT" | head -1)
+    # Guard against Sentinel returning an error string (e.g. NOAUTH, ERR, WRONGPASS)
+    # instead of a hostname — those must never end up in a replicaof directive.
+    if echo "$CANDIDATE" | grep -qE "^(NOAUTH|ERR |WRONGPASS|-)"; then
+      echo "Sentinel $SHOST returned error: $CANDIDATE — skipping"
+      continue
+    fi
+    MASTER_ADDR="$CANDIDATE"
     echo "Sentinel returned master: $MASTER_ADDR"
     break
   fi
@@ -221,10 +237,28 @@ fi`,
 					replicationPort,         // 10: replication port
 					ReplicaConfigMountPath,  // 11: replica config mount
 					cliTLSFlags,             // 12: optional TLS flags for valkey-cli
+					cliAuthFlags,            // 13: optional auth flags for valkey-cli
 				),
 			},
 			VolumeMounts: buildInitContainerVolumeMounts(v),
-		})
+		}
+
+		// Inject the password env var so the shell script can use $VALKEY_PASSWORD.
+		if v.IsAuthEnabled() {
+			initContainer.Env = append(initContainer.Env, corev1.EnvVar{
+				Name: AuthSecretEnvName,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: v.Spec.Auth.SecretName,
+						},
+						Key: v.Spec.Auth.SecretPasswordKey,
+					},
+				},
+			})
+		}
+
+		initContainers = append(initContainers, initContainer)
 	}
 
 	// If persistence is NOT enabled, use an emptyDir for data.

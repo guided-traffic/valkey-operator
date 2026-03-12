@@ -1193,6 +1193,60 @@ func TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379(t *testing.T
 		"Init container script must NOT use --tls flag when TLS is disabled")
 }
 
+// TestBuildStatefulSet_HA_InitContainer_Auth_PassesCredentials verifies that when
+// auth is enabled the init container script passes -a "$VALKEY_PASSWORD" to
+// valkey-cli so Sentinel does not return "NOAUTH Authentication required."
+// and the VALKEY_PASSWORD env var is injected into the init container.
+func TestBuildStatefulSet_HA_InitContainer_Auth_PassesCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.Contains(t, script, "-a \"$VALKEY_PASSWORD\"",
+		"Init container script must pass -a flag with password when auth is enabled")
+	assert.Contains(t, script, "--no-auth-warning",
+		"Init container script must suppress auth warning")
+	assert.Contains(t, script, "NOAUTH",
+		"Init container script must guard against NOAUTH error responses from Sentinel")
+
+	// The VALKEY_PASSWORD env var must be injected so the shell can expand it.
+	require.Len(t, init.Env, 1, "Init container must have VALKEY_PASSWORD env var")
+	assert.Equal(t, AuthSecretEnvName, init.Env[0].Name)
+	assert.Equal(t, "my-secret", init.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "password", init.Env[0].ValueFrom.SecretKeyRef.Key)
+}
+
+// TestBuildStatefulSet_HA_InitContainer_NoAuth_NoCredentials verifies that when
+// auth is disabled the init container script does not include auth flags.
+func TestBuildStatefulSet_HA_InitContainer_NoAuth_NoCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.NotContains(t, script, "-a ",
+		"Init container script must NOT include -a flag when auth is disabled")
+	assert.Empty(t, init.Env,
+		"Init container must have no env vars when auth is disabled")
+}
+
 // TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume verifies that the init
 // container mounts the TLS secret volume when TLS is enabled.
 func TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume(t *testing.T) {
