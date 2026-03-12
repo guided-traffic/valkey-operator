@@ -239,6 +239,7 @@ func TestE2E_Upgrade_SentinelQuorumDuringRollingUpdate(t *testing.T) {
 
 	masterPod := tc.findMasterPod(t, ns, name, 3)
 	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
+	tc.waitForSentinelSlaves(t, ns, name, 2)
 	t.Logf("Initial master: %s", masterPod)
 
 	// Monitor sentinel pod readiness in the background throughout the rolling
@@ -258,7 +259,7 @@ func TestE2E_Upgrade_SentinelQuorumDuringRollingUpdate(t *testing.T) {
 			select {
 			case <-stopMonitor:
 				return
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(2 * time.Second):
 				pods, err := tc.kube.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 					LabelSelector: selector,
 				})
@@ -279,6 +280,11 @@ func TestE2E_Upgrade_SentinelQuorumDuringRollingUpdate(t *testing.T) {
 	tc.updateValkeyImage(t, ns, name, updatedImage)
 	tc.waitForAllPodsImage(t, ns, name, 3, updatedImage)
 	tc.waitForStatefulSetReady(t, ns, name, 3)
+	// Wait for replicas to reconnect to the (possibly new) master before
+	// checking the CRD phase. After a sentinel failover the new master may
+	// briefly report only 1 connected slave, which keeps the phase at Syncing.
+	newMasterPod := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, newMasterPod, 6379, 2)
 	tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 
 	// Stop monitor.

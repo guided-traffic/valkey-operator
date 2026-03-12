@@ -16,6 +16,8 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/health"
+	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 // --- Unit Tests for Rolling Update Helper Functions ---
@@ -1835,4 +1837,213 @@ func TestPersistKnownMaster_NoOpIfUnchanged(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "ha", Namespace: "default"}, updated))
 	assert.Equal(t, masterAddr, updated.Annotations[builder.AnnotationKnownMaster],
 		"annotation must remain unchanged when persistKnownMaster is called with the same address")
+}
+
+// rollingUpdateTestCACert is a self-signed CA certificate for testing TLS config
+// in rolling-update sentinel port-selection tests.
+const rollingUpdateTestCACert = `-----BEGIN CERTIFICATE-----
+MIIBejCCAR+gAwIBAgIUS2/Z6nko0KrjmZ0isXIKpnW9gaMwCgYIKoZIzj0EAwIw
+EjEQMA4GA1UECgwHQWNtZSBDbzAeFw0yNjAyMTkxNTI1NThaFw0zNjAyMTcxNTI1
+NThaMBIxEDAOBgNVBAoMB0FjbWUgQ28wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
+AARIjEAmZv4pCmau7ruKl2JZHwl2MjolHJYy7lxhkLw7TWfj8iX7Fxnhlz0BXZqP
+oF7ek0Fxvw7p60NYXxWjwkxZo1MwUTAdBgNVHQ4EFgQU48l9XI8AgN3399I9KLB1
+D7y4XccwHwYDVR0jBBgwFoAU48l9XI8AgN3399I9KLB1D7y4XccwDwYDVR0TAQH/
+BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEA/M1Mw9nDZg7HKX8NxL+GZy8KSvOp
+HZpATeWHjH8TsQ0CIQCkTrqAe9DpBTdPlF6f9kyUkVLtXiMjb6KTTH9m8x3Zzg==
+-----END CERTIFICATE-----`
+
+// newTestSentinelTLSSecret builds a fake TLS secret with a valid CA certificate
+// so that buildTLSConfig returns a non-nil *tls.Config for sentinel connections.
+func newTestSentinelTLSSecret(secretName, ns string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: ns,
+		},
+		Data: map[string][]byte{
+			"ca.crt": []byte(rollingUpdateTestCACert),
+		},
+	}
+}
+
+// TestTriggerSentinelFailover_TLS_UsesTLSPort verifies that when TLS is enabled for
+// the Valkey cluster, triggerSentinelFailover connects to the sentinel TLS port
+// (36379) instead of the plain-text port (26379).
+//
+// Regression test for: operator stuck in failover-reset loop because TLS client
+// was dialing the plain port (26379), causing TLS handshake failures reported as
+// "unexpected error" rather than connection refused/timeout.
+func TestTriggerSentinelFailover_TLS_UsesTLSPort(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 1}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "test-issuer"},
+			},
+		}
+	})
+
+	secretName := builder.SentinelTLSSecretName(v)
+	tlsSecret := newTestSentinelTLSSecret(secretName, "default")
+	r, _ := newTestReconciler(v, tlsSecret)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	// The function must fail (no real sentinel running), but the error must
+	// reference the TLS port 36379, proving the correct port was selected.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelTLSPort),
+		"sentinel failover with TLS enabled must target the TLS port (%d)", builder.SentinelTLSPort)
+	assert.NotContains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
+		"sentinel failover with TLS enabled must NOT target the plain-text port (%d)", builder.SentinelPort)
+}
+
+// perPodMockChecker is an InstanceChecker mock that returns per-pod replication info.
+// This allows unit tests that require specific replication states per pod.
+type perPodMockChecker struct {
+	infos map[string]*valkeyclient.ReplicationInfo
+}
+
+func (m *perPodMockChecker) PingPod(_ context.Context, _ *vkov1.Valkey, _ string) error {
+	return nil
+}
+
+func (m *perPodMockChecker) CheckCluster(_ context.Context, v *vkov1.Valkey) *health.ClusterState {
+	return &health.ClusterState{
+		MasterPod:     fmt.Sprintf("%s-0", v.Name),
+		ReadyReplicas: v.Spec.Replicas - 1,
+		TotalReplicas: v.Spec.Replicas - 1,
+		AllSynced:     true,
+	}
+}
+
+func (m *perPodMockChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error) {
+	if info, ok := m.infos[podName]; ok {
+		return info, nil
+	}
+	return nil, fmt.Errorf("mock: no replication info for %s", podName)
+}
+
+// TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds verifies that
+// when finalization is stalled and connectedSlaves < expectedReplicas due to
+// cascaded replication, checkFinalizationTopology calls forceReplicaConnections
+// to break the chain and returns nil (proceeds with finalization).
+//
+// Root cause: after a failover, a replica can end up connected to the old master
+// (now itself a replica) instead of the new master — a cascaded chain:
+//
+//	new-master → old-master-pod → cascaded-replica
+//
+// The cascaded replica does not appear in the new master's INFO replication, so
+// after SENTINEL REMOVE+MONITOR sentinel cannot discover or fix it. Without
+// forceReplicaConnections the cluster is permanently stuck in "Syncing: 1/2".
+func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+	v := newTestValkey("ha-cascaded", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	// Finalization has been stalled for longer than finalizationStallTimeout.
+	stalledTime := time.Now().UTC().Add(-finalizationStallTimeout - time.Minute)
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState:    stateReplacingMaster,
+		annotationFinalizationTimestamp: stalledTime.Format(time.RFC3339),
+	}
+
+	// All pods have the new image. Pod-1 is master (after failover from pod-0).
+	pod0 := createPodForSts(v, 0, "valkey/valkey:9.0", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:9.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:9.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster
+
+	// Pod-1 is master with only 1 connected slave. Pod-2 is the cascaded replica
+	// (connected to pod-0, not pod-1) and does not appear in pod-1's slave list.
+	mockChecker := &perPodMockChecker{
+		infos: map[string]*valkeyclient.ReplicationInfo{
+			"ha-cascaded-1": {Role: common.RoleMaster, ConnectedSlaves: 1},
+			"ha-cascaded-0": {Role: common.RoleReplica},
+			"ha-cascaded-2": {Role: common.RoleReplica},
+		},
+	}
+
+	r, _ := newTestReconciler(v, pod0, pod1, pod2)
+	r.InstanceChecker = mockChecker
+	reconcileOnce(t, r, "ha-cascaded", "default")
+
+	pods := []podState{
+		{name: "ha-cascaded-0", pod: pod0, exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "ha-cascaded-1", pod: pod1, exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "ha-cascaded-2", pod: pod2, exists: true, ready: true, needsUpdate: false, isMaster: false},
+	}
+
+	// checkFinalizationTopology must return nil (proceed with partial sync) even
+	// with only 1/2 replicas directly connected, because the stall path now calls
+	// forceReplicaConnections to break the cascaded chain before resetting sentinel.
+	result := r.checkFinalizationTopology(context.Background(), v, pods)
+	assert.Nil(t, result,
+		"Should proceed with finalization when stalled, even with cascaded replication (1/2 replicas direct)")
+}
+
+// TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMasterAddr
+// verifies that when GetReplicationInfo fails during a stalled finalization,
+// syncSentinelWithMaster uses the identified master pod's address (not an empty
+// string that would fall back to pod-0, which may not be the master).
+func TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMasterAddr(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent sentinel pods")
+	}
+	v := newTestValkey("ha-errstall", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	stalledTime := time.Now().UTC().Add(-finalizationStallTimeout - time.Minute)
+	v.Annotations = map[string]string{
+		annotationFinalizationTimestamp: stalledTime.Format(time.RFC3339),
+	}
+
+	// Pod-2 is master (not pod-0 — verifies the fix avoids the pod-0 fallback).
+	masterPS := podState{
+		name:     "ha-errstall-2",
+		isMaster: true,
+		exists:   true,
+		ready:    true,
+	}
+
+	// Default mockInstanceChecker returns an error for GetReplicationInfo,
+	// simulating a connectivity failure during a stalled finalization.
+	r, _ := newTestReconciler(v)
+
+	// syncSentinelWithMaster must return nil (proceed) in the stalled error path.
+	// Before the fix it used resetSentinelState("") which defaults to pod-0;
+	// after the fix it uses the correct master address from masterPS.name.
+	result := r.syncSentinelWithMaster(context.Background(), v, masterPS, 2,
+		r.getInstanceChecker(), true)
+	assert.Nil(t, result,
+		"Should return nil in stalled error path to continue finalization with correct master address")
+}
+
+// TestTriggerSentinelFailover_NoTLS_UsesPlainPort verifies that when TLS is disabled,
+// triggerSentinelFailover targets the plain-text sentinel port (26379).
+func TestTriggerSentinelFailover_NoTLS_UsesPlainPort(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 1}
+		// No TLS spec → plain-text mode.
+	})
+
+	r, _ := newTestReconciler(v)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
+		"sentinel failover without TLS must target the plain-text port (%d)", builder.SentinelPort)
 }

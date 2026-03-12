@@ -429,6 +429,17 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 		if !ps.isMaster {
 			continue
 		}
+		// When finalization is stalled, break any cascaded replication chains by
+		// sending SLAVEOF directly to all non-master pods. After a failover, a
+		// replica can end up connected to the old master (now itself a replica)
+		// instead of the new master — a cascaded chain: new-master → old-master-pod
+		// → replica. The cascaded replica does not appear in the new master's INFO
+		// replication, so after SENTINEL REMOVE+MONITOR sentinel cannot discover
+		// or reconfigure it. forceReplicaConnections bypasses sentinel and ensures
+		// every replica connects directly to the current master.
+		if stalled {
+			r.forceReplicaConnections(ctx, v, ps.name, pods)
+		}
 		return r.syncSentinelWithMaster(ctx, v, ps, expectedReplicas, checker, stalled)
 	}
 
@@ -447,7 +458,11 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 		if stalled {
 			logger.Info("Finalization stalled, cannot verify replication, resetting sentinel and proceeding",
 				"master", masterPS.name, "error", err)
-			r.resetSentinelState(ctx, v, "")
+			// Use the identified master's address instead of empty string to avoid
+			// the pod-0 fallback in resetSentinelState when pod-0 is not the master.
+			headlessNameOnErr := common.HeadlessServiceName(v, common.ComponentValkey)
+			masterAddrOnErr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPS.name, headlessNameOnErr, v.Namespace)
+			r.resetSentinelState(ctx, v, masterAddrOnErr)
 			return nil
 		}
 		r.ensureFinalizationTimestamp(ctx, v)
@@ -1341,12 +1356,16 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
@@ -1410,13 +1429,17 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			logger.V(1).Info("Could not build TLS config for sentinel reconfig", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 
@@ -1470,7 +1493,6 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	var lastErr error
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
@@ -1478,6 +1500,11 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 			logger.V(1).Info("Could not build TLS config for sentinel failover", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		if err := c.SentinelFailover(monitorName); err != nil {
