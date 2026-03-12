@@ -429,6 +429,17 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 		if !ps.isMaster {
 			continue
 		}
+		// When finalization is stalled, break any cascaded replication chains by
+		// sending SLAVEOF directly to all non-master pods. After a failover, a
+		// replica can end up connected to the old master (now itself a replica)
+		// instead of the new master — a cascaded chain: new-master → old-master-pod
+		// → replica. The cascaded replica does not appear in the new master's INFO
+		// replication, so after SENTINEL REMOVE+MONITOR sentinel cannot discover
+		// or reconfigure it. forceReplicaConnections bypasses sentinel and ensures
+		// every replica connects directly to the current master.
+		if stalled {
+			r.forceReplicaConnections(ctx, v, ps.name, pods)
+		}
 		return r.syncSentinelWithMaster(ctx, v, ps, expectedReplicas, checker, stalled)
 	}
 
@@ -447,7 +458,11 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 		if stalled {
 			logger.Info("Finalization stalled, cannot verify replication, resetting sentinel and proceeding",
 				"master", masterPS.name, "error", err)
-			r.resetSentinelState(ctx, v, "")
+			// Use the identified master's address instead of empty string to avoid
+			// the pod-0 fallback in resetSentinelState when pod-0 is not the master.
+			headlessNameOnErr := common.HeadlessServiceName(v, common.ComponentValkey)
+			masterAddrOnErr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPS.name, headlessNameOnErr, v.Namespace)
+			r.resetSentinelState(ctx, v, masterAddrOnErr)
 			return nil
 		}
 		r.ensureFinalizationTimestamp(ctx, v)
