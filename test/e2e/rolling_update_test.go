@@ -116,9 +116,12 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
-	// Wait for replication to fully establish.
+	// Wait for replication to fully establish and for Sentinel to have discovered
+	// the full topology. Without this, the rolling update may stall if Sentinel
+	// has not yet learned about all replicas (num-slaves < 2).
 	initialMasterPod := tc.findMasterPod(t, ns, name, 3)
 	tc.waitForConnectedReplicas(t, ns, initialMasterPod, 6379, 2)
+	tc.waitForSentinelSlaves(t, ns, name, 2)
 
 	t.Run("Initial pods run expected image", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
@@ -136,27 +139,22 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 
 	// Write test data to master before update.
 	t.Run("Write test data before update", func(t *testing.T) {
-		testData := map[string]string{
+		// Use a single MSET to write all string keys in one kubectl exec round-trip.
+		tc.valkeyMSET(t, ns, initialMasterPod, 6379, map[string]string{
 			"rolling:key1": "value-before-update",
 			"rolling:key2": "critical-data",
 			"rolling:key3": "must-survive-rolling-update",
-		}
+		})
 
-		for key, value := range testData {
-			resp := tc.valkeyExec(t, ns, initialMasterPod, 6379, "SET", key, value)
-			assert.Equal(t, "OK", resp, "SET %s should succeed", key)
-		}
-
-		// Also write a counter to verify data integrity.
+		// Write a list using variadic RPUSH (single round-trip for all 10 items).
+		listArgs := []string{"RPUSH", "rolling:list"}
 		for i := 0; i < 10; i++ {
-			tc.valkeyExec(t, ns, initialMasterPod, 6379, "RPUSH", "rolling:list", fmt.Sprintf("item-%d", i))
+			listArgs = append(listArgs, fmt.Sprintf("item-%d", i))
 		}
+		tc.valkeyExec(t, ns, initialMasterPod, 6379, listArgs...)
 
 		// Wait for replication to sync.
-		require.Eventually(t, func() bool {
-			info := tc.valkeyExec(t, ns, initialMasterPod, 6379, "INFO", "replication")
-			return strings.Contains(info, "connected_slaves:2")
-		}, 30*time.Second, time.Second, "Master should have 2 connected replicas")
+		tc.waitForConnectedReplicas(t, ns, initialMasterPod, 6379, 2)
 
 		// Verify data is on replicas.
 		for i := 0; i < 3; i++ {
@@ -165,9 +163,9 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExec(t, ns, podName, 6379, "GET", "rolling:key1")
+				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
-			}, 30*time.Second, time.Second, "Data should replicate to %s", podName)
+			}, 30*time.Second, 2*time.Second, "Data should replicate to %s", podName)
 		}
 	})
 
@@ -217,17 +215,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	})
 
 	t.Run("Data survives rolling update", func(t *testing.T) {
-		// Find the current master.
-		var currentMaster string
-		for i := 0; i < 3; i++ {
-			podName := fmt.Sprintf("%s-%d", name, i)
-			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
-			if strings.Contains(info, "role:master") {
-				currentMaster = podName
-				break
-			}
-		}
-		require.NotEmpty(t, currentMaster, "Should find a master after rolling update")
+		currentMaster := tc.findMasterPod(t, ns, name, 3)
 
 		// Verify string data.
 		resp := tc.valkeyExec(t, ns, currentMaster, 6379, "GET", "rolling:key1")
@@ -245,21 +233,12 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	})
 
 	t.Run("Replicas have data after rolling update", func(t *testing.T) {
-		// Wait for replication to re-establish.
-		var currentMaster string
-		for i := 0; i < 3; i++ {
-			podName := fmt.Sprintf("%s-%d", name, i)
-			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
-			if strings.Contains(info, "role:master") {
-				currentMaster = podName
-				break
-			}
-		}
-
-		require.Eventually(t, func() bool {
-			info := tc.valkeyExecAllowError(t, ns, currentMaster, 6379, "INFO", "replication")
-			return strings.Contains(info, "connected_slaves:2")
-		}, 90*time.Second, 2*time.Second, "Master should have 2 replicas after rolling update")
+		// Wait for replication to re-establish after rolling update.
+		// findMasterPod retries until a master is found, then waitForConnectedReplicas
+		// waits up to 3 minutes for all replicas to sync — both are more robust than
+		// an ad-hoc loop + short Eventually.
+		currentMaster := tc.findMasterPod(t, ns, name, 3)
+		tc.waitForConnectedReplicas(t, ns, currentMaster, 6379, 2)
 
 		// Verify data on replicas.
 		for i := 0; i < 3; i++ {
@@ -270,7 +249,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 			require.Eventually(t, func() bool {
 				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
-			}, 60*time.Second, 2*time.Second, "Data should replicate to %s after rolling update", podName)
+			}, 60*time.Second, 3*time.Second, "Data should replicate to %s after rolling update", podName)
 		}
 	})
 
@@ -282,16 +261,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	})
 
 	t.Run("New data can be written after rolling update", func(t *testing.T) {
-		var currentMaster string
-		for i := 0; i < 3; i++ {
-			podName := fmt.Sprintf("%s-%d", name, i)
-			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
-			if strings.Contains(info, "role:master") {
-				currentMaster = podName
-				break
-			}
-		}
-		require.NotEmpty(t, currentMaster)
+		currentMaster := tc.findMasterPod(t, ns, name, 3)
 
 		resp := tc.valkeyExec(t, ns, currentMaster, 6379, "SET", "post-rolling-update", "success")
 		assert.Equal(t, "OK", resp)
@@ -301,6 +271,11 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	})
 
 	t.Run("CRD status is OK after rolling update", func(t *testing.T) {
+		// Wait for the operator to settle — previous subtests may have triggered
+		// a brief replication-sync phase which causes the status to oscillate
+		// between "OK" and "Syncing" for a short time.
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+
 		status := tc.getValkeyStatus(t, ns, name)
 
 		phase, _, _ := unstructuredNestedString(status, "phase")
@@ -313,8 +288,11 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 
 // TestE2E_RollingUpdate_HA_NoDataLoss is a focused test verifying zero data loss
 // during a rolling update of an HA cluster.
+//
+// NOTE: Does NOT call t.Parallel(). Running two HA rolling-update tests in
+// parallel on a single-node Kind cluster causes severe resource contention and
+// flaky results. This test runs after the parallel phase has finished.
 func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
-	t.Parallel()
 	tc := newTestClients(t)
 	ns := "e2e-rolling-dataloss"
 	cleanup := tc.createNamespace(t, ns)
@@ -344,28 +322,27 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 	// Find master and wait for replication to fully establish.
 	masterPod := tc.findMasterPod(t, ns, name, 3)
 	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
+	tc.waitForSentinelSlaves(t, ns, name, 2)
 	t.Logf("Master pod: %s", masterPod)
 
 	numKeys := 100
 	t.Run("Write test dataset", func(t *testing.T) {
+		// Use a single MSET to write all 100 keys in one kubectl exec round-trip
+		// instead of 100 individual SET calls.
+		data := make(map[string]string, numKeys)
 		for i := 0; i < numKeys; i++ {
-			key := fmt.Sprintf("dataloss:key:%d", i)
-			value := fmt.Sprintf("value-%d-%s", i, time.Now().Format(time.RFC3339Nano))
-			resp := tc.valkeyExec(t, ns, masterPod, 6379, "SET", key, value)
-			require.Equal(t, "OK", resp, "SET %s should succeed", key)
+			data[fmt.Sprintf("dataloss:key:%d", i)] = fmt.Sprintf("value-%d", i)
 		}
+		tc.valkeyMSET(t, ns, masterPod, 6379, data)
 
 		// Verify DBSIZE on master.
 		dbsize := tc.valkeyExec(t, ns, masterPod, 6379, "DBSIZE")
 		t.Logf("Master DBSIZE before rolling update: %s", dbsize)
 	})
 
-	// Wait for full sync.
+	// Wait for full replication sync.
 	t.Run("Wait for replication sync", func(t *testing.T) {
-		require.Eventually(t, func() bool {
-			info := tc.valkeyExec(t, ns, masterPod, 6379, "INFO", "replication")
-			return strings.Contains(info, "connected_slaves:2")
-		}, 30*time.Second, time.Second)
+		tc.waitForConnectedReplicas(t, ns, masterPod, 6379, 2)
 	})
 
 	// Record DBSIZE before update.
@@ -510,11 +487,12 @@ func (tc *testClients) updateValkeyImage(t *testing.T, namespace, name, newImage
 // waitForAllPodsImage waits until all pods in a StatefulSet run the expected image.
 // Uses rollingUpdateTimeout since rolling updates in CI with parallel tests may take
 // significantly longer than standard operations due to resource contention.
+// Uses rollingUpdatePollInterval to reduce API server load from parallel polling.
 func (tc *testClients) waitForAllPodsImage(t *testing.T, namespace, stsName string, replicas int, expectedImage string) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, rollingUpdateTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, rollingUpdatePollInterval, rollingUpdateTimeout, true, func(ctx context.Context) (bool, error) {
 		for i := 0; i < replicas; i++ {
 			podName := fmt.Sprintf("%s-%d", stsName, i)
 			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})

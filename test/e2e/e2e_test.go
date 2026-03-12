@@ -37,11 +37,17 @@ const testTimeout = 5 * time.Minute
 // rollingUpdateTimeout is a longer timeout for rolling update operations.
 // Each HA rolling update involves 3 pod replacements + sentinel failover + sentinel
 // sync, which can take several minutes on a loaded single-node Kind cluster.
-// 10 minutes gives enough headroom even when the cluster is moderately loaded.
-const rollingUpdateTimeout = 10 * time.Minute
+// 12 minutes gives enough headroom even when the cluster is moderately loaded.
+const rollingUpdateTimeout = 12 * time.Minute
 
-// pollInterval is the interval between polling attempts.
+// pollInterval is the interval between polling attempts for short-lived operations.
 const pollInterval = 2 * time.Second
+
+// rollingUpdatePollInterval is a coarser polling interval for long-running
+// rolling update waits. Using a larger interval reduces the number of API
+// server requests made by parallel tests, preventing rate-limiter exhaustion
+// ("client rate limiter Wait returned an error: context deadline exceeded").
+const rollingUpdatePollInterval = 5 * time.Second
 
 // valkeyGVR is the GroupVersionResource for the Valkey CRD.
 var valkeyGVR = schema.GroupVersionResource{
@@ -69,6 +75,13 @@ func newTestClients(t *testing.T) *testClients {
 
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	require.NoError(t, err, "Failed to build kubeconfig")
+
+	// Raise API client rate limits to avoid "client rate limiter Wait returned an
+	// error: context deadline exceeded" when multiple parallel e2e tests poll the
+	// API server simultaneously. The default is 5 QPS / 10 burst which is too
+	// conservative for concurrent long-lived polling loops.
+	config.QPS = 50
+	config.Burst = 100
 
 	kubeClient, err := kubernetes.NewForConfig(config)
 	require.NoError(t, err, "Failed to create kubernetes client")
@@ -156,12 +169,18 @@ func (tc *testClients) waitForValkeyPhaseAfterRollingUpdate(t *testing.T, namesp
 }
 
 // waitForValkeyPhaseWithTimeout waits until the Valkey CR reaches the expected phase
-// within the given timeout.
+// within the given timeout. Uses rollingUpdatePollInterval for long timeouts to
+// reduce API server load from parallel tests.
 func (tc *testClients) waitForValkeyPhaseWithTimeout(t *testing.T, namespace, name, expectedPhase string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
+	interval := pollInterval
+	if timeout >= rollingUpdateTimeout {
+		interval = rollingUpdatePollInterval
+	}
+
+	err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
 		valkey, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -235,6 +254,20 @@ func (tc *testClients) valkeyExec(t *testing.T, namespace, podName string, port 
 
 	require.NoError(t, lastErr, "valkeyExec failed after %d attempts for pod %s", maxAttempts, podName)
 	return "" // unreachable
+}
+
+// valkeyMSET writes multiple key/value pairs to Valkey via a single MSET command.
+// This is significantly faster than calling valkeyExec separately for each key
+// because it only spawns one kubectl exec subprocess.
+func (tc *testClients) valkeyMSET(t *testing.T, namespace, podName string, port int, data map[string]string) {
+	t.Helper()
+	args := make([]string, 0, 1+len(data)*2)
+	args = append(args, "MSET")
+	for k, v := range data {
+		args = append(args, k, v)
+	}
+	resp := tc.valkeyExec(t, namespace, podName, port, args...)
+	require.Equal(t, "OK", resp, "MSET should succeed on pod %s", podName)
 }
 
 // waitForPodReady waits until a specific pod is in Ready condition.
@@ -368,6 +401,8 @@ func (tc *testClients) waitForServiceEndpoints(t *testing.T, namespace, name str
 func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterPod string, port, expectedReplicas int) {
 	t.Helper()
 	expectedStr := fmt.Sprintf("connected_slaves:%d", expectedReplicas)
+	// Allow 3 minutes — after a rolling update replicas need time to reconnect and
+	// complete the initial replication sync, which can be slow on a loaded Kind cluster.
 	require.Eventually(t, func() bool {
 		info := tc.valkeyExecAllowError(t, namespace, masterPod, port, "INFO", "replication")
 		if !strings.Contains(info, expectedStr) {
@@ -375,7 +410,7 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 		}
 		// Ensure no sync is in progress.
 		return !strings.Contains(info, "master_sync_in_progress:1")
-	}, 90*time.Second, 2*time.Second, "Master %s should have %d connected replicas", masterPod, expectedReplicas)
+	}, 3*time.Minute, 3*time.Second, "Master %s should have %d connected replicas", masterPod, expectedReplicas)
 	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
 }
 
