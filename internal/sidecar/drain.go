@@ -38,17 +38,18 @@ type drainLog interface {
 // When the pod is the master, it patches the label to "draining", triggers
 // a failover (via Sentinel or manually), and waits for the role to change.
 type DrainHandler struct {
-	detector        RoleDetector
-	patcher         PodPatcher
-	clientFactory   ValkeyClientFactory
-	podName         string
-	podNamespace    string
-	sentinelEnabled bool
-	sentinelMonitor string
-	sentinelAddrs   []string
-	headlessSvc     string
-	replicas        int
-	valkeyPort      string
+	detector              RoleDetector
+	patcher               PodPatcher
+	clientFactory         ValkeyClientFactory
+	sentinelClientFactory ValkeyClientFactory // for sentinel connections (may differ in auth)
+	podName               string
+	podNamespace          string
+	sentinelEnabled       bool
+	sentinelMonitor       string
+	sentinelAddrs         []string
+	headlessSvc           string
+	replicas              int
+	valkeyPort            string
 }
 
 // NewDrainHandlerWithDeps creates a DrainHandler with injected dependencies (for testing).
@@ -56,6 +57,7 @@ func NewDrainHandlerWithDeps(
 	detector RoleDetector,
 	patcher PodPatcher,
 	clientFactory ValkeyClientFactory,
+	sentinelClientFactory ValkeyClientFactory,
 	podName, podNamespace string,
 	sentinelEnabled bool,
 	sentinelMonitor string,
@@ -64,18 +66,22 @@ func NewDrainHandlerWithDeps(
 	replicas int,
 	valkeyPort string,
 ) *DrainHandler {
+	if sentinelClientFactory == nil {
+		sentinelClientFactory = clientFactory
+	}
 	return &DrainHandler{
-		detector:        detector,
-		patcher:         patcher,
-		clientFactory:   clientFactory,
-		podName:         podName,
-		podNamespace:    podNamespace,
-		sentinelEnabled: sentinelEnabled,
-		sentinelMonitor: sentinelMonitor,
-		sentinelAddrs:   sentinelAddrs,
-		headlessSvc:     headlessSvc,
-		replicas:        replicas,
-		valkeyPort:      valkeyPort,
+		detector:              detector,
+		patcher:               patcher,
+		clientFactory:         clientFactory,
+		sentinelClientFactory: sentinelClientFactory,
+		podName:               podName,
+		podNamespace:          podNamespace,
+		sentinelEnabled:       sentinelEnabled,
+		sentinelMonitor:       sentinelMonitor,
+		sentinelAddrs:         sentinelAddrs,
+		headlessSvc:           headlessSvc,
+		replicas:              replicas,
+		valkeyPort:            valkeyPort,
 	}
 }
 
@@ -116,7 +122,7 @@ func (d *DrainHandler) Handle(ctx context.Context) error {
 func (d *DrainHandler) sentinelFailover(ctx context.Context, log drainLog) error {
 	var lastErr error
 	for _, addr := range d.sentinelAddrs {
-		client := d.clientFactory.NewClient(addr)
+		client := d.sentinelClientFactory.NewClient(addr)
 		if err := client.SentinelFailover(d.sentinelMonitor); err != nil {
 			log.Error(err, "sentinel failover command failed", "sentinel", addr)
 			lastErr = err
@@ -311,6 +317,20 @@ func buildDrainHandler(cfg Config, detector RoleDetector, patcher PodPatcher) (*
 		return nil, err
 	}
 
+	// When sentinel auth is disabled, create a separate factory without password
+	// for sentinel connections. Sentinel still connects to Valkey with auth-pass,
+	// but clients (including the sidecar) connect to Sentinel without AUTH.
+	sentinelFactory := ValkeyClientFactory(factory)
+	if cfg.SentinelDisableAuth {
+		sentinelCfg := cfg
+		sentinelCfg.Password = ""
+		sf, err := newRealValkeyClientFactory(sentinelCfg)
+		if err != nil {
+			return nil, err
+		}
+		sentinelFactory = sf
+	}
+
 	var sentinelAddrs []string
 	if cfg.SentinelAddrs != "" {
 		sentinelAddrs = strings.Split(cfg.SentinelAddrs, ",")
@@ -322,16 +342,17 @@ func buildDrainHandler(cfg Config, detector RoleDetector, patcher PodPatcher) (*
 	}
 
 	return &DrainHandler{
-		detector:        detector,
-		patcher:         patcher,
-		clientFactory:   factory,
-		podName:         cfg.PodName,
-		podNamespace:    cfg.PodNamespace,
-		sentinelEnabled: cfg.SentinelEnabled,
-		sentinelMonitor: cfg.SentinelMonitor,
-		sentinelAddrs:   sentinelAddrs,
-		headlessSvc:     cfg.HeadlessSvc,
-		replicas:        cfg.Replicas,
-		valkeyPort:      port,
+		detector:              detector,
+		patcher:               patcher,
+		clientFactory:         factory,
+		sentinelClientFactory: sentinelFactory,
+		podName:               cfg.PodName,
+		podNamespace:          cfg.PodNamespace,
+		sentinelEnabled:       cfg.SentinelEnabled,
+		sentinelMonitor:       cfg.SentinelMonitor,
+		sentinelAddrs:         sentinelAddrs,
+		headlessSvc:           cfg.HeadlessSvc,
+		replicas:              cfg.Replicas,
+		valkeyPort:            port,
 	}, nil
 }

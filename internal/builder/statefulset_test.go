@@ -1282,6 +1282,105 @@ func TestBuildStatefulSet_HA_InitContainer_NoAuth_NoCredentials(t *testing.T) {
 		"Init container must have no env vars when auth is disabled")
 }
 
+// TestBuildStatefulSet_HA_InitContainer_AuthDisabled_NoCredentials verifies that when
+// auth is enabled but sentinel disableAuth is true, the init container script does NOT
+// include auth flags for Sentinel queries (since Sentinel has no requirepass).
+func TestBuildStatefulSet_HA_InitContainer_AuthDisabled_NoCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.NotContains(t, script, "-a ",
+		"Init container script must NOT include -a flag when sentinel auth is disabled")
+
+	// The VALKEY_PASSWORD env var must still be injected because the main Valkey
+	// container still needs it for --requirepass/--masterauth.
+}
+
+// TestBuildStatefulSet_Sidecar_SentinelDisableAuth verifies that the sidecar container
+// receives --sentinel-disable-auth=true when sentinel disableAuth is enabled.
+func TestBuildStatefulSet_Sidecar_SentinelDisableAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	var sidecar *corev1.Container
+	for i := range sts.Spec.Template.Spec.Containers {
+		if sts.Spec.Template.Spec.Containers[i].Name == SidecarContainerName {
+			sidecar = &sts.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	require.NotNil(t, sidecar, "sidecar container must exist")
+
+	hasDisableAuth := false
+	for _, arg := range sidecar.Args {
+		if arg == "--sentinel-disable-auth=true" {
+			hasDisableAuth = true
+			break
+		}
+	}
+	assert.True(t, hasDisableAuth, "sidecar must have --sentinel-disable-auth=true arg")
+}
+
+// TestBuildStatefulSet_Sidecar_NoSentinelDisableAuth verifies that --sentinel-disable-auth
+// is NOT present when sentinel disableAuth is false (default).
+func TestBuildStatefulSet_Sidecar_NoSentinelDisableAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	var sidecar *corev1.Container
+	for i := range sts.Spec.Template.Spec.Containers {
+		if sts.Spec.Template.Spec.Containers[i].Name == SidecarContainerName {
+			sidecar = &sts.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	require.NotNil(t, sidecar, "sidecar container must exist")
+
+	for _, arg := range sidecar.Args {
+		assert.NotContains(t, arg, "sentinel-disable-auth",
+			"sidecar must NOT have --sentinel-disable-auth when not set")
+	}
+}
+
 // TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume verifies that the init
 // container mounts the TLS secret volume when TLS is enabled.
 func TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume(t *testing.T) {

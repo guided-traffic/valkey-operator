@@ -185,6 +185,51 @@ func TestGenerateSentinelConf_WithoutAuth_NoRequirepass(t *testing.T) {
 		"sentinel.conf must not contain requirepass when auth is disabled")
 }
 
+// TestGenerateSentinelConf_DisableAuth_NoRequirepass verifies that when auth is configured
+// but sentinel disableAuth is true, the sentinel config omits requirepass but still contains
+// sentinel auth-pass for Sentinel→Valkey authentication.
+func TestGenerateSentinelConf_DisableAuth_NoRequirepass(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.NotContains(t, conf, "requirepass",
+		"sentinel.conf must not contain requirepass when disableAuth is true")
+	assert.Contains(t, conf, "sentinel auth-pass test %VALKEY_PASSWORD%",
+		"sentinel.conf must still contain sentinel auth-pass for Valkey connectivity")
+}
+
+// TestGenerateSentinelConf_DisableAuth_False_KeepsRequirepass verifies that when disableAuth
+// is explicitly false, the sentinel config contains both requirepass and sentinel auth-pass.
+func TestGenerateSentinelConf_DisableAuth_False_KeepsRequirepass(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: false,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	conf := GenerateSentinelConf(v)
+
+	assert.Contains(t, conf, "requirepass %VALKEY_PASSWORD%")
+	assert.Contains(t, conf, "sentinel auth-pass test %VALKEY_PASSWORD%")
+}
+
 // TestGenerateSentinelConf_TLSOnly_UsesTLSPort36379 verifies that when TLS is enabled
 // (without allowUnencrypted), the sentinel config uses tls-port 36379 (= 26379 + 10000)
 // and disables the plaintext port (port 0). This is the corrected +10000 convention.
@@ -1089,6 +1134,124 @@ func TestBuildSentinelContainer_NoAuth_NoPasswordEnvVar(t *testing.T) {
 	c := buildSentinelContainer(v)
 
 	assert.Empty(t, c.Env, "no env vars should be set on the Sentinel container when auth is disabled")
+}
+
+// TestSentinelProbeCommand_AuthDisabled_NoAuthFlag verifies that when auth is enabled
+// but sentinel disableAuth is true, the probe command does not include auth flags.
+func TestSentinelProbeCommand_AuthDisabled_NoAuthFlag(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := SentinelProbeCommand(v)
+
+	// When sentinel auth is disabled, the probe should not authenticate.
+	// Without TLS this falls back to the plain valkey-cli ping.
+	require.Equal(t, []string{"valkey-cli", "-p", "26379", "ping"}, cmd)
+}
+
+// TestSentinelProbeCommand_AuthDisabled_WithTLS verifies that when sentinel auth is
+// disabled but TLS is enabled, the probe uses TLS flags without auth flags.
+func TestSentinelProbeCommand_AuthDisabled_WithTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := SentinelProbeCommand(v)
+
+	// TLS exec probe but no auth.
+	require.Equal(t, []string{
+		"valkey-cli",
+		"--tls",
+		"--cacert", TLSMountPath + "/ca.crt",
+		"-p", "36379",
+		"ping",
+	}, cmd)
+}
+
+// TestBuildSentinelContainer_AuthDisabled_NoPasswordEnvVar verifies that when
+// sentinel disableAuth is true, the main sentinel container has no VALKEY_PASSWORD
+// env var (probe doesn't need it), even though auth is globally enabled.
+func TestBuildSentinelContainer_AuthDisabled_NoPasswordEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "pass",
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	assert.Empty(t, c.Env,
+		"no env vars on the sentinel container when sentinel auth is disabled")
+}
+
+// TestBuildSentinelContainer_AuthDisabled_UsesTCPSocketProbe verifies that when
+// sentinel auth is disabled and TLS is off, the probe falls back to tcpSocket.
+func TestBuildSentinelContainer_AuthDisabled_UsesTCPSocketProbe(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	c := buildSentinelContainer(v)
+
+	require.NotNil(t, c.ReadinessProbe.TCPSocket,
+		"readiness probe should be tcpSocket when auth is disabled and no TLS")
+	assert.Nil(t, c.ReadinessProbe.Exec)
+}
+
+// TestBuildSentinelPodSpec_AuthDisabled_InitContainerStillHasEnv verifies that the
+// init container still gets the VALKEY_PASSWORD env var even when sentinel auth is
+// disabled, because it needs to inject sentinel auth-pass into the config.
+func TestBuildSentinelPodSpec_AuthDisabled_InitContainerStillHasEnv(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "pass",
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	require.Len(t, init.Env, 1, "init container must have the password env var for sed replacement")
+	assert.Equal(t, AuthSecretEnvName, init.Env[0].Name)
 }
 
 // TestBuildSentinelStatefulSet_TLSOnly_NoTCPSocketProbes is an integration-level

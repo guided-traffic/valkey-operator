@@ -106,14 +106,15 @@ func newTestDrainHandler(
 	opts ...func(*DrainHandler),
 ) *DrainHandler {
 	h := &DrainHandler{
-		detector:      detector,
-		patcher:       patcher,
-		clientFactory: factory,
-		podName:       "test-0",
-		podNamespace:  "default",
-		headlessSvc:   "test-headless.default.svc.cluster.local",
-		replicas:      3,
-		valkeyPort:    "6379",
+		detector:              detector,
+		patcher:               patcher,
+		clientFactory:         factory,
+		sentinelClientFactory: factory,
+		podName:               "test-0",
+		podNamespace:          "default",
+		headlessSvc:           "test-headless.default.svc.cluster.local",
+		replicas:              3,
+		valkeyPort:            "6379",
 	}
 	for _, opt := range opts {
 		opt(h)
