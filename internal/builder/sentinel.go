@@ -158,13 +158,24 @@ func generateSentinelConf(v *vkov1.Valkey, useKnownMaster bool) string {
 	// AUTH command with "ERR AUTH called without any password configured for the default user",
 	// which causes the operator health checker to permanently fail Sentinel connectivity checks.
 	// sentinel auth-pass is the separate credential Sentinel uses to connect to Valkey nodes.
+	// When DisableAuth is set on the Sentinel spec, requirepass is omitted so that clients
+	// can connect to Sentinel without authentication — but auth-pass is still emitted so
+	// that Sentinel can authenticate with password-protected Valkey nodes.
 	if v.IsAuthEnabled() {
-		lines = append(lines,
-			"# Auth",
-			"requirepass %VALKEY_PASSWORD%",
-			fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
-			"",
-		)
+		if v.IsSentinelAuthDisabled() {
+			lines = append(lines,
+				"# Auth (sentinel client auth disabled, auth-pass only)",
+				fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
+				"",
+			)
+		} else {
+			lines = append(lines,
+				"# Auth",
+				"requirepass %VALKEY_PASSWORD%",
+				fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
+				"",
+			)
+		}
 	}
 
 	return strings.Join(lines, "\n")
@@ -362,7 +373,10 @@ func SentinelProbeCommand(v *vkov1.Valkey) []string {
 		port = fmt.Sprintf("%d", SentinelPort)
 	}
 
-	if v.IsAuthEnabled() {
+	// When auth is enabled AND sentinel auth is not disabled, the probe must authenticate.
+	sentinelNeedsAuth := v.IsAuthEnabled() && !v.IsSentinelAuthDisabled()
+
+	if sentinelNeedsAuth {
 		var cmdStr string
 		if v.IsTLSEnabled() {
 			cmdStr = fmt.Sprintf(
@@ -413,13 +427,15 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 		})
 	}
 
-	// Build probe handler. When TLS or auth is enabled, use an exec probe with
-	// valkey-cli so that the probe speaks the correct protocol. A bare tcpSocket
-	// probe against a TLS-only port causes the Sentinel to log continuous
+	// Build probe handler. When TLS is enabled or sentinel requires auth, use an exec
+	// probe with valkey-cli so that the probe speaks the correct protocol. A bare
+	// tcpSocket probe against a TLS-only port causes the Sentinel to log continuous
 	// "SSL routines::unexpected eof while reading" errors because kubelet
 	// opens the TCP connection without performing a TLS handshake.
+	// When sentinel auth is disabled, the probe still needs exec for TLS but not for auth.
+	sentinelNeedsAuth := v.IsAuthEnabled() && !v.IsSentinelAuthDisabled()
 	var probeHandler corev1.ProbeHandler
-	if v.IsTLSEnabled() || v.IsAuthEnabled() {
+	if v.IsTLSEnabled() || sentinelNeedsAuth {
 		probeHandler = corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
 				Command: SentinelProbeCommand(v),
@@ -484,8 +500,10 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 	}
 
 	// Inject auth password env var into the main Sentinel container when auth
-	// is enabled, so the probe command can reference $VALKEY_PASSWORD.
-	if v.IsAuthEnabled() {
+	// is enabled AND sentinel auth is not disabled, so the probe command can
+	// reference $VALKEY_PASSWORD. When sentinel auth is disabled, the probe
+	// does not authenticate and the env var is not needed in the main container.
+	if v.IsAuthEnabled() && !v.IsSentinelAuthDisabled() {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name: AuthSecretEnvName,
 			ValueFrom: &corev1.EnvVarSource{

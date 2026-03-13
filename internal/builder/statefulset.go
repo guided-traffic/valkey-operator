@@ -163,12 +163,13 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			cliTLSFlags = fmt.Sprintf("--tls --cacert %s/ca.crt", TLSMountPath)
 		}
 
-		// When auth is enabled, Sentinel also requires a password (requirepass).
-		// The init container must authenticate before issuing SENTINEL commands,
-		// otherwise Sentinel returns "NOAUTH Authentication required." which gets
-		// mistakenly written as the replicaof hostname, causing Valkey to crash.
+		// When auth is enabled AND sentinel auth is not disabled, Sentinel requires
+		// a password (requirepass). The init container must authenticate before issuing
+		// SENTINEL commands, otherwise Sentinel returns "NOAUTH Authentication required."
+		// which gets mistakenly written as the replicaof hostname, causing Valkey to crash.
+		// When sentinel auth IS disabled, Sentinel does not have requirepass, so no auth flags.
 		cliAuthFlags := ""
-		if v.IsAuthEnabled() {
+		if v.IsAuthEnabled() && !v.IsSentinelAuthDisabled() {
 			cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
 		}
 
@@ -534,6 +535,9 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 		args = append(args, "--sentinel-enabled=true")
 		args = append(args, fmt.Sprintf("--sentinel-monitor=%s", SentinelMonitorName(v)))
 		args = append(args, fmt.Sprintf("--sentinel-addrs=%s", buildSentinelAddrList(v)))
+		if v.IsSentinelAuthDisabled() {
+			args = append(args, "--sentinel-disable-auth=true")
+		}
 	}
 
 	// Headless service and replica count for drain handler replica discovery.

@@ -55,6 +55,7 @@ func parseFlags() sidecar.Config {
 	flag.BoolVar(&cfg.SentinelEnabled, "sentinel-enabled", envBool("SENTINEL_ENABLED"), "Whether Sentinel is used for failover")
 	flag.StringVar(&cfg.SentinelMonitor, "sentinel-monitor", envString("SENTINEL_MONITOR", ""), "Sentinel monitor name")
 	flag.StringVar(&cfg.SentinelAddrs, "sentinel-addrs", envString("SENTINEL_ADDRS", ""), "Comma-separated sentinel addresses")
+	flag.BoolVar(&cfg.SentinelDisableAuth, "sentinel-disable-auth", envBool("SENTINEL_DISABLE_AUTH"), "Whether Sentinel client auth is disabled")
 	flag.StringVar(&cfg.HeadlessSvc, "headless-svc", envString("HEADLESS_SVC", ""), "Headless service FQDN for DNS-based replica discovery")
 	flag.IntVar(&cfg.Replicas, "replicas", envInt("REPLICAS", 1), "Number of Valkey replicas in the StatefulSet")
 	flag.DurationVar(&cfg.FailoverTimeout, "failover-timeout", envDuration("SIDECAR_FAILOVER_TIMEOUT", 60*time.Second), "Max time to wait for failover completion")

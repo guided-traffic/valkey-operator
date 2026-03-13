@@ -467,6 +467,62 @@ func TestIsSentinelUnencryptedAllowed(t *testing.T) {
 
 // --- Full CRD Struct Construction ---
 
+func TestIsSentinelAuthDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		auth     *AuthSpec
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{
+			name:     "no auth, no sentinel",
+			auth:     nil,
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "auth enabled, no sentinel",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel enabled, disableAuth false",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: false},
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel enabled, disableAuth true",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: true},
+			expected: true,
+		},
+		{
+			name:     "no auth, sentinel disableAuth true",
+			auth:     nil,
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: true},
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel disabled, disableAuth true",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: false, DisableAuth: true},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Auth = tt.auth
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expected, v.IsSentinelAuthDisabled())
+		})
+	}
+}
+
 func TestValkeySpec_FullConfiguration(t *testing.T) {
 	v := newValkey("full-test", func(v *Valkey) {
 		v.Spec = ValkeySpec{

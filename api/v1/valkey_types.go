@@ -72,6 +72,15 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	AllowUnencrypted bool `json:"allowUnencrypted,omitempty"`
+
+	// DisableAuth disables password authentication for Sentinel client connections.
+	// When true, Sentinel does not require a password from connecting clients
+	// (no requirepass directive), but still uses sentinel auth-pass to
+	// authenticate with Valkey nodes. Only effective when spec.auth is configured.
+	// Default: false (Sentinel requires the same password as Valkey).
+	// +kubebuilder:default=false
+	// +optional
+	DisableAuth bool `json:"disableAuth,omitempty"`
 }
 
 // AuthSpec defines authentication configuration for Valkey.
@@ -336,6 +345,14 @@ func (v *Valkey) IsValkeyUnencryptedAllowed() bool {
 func (v *Valkey) IsSentinelUnencryptedAllowed() bool {
 	return v.IsTLSEnabled() && v.IsSentinelEnabled() &&
 		v.Spec.Sentinel != nil && v.Spec.Sentinel.AllowUnencrypted
+}
+
+// IsSentinelAuthDisabled returns true when auth is configured but Sentinel
+// client connections should not require a password (no requirepass directive).
+// Sentinel still uses sentinel auth-pass to authenticate with Valkey nodes.
+func (v *Valkey) IsSentinelAuthDisabled() bool {
+	return v.IsAuthEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.DisableAuth
 }
 
 func init() {

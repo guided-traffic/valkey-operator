@@ -223,6 +223,15 @@ spec:
                       AllowUnencrypted keeps the plaintext Sentinel port (26379) open alongside the TLS port (36379).
                       Only effective when spec.tls.enabled is true. Default: false.
                     type: boolean
+                  disableAuth:
+                    default: false
+                    description: |-
+                      DisableAuth disables password authentication for Sentinel client connections.
+                      When true, Sentinel does not require a password from connecting clients
+                      (no requirepass directive), but still uses sentinel auth-pass to
+                      authenticate with Valkey nodes. Only effective when spec.auth is configured.
+                      Default: false (Sentinel requires the same password as Valkey).
+                    type: boolean
                   enabled:
                     default: false
                     description: Enabled activates Sentinel-based HA mode.
