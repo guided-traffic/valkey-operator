@@ -278,6 +278,31 @@ spec:
     secretPasswordKey: password
 ```
 
+### HA — With Authentication (Sentinel Unauthenticated)
+
+Valkey requires a password, but Sentinel accepts client connections without authentication. This is useful when Sentinel discovery clients (e.g., application frameworks) do not support Sentinel AUTH.
+
+Sentinel still uses `auth-pass` internally to connect to password-protected Valkey nodes.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: auth-nosentinel-auth
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+    disableAuth: true     # Sentinel accepts unauthenticated client connections
+  auth:
+    secretName: valkey-auth
+    secretPasswordKey: password
+```
+
+> **Security note:** `disableAuth` only affects Sentinel — Valkey itself always requires the configured password. Consider enabling TLS and/or `networkPolicy` to restrict Sentinel access when using this option.
+
 ---
 
 ## CRD Reference
@@ -305,6 +330,7 @@ spec:
 | `enabled` | `bool` | `false` | Enable Sentinel HA mode |
 | `replicas` | `int32` | `3` | Number of Sentinel instances |
 | `allowUnencrypted` | `bool` | `false` | Keep plaintext Sentinel port (`26379`) open alongside TLS port (`36379`). Only effective when `spec.tls.enabled: true`. |
+| `disableAuth` | `bool` | `false` | Disable password authentication for Sentinel client connections. Sentinel still uses `auth-pass` to connect to Valkey nodes. Only effective when `spec.auth` is configured. |
 | `podLabels` | `map[string]string` | — | Additional labels for Sentinel pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Sentinel pods |
 
