@@ -261,6 +261,55 @@ fi`,
 		initContainers = append(initContainers, initContainer)
 	}
 
+	// In multi-replica mode without Sentinel, use a simple ordinal-based init
+	// container to select master or replica config. Pod-0 gets the master config,
+	// all other pods get the replica config (which contains `replicaof`).
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: ReplicaConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: ReplicaConfigMapName(v),
+						},
+					},
+				},
+			},
+			corev1.Volume{
+				Name: WritableConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
+
+		initContainer := corev1.Container{
+			Name:  "init-config-selector",
+			Image: v.Spec.Image,
+			Command: []string{
+				"sh", "-c",
+				fmt.Sprintf(
+					`# Ordinal-based config selection for non-Sentinel replication.
+ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+if [ "$ORDINAL" = "0" ]; then
+  echo "Pod ordinal 0 — using master config"
+  cp %[1]s/%[3]s %[2]s/%[3]s
+else
+  echo "Pod ordinal $ORDINAL — using replica config"
+  cp %[4]s/%[3]s %[2]s/%[3]s
+fi`,
+					ConfigMountPath,         // 1: master config mount (readonly)
+					WritableConfigMountPath, // 2: writable config mount
+					ValkeyConfigKey,         // 3: config file name
+					ReplicaConfigMountPath,  // 4: replica config mount (readonly)
+				),
+			},
+			VolumeMounts: buildInitContainerVolumeMounts(v),
+		}
+		initContainers = append(initContainers, initContainer)
+	}
+
 	// If persistence is NOT enabled, use an emptyDir for data.
 	if !v.IsPersistenceEnabled() {
 		volumes = append(volumes, corev1.Volume{
@@ -304,11 +353,17 @@ fi`,
 	return spec
 }
 
+// needsInitContainer returns true when the pod spec requires an init container
+// to select the correct configuration (master vs replica).
+func needsInitContainer(v *vkov1.Valkey) bool {
+	return v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel()
+}
+
 // configMountForContainer returns the config mount path used by the valkey container.
-// In HA mode, this is the writable config directory (populated by init container).
+// In multi-replica mode, this is the writable config directory (populated by init container).
 // In standalone mode, this is the readonly ConfigMap mount.
 func configMountForContainer(v *vkov1.Valkey) string {
-	if v.IsSentinelEnabled() {
+	if needsInitContainer(v) {
 		return WritableConfigMountPath
 	}
 	return ConfigMountPath
@@ -316,7 +371,7 @@ func configMountForContainer(v *vkov1.Valkey) string {
 
 // configVolumeNameForContainer returns the volume name to mount for the valkey config.
 func configVolumeNameForContainer(v *vkov1.Valkey) string {
-	if v.IsSentinelEnabled() {
+	if needsInitContainer(v) {
 		return WritableConfigVolumeName
 	}
 	return ConfigVolumeName
@@ -331,7 +386,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		{
 			Name:      cfgVolume,
 			MountPath: cfgMount,
-			ReadOnly:  !v.IsSentinelEnabled(), // Writable in HA mode (init container writes here).
+			ReadOnly:  !needsInitContainer(v), // Writable when init container populates config.
 		},
 		{
 			Name:      DataVolumeName,

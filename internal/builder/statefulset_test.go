@@ -172,6 +172,41 @@ func TestBuildStatefulSet_MultipleReplicas(t *testing.T) {
 	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, int32(3), *sts.Spec.Replicas)
+
+	// Multi-replica without Sentinel must have an init container.
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initC := sts.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "init-config-selector", initC.Name)
+
+	// Must have replica-config and writable-config volumes.
+	volNames := make([]string, 0, len(sts.Spec.Template.Spec.Volumes))
+	for _, vol := range sts.Spec.Template.Spec.Volumes {
+		volNames = append(volNames, vol.Name)
+	}
+	assert.Contains(t, volNames, ReplicaConfigVolumeName)
+	assert.Contains(t, volNames, WritableConfigVolumeName)
+
+	// Valkey container must use the writable config mount.
+	valkeyContainer := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, ValkeyContainerName, valkeyContainer.Name)
+	foundWritableMount := false
+	for _, vm := range valkeyContainer.VolumeMounts {
+		if vm.Name == WritableConfigVolumeName {
+			assert.Equal(t, WritableConfigMountPath, vm.MountPath)
+			assert.False(t, vm.ReadOnly)
+			foundWritableMount = true
+		}
+	}
+	assert.True(t, foundWritableMount, "valkey container must mount writable config volume")
+}
+
+func TestBuildStatefulSet_SingleReplica_NoInitContainer(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	// Single replica (standalone) must NOT have an init container.
+	assert.Empty(t, sts.Spec.Template.Spec.InitContainers)
 }
 
 func TestBuildStatefulSet_ConfigMapReference(t *testing.T) {
