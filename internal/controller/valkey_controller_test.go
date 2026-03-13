@@ -1474,6 +1474,49 @@ func TestReconcile_StandaloneDoesNotCreateSentinel(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err))
 }
 
+func TestReconcile_MultiReplicaWithoutSentinel_CreatesReplicaConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-replica-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data, builder.ValkeyConfigKey)
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "replicaof")
+}
+
+func TestReconcile_MultiReplicaWithoutSentinel_SetsMasterPod(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Second reconcile should report OK with master pod set.
+	reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseOK, v.Status.Phase)
+	assert.Equal(t, "test-0", v.Status.MasterPod)
+}
+
 // --- Auth Tests ---
 
 func TestReconcile_Auth_StatefulSetHasEnvVar(t *testing.T) {

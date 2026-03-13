@@ -283,6 +283,13 @@ func (v *Valkey) IsSentinelEnabled() bool {
 	return v.Spec.Sentinel != nil && v.Spec.Sentinel.Enabled
 }
 
+// IsMultiReplicaWithoutSentinel returns true when more than one replica is
+// requested but Sentinel is not enabled. In this mode the operator uses a
+// simple ordinal-based init container to assign pod-0 as master.
+func (v *Valkey) IsMultiReplicaWithoutSentinel() bool {
+	return v.Spec.Replicas > 1 && !v.IsSentinelEnabled()
+}
+
 // IsAuthEnabled returns true if authentication is configured.
 func (v *Valkey) IsAuthEnabled() bool {
 	return v.Spec.Auth != nil && v.Spec.Auth.SecretName != ""

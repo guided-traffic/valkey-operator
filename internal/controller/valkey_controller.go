@@ -228,8 +228,8 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		return err
 	}
 
-	// Reconcile replica ConfigMap in HA mode.
-	if valkey.IsSentinelEnabled() {
+	// Reconcile replica ConfigMap in multi-replica mode (Sentinel or non-Sentinel replication).
+	if valkey.IsSentinelEnabled() || valkey.IsMultiReplicaWithoutSentinel() {
 		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
 			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
 			return err
@@ -908,10 +908,8 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Phase = vkov1.ValkeyPhaseOK
 			v.Status.Message = "All replicas are ready"
 
-			// In standalone mode, the single pod is the master.
-			if v.Spec.Replicas == 1 {
-				v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
-			}
+			// Pod-0 is the master (standalone single pod or ordinal-based multi-replica).
+			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
 				Type:               "Ready",

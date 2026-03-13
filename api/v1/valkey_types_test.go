@@ -61,6 +61,50 @@ func TestIsSentinelEnabled(t *testing.T) {
 	}
 }
 
+func TestIsMultiReplicaWithoutSentinel(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int32
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{
+			name:     "single replica, no sentinel",
+			replicas: 1,
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "multi replica, no sentinel",
+			replicas: 3,
+			sentinel: nil,
+			expected: true,
+		},
+		{
+			name:     "multi replica, sentinel enabled",
+			replicas: 3,
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3},
+			expected: false,
+		},
+		{
+			name:     "multi replica, sentinel disabled",
+			replicas: 3,
+			sentinel: &SentinelSpec{Enabled: false},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expected, v.IsMultiReplicaWithoutSentinel())
+		})
+	}
+}
+
 func TestIsAuthEnabled(t *testing.T) {
 	tests := []struct {
 		name     string
