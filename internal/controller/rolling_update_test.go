@@ -2548,3 +2548,597 @@ func TestTriggerSentinelFailover_NoTLS_UsesPlainPort(t *testing.T) {
 	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
 		"sentinel failover without TLS must target the plain-text port (%d)", builder.SentinelPort)
 }
+
+// TestTriggerSentinelFailover_DisableAuth_NoAuthSent verifies that when
+// sentinel.disableAuth is true, the operator does NOT send AUTH to sentinel.
+// Regression test for: operator stuck in failover loop because AUTH was sent
+// to sentinel that has no password configured.
+func TestTriggerSentinelFailover_DisableAuth_NoAuthSent(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    1,
+			DisableAuth: true,
+		}
+	})
+
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("supersecret")},
+	}
+	r, _ := newTestReconciler(v, authSecret)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	// The function will fail (no real sentinel), but the error must NOT contain
+	// "AUTH failed" — it should be a connection error instead, proving no AUTH was sent.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "AUTH failed",
+		"sentinel failover with disableAuth must not send AUTH to sentinel")
+}
+
+// TestIsSentinelAwareOfReplicas_DisableAuth verifies that isSentinelAwareOfReplicas
+// respects disableAuth when connecting to sentinel.
+func TestIsSentinelAwareOfReplicas_DisableAuth(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("supersecret")},
+	}
+	r, _ := newTestReconciler(v, authSecret)
+
+	// All sentinels unreachable → returns true (optimistic).
+	// The important thing is it doesn't panic or behave differently with disableAuth.
+	result := r.isSentinelAwareOfReplicas(context.Background(), v, 2)
+	assert.True(t, result, "Should return true when all sentinels are unreachable")
+}
+
+// --- Edge Case Tests for Private Helper Functions ---
+
+func TestPodImageChanged_NoContainers(t *testing.T) {
+	pod := &corev1.Pod{}
+	assert.False(t, podImageChanged(pod, "valkey:9.0", "sidecar:2.0"))
+}
+
+func TestPodImageChanged_UnknownContainerIgnored(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "unknown-container", Image: "some-image:1.0"},
+			},
+		},
+	}
+	assert.False(t, podImageChanged(pod, "valkey:9.0", "sidecar:2.0"))
+}
+
+func TestPodImageChanged_ValkeyMatchesSidecarDiffers(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey:9.0"},
+				{Name: builder.SidecarContainerName, Image: "sidecar:1.0"},
+			},
+		},
+	}
+	assert.True(t, podImageChanged(pod, "valkey:9.0", "sidecar:2.0"))
+}
+
+func TestPodImageChanged_BothEmpty(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey:8.0"},
+				{Name: builder.SidecarContainerName, Image: "sidecar:1.0"},
+			},
+		},
+	}
+	// Empty desired images → skip checks.
+	assert.False(t, podImageChanged(pod, "", ""))
+}
+
+func TestPodAnnotationHashChanged_NilAnnotations(t *testing.T) {
+	pod := &corev1.Pod{} // Annotations is nil.
+	assert.False(t, podAnnotationHashChanged(pod, "cafebabe"))
+}
+
+func TestPodAnnotationHashChanged_EmptyDesiredHash(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationConfigHash: "oldhash"},
+		},
+	}
+	assert.False(t, podAnnotationHashChanged(pod, ""))
+}
+
+func TestPodAnnotationHashChanged_PodHashEmptyDesiredNonEmpty(t *testing.T) {
+	// Pod was created before the feature (no annotation) — should not trigger update.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{},
+		},
+	}
+	assert.False(t, podAnnotationHashChanged(pod, "newhash"))
+}
+
+func TestPodAnnotationHashChanged_SameHash(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationConfigHash: "aabbccdd"},
+		},
+	}
+	assert.False(t, podAnnotationHashChanged(pod, "aabbccdd"))
+}
+
+func TestPodAnnotationHashChanged_DifferentHash(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationConfigHash: "oldhash"},
+		},
+	}
+	assert.True(t, podAnnotationHashChanged(pod, "newhash"))
+}
+
+// --- podSpecHashChanged edge cases ---
+
+func TestPodSpecHashChanged_EmptyDesiredHash(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationPodSpecHash: "something"},
+		},
+	}
+	assert.False(t, podSpecHashChanged(pod, "", nil))
+}
+
+func TestPodSpecHashChanged_PodHasAnnotation_Match(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationPodSpecHash: "aabb"},
+		},
+	}
+	assert.False(t, podSpecHashChanged(pod, "aabb", nil))
+}
+
+func TestPodSpecHashChanged_PodHasAnnotation_Mismatch(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{builder.AnnotationPodSpecHash: "aabb"},
+		},
+	}
+	assert.True(t, podSpecHashChanged(pod, "ccdd", nil))
+}
+
+func TestPodSpecHashChanged_NoAnnotation_NilContainers(t *testing.T) {
+	pod := &corev1.Pod{} // No annotations, no containers.
+	assert.False(t, podSpecHashChanged(pod, "newhash", nil))
+}
+
+func TestPodSpecHashChanged_NoAnnotation_ResourcesMatch(t *testing.T) {
+	containers := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		},
+	}}
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: containers},
+	}
+	assert.False(t, podSpecHashChanged(pod, "newhash", containers))
+}
+
+func TestPodSpecHashChanged_NoAnnotation_ResourcesDiffer(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: builder.ValkeyContainerName,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				},
+			}},
+		},
+	}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+		},
+	}}
+	assert.True(t, podSpecHashChanged(pod, "newhash", desired))
+}
+
+// --- containersResourceChanged edge cases ---
+
+func TestContainersResourceChanged_BothEmpty(t *testing.T) {
+	assert.False(t, containersResourceChanged([]corev1.Container{}, []corev1.Container{}))
+}
+
+func TestContainersResourceChanged_ActualHasNoMatch(t *testing.T) {
+	actual := []corev1.Container{{Name: "foo"}}
+	desired := []corev1.Container{{Name: "bar"}}
+	assert.False(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_LimitsRemovedInDesired(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name:      builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{},
+	}}
+	assert.True(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_MultipleContainers_OnlyFirstDiffers(t *testing.T) {
+	actual := []corev1.Container{
+		{
+			Name: builder.ValkeyContainerName,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+			},
+		},
+		{
+			Name: builder.SidecarContainerName,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m")},
+			},
+		},
+	}
+	desired := []corev1.Container{
+		{
+			Name: builder.ValkeyContainerName,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+			},
+		},
+		{
+			Name: builder.SidecarContainerName,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m")},
+			},
+		},
+	}
+	assert.True(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_EquivalentQuantities(t *testing.T) {
+	// 1000m CPU == 1 CPU — Quantity.Cmp handles this.
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+		},
+	}}
+	assert.False(t, containersResourceChanged(actual, desired))
+}
+
+// --- resourceListEqual edge cases ---
+
+func TestResourceListEqual_BothNil(t *testing.T) {
+	assert.True(t, resourceListEqual(nil, nil))
+}
+
+func TestResourceListEqual_OneNilOneEmpty(t *testing.T) {
+	assert.True(t, resourceListEqual(nil, corev1.ResourceList{}))
+}
+
+func TestResourceListEqual_DifferentKeys(t *testing.T) {
+	a := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}
+	b := corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")}
+	assert.False(t, resourceListEqual(a, b))
+}
+
+func TestResourceListEqual_SameKeysDifferentValues(t *testing.T) {
+	a := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}
+	b := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")}
+	assert.False(t, resourceListEqual(a, b))
+}
+
+func TestResourceListEqual_SameKeysEqualValues(t *testing.T) {
+	a := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("250m"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
+	}
+	b := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("250m"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
+	}
+	assert.True(t, resourceListEqual(a, b))
+}
+
+func TestResourceListEqual_DifferentLengths(t *testing.T) {
+	a := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}
+	b := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("100m"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
+	}
+	assert.False(t, resourceListEqual(a, b))
+}
+
+// --- isPodReady edge cases ---
+
+func TestIsPodReady_MultipleConditions(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	assert.False(t, isPodReady(pod), "PodReady is False, even though other conditions are True")
+}
+
+func TestIsPodReady_ReadyConditionMissing(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	assert.False(t, isPodReady(pod), "Should return false when Ready condition is missing")
+}
+
+// --- sidecarImageFromSts edge cases ---
+
+func TestSidecarImageFromSts_MultipleContainers(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+						{Name: "unrelated", Image: "unrelated:1.0"},
+						{Name: builder.SidecarContainerName, Image: "sidecar:2.0"},
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "sidecar:2.0", sidecarImageFromSts(sts))
+}
+
+func TestSidecarImageFromSts_EmptyContainers(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{},
+		},
+	}
+	assert.Equal(t, "", sidecarImageFromSts(sts))
+}
+
+// --- detectImageChange edge cases ---
+
+func TestDetectImageChange_MultipleContainers_FirstMatches(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Image: "valkey/valkey:8.0"},
+						{Image: "sidecar:1.0"},
+					},
+				},
+			},
+		},
+	}
+	// detectImageChange only checks first container.
+	assert.False(t, detectImageChange("valkey/valkey:8.0", sts))
+}
+
+func TestDetectImageChange_EmptyDesired(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Image: "valkey/valkey:8.0"},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, detectImageChange("", sts))
+}
+
+// --- sentinelPodNeedsUpdate edge cases ---
+
+func TestSentinelPodNeedsUpdate_ImageMatch_NoAnnotations(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	template := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_ImageDiffers(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:8.0"},
+			},
+		},
+	}
+	template := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_ConfigHashMismatch(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "oldhash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "newhash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_ConfigHashMatch(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "samehash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "samehash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+// --- countUpdatedPods / countReplacedPods edge cases ---
+
+func TestCountUpdatedPods_AllUpdatedAndReady(t *testing.T) {
+	pods := []podState{
+		{needsUpdate: false, ready: true},
+		{needsUpdate: false, ready: true},
+		{needsUpdate: false, ready: true},
+	}
+	assert.Equal(t, 3, countUpdatedPods(pods))
+}
+
+func TestCountUpdatedPods_NoneUpdated(t *testing.T) {
+	pods := []podState{
+		{needsUpdate: true, ready: true},
+		{needsUpdate: true, ready: true},
+	}
+	assert.Equal(t, 0, countUpdatedPods(pods))
+}
+
+func TestCountUpdatedPods_UpdatedButNotReady(t *testing.T) {
+	pods := []podState{
+		{needsUpdate: false, ready: false},
+		{needsUpdate: false, ready: false},
+	}
+	assert.Equal(t, 0, countUpdatedPods(pods))
+}
+
+func TestCountUpdatedPods_EmptySlice(t *testing.T) {
+	assert.Equal(t, 0, countUpdatedPods(nil))
+	assert.Equal(t, 0, countUpdatedPods([]podState{}))
+}
+
+func TestCountReplacedPods_AllReplaced(t *testing.T) {
+	pods := []podState{
+		{needsUpdate: false, ready: true},
+		{needsUpdate: false, ready: false},
+	}
+	assert.Equal(t, 2, countReplacedPods(pods))
+}
+
+func TestCountReplacedPods_NoneReplaced(t *testing.T) {
+	pods := []podState{
+		{needsUpdate: true, ready: true},
+		{needsUpdate: true, ready: false},
+	}
+	assert.Equal(t, 0, countReplacedPods(pods))
+}
+
+func TestCountReplacedPods_EmptySlice(t *testing.T) {
+	assert.Equal(t, 0, countReplacedPods(nil))
+	assert.Equal(t, 0, countReplacedPods([]podState{}))
+}
+
+// --- podSpecHashFromSts edge cases ---
+
+func TestPodSpecHashFromSts_NilAnnotations(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: nil,
+				},
+			},
+		},
+	}
+	assert.Equal(t, "", podSpecHashFromSts(sts))
+}
+
+func TestPodSpecHashFromSts_EmptyAnnotations(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "", podSpecHashFromSts(sts))
+}
