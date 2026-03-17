@@ -734,3 +734,208 @@ func TestIsSyncedReplica(t *testing.T) {
 		})
 	}
 }
+
+// --- Edge case tests for drain handler functions ---
+
+func TestPodBaseName_EmptyString(t *testing.T) {
+	assert.Equal(t, "", podBaseName(""))
+}
+
+func TestPodBaseName_EndsWithDash(t *testing.T) {
+	assert.Equal(t, "pod", podBaseName("pod-"))
+}
+
+func TestPodBaseName_StartsWithDash(t *testing.T) {
+	assert.Equal(t, "", podBaseName("-0"))
+}
+
+func TestPodBaseName_MultipleDashes(t *testing.T) {
+	assert.Equal(t, "my-fancy-cluster", podBaseName("my-fancy-cluster-5"))
+}
+
+func TestSplitHostPort_EmptyString(t *testing.T) {
+	host, port := splitHostPort("")
+	assert.Equal(t, "", host)
+	assert.Equal(t, "", port)
+}
+
+func TestSplitHostPort_PortOnly(t *testing.T) {
+	host, port := splitHostPort(":6379")
+	assert.Equal(t, "", host)
+	assert.Equal(t, "6379", port)
+}
+
+func TestSplitHostPort_MultipleColons(t *testing.T) {
+	// For IPv6-like addresses, splits at last colon.
+	host, port := splitHostPort("fd00::1:6379")
+	assert.Equal(t, "fd00::1", host)
+	assert.Equal(t, "6379", port)
+}
+
+func TestBuildReplicaAddrs_ZeroReplicas(t *testing.T) {
+	handler := &DrainHandler{
+		podName:     "test-0",
+		headlessSvc: "test-headless",
+		replicas:    0,
+		valkeyPort:  "6379",
+	}
+	addrs := handler.buildReplicaAddrs()
+	assert.Empty(t, addrs)
+}
+
+func TestBuildReplicaAddrs_LargeReplicas(t *testing.T) {
+	handler := &DrainHandler{
+		podName:     "test-5",
+		headlessSvc: "test-headless",
+		replicas:    10,
+		valkeyPort:  "6379",
+	}
+	addrs := handler.buildReplicaAddrs()
+	// Should have 9 addresses (10 replicas - 1 self).
+	assert.Len(t, addrs, 9)
+	// Ensure self is excluded.
+	for _, addr := range addrs {
+		assert.NotContains(t, addr, "test-5.")
+	}
+}
+
+func TestBuildReplicaAddrs_TLSPort(t *testing.T) {
+	handler := &DrainHandler{
+		podName:     "test-0",
+		headlessSvc: "test-headless",
+		replicas:    2,
+		valkeyPort:  "16379",
+	}
+	addrs := handler.buildReplicaAddrs()
+	assert.Len(t, addrs, 1)
+	assert.Contains(t, addrs[0], ":16379")
+}
+
+func TestIsConnectionRefused_WrappedError(t *testing.T) {
+	inner := fmt.Errorf("connection refused")
+	wrapped := fmt.Errorf("dial tcp: %w", inner)
+	assert.True(t, isConnectionRefused(wrapped))
+}
+
+func TestIsSyncedReplica_EmptyRole(t *testing.T) {
+	info := &valkeyclient.ReplicationInfo{
+		Role:             "",
+		MasterLinkStatus: "up",
+	}
+	assert.False(t, isSyncedReplica(info))
+}
+
+func TestIsSyncedReplica_LoadingRole(t *testing.T) {
+	info := &valkeyclient.ReplicationInfo{
+		Role:             "loading",
+		MasterLinkStatus: "up",
+	}
+	assert.False(t, isSyncedReplica(info))
+}
+
+func TestIsSyncedReplica_EmptyLinkStatus(t *testing.T) {
+	info := &valkeyclient.ReplicationInfo{
+		Role:             "slave",
+		MasterLinkStatus: "",
+	}
+	assert.False(t, isSyncedReplica(info))
+}
+
+func TestDrainHandler_SeparateSentinelClientFactory(t *testing.T) {
+	// Verify that sentinel connections use the separate sentinel factory.
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+
+	mainFactory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{},
+	}
+	sentinelFactory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"sentinel-0:26379": {},
+		},
+	}
+
+	handler := &DrainHandler{
+		detector:              detector,
+		patcher:               patcher,
+		clientFactory:         mainFactory,
+		sentinelClientFactory: sentinelFactory,
+		podName:               "test-0",
+		podNamespace:          "default",
+		sentinelEnabled:       true,
+		sentinelMonitor:       "test",
+		sentinelAddrs:         []string{"sentinel-0:26379"},
+		headlessSvc:           "test-headless",
+		replicas:              3,
+		valkeyPort:            "6379",
+	}
+
+	// Simulate role change.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetRole(common.RoleReplica)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := handler.Handle(ctx)
+	assert.NoError(t, err)
+}
+
+func TestDrainHandler_ManualFailover_PromotionFails(t *testing.T) {
+	detector := &mockRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+
+	replicaClient := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{
+			Role:             "slave",
+			MasterLinkStatus: "up",
+		},
+		replicaOfErr: errors.New("ERR command not allowed"),
+	}
+
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"test-1.test-headless.default.svc.cluster.local:6379": replicaClient,
+			"test-2.test-headless.default.svc.cluster.local:6379": replicaClient,
+		},
+	}
+
+	handler := newTestDrainHandler(detector, patcher, factory)
+
+	err := handler.Handle(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "promoting replica")
+}
+
+func TestDrainHandler_EmptySentinelAddrs(t *testing.T) {
+	detector := &mockRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{}
+	factory := &mockValkeyClientFactory{clients: map[string]*mockValkeyCommander{}}
+
+	handler := newTestDrainHandler(detector, patcher, factory, func(h *DrainHandler) {
+		h.sentinelEnabled = true
+		h.sentinelMonitor = "test"
+		h.sentinelAddrs = nil // No sentinel addresses.
+	})
+
+	err := handler.Handle(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "all sentinels failed")
+}
+
+func TestNewDrainHandlerWithDeps_NilSentinelFactory(t *testing.T) {
+	detector := &mockRoleDetector{role: common.RoleReplica}
+	patcher := &mockPodPatcher{}
+	factory := &mockValkeyClientFactory{clients: map[string]*mockValkeyCommander{}}
+
+	handler := NewDrainHandlerWithDeps(
+		detector, patcher, factory, nil, // nil sentinel factory.
+		"test-0", "default", false, "", nil, "test-headless", 3, "6379",
+	)
+
+	// Should use the main factory as sentinel factory.
+	assert.NotNil(t, handler)
+	assert.Equal(t, factory, handler.sentinelClientFactory)
+}

@@ -486,3 +486,503 @@ func TestSentinelResetSequence_IncludesAuthPass(t *testing.T) {
 	assert.GreaterOrEqual(t, len(recorded), 3,
 		"expected at least AUTH + REMOVE + MONITOR + SET commands")
 }
+
+// --- Edge Case Tests for RESP parsing ---
+
+func TestReadFullResponse_SimpleString(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+PONG\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.Ping()
+	assert.NoError(t, err)
+}
+
+func TestReadFullResponse_ErrorResponse(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "-ERR unknown command\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.Ping()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown command")
+}
+
+func TestReadFullResponse_IntegerResponse(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, ":42\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	size, err := c.DBSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 42, size)
+}
+
+func TestReadFullResponse_BulkString(t *testing.T) {
+	// Simulate a bulk string response for INFO replication.
+	data := "role:master\r\nconnected_slaves:2\r\nmaster_sync_in_progress:0\r\n"
+	resp := fmt.Sprintf("$%d\r\n%s\r\n", len(data), data)
+
+	addr, cleanup := fakeRESPServerCustom(t, resp)
+	defer cleanup()
+
+	c := New(addr)
+	info, err := c.InfoReplication()
+	assert.NoError(t, err)
+	assert.Equal(t, "master", info.Role)
+	assert.Equal(t, 2, info.ConnectedSlaves)
+}
+
+func TestReadFullResponse_NullBulkString(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "$-1\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	// Null bulk string returns empty, parsed as empty replication info.
+	info, err := c.InfoReplication()
+	assert.NoError(t, err)
+	assert.NotNil(t, info)
+	assert.Equal(t, "", info.Role)
+}
+
+func TestReadArray_EmptyArray(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "*0\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	info, err := c.SentinelMaster("test")
+	assert.NoError(t, err)
+	assert.NotNil(t, info)
+	assert.Equal(t, "", info.Name)
+}
+
+func TestDBSize_Zero(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, ":0\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	size, err := c.DBSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, size)
+}
+
+func TestDBSize_Large(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, ":999999\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	size, err := c.DBSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 999999, size)
+}
+
+func TestPing_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+PONG\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.Ping()
+	assert.NoError(t, err)
+}
+
+func TestPing_UnexpectedResponse(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+LOADING\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.Ping()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected response")
+}
+
+func TestPing_ConnectionError(t *testing.T) {
+	c := New("127.0.0.1:1") // Port 1 is unlikely to be open.
+	c.SetTimeout(500 * time.Millisecond)
+	err := c.Ping()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "ping")
+}
+
+func TestInfoReplication_ConnectionError(t *testing.T) {
+	c := New("127.0.0.1:1")
+	c.SetTimeout(500 * time.Millisecond)
+	info, err := c.InfoReplication()
+	assert.Error(t, err)
+	assert.Nil(t, info)
+}
+
+func TestSentinelFailover_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelFailover("mymaster")
+	assert.NoError(t, err)
+}
+
+func TestSentinelFailover_Error(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "-ERR No such master\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelFailover("nonexistent")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "sentinel failover")
+}
+
+func TestSentinelReset_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelReset("*")
+	assert.NoError(t, err)
+}
+
+func TestSentinelRemove_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelRemove("mymaster")
+	assert.NoError(t, err)
+}
+
+func TestSentinelMonitorAdd_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelMonitorAdd("mymaster", "10.0.0.1", 6379, 2)
+	assert.NoError(t, err)
+}
+
+func TestSentinelSet_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.SentinelSet("mymaster", "down-after-milliseconds", "5000")
+	assert.NoError(t, err)
+}
+
+func TestReplicaOf_Success(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "+OK\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	err := c.ReplicaOf("NO", "ONE")
+	assert.NoError(t, err)
+}
+
+func TestReplicaOf_ConnectionError(t *testing.T) {
+	c := New("127.0.0.1:1")
+	c.SetTimeout(500 * time.Millisecond)
+	err := c.ReplicaOf("10.0.0.1", "6379")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "replicaof")
+}
+
+func TestWait_ConnectionError(t *testing.T) {
+	c := New("127.0.0.1:1")
+	c.SetTimeout(500 * time.Millisecond)
+	acked, err := c.Wait(2, 1000)
+	assert.Error(t, err)
+	assert.Equal(t, 0, acked)
+}
+
+// --- NewWithPassword / NewTLSWithPassword ---
+
+func TestNewWithPassword(t *testing.T) {
+	c := NewWithPassword("localhost:6379", "secret")
+	assert.Equal(t, "localhost:6379", c.addr)
+	assert.Equal(t, "secret", c.password)
+	assert.Nil(t, c.tlsConfig)
+}
+
+func TestNewTLSWithPassword(t *testing.T) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	c := NewTLSWithPassword("localhost:16379", tlsCfg, "secret")
+	assert.Equal(t, "localhost:16379", c.addr)
+	assert.Equal(t, "secret", c.password)
+	assert.NotNil(t, c.tlsConfig)
+}
+
+// --- Authentication tests ---
+
+func TestExec_AuthSuccess(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+
+		// Read AUTH command.
+		_, _ = conn.Read(buf)
+		_, _ = conn.Write([]byte("+OK\r\n"))
+
+		// Read PING command.
+		_, _ = conn.Read(buf)
+		_, _ = conn.Write([]byte("+PONG\r\n"))
+	}()
+
+	c := NewWithPassword(ln.Addr().String(), "mysecret")
+	err = c.Ping()
+	assert.NoError(t, err)
+}
+
+func TestExec_AuthFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+
+		// Read AUTH command.
+		_, _ = conn.Read(buf)
+		_, _ = conn.Write([]byte("-ERR invalid password\r\n"))
+	}()
+
+	c := NewWithPassword(ln.Addr().String(), "wrongpassword")
+	err = c.Ping()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "AUTH failed")
+}
+
+// --- parseReplicationInfo edge cases ---
+
+func TestParseReplicationInfo_OnlyComments(t *testing.T) {
+	raw := "# Replication\n# Server\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "", info.Role)
+	assert.Equal(t, 0, info.ConnectedSlaves)
+}
+
+func TestParseReplicationInfo_NoColonInLine(t *testing.T) {
+	raw := "role:master\ngarbage_line_without_colon\nconnected_slaves:1\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "master", info.Role)
+	assert.Equal(t, 1, info.ConnectedSlaves)
+}
+
+func TestParseReplicationInfo_ValueWithColon(t *testing.T) {
+	// master_host can contain colons in IPv6 addresses.
+	raw := "role:slave\nmaster_host:fd00::1\nmaster_port:6379\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "slave", info.Role)
+	assert.Equal(t, "fd00::1", info.MasterHost)
+	assert.Equal(t, "6379", info.MasterPort)
+}
+
+func TestParseReplicationInfo_WhitespaceLines(t *testing.T) {
+	raw := "  \n\nrole:master\n  \nconnected_slaves:0\n\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "master", info.Role)
+}
+
+func TestParseReplicationInfo_MasterLinkDown(t *testing.T) {
+	raw := "role:slave\nmaster_link_status:down\nmaster_sync_in_progress:0\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "down", info.MasterLinkStatus)
+	assert.False(t, info.MasterSyncInProgress)
+}
+
+func TestParseReplicationInfo_InvalidConnectedSlaves(t *testing.T) {
+	raw := "role:master\nconnected_slaves:abc\n"
+	info := parseReplicationInfo(raw)
+	assert.Equal(t, "master", info.Role)
+	assert.Equal(t, 0, info.ConnectedSlaves) // Invalid parses to 0.
+}
+
+// --- parseSentinelMasterInfo edge cases ---
+
+func TestParseSentinelMasterInfo_OddNumberOfLines(t *testing.T) {
+	// Last line has no pair — should be silently ignored.
+	raw := "name\nmymaster\nip\n10.0.0.1\norphan_key\n"
+	info := parseSentinelMasterInfo(raw)
+	assert.Equal(t, "mymaster", info.Name)
+	assert.Equal(t, "10.0.0.1", info.IP)
+}
+
+func TestParseSentinelMasterInfo_AllFields(t *testing.T) {
+	raw := "name\ntest\nip\n10.0.0.5\nport\n6379\nflags\nmaster\nnum-slaves\n3\nquorum\n2\n"
+	info := parseSentinelMasterInfo(raw)
+	assert.Equal(t, "test", info.Name)
+	assert.Equal(t, "10.0.0.5", info.IP)
+	assert.Equal(t, "6379", info.Port)
+	assert.Equal(t, "master", info.Flags)
+	assert.Equal(t, 3, info.NumSlaves)
+	assert.Equal(t, 2, info.Quorum)
+}
+
+func TestParseSentinelMasterInfo_InvalidNumSlaves(t *testing.T) {
+	raw := "name\ntest\nnum-slaves\ninvalid\n"
+	info := parseSentinelMasterInfo(raw)
+	assert.Equal(t, "test", info.Name)
+	assert.Equal(t, 0, info.NumSlaves) // Invalid parses to 0.
+}
+
+func TestParseSentinelMasterInfo_FlagsWithErrors(t *testing.T) {
+	raw := "name\ntest\nflags\ns_down,master\n"
+	info := parseSentinelMasterInfo(raw)
+	assert.Equal(t, "s_down,master", info.Flags)
+}
+
+// --- connHint edge cases ---
+
+func TestConnHint_ENETUNREACH(t *testing.T) {
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: syscall.ENETUNREACH,
+	}
+
+	hint := connHint("10.0.0.1:6379", err)
+	assert.Contains(t, hint, "route")
+}
+
+func TestConnHint_NilError(t *testing.T) {
+	// Should not panic with nil error. connHint is only called with non-nil errors,
+	// but verify robustness.
+	hint := connHint("10.0.0.1:6379", fmt.Errorf("some error"))
+	assert.NotEmpty(t, hint)
+}
+
+// --- readBulkString edge cases ---
+
+func TestReadBulkString_EmptyBulk(t *testing.T) {
+	// $0\r\n\r\n — zero-length bulk string.
+	reader := bufio.NewReader(strings.NewReader("\r\n"))
+	result, err := readBulkString(reader, "$0")
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+}
+
+func TestReadBulkString_NullBulk(t *testing.T) {
+	// $-1 — null bulk string.
+	result, err := readBulkString(bufio.NewReader(strings.NewReader("")), "$-1")
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+}
+
+func TestReadBulkString_NormalData(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("hello\r\n"))
+	result, err := readBulkString(reader, "$5")
+	assert.NoError(t, err)
+	assert.Equal(t, "hello", result)
+}
+
+func TestReadBulkString_InvalidSizeHeader(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(""))
+	_, err := readBulkString(reader, "$abc")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing bulk string size")
+}
+
+// --- readArray edge cases ---
+
+func TestReadArray_EmptyArrayDirect(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(""))
+	result, err := readArray(reader, "*0")
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+}
+
+func TestReadArray_SingleElement(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("$3\r\nfoo\r\n"))
+	result, err := readArray(reader, "*1")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "foo")
+}
+
+func TestReadArray_NilElement(t *testing.T) {
+	// A nil bulk string element ($-1).
+	reader := bufio.NewReader(strings.NewReader("$-1\r\n"))
+	result, err := readArray(reader, "*1")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "(nil)")
+}
+
+func TestReadArray_InvalidCountHeader(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(""))
+	_, err := readArray(reader, "*abc")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing array count")
+}
+
+func TestReadArray_MultipleElements(t *testing.T) {
+	data := "$4\r\nname\r\n$4\r\ntest\r\n$2\r\nip\r\n$8\r\n10.0.0.1\r\n"
+	reader := bufio.NewReader(strings.NewReader(data))
+	result, err := readArray(reader, "*4")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "name")
+	assert.Contains(t, result, "test")
+	assert.Contains(t, result, "ip")
+	assert.Contains(t, result, "10.0.0.1")
+}
+
+// --- formatRESP edge cases ---
+
+func TestFormatRESP_EmptyArgs(t *testing.T) {
+	resp := formatRESP([]string{})
+	assert.Equal(t, "*0\r\n", resp)
+}
+
+func TestFormatRESP_ArgWithSpaces(t *testing.T) {
+	resp := formatRESP([]string{"SET", "key with spaces", "value"})
+	assert.Contains(t, resp, "$15\r\nkey with spaces\r\n")
+}
+
+func TestFormatRESP_EmptyString(t *testing.T) {
+	resp := formatRESP([]string{""})
+	assert.Equal(t, "*1\r\n$0\r\n\r\n", resp)
+}
+
+// --- ConnectionError edge cases ---
+
+func TestConnectionError_NilCause(t *testing.T) {
+	e := &ConnectionError{
+		Addr:  "10.0.0.1:6379",
+		Cause: nil,
+		Hint:  "some hint",
+	}
+	assert.Contains(t, e.Error(), "10.0.0.1:6379")
+	assert.Nil(t, e.Unwrap())
+}
+
+// fakeRESPServerCustom starts a TCP listener that accepts one connection,
+// reads one command, and responds with the given raw RESP response.
+func fakeRESPServerCustom(t *testing.T, response string) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		// Read and discard the incoming command.
+		buf := make([]byte, 4096)
+		_, _ = conn.Read(buf)
+
+		// Respond with custom RESP data.
+		_, _ = conn.Write([]byte(response))
+	}()
+
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
