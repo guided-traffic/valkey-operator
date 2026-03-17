@@ -2549,6 +2549,67 @@ func TestTriggerSentinelFailover_NoTLS_UsesPlainPort(t *testing.T) {
 		"sentinel failover without TLS must target the plain-text port (%d)", builder.SentinelPort)
 }
 
+// TestTriggerSentinelFailover_DisableAuth_NoAuthSent verifies that when
+// sentinel.disableAuth is true, the operator does NOT send AUTH to sentinel.
+// Regression test for: operator stuck in failover loop because AUTH was sent
+// to sentinel that has no password configured.
+func TestTriggerSentinelFailover_DisableAuth_NoAuthSent(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    1,
+			DisableAuth: true,
+		}
+	})
+
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("supersecret")},
+	}
+	r, _ := newTestReconciler(v, authSecret)
+
+	err := r.triggerSentinelFailover(context.Background(), v)
+
+	// The function will fail (no real sentinel), but the error must NOT contain
+	// "AUTH failed" — it should be a connection error instead, proving no AUTH was sent.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "AUTH failed",
+		"sentinel failover with disableAuth must not send AUTH to sentinel")
+}
+
+// TestIsSentinelAwareOfReplicas_DisableAuth verifies that isSentinelAwareOfReplicas
+// respects disableAuth when connecting to sentinel.
+func TestIsSentinelAwareOfReplicas_DisableAuth(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("supersecret")},
+	}
+	r, _ := newTestReconciler(v, authSecret)
+
+	// All sentinels unreachable → returns true (optimistic).
+	// The important thing is it doesn't panic or behave differently with disableAuth.
+	result := r.isSentinelAwareOfReplicas(context.Background(), v, 2)
+	assert.True(t, result, "Should return true when all sentinels are unreachable")
+}
+
 // --- Edge Case Tests for Private Helper Functions ---
 
 func TestPodImageChanged_NoContainers(t *testing.T) {

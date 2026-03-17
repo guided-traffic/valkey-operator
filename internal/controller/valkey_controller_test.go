@@ -2159,3 +2159,75 @@ func TestReconcile_StatusOperatorVersion_UpdatedOnVersionChange(t *testing.T) {
 	assert.Equal(t, newVersion, updated.Status.OperatorVersion,
 		"status.operatorVersion must be updated when the operator version changes")
 }
+
+// --- sentinelPassword Tests ---
+
+func TestSentinelPassword_ReturnsEmpty_WhenDisableAuthTrue(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+	r, _ := newTestReconciler(v, authSecret)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "", pwd, "sentinel password must be empty when disableAuth is true")
+}
+
+func TestSentinelPassword_ReturnsPassword_WhenDisableAuthFalse(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: false,
+		}
+	})
+	r, _ := newTestReconciler(v, authSecret)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "supersecret", pwd, "sentinel password must match secret when disableAuth is false")
+}
+
+func TestSentinelPassword_ReturnsEmpty_WhenNoAuth(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "", pwd, "sentinel password must be empty when auth is not configured")
+}

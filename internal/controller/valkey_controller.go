@@ -130,6 +130,16 @@ func (r *ValkeyReconciler) readValkeyPassword(ctx context.Context, v *vkov1.Valk
 	return string(secret.Data[v.Spec.Auth.SecretPasswordKey])
 }
 
+// sentinelPassword returns the password to use when connecting to Sentinel.
+// When sentinel auth is disabled (disableAuth: true), Sentinel does not
+// require client authentication, so an empty password is returned.
+func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey) string {
+	if v.IsSentinelAuthDisabled() {
+		return ""
+	}
+	return r.readValkeyPassword(ctx, v)
+}
+
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys/finalizers,verbs=update

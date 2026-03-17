@@ -1449,7 +1449,7 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	password := r.sentinelPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -1522,7 +1522,8 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	sentinelPwd := r.sentinelPassword(ctx, v)
+	valkeyPwd := r.readValkeyPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -1538,7 +1539,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		}
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, password, tlsConfig)
+		c := r.newValkeyClient(addr, sentinelPwd, tlsConfig)
 
 		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
 		if err := c.SentinelRemove(monitorName); err != nil {
@@ -1566,8 +1567,8 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		// Restore auth-pass so sentinel can authenticate to the monitored Valkey master.
 		// Without this, sentinel marks the master as s_down/disconnected and cannot
 		// discover replicas, causing NOGOODSLAVE on failover attempts.
-		if password != "" {
-			_ = c.SentinelSet(monitorName, "auth-pass", password)
+		if valkeyPwd != "" {
+			_ = c.SentinelSet(monitorName, "auth-pass", valkeyPwd)
 		}
 
 		logger.Info("Sentinel reconfigured successfully", "sentinel", podName, "masterAddr", masterAddr)
@@ -1584,7 +1585,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	password := r.sentinelPassword(ctx, v)
 
 	// Try each sentinel until one successfully triggers failover.
 	var lastErr error
