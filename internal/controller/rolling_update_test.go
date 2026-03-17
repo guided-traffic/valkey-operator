@@ -2655,7 +2655,7 @@ func TestPodImageChanged_BothEmpty(t *testing.T) {
 
 func TestPodAnnotationHashChanged_NilAnnotations(t *testing.T) {
 	pod := &corev1.Pod{} // Annotations is nil.
-	assert.False(t, podAnnotationHashChanged(pod, builder.AnnotationConfigHash, "cafebabe"))
+	assert.False(t, podAnnotationHashChanged(pod, "cafebabe"))
 }
 
 func TestPodAnnotationHashChanged_EmptyDesiredHash(t *testing.T) {
@@ -2664,7 +2664,7 @@ func TestPodAnnotationHashChanged_EmptyDesiredHash(t *testing.T) {
 			Annotations: map[string]string{builder.AnnotationConfigHash: "oldhash"},
 		},
 	}
-	assert.False(t, podAnnotationHashChanged(pod, builder.AnnotationConfigHash, ""))
+	assert.False(t, podAnnotationHashChanged(pod, ""))
 }
 
 func TestPodAnnotationHashChanged_PodHashEmptyDesiredNonEmpty(t *testing.T) {
@@ -2674,7 +2674,7 @@ func TestPodAnnotationHashChanged_PodHashEmptyDesiredNonEmpty(t *testing.T) {
 			Annotations: map[string]string{},
 		},
 	}
-	assert.False(t, podAnnotationHashChanged(pod, builder.AnnotationConfigHash, "newhash"))
+	assert.False(t, podAnnotationHashChanged(pod, "newhash"))
 }
 
 func TestPodAnnotationHashChanged_SameHash(t *testing.T) {
@@ -2683,7 +2683,7 @@ func TestPodAnnotationHashChanged_SameHash(t *testing.T) {
 			Annotations: map[string]string{builder.AnnotationConfigHash: "aabbccdd"},
 		},
 	}
-	assert.False(t, podAnnotationHashChanged(pod, builder.AnnotationConfigHash, "aabbccdd"))
+	assert.False(t, podAnnotationHashChanged(pod, "aabbccdd"))
 }
 
 func TestPodAnnotationHashChanged_DifferentHash(t *testing.T) {
@@ -2692,7 +2692,7 @@ func TestPodAnnotationHashChanged_DifferentHash(t *testing.T) {
 			Annotations: map[string]string{builder.AnnotationConfigHash: "oldhash"},
 		},
 	}
-	assert.True(t, podAnnotationHashChanged(pod, builder.AnnotationConfigHash, "newhash"))
+	assert.True(t, podAnnotationHashChanged(pod, "newhash"))
 }
 
 // --- podSpecHashChanged edge cases ---

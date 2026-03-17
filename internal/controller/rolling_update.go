@@ -196,7 +196,7 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 	if podImageChanged(pod, desiredValkeyImage, desiredSidecarImage) {
 		return true
 	}
-	if podAnnotationHashChanged(pod, builder.AnnotationConfigHash, desiredConfigHash) {
+	if podAnnotationHashChanged(pod, desiredConfigHash) {
 		return true
 	}
 	return podSpecHashChanged(pod, desiredPodSpecHash, desiredContainers)
@@ -220,14 +220,14 @@ func podImageChanged(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage st
 	return false
 }
 
-// podAnnotationHashChanged returns true when the pod carries the given annotation
-// with a value that differs from desiredHash. Returns false when the pod lacks the
-// annotation or desiredHash is empty.
-func podAnnotationHashChanged(pod *corev1.Pod, annotationKey, desiredHash string) bool {
+// podAnnotationHashChanged returns true when the pod carries the config-hash
+// annotation with a value that differs from desiredHash. Returns false when the
+// pod lacks the annotation or desiredHash is empty.
+func podAnnotationHashChanged(pod *corev1.Pod, desiredHash string) bool {
 	if desiredHash == "" {
 		return false
 	}
-	podHash := pod.Annotations[annotationKey]
+	podHash := pod.Annotations[builder.AnnotationConfigHash]
 	return podHash != "" && podHash != desiredHash
 }
 
