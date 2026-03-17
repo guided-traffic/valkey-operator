@@ -71,7 +71,7 @@ func TestPodNeedsUpdate_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
 }
 
 func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
@@ -82,12 +82,12 @@ func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", ""))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
 }
 
 func TestPodNeedsUpdate_EmptyContainers(t *testing.T) {
 	pod := &corev1.Pod{}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
 }
 
 func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
@@ -101,7 +101,7 @@ func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
 		},
 	}
 	// Valkey image matches, but sidecar image changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, ""))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", ""))
 }
 
 func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
@@ -114,7 +114,7 @@ func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", ""))
 }
 
 func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
@@ -127,7 +127,7 @@ func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
 		},
 	}
 	// Empty desiredSidecarImage → sidecar check skipped.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
 }
 
 // --- podNeedsUpdate: config hash checks ---
@@ -146,7 +146,7 @@ func TestPodNeedsUpdate_ConfigHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different hash → allowUnencrypted was toggled → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe"))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
 }
 
 func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
@@ -162,7 +162,7 @@ func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
 }
 
 func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
@@ -175,7 +175,7 @@ func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
@@ -192,7 +192,96 @@ func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
 		},
 	}
 	// Empty desired hash → skip config hash check entirely.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+}
+
+// --- podNeedsUpdate: pod spec hash checks ---
+
+func TestPodNeedsUpdate_PodSpecHashMismatch_TriggersUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "aabbccdd",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	// Pod has a different pod spec hash → resources changed → needs update.
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344"))
+}
+
+func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "aabbccdd",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd"))
+}
+
+func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
+	// Pod created before pod-spec-hash feature — no annotation present.
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd"))
+}
+
+func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "oldhash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+}
+
+// --- podSpecHashFromSts ---
+
+func TestPodSpecHashFromSts_Found(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						builder.AnnotationPodSpecHash: "abcd1234",
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "abcd1234", podSpecHashFromSts(sts))
+}
+
+func TestPodSpecHashFromSts_NotFound(t *testing.T) {
+	sts := &appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{},
+		},
+	}
+	assert.Equal(t, "", podSpecHashFromSts(sts))
 }
 
 // --- sidecarImageFromSts ---
@@ -1545,6 +1634,99 @@ func TestSentinelPodNeedsUpdate_EmptyTemplate(t *testing.T) {
 	}}}
 	template := corev1.PodTemplateSpec{}
 	// Template has no containers — nothing to compare against.
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_PodSpecHashMismatch_TriggersUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "oldhash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "newhash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "samehash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "samehash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_ConfigHashMismatch_TriggersUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "oldcfg",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationConfigHash: "newcfg",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_NoPodAnnotations_SkipsHashCheck(t *testing.T) {
+	// Sentinel pod without annotations (old operator) — skip hash checks.
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "newhash",
+				builder.AnnotationConfigHash:  "newcfg",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.SentinelContainerName, Image: "valkey/valkey:9.0"},
+		}},
+	}
 	assert.False(t, sentinelPodNeedsUpdate(pod, template))
 }
 

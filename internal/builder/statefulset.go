@@ -1,7 +1,9 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -68,6 +70,7 @@ func BuildStatefulSet(v *vkov1.Valkey, operatorImage string) *appsv1.StatefulSet
 		podAnnotations = make(map[string]string)
 	}
 	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+	podAnnotations[AnnotationPodSpecHash] = ComputePodSpecHash(v, operatorImage)
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -709,6 +712,19 @@ func buildVolumeClaimTemplates(v *vkov1.Valkey) []corev1.PersistentVolumeClaim {
 	}
 
 	return []corev1.PersistentVolumeClaim{pvc}
+}
+
+// ComputePodSpecHash returns a short hex digest of the pod spec built for
+// this Valkey CR. It is embedded in the StatefulSet pod template annotations so
+// that any change to the pod specification (resources, probes, volumes, env
+// vars, etc.) is detected by the rolling update logic — even though the
+// StatefulSet uses the OnDelete update strategy.
+func ComputePodSpecHash(v *vkov1.Valkey, operatorImage string) string {
+	spec := buildPodSpec(v, operatorImage)
+	data, _ := json.Marshal(spec)
+	h := fnv.New32a()
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%08x", h.Sum32())
 }
 
 // StatefulSetHasChanged returns true if the live StatefulSet differs from the desired spec

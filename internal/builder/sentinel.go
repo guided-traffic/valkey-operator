@@ -1,7 +1,9 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -220,6 +222,7 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 		podAnnotations = make(map[string]string)
 	}
 	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+	podAnnotations[AnnotationPodSpecHash] = ComputeSentinelPodSpecHash(v)
 
 	replicas := int32(3)
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
@@ -531,4 +534,15 @@ func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 		}
 	}
 	return podTemplateChanged(desired.Spec.Template, current.Spec.Template)
+}
+
+// ComputeSentinelPodSpecHash returns a short hex digest of the sentinel pod spec
+// built for this Valkey CR. Works identically to ComputePodSpecHash but for
+// sentinel pods.
+func ComputeSentinelPodSpecHash(v *vkov1.Valkey) string {
+	spec := buildSentinelPodSpec(v)
+	data, _ := json.Marshal(spec)
+	h := fnv.New32a()
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%08x", h.Sum32())
 }

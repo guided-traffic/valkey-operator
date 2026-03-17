@@ -15,6 +15,13 @@ const AnnotationOperatorVersion = "vko.gtrfc.com/operator-version"
 // the operator's rolling update logic then detects and acts upon.
 const AnnotationConfigHash = "vko.gtrfc.com/config-hash"
 
+// AnnotationPodSpecHash is the annotation key used to store a hash of the
+// generated pod spec (containers, resources, probes, volumes, etc.).
+// It is embedded in the StatefulSet pod template so that pod-spec-level
+// changes (e.g. resource requests/limits) are detected by the rolling
+// update logic, even though the StatefulSet uses OnDelete strategy.
+const AnnotationPodSpecHash = "vko.gtrfc.com/pod-spec-hash"
+
 // ApplyOperatorVersion sets the operator-version annotation on a Kubernetes object.
 // If version is empty the annotation is left unchanged.
 func ApplyOperatorVersion(obj metav1.Object, version string) {
