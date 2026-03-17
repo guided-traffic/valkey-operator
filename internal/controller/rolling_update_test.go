@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -71,7 +72,7 @@ func TestPodNeedsUpdate_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
@@ -82,12 +83,12 @@ func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyContainers(t *testing.T) {
 	pod := &corev1.Pod{}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
@@ -101,7 +102,7 @@ func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
 		},
 	}
 	// Valkey image matches, but sidecar image changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", ""))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
@@ -114,7 +115,7 @@ func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
@@ -127,7 +128,7 @@ func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
 		},
 	}
 	// Empty desiredSidecarImage → sidecar check skipped.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: config hash checks ---
@@ -146,7 +147,7 @@ func TestPodNeedsUpdate_ConfigHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different hash → allowUnencrypted was toggled → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
 }
 
 func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
@@ -162,7 +163,7 @@ func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
 }
 
 func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
@@ -175,7 +176,7 @@ func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
@@ -192,7 +193,7 @@ func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
 		},
 	}
 	// Empty desired hash → skip config hash check entirely.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: pod spec hash checks ---
@@ -211,7 +212,7 @@ func TestPodNeedsUpdate_PodSpecHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different pod spec hash → resources changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344"))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344", nil))
 }
 
 func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
@@ -227,7 +228,7 @@ func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
 }
 
 func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
@@ -239,7 +240,7 @@ func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd"))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
@@ -255,7 +256,325 @@ func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", ""))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+}
+
+// --- podNeedsUpdate: resource fallback for pods without hash annotation ---
+
+func TestPodNeedsUpdate_NoAnnotation_ResourceChanged_TriggersUpdate(t *testing.T) {
+	// Pod created before pod-spec-hash feature, but actual resources differ
+	// from the desired containers.  The fallback comparison must detect this.
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  builder.ValkeyContainerName,
+					Image: "valkey/valkey:9.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("250m"),
+						},
+					},
+				},
+			},
+		},
+	}
+	desiredContainers := []corev1.Container{
+		{
+			Name:  builder.ValkeyContainerName,
+			Image: "valkey/valkey:9.0",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("500m"),
+				},
+			},
+		},
+	}
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+}
+
+func TestPodNeedsUpdate_NoAnnotation_ResourceUnchanged_NoUpdate(t *testing.T) {
+	// Pod created before pod-spec-hash feature — resources match the desired spec.
+	// Must NOT trigger a rolling update (operator upgrade scenario).
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  builder.ValkeyContainerName,
+					Image: "valkey/valkey:9.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("250m"),
+						},
+					},
+				},
+			},
+		},
+	}
+	desiredContainers := []corev1.Container{
+		{
+			Name:  builder.ValkeyContainerName,
+			Image: "valkey/valkey:9.0",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("250m"),
+				},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+}
+
+func TestPodNeedsUpdate_NoAnnotation_LimitsChanged_TriggersUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  builder.ValkeyContainerName,
+					Image: "valkey/valkey:9.0",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				},
+			},
+		},
+	}
+	desiredContainers := []corev1.Container{
+		{
+			Name:  builder.ValkeyContainerName,
+			Image: "valkey/valkey:9.0",
+			Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: resource.MustParse("512Mi"),
+				},
+			},
+		},
+	}
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+}
+
+func TestPodNeedsUpdate_WithAnnotation_IgnoresContainersFallback(t *testing.T) {
+	// When the annotation IS present, the container comparison is skipped;
+	// the hash check alone determines whether an update is needed.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "samehash",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  builder.ValkeyContainerName,
+					Image: "valkey/valkey:9.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("250m"),
+						},
+					},
+				},
+			},
+		},
+	}
+	desiredContainers := []corev1.Container{
+		{
+			Name:  builder.ValkeyContainerName,
+			Image: "valkey/valkey:9.0",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("500m"),
+				},
+			},
+		},
+	}
+	// Hash matches → no update, even though resources differ.
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "samehash", desiredContainers))
+}
+
+func TestPodNeedsUpdate_NoAnnotation_NilDesiredContainers_SkipsFallback(t *testing.T) {
+	// Nil desiredContainers → fallback comparison is skipped (backward compat).
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  builder.ValkeyContainerName,
+					Image: "valkey/valkey:9.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("250m"),
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", nil))
+}
+
+// --- containersResourceChanged ---
+
+func TestContainersResourceChanged_RequestsDiffer(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+		},
+	}}
+	assert.True(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_LimitsDiffer(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+		},
+	}}
+	assert.True(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_Equal(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+		},
+	}}
+	assert.False(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_NilSlices(t *testing.T) {
+	assert.False(t, containersResourceChanged(nil, nil))
+}
+
+func TestContainersResourceChanged_UnknownContainerSkipped(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: "unknown",
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+		},
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+		},
+	}}
+	// "unknown" is not in desired → skipped; no match found → false
+	assert.False(t, containersResourceChanged(actual, desired))
+}
+
+func TestContainersResourceChanged_RequestsAddedInDesired(t *testing.T) {
+	actual := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+	}}
+	desired := []corev1.Container{{
+		Name: builder.ValkeyContainerName,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		},
+	}}
+	assert.True(t, containersResourceChanged(actual, desired))
+}
+
+// --- countReplacedPods ---
+
+func TestCountReplacedPods(t *testing.T) {
+	pods := []podState{
+		{name: "p-0", needsUpdate: true, ready: true},
+		{name: "p-1", needsUpdate: false, ready: true},
+		{name: "p-2", needsUpdate: false, ready: false}, // replaced but not ready
+	}
+	// countUpdatedPods only counts ready + !needsUpdate → 1
+	assert.Equal(t, 1, countUpdatedPods(pods))
+	// countReplacedPods ignores readiness → 2
+	assert.Equal(t, 2, countReplacedPods(pods))
+}
+
+// --- sentinel podNeedsUpdate: resource fallback ---
+
+func TestSentinelPodNeedsUpdate_NoPodAnnotations_ResourceChanged_TriggersUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{
+				Name:  builder.SentinelContainerName,
+				Image: "valkey/valkey:9.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				},
+			},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "newhash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{
+				Name:  builder.SentinelContainerName,
+				Image: "valkey/valkey:9.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+				},
+			},
+		}},
+	}
+	assert.True(t, sentinelPodNeedsUpdate(pod, template))
+}
+
+func TestSentinelPodNeedsUpdate_NoPodAnnotations_ResourceUnchanged_NoUpdate(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{
+				Name:  builder.SentinelContainerName,
+				Image: "valkey/valkey:9.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				},
+			},
+		}},
+	}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				builder.AnnotationPodSpecHash: "newhash",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{
+				Name:  builder.SentinelContainerName,
+				Image: "valkey/valkey:9.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				},
+			},
+		}},
+	}
+	assert.False(t, sentinelPodNeedsUpdate(pod, template))
 }
 
 // --- podSpecHashFromSts ---
