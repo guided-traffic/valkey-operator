@@ -1118,6 +1118,54 @@ func TestBuildStatefulSet_PreservesUserAnnotationsAlongsideConfigHash(t *testing
 	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
 }
 
+// --- BuildStatefulSet: pod spec hash annotation ---
+
+func TestBuildStatefulSet_InjectsPodSpecHashAnnotation(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	hash, ok := sts.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.True(t, ok, "pod template must carry the pod spec hash annotation")
+	assert.NotEmpty(t, hash, "pod spec hash must not be empty")
+}
+
+func TestBuildStatefulSet_PodSpecHashChangesWithResources(t *testing.T) {
+	v1 := newTestValkey("test")
+	sts1 := BuildStatefulSet(v1, testOperatorImage)
+
+	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Resources = corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("512Mi"),
+			},
+		}
+	})
+	sts2 := BuildStatefulSet(v2, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationPodSpecHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.NotEqual(t, hash1, hash2, "pod spec hash must differ when resources change")
+}
+
+func TestBuildStatefulSet_PodSpecHashStableForSameSpec(t *testing.T) {
+	v := newTestValkey("test")
+	sts1 := BuildStatefulSet(v, testOperatorImage)
+	sts2 := BuildStatefulSet(v, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationPodSpecHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.Equal(t, hash1, hash2, "pod spec hash must be stable for the same spec")
+}
+
+func TestComputePodSpecHash_ChangesWithOperatorImage(t *testing.T) {
+	v := newTestValkey("test")
+	hash1 := ComputePodSpecHash(v, "operator:v1.0")
+	hash2 := ComputePodSpecHash(v, "operator:v2.0")
+	assert.NotEqual(t, hash1, hash2, "pod spec hash must change when operator image changes")
+}
+
 // --- Valkey container ports ---
 
 // TestBuildStatefulSet_TLSOnly_SinglePort16379 verifies that when TLS is enabled

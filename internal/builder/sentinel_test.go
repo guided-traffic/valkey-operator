@@ -533,6 +533,22 @@ func TestBuildSentinelStatefulSet_AlwaysHasConfigHashAnnotation(t *testing.T) {
 	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
 }
 
+func TestBuildSentinelStatefulSet_InjectsPodSpecHashAnnotation(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	require.NotNil(t, sts.Spec.Template.Annotations)
+	hash, ok := sts.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.True(t, ok, "sentinel pod template must carry the pod spec hash annotation")
+	assert.NotEmpty(t, hash, "sentinel pod spec hash must not be empty")
+}
+
 func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{

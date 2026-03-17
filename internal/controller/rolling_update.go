@@ -128,6 +128,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
 	desiredConfigHash := builder.ComputeConfigHash(v)
+	desiredPodSpecHash := podSpecHashFromSts(currentSts)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -140,7 +141,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash) {
 			needsRollingUpdate = true
 			break
 		}
@@ -178,14 +179,16 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 }
 
 // podNeedsUpdate returns true if the pod needs to be replaced because its
-// valkey or sidecar container image differs from the desired image, or because
-// its config hash annotation (AnnotationConfigHash) differs from the desired hash.
+// valkey or sidecar container image differs from the desired image, because
+// its config hash annotation (AnnotationConfigHash) differs from the desired hash,
+// or because its pod spec hash annotation (AnnotationPodSpecHash) differs from the
+// desired hash (e.g. resource requests/limits changed).
 // Pass empty strings to skip the respective checks.
 //
-// Config hash check: only pods that already carry the annotation are compared —
+// Config/spec hash check: only pods that already carry the annotation are compared —
 // pods created by an older operator version (without the annotation) are left
 // untouched until they restart for another reason and receive the annotation.
-func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash string) bool {
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash, desiredPodSpecHash string) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
@@ -209,6 +212,13 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 			return true
 		}
 	}
+	// Pod spec hash check: trigger rolling update when the pod carries a hash
+	// that no longer matches the desired pod spec (e.g. resources changed).
+	if desiredPodSpecHash != "" {
+		if podHash := pod.Annotations[builder.AnnotationPodSpecHash]; podHash != "" && podHash != desiredPodSpecHash {
+			return true
+		}
+	}
 	return false
 }
 
@@ -221,6 +231,12 @@ func sidecarImageFromSts(sts *appsv1.StatefulSet) string {
 		}
 	}
 	return ""
+}
+
+// podSpecHashFromSts returns the pod spec hash from a StatefulSet's pod template
+// annotations, or empty string when the annotation is not present.
+func podSpecHashFromSts(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.AnnotationPodSpecHash]
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -640,7 +656,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v))
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts))
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -1548,7 +1564,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v)) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts)) {
 			// For sidecar-only changes in standalone mode, defer the update to the
 			// next natural pod restart rather than auto-deleting the pod.
 			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
@@ -1623,12 +1639,26 @@ func isSidecarOnlyChange(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImag
 // sentinelPodNeedsUpdate returns true when the running pod's container images
 // differ from what the sentinel StatefulSet template specifies.
 func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	// Check container images.
 	desired := make(map[string]string, len(desiredTemplate.Spec.Containers))
 	for _, c := range desiredTemplate.Spec.Containers {
 		desired[c.Name] = c.Image
 	}
 	for _, c := range pod.Spec.Containers {
 		if want, ok := desired[c.Name]; ok && c.Image != want {
+			return true
+		}
+	}
+	// Check pod spec hash annotation: trigger update when the pod carries a hash
+	// that no longer matches the desired template (e.g. resources changed).
+	if desiredHash, ok := desiredTemplate.Annotations[builder.AnnotationPodSpecHash]; ok && desiredHash != "" {
+		if podHash := pod.Annotations[builder.AnnotationPodSpecHash]; podHash != "" && podHash != desiredHash {
+			return true
+		}
+	}
+	// Check config hash annotation.
+	if desiredHash, ok := desiredTemplate.Annotations[builder.AnnotationConfigHash]; ok && desiredHash != "" {
+		if podHash := pod.Annotations[builder.AnnotationConfigHash]; podHash != "" && podHash != desiredHash {
 			return true
 		}
 	}
