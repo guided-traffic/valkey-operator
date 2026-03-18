@@ -523,3 +523,91 @@ func TestStandaloneMode_Integration(t *testing.T) {
 		require.NoError(t, k8sClient.Delete(ctx, authSecret))
 	})
 }
+
+func TestHACluster_ReplicaAnnounceIP_Integration(t *testing.T) {
+	ctx := testCtx
+
+	t.Run("HA cluster init container injects replica-announce-ip", func(t *testing.T) {
+		// Non-TLS HA cluster.
+		v := &vkov1.Valkey{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ha-announce-test",
+				Namespace: "default",
+			},
+			Spec: vkov1.ValkeySpec{
+				Replicas: 3,
+				Image:    "valkey/valkey:8.0",
+				Sentinel: &vkov1.SentinelSpec{
+					Enabled:  true,
+					Replicas: 3,
+				},
+			},
+		}
+		require.NoError(t, k8sClient.Create(ctx, v))
+
+		require.Eventually(t, func() bool {
+			sts := &appsv1.StatefulSet{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "ha-announce-test", Namespace: "default",
+			}, sts)
+			return err == nil
+		}, 10*time.Second, 250*time.Millisecond, "Valkey StatefulSet should be created")
+
+		valkeySts := &appsv1.StatefulSet{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-announce-test", Namespace: "default",
+		}, valkeySts))
+
+		require.Len(t, valkeySts.Spec.Template.Spec.InitContainers, 1)
+		script := valkeySts.Spec.Template.Spec.InitContainers[0].Command[2]
+		assert.Contains(t, script, "replica-announce-ip $MY_HOST",
+			"init container script must inject replica-announce-ip")
+		assert.Contains(t, script, "replica-announce-port 6379",
+			"init container script must inject replica-announce-port with plain port")
+
+		// Cleanup.
+		require.NoError(t, k8sClient.Delete(ctx, v, client.GracePeriodSeconds(0)))
+	})
+
+	t.Run("HA cluster TLS init container injects replica-announce-port 16379", func(t *testing.T) {
+		vTLS := &vkov1.Valkey{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ha-announce-tls-test",
+				Namespace: "default",
+			},
+			Spec: vkov1.ValkeySpec{
+				Replicas: 3,
+				Image:    "valkey/valkey:8.0",
+				Sentinel: &vkov1.SentinelSpec{
+					Enabled:  true,
+					Replicas: 3,
+				},
+				TLS: &vkov1.TLSSpec{Enabled: true},
+			},
+		}
+		require.NoError(t, k8sClient.Create(ctx, vTLS))
+
+		require.Eventually(t, func() bool {
+			sts := &appsv1.StatefulSet{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "ha-announce-tls-test", Namespace: "default",
+			}, sts)
+			return err == nil
+		}, 10*time.Second, 250*time.Millisecond, "TLS Valkey StatefulSet should be created")
+
+		tlsSts := &appsv1.StatefulSet{}
+		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
+			Name: "ha-announce-tls-test", Namespace: "default",
+		}, tlsSts))
+
+		require.Len(t, tlsSts.Spec.Template.Spec.InitContainers, 1)
+		tlsScript := tlsSts.Spec.Template.Spec.InitContainers[0].Command[2]
+		assert.Contains(t, tlsScript, "replica-announce-ip $MY_HOST",
+			"TLS init container script must inject replica-announce-ip")
+		assert.Contains(t, tlsScript, "replica-announce-port 16379",
+			"TLS init container script must inject replica-announce-port with TLS port")
+
+		// Cleanup.
+		require.NoError(t, k8sClient.Delete(ctx, vTLS, client.GracePeriodSeconds(0)))
+	})
+}

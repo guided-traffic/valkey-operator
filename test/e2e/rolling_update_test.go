@@ -548,3 +548,76 @@ func (tc *testClients) findMasterPod(t *testing.T, namespace, name string, repli
 
 	return masterPod
 }
+
+// TestE2E_RollingUpdate_HA_TLS_NoTLSErrors is a regression test for the TLS bad
+// certificate issue during Sentinel failover. Before the replica-announce-ip fix,
+// Sentinel would announce IPs instead of hostnames after failover, causing TLS
+// clients to fail certificate validation for ~67 seconds.
+func TestE2E_RollingUpdate_HA_TLS_NoTLSErrors(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-rolling-ha-tls"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "roll-tls"
+	initialImage := "valkey/valkey:8.0"
+	updatedImage := "valkey/valkey:8.1"
+
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    initialImage,
+		"tls":      tlsSpec(),
+		"sentinel": map[string]interface{}{
+			"enabled":  true,
+			"replicas": int64(3),
+		},
+	})
+
+	t.Log("Creating TLS HA Valkey CR for rolling update regression test")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for full cluster readiness.
+	tc.waitForStatefulSetReady(t, ns, name, 3)
+	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
+	for i := 0; i < 3; i++ {
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-%d", name, i))
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i))
+	}
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+	tc.waitForConnectedReplicasTLS(t, ns, masterPod, 2)
+
+	t.Run("Write test data before TLS rolling update", func(t *testing.T) {
+		resp := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "SET", "tls-roll-key", "pre-update")
+		assert.Equal(t, "OK", resp)
+	})
+
+	t.Run("Trigger rolling update via image change", func(t *testing.T) {
+		tc.updateValkeyImage(t, ns, name, updatedImage)
+		tc.waitForAllPodsImage(t, ns, name, 3, updatedImage)
+		tc.waitForStatefulSetReady(t, ns, name, 3)
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+	})
+
+	t.Run("No TLS bad certificate errors after rolling update", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			logs := tc.getPodLogs(t, ns, podName, "valkey")
+			assert.NotContains(t, logs, "ssl/tls alert bad certificate",
+				"Pod %s must not have TLS bad certificate errors after rolling update", podName)
+			assert.NotContains(t, logs, "cannot validate certificate",
+				"Pod %s must not have certificate validation errors", podName)
+		}
+	})
+
+	t.Run("Data accessible after TLS rolling update", func(t *testing.T) {
+		newMaster := tc.findMasterPodTLS(t, ns, name, 3)
+		require.Eventually(t, func() bool {
+			resp := tc.valkeyTLSExecAllowError(t, ns, newMaster, tlsValkeyPort, "GET", "tls-roll-key")
+			return resp == "pre-update"
+		}, 30*time.Second, 2*time.Second, "Data should be accessible after TLS rolling update")
+	})
+}
