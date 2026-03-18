@@ -77,28 +77,39 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
 		tc.valkeyExec(t, ns, sentinelPod, 26379, "SENTINEL", "FAILOVER", name)
 
-		// Wait for failover to complete — a new master should emerge.
+		// Wait for failover to fully settle: exactly one master that is not pod-0,
+		// and that master must have 2 connected replicas (replication re-established).
+		var postFailoverMaster string
 		require.Eventually(t, func() bool {
-			newMaster := ""
+			masters := []string{}
 			for i := 0; i < 3; i++ {
 				podName := fmt.Sprintf("%s-%d", name, i)
 				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
 				if strings.Contains(info, "role:master") {
-					newMaster = podName
+					masters = append(masters, podName)
 				}
 			}
-			if newMaster != "" && newMaster != fmt.Sprintf("%s-0", name) {
-				t.Logf("Failover complete, new master: %s", newMaster)
-				return true
+			if len(masters) != 1 {
+				t.Logf("Failover settling: %d masters found %v", len(masters), masters)
+				return false
 			}
-			return false
-		}, 90*time.Second, 3*time.Second, "Failover should move master away from pod-0")
+			if masters[0] == fmt.Sprintf("%s-0", name) {
+				t.Logf("Master still pod-0, waiting for failover")
+				return false
+			}
+			// Also verify replication settled (2 connected slaves).
+			info := tc.valkeyExecAllowError(t, ns, masters[0], 6379, "INFO", "replication")
+			if !strings.Contains(info, "connected_slaves:2") {
+				t.Logf("Master %s does not yet have 2 connected slaves", masters[0])
+				return false
+			}
+			postFailoverMaster = masters[0]
+			return true
+		}, 3*time.Minute, 3*time.Second,
+			"Failover should move master away from pod-0 with 2 replicas")
 
-		// Wait for replication and sentinel to settle after failover.
-		newMaster := tc.findMasterPod(t, ns, name, 3)
-		tc.waitForConnectedReplicas(t, ns, newMaster, 6379, 2)
 		tc.waitForSentinelSlaves(t, ns, name, 2)
-		t.Logf("Post-failover master: %s", newMaster)
+		t.Logf("Post-failover master: %s", postFailoverMaster)
 	}
 
 	// Record pre-restart master (should NOT be pod-0).
