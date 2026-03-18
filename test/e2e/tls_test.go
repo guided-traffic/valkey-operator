@@ -1917,3 +1917,120 @@ func TestE2E_TLS_AllowUnencrypted_HA(t *testing.T) {
 		tc.waitForDeletion(t, ns, name)
 	})
 }
+
+// TestE2E_TLS_HAClusterWithSentinel_ReplicaAnnounceIP verifies that Sentinel knows
+// replica hostnames (not IPs) from the start, thanks to replica-announce-ip.
+// After a SENTINEL FAILOVER, get-master-addr-by-name must return a hostname immediately.
+func TestE2E_TLS_HAClusterWithSentinel_ReplicaAnnounceIP(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-tls-announce"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "announce"
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    "valkey/valkey:8.0",
+		"tls":      tlsSpec(),
+		"sentinel": map[string]interface{}{
+			"enabled":  true,
+			"replicas": int64(3),
+		},
+	})
+
+	t.Log("Creating TLS HA Valkey with Sentinel for replica-announce-ip test")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for all components to be ready.
+	tc.waitForStatefulSetReady(t, ns, name, 3)
+	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
+	for i := 0; i < 3; i++ {
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-%d", name, i))
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i))
+	}
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	// Wait for Sentinel to discover replicas.
+	masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+	tc.waitForConnectedReplicasTLS(t, ns, masterPod, 2)
+
+	// =========================================================================
+	// Phase 1: Sentinel knows replica hostnames (not IPs)
+	// =========================================================================
+
+	t.Run("Sentinel replicas show hostnames not IPs", func(t *testing.T) {
+		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
+		var resp string
+		require.Eventually(t, func() bool {
+			resp = tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "replicas", name)
+			return resp != "" && !strings.Contains(resp, "ERR")
+		}, 60*time.Second, 2*time.Second, "Sentinel should report replicas")
+
+		t.Logf("SENTINEL replicas output:\n%s", truncateLogs(resp, 1000))
+
+		// The output should contain pod FQDNs, not bare IPs.
+		assert.Contains(t, resp, fmt.Sprintf("%s-headless", name),
+			"Sentinel replicas should use FQDN hostnames (containing headless service name)")
+	})
+
+	// =========================================================================
+	// Phase 2: INFO REPLICATION on master shows replica hostnames
+	// =========================================================================
+
+	t.Run("Master INFO replication shows replica hostnames", func(t *testing.T) {
+		info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
+		t.Logf("Master INFO replication:\n%s", truncateLogs(info, 800))
+
+		// slave0: ip=<hostname>,port=... should contain the headless service name.
+		assert.Contains(t, info, fmt.Sprintf("%s-headless", name),
+			"Master INFO replication should show replica FQDNs (via replica-announce-ip)")
+	})
+
+	// =========================================================================
+	// Phase 3: SENTINEL FAILOVER returns hostname immediately
+	// =========================================================================
+
+	t.Run("Sentinel failover returns hostname immediately", func(t *testing.T) {
+		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
+
+		// Trigger manual failover.
+		resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "failover", name)
+		t.Logf("SENTINEL FAILOVER response: %s", resp)
+		assert.Equal(t, "OK", resp, "SENTINEL FAILOVER should return OK")
+
+		// Wait for failover to complete (new master elected).
+		require.Eventually(t, func() bool {
+			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "get-master-addr-by-name", name)
+			if resp == "" {
+				return false
+			}
+			t.Logf("get-master-addr-by-name: %s", resp)
+			// Must be a hostname, not an IP. Hostnames contain letters and dots.
+			lines := strings.Split(resp, "\n")
+			if len(lines) < 1 {
+				return false
+			}
+			addr := strings.TrimSpace(lines[0])
+			// A hostname contains the headless service service name; an IP is digits+dots.
+			return strings.Contains(addr, fmt.Sprintf("%s-headless", name))
+		}, 60*time.Second, 2*time.Second,
+			"SENTINEL get-master-addr-by-name should return a hostname (not IP) after failover")
+	})
+
+	// =========================================================================
+	// Phase 4: No TLS errors in logs after failover
+	// =========================================================================
+
+	t.Run("No TLS bad certificate errors in Valkey logs", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			logs := tc.getPodLogs(t, ns, podName, "valkey")
+			assert.NotContains(t, logs, "ssl/tls alert bad certificate",
+				"Pod %s should not have TLS bad certificate errors", podName)
+			assert.NotContains(t, logs, "cannot validate certificate",
+				"Pod %s should not have certificate validation errors", podName)
+		}
+	})
+}

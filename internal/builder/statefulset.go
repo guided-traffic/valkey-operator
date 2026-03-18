@@ -228,7 +228,13 @@ else
   else
     cp %[11]s/%[8]s %[9]s/%[8]s
   fi
-fi`,
+fi
+
+# Announce this pod's FQDN to Sentinel so it uses hostnames instead of IPs.
+echo "" >> %[9]s/%[8]s
+echo "# Announce hostname for Sentinel discovery (injected by init container)" >> %[9]s/%[8]s
+echo "replica-announce-ip $MY_HOST" >> %[9]s/%[8]s
+echo "replica-announce-port %[10]d" >> %[9]s/%[8]s`,
 					sentinelHeadless, // 1: sentinel headless service
 					v.Namespace,      // 2: namespace
 					monitorName,      // 3: sentinel monitor name
@@ -288,6 +294,11 @@ fi`,
 			},
 		)
 
+		replicationPort := ValkeyPort
+		if v.IsTLSEnabled() {
+			replicationPort = TLSPort
+		}
+
 		initContainer := corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
@@ -295,6 +306,7 @@ fi`,
 				"sh", "-c",
 				fmt.Sprintf(
 					`# Ordinal-based config selection for non-Sentinel replication.
+MY_HOST="$HOSTNAME.%[5]s.%[6]s.svc.cluster.local"
 ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
 if [ "$ORDINAL" = "0" ]; then
   echo "Pod ordinal 0 — using master config"
@@ -302,11 +314,20 @@ if [ "$ORDINAL" = "0" ]; then
 else
   echo "Pod ordinal $ORDINAL — using replica config"
   cp %[4]s/%[3]s %[2]s/%[3]s
-fi`,
+fi
+
+# Announce this pod's FQDN so replication info shows hostnames instead of IPs.
+echo "" >> %[2]s/%[3]s
+echo "# Announce hostname for replication discovery (injected by init container)" >> %[2]s/%[3]s
+echo "replica-announce-ip $MY_HOST" >> %[2]s/%[3]s
+echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 					ConfigMountPath,         // 1: master config mount (readonly)
 					WritableConfigMountPath, // 2: writable config mount
 					ValkeyConfigKey,         // 3: config file name
 					ReplicaConfigMountPath,  // 4: replica config mount (readonly)
+					common.HeadlessServiceName(v, common.ComponentValkey), // 5: valkey headless service
+					v.Namespace,     // 6: namespace
+					replicationPort, // 7: replication port
 				),
 			},
 			VolumeMounts: buildInitContainerVolumeMounts(v),

@@ -1458,3 +1458,103 @@ func TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount(t *testing.T) {
 			"Init container must not mount TLS volume when TLS is disabled")
 	}
 }
+
+// --- replica-announce-ip / replica-announce-port ---
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, `replica-announce-ip $MY_HOST`,
+		"Sentinel init container must inject replica-announce-ip")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnouncePort_TLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 16379",
+		"Sentinel init container must announce TLS port when TLS is enabled")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnouncePort_Plain(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 6379",
+		"Sentinel init container must announce plain port when TLS is disabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, `replica-announce-ip $MY_HOST`,
+		"Non-Sentinel init container must inject replica-announce-ip")
+	assert.Contains(t, script, "replica-announce-port 6379",
+		"Non-Sentinel init container must announce plain port")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnouncePort_TLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 16379",
+		"Non-Sentinel init container must announce TLS port when TLS is enabled")
+}
+
+func TestBuildStatefulSet_Standalone_NoReplicaAnnounce(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	// Standalone has no init container — no replica-announce-ip injection.
+	assert.Empty(t, sts.Spec.Template.Spec.InitContainers,
+		"Standalone must not have init containers")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_ReplicaAnnounceUsesCorrectFQDN(t *testing.T) {
+	v := newTestValkey("myapp", func(v *vkov1.Valkey) {
+		v.Namespace = "production"
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	// MY_HOST must use the correct headless service and namespace.
+	assert.Contains(t, script, `MY_HOST="$HOSTNAME.myapp-headless.production.svc.cluster.local"`,
+		"MY_HOST must use correct headless service name and namespace")
+}

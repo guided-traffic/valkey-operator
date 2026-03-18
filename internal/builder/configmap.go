@@ -122,6 +122,8 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
 	var lines []string
 
+	// replica-announce-ip and replica-announce-port are injected dynamically
+	// by the init container, as they depend on the pod's hostname.
 	lines = append(lines, "# Replication")
 
 	// Use TLS port for replication when TLS is enabled.

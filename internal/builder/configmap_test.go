@@ -381,3 +381,25 @@ func TestComputeConfigHash_StableWhenKnownMasterChanges(t *testing.T) {
 	assert.Equal(t, ComputeConfigHash(vBefore), ComputeConfigHash(vAfter),
 		"hash must remain stable when AnnotationKnownMaster changes (post-failover)")
 }
+
+// TestGenerateValkeyConf_HA_NoStaticReplicaAnnounceIP verifies that GenerateValkeyConf
+// does NOT include replica-announce-ip in the static config. The directive is
+// injected dynamically by the init container since it depends on the pod hostname.
+func TestGenerateValkeyConf_HA_NoStaticReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	masterConf := GenerateValkeyConf(v, false)
+	replicaConf := GenerateValkeyConf(v, true)
+
+	assert.NotContains(t, masterConf, "replica-announce-ip",
+		"static master config must not contain replica-announce-ip")
+	assert.NotContains(t, masterConf, "replica-announce-port",
+		"static master config must not contain replica-announce-port")
+	assert.NotContains(t, replicaConf, "replica-announce-ip",
+		"static replica config must not contain replica-announce-ip")
+	assert.NotContains(t, replicaConf, "replica-announce-port",
+		"static replica config must not contain replica-announce-port")
+}
