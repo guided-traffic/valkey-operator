@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -902,8 +903,8 @@ func TestBuildSentinelStatefulSet_WithoutAuth_InitContainerNoEnvVar(t *testing.T
 	initContainer := sts.Spec.Template.Spec.InitContainers[0]
 	assert.Empty(t, initContainer.Env)
 
-	// Init container command should just copy (no sed).
-	assert.NotContains(t, initContainer.Command[2], "sed")
+	// Init container command should not contain password placeholder sed.
+	assert.NotContains(t, initContainer.Command[2], "%VALKEY_PASSWORD%")
 }
 
 func TestBuildSentinelStatefulSet_WithAuth_ConfigContainsAuthPlaceholder(t *testing.T) {
@@ -1355,4 +1356,146 @@ func TestBuildSentinelContainer_TLSAndAllowUnencrypted_DualPorts(t *testing.T) {
 		"Named port 'sentinel' must be TLS port 36379")
 	assert.Equal(t, int32(SentinelPort), portsByName["sentinel-plain"],
 		"Named port 'sentinel-plain' must be plaintext port 26379")
+}
+
+// --- Master Validation in init-sentinel-config ---
+
+func TestBuildSentinelInitCommand_ContainsMasterValidation(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	cmd := buildSentinelInitCommand(v)
+
+	assert.Contains(t, cmd, "CONFIGURED_MASTER=",
+		"init command must extract the configured master from sentinel.conf")
+	assert.Contains(t, cmd, "valkey-cli",
+		"init command must probe Valkey nodes via valkey-cli")
+	assert.Contains(t, cmd, "ROLE",
+		"init command must use the ROLE command to check master status")
+	assert.Contains(t, cmd, "seq 0 2",
+		"init command must iterate over all 3 Valkey pod ordinals (0..2)")
+	assert.Contains(t, cmd, "test-headless.default.svc.cluster.local",
+		"init command must use the correct Valkey headless service FQDN")
+	assert.Contains(t, cmd, "sentinel monitor",
+		"init command must rewrite the sentinel monitor line when master changes")
+}
+
+func TestBuildSentinelInitCommand_WithTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	cmd := buildSentinelInitCommand(v)
+
+	assert.Contains(t, cmd, "--tls --cacert /tls/ca.crt",
+		"init command must use TLS flags when TLS is enabled")
+	assert.Contains(t, cmd, fmt.Sprintf("-p %d", TLSPort),
+		"init command must use TLS port when TLS is enabled")
+}
+
+func TestBuildSentinelInitCommand_WithAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	cmd := buildSentinelInitCommand(v)
+
+	assert.Contains(t, cmd, "-a \"$VALKEY_PASSWORD\" --no-auth-warning",
+		"init command must use auth flags when auth is enabled")
+	assert.Contains(t, cmd, "%VALKEY_PASSWORD%",
+		"init command must contain password placeholder sed when auth is enabled")
+}
+
+func TestBuildSentinelInitCommand_WithoutAuth_NoPasswordSed(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	cmd := buildSentinelInitCommand(v)
+
+	assert.NotContains(t, cmd, "%VALKEY_PASSWORD%",
+		"init command must not contain password sed when auth is disabled")
+}
+
+func TestBuildSentinelInitCommand_FiveReplicas(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 5
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 5,
+		}
+	})
+
+	cmd := buildSentinelInitCommand(v)
+
+	assert.Contains(t, cmd, "seq 0 4",
+		"init command must iterate over all 5 Valkey pod ordinals (0..4)")
+}
+
+func TestSentinelInitContainer_TLSVolumeMount(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+
+	hasTLSMount := false
+	for _, vm := range initContainer.VolumeMounts {
+		if vm.Name == TLSVolumeName && vm.MountPath == TLSMountPath {
+			hasTLSMount = true
+			assert.True(t, vm.ReadOnly, "TLS volume mount must be read-only")
+		}
+	}
+	assert.True(t, hasTLSMount,
+		"init container must mount TLS volume to probe Valkey nodes via TLS")
+}
+
+func TestSentinelInitContainer_NoTLSVolumeMount_WhenNoTLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildSentinelStatefulSet(v)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initContainer := sts.Spec.Template.Spec.InitContainers[0]
+
+	for _, vm := range initContainer.VolumeMounts {
+		assert.NotEqual(t, TLSVolumeName, vm.Name,
+			"init container must NOT mount TLS volume when TLS is disabled")
+	}
 }
