@@ -66,8 +66,9 @@ func TestMain(m *testing.M) {
 	}
 
 	reconciler := &controller.ValkeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		OperatorImage: "valkey-operator:test",
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic("failed to setup controller: " + err.Error())

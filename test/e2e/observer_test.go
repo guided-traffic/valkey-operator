@@ -114,5 +114,3 @@ func TestE2E_Observer(t *testing.T) {
 		assert.True(t, apierrors.IsNotFound(err), "observer deployment should not exist for standalone without observer spec")
 	})
 }
-
-
