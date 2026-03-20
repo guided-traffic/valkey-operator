@@ -394,9 +394,9 @@ func (c *Client) exec(args ...string) (string, error) {
 // formatRESP formats a command into RESP array format.
 func formatRESP(args []string) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
+	fmt.Fprintf(&sb, "*%d\r\n", len(args))
 	for _, arg := range args {
-		sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
+		fmt.Fprintf(&sb, "$%d\r\n%s\r\n", len(arg), arg)
 	}
 	return sb.String()
 }
