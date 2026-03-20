@@ -267,8 +267,70 @@ func (c *Client) DBSize() (int, error) {
 	return size, nil
 }
 
-// exec sends a RESP command and reads the response.
-func (c *Client) exec(args ...string) (string, error) {
+// ExecMulti executes multiple commands in a single connection. Each command
+// is a slice of strings. All responses are read and the last non-OK error is returned.
+// This is used for SELECT + SET sequences where both commands must run on the same connection.
+func (c *Client) ExecMulti(commands ...[]string) error {
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return err
+	}
+
+	if err := c.authenticate(conn); err != nil {
+		return err
+	}
+
+	for _, cmd := range commands {
+		if _, writeErr := conn.Write([]byte(formatRESP(cmd))); writeErr != nil {
+			return fmt.Errorf("sending command %v: %w", cmd[0], writeErr)
+		}
+		resp, readErr := readFullResponse(conn)
+		if readErr != nil {
+			return fmt.Errorf("command %v on %s: %w", cmd[0], c.addr, readErr)
+		}
+		_ = resp
+	}
+	return nil
+}
+
+// ExecGet executes a sequence of commands and returns the response of the last one.
+// Used for SELECT + GET sequences on a single connection.
+func (c *Client) ExecGet(commands ...[]string) (string, error) {
+	conn, err := c.dial()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return "", err
+	}
+
+	if err := c.authenticate(conn); err != nil {
+		return "", err
+	}
+
+	var lastResp string
+	for _, cmd := range commands {
+		if _, writeErr := conn.Write([]byte(formatRESP(cmd))); writeErr != nil {
+			return "", fmt.Errorf("sending command %v: %w", cmd[0], writeErr)
+		}
+		resp, readErr := readFullResponse(conn)
+		if readErr != nil {
+			return "", fmt.Errorf("command %v on %s: %w", cmd[0], c.addr, readErr)
+		}
+		lastResp = resp
+	}
+	return lastResp, nil
+}
+
+// dial establishes a TCP (or TLS) connection to the server.
+func (c *Client) dial() (net.Conn, error) {
 	var conn net.Conn
 	var err error
 
@@ -279,7 +341,35 @@ func (c *Client) exec(args ...string) (string, error) {
 		conn, err = net.DialTimeout("tcp", c.addr, c.timeout)
 	}
 	if err != nil {
-		return "", &ConnectionError{Addr: c.addr, Cause: err, Hint: connHint(c.addr, err)}
+		return nil, &ConnectionError{Addr: c.addr, Cause: err, Hint: connHint(c.addr, err)}
+	}
+	return conn, nil
+}
+
+// authenticate sends AUTH if a password is configured. Must be called after dial.
+func (c *Client) authenticate(conn net.Conn) error {
+	if c.password == "" {
+		return nil
+	}
+	authCmd := formatRESP([]string{"AUTH", c.password})
+	if _, err := conn.Write([]byte(authCmd)); err != nil {
+		return fmt.Errorf("sending AUTH: %w", err)
+	}
+	authResp, err := readFullResponse(conn)
+	if err != nil {
+		return fmt.Errorf("AUTH failed on %s: %w", c.addr, err)
+	}
+	if !strings.Contains(authResp, "OK") {
+		return fmt.Errorf("AUTH failed on %s: %s", c.addr, authResp)
+	}
+	return nil
+}
+
+// exec sends a RESP command and reads the response.
+func (c *Client) exec(args ...string) (string, error) {
+	conn, err := c.dial()
+	if err != nil {
+		return "", err
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -287,19 +377,8 @@ func (c *Client) exec(args ...string) (string, error) {
 		return "", err
 	}
 
-	// Authenticate if password is configured.
-	if c.password != "" {
-		authCmd := formatRESP([]string{"AUTH", c.password})
-		if _, err := conn.Write([]byte(authCmd)); err != nil {
-			return "", fmt.Errorf("sending AUTH: %w", err)
-		}
-		authResp, err := readFullResponse(conn)
-		if err != nil {
-			return "", fmt.Errorf("AUTH failed on %s: %w", c.addr, err)
-		}
-		if !strings.Contains(authResp, "OK") {
-			return "", fmt.Errorf("AUTH failed on %s: %s", c.addr, authResp)
-		}
+	if err := c.authenticate(conn); err != nil {
+		return "", err
 	}
 
 	// Send command in RESP format.

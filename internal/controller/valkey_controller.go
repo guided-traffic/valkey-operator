@@ -147,6 +147,7 @@ func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
@@ -287,6 +288,27 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		}
 	}
 
+	// Reconcile Observer Deployment (create or cleanup).
+	if err := r.reconcileObserver(ctx, valkey); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// reconcileObserver creates the observer deployment when enabled, or cleans it up when disabled.
+func (r *ValkeyReconciler) reconcileObserver(ctx context.Context, valkey *vkov1.Valkey) error {
+	if valkey.IsObserverEnabled() {
+		if err := r.reconcileObserverDeployment(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Observer: %v", err))
+			return err
+		}
+	} else {
+		if err := r.cleanupObserverDeployment(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup Observer: %v", err))
+			return err
+		}
+	}
 	return nil
 }
 
@@ -826,6 +848,14 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 		}
 	}
 
+	// Observer NetworkPolicy (only if observer is enabled).
+	if v.IsObserverEnabled() {
+		desiredObserver := builder.BuildObserverNetworkPolicy(v)
+		if err := r.reconcileNetworkPolicy(ctx, v, desiredObserver); err != nil {
+			return fmt.Errorf("observer networkpolicy: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -859,6 +889,79 @@ func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.
 	return nil
 }
 
+// reconcileObserverDeployment ensures the Observer Deployment exists and matches the desired state.
+func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildObserverDeployment(v, r.OperatorImage)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on Observer Deployment: %w", err)
+	}
+
+	current := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Observer Deployment", "name", desired.Name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if builder.ObserverDeploymentHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		logger.Info("Updating Observer Deployment", "name", desired.Name)
+		current.Spec = desired.Spec
+		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
+// cleanupObserverDeployment removes the Observer Deployment and NetworkPolicy if they exist.
+func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+
+	// Delete Observer Deployment.
+	deploy := &appsv1.Deployment{}
+	deployName := types.NamespacedName{Name: builder.ObserverDeploymentName(v), Namespace: v.Namespace}
+	if err := r.Get(ctx, deployName, deploy); err == nil {
+		logger.Info("Deleting Observer Deployment", "name", deploy.Name)
+		if err := r.Delete(ctx, deploy); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("deleting observer deployment: %w", err)
+		}
+	}
+
+	// Delete Observer NetworkPolicy if NP is enabled.
+	if v.IsNetworkPolicyEnabled() {
+		np := &networkingv1.NetworkPolicy{}
+		npName := types.NamespacedName{Name: builder.ObserverNetworkPolicyName(v), Namespace: v.Namespace}
+		if err := r.Get(ctx, npName, np); err == nil {
+			logger.Info("Deleting Observer NetworkPolicy", "name", np.Name)
+			if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("deleting observer network policy: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.
+func (r *ValkeyReconciler) isObserverDeploymentReady(ctx context.Context, v *vkov1.Valkey) bool {
+	deploy := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      builder.ObserverDeploymentName(v),
+		Namespace: v.Namespace,
+	}, deploy)
+	if err != nil {
+		return false
+	}
+	return deploy.Status.ReadyReplicas > 0
+}
+
 // updateStatus reads the current StatefulSet and updates the Valkey status accordingly.
 func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) error {
 	sts := &appsv1.StatefulSet{}
@@ -885,6 +988,14 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 
 	readyReplicas := sts.Status.ReadyReplicas
 	v.Status.ReadyReplicas = readyReplicas
+
+	// Update observer status.
+	if v.IsObserverEnabled() {
+		observerReady := r.isObserverDeploymentReady(ctx, v)
+		v.Status.ObserverReady = &observerReady
+	} else {
+		v.Status.ObserverReady = nil
+	}
 
 	// In HA mode, also check Sentinel readiness.
 	if v.IsSentinelEnabled() {
@@ -1087,6 +1198,9 @@ func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 	if prev.OperatorVersion != curr.OperatorVersion {
 		return false
 	}
+	if !reflect.DeepEqual(prev.ObserverReady, curr.ObserverReady) {
+		return false
+	}
 	if !reflect.DeepEqual(prev.Conditions, curr.Conditions) {
 		return false
 	}
@@ -1163,6 +1277,7 @@ func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vkov1.Valkey{}, ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).

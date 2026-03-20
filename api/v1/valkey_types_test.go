@@ -647,6 +647,112 @@ func TestValkeyStatus_ConditionsSlice(t *testing.T) {
 	assert.Equal(t, "Ready", v.Status.Conditions[0].Type)
 }
 
+// --- Observer Helper Tests ---
+
+func TestIsObserverEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		observer *ObserverSpec
+		expected bool
+	}{
+		{
+			name:     "nil observer spec",
+			observer: nil,
+			expected: false,
+		},
+		{
+			name:     "observer disabled",
+			observer: &ObserverSpec{Enabled: false},
+			expected: false,
+		},
+		{
+			name:     "observer enabled",
+			observer: &ObserverSpec{Enabled: true},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Observer = tt.observer
+			})
+			assert.Equal(t, tt.expected, v.IsObserverEnabled())
+		})
+	}
+}
+
+func TestGetObserverDB(t *testing.T) {
+	tests := []struct {
+		name     string
+		observer *ObserverSpec
+		expected int
+	}{
+		{
+			name:     "nil observer spec returns default 15",
+			observer: nil,
+			expected: 15,
+		},
+		{
+			name:     "observer spec with nil DB returns default 15",
+			observer: &ObserverSpec{Enabled: true},
+			expected: 15,
+		},
+		{
+			name:     "observer spec with explicit DB",
+			observer: &ObserverSpec{Enabled: true, DB: intPtr(3)},
+			expected: 3,
+		},
+		{
+			name:     "observer spec with DB 0",
+			observer: &ObserverSpec{Enabled: true, DB: intPtr(0)},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Observer = tt.observer
+			})
+			assert.Equal(t, tt.expected, v.GetObserverDB())
+		})
+	}
+}
+
+func TestGetObserverResources(t *testing.T) {
+	t.Run("nil observer spec returns defaults", func(t *testing.T) {
+		v := newValkey("test")
+		res := v.GetObserverResources()
+		assert.Equal(t, resource.MustParse("50m"), res.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("64Mi"), res.Requests[corev1.ResourceMemory])
+		assert.Empty(t, res.Limits)
+	})
+
+	t.Run("custom resources", func(t *testing.T) {
+		customRes := &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true, Resources: customRes}
+		})
+		res := v.GetObserverResources()
+		assert.Equal(t, resource.MustParse("100m"), res.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("128Mi"), res.Requests[corev1.ResourceMemory])
+		assert.Equal(t, resource.MustParse("256Mi"), res.Limits[corev1.ResourceMemory])
+	})
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
 // --- PersistenceMode ---
 
 func TestPersistenceMode_Values(t *testing.T) {
