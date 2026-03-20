@@ -1833,8 +1833,9 @@ func TestIsSidecarOnlyChange_NothingChanged(t *testing.T) {
 // --- handleStandaloneRollingUpdate — sidecar-only deferred update ---
 
 func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *testing.T) {
-	// When only the sidecar image changed, the pod must NOT be deleted.
-	// The update is deferred to the next natural pod restart.
+	// When only the sidecar image changed on a TRUE standalone (replicas=1),
+	// the pod must NOT be deleted. The update is deferred to the next natural
+	// pod restart.
 	const newSidecar = "operator:v2.0"
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Image = "valkey/valkey:9.0"
@@ -1877,7 +1878,79 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 	// Pod must NOT have been deleted.
 	existingPod := &corev1.Pod{}
 	err := c.Get(context.Background(), types.NamespacedName{Name: "test-0", Namespace: "default"}, existingPod)
-	assert.NoError(t, err, "Pod must NOT be deleted for a sidecar-only change in standalone mode")
+	assert.NoError(t, err, "Pod must NOT be deleted for a sidecar-only change in true standalone mode")
+}
+
+func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod(t *testing.T) {
+	// When only the sidecar image changed but the cluster has multiple replicas
+	// (replicas > 1), the pod MUST be deleted because there is redundancy.
+	const newSidecar = "operator:v2.0"
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Replicas = 3
+	})
+	// Pod runs the correct valkey image but an outdated sidecar.
+	pod0 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-2", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+			{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "test", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	for i, cont := range sts.Spec.Template.Spec.Containers {
+		if cont.Name == builder.SidecarContainerName {
+			sts.Spec.Template.Spec.Containers[i].Image = newSidecar
+		}
+	}
+
+	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
+
+	// Must trigger a rolling update (requeue), not defer.
+	assert.True(t, result.NeedsRequeue, "Multi-replica sidecar-only change must trigger requeue")
+	assert.Nil(t, result.Error)
+
+	// First pod (test-0) should have been deleted.
+	pod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test-0", Namespace: "default"}, pod)
+	assert.Error(t, err, "Pod must be deleted for sidecar-only change with multi-replica cluster")
 }
 
 func TestHandleStandaloneRollingUpdate_ValkeyImageChange_StillDeletesPod(t *testing.T) {

@@ -1618,20 +1618,25 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	return fmt.Errorf("all sentinel failover attempts failed, last error: %w", lastErr)
 }
 
-// handleStandaloneRollingUpdate handles rolling update for standalone (non-HA) mode.
+// handleStandaloneRollingUpdate handles rolling update for non-HA (no Sentinel) mode.
 //
 // When the valkey image changes, the pod is deleted so the StatefulSet recreates it
-// with the new template. When only the sidecar image changed (operator upgrade),
-// the pod is NOT automatically restarted to avoid disrupting single-instance clusters
-// without redundancy. Instead, a SidecarUpdatePending condition is set and the
-// update is deferred to the next natural pod restart (manual delete, eviction, or
-// valkey image change).
+// with the new template. When only the sidecar image changed (operator upgrade)
+// and the cluster has only a single replica (true standalone), the pod is NOT
+// automatically restarted to avoid disrupting a single-instance cluster without
+// redundancy. Instead, a SidecarUpdatePending condition is set and the update is
+// deferred to the next natural pod restart (manual delete, eviction, or valkey
+// image change).
+//
+// For multi-replica clusters without Sentinel, sidecar-only changes ARE applied
+// via a rolling update because the remaining replicas provide redundancy.
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	sidecarPending := false
+	isTrueStandalone := v.Spec.Replicas <= 1
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -1647,9 +1652,10 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		}
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
-			// For sidecar-only changes in standalone mode, defer the update to the
-			// next natural pod restart rather than auto-deleting the pod.
-			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
+			// For sidecar-only changes in true standalone mode (single replica),
+			// defer the update to the next natural pod restart rather than
+			// auto-deleting the only instance.
+			if isTrueStandalone && isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
 				logger.Info("Standalone pod has outdated sidecar; update deferred to next pod restart",
 					"pod", podName)
 				sidecarPending = true
