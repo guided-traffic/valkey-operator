@@ -1758,7 +1758,20 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 
 	updatedCount := countUpdatedPods(pods)
 	if updatedCount == totalPods {
-		return r.finalizeMultiReplicaRollingUpdate(ctx, v, pods)
+		// All pods are updated, but the state machine may still need to complete
+		// (e.g., post-failover handling or topology restoration). Dispatch to the
+		// correct handler before finalizing, otherwise these handlers are never
+		// reached because dispatchMultiReplicaState is only called when
+		// updatedCount != totalPods.
+		currentState := r.getRollingUpdateState(v)
+		switch currentState {
+		case stateManualFailover, stateReplacingMaster:
+			return r.handlePostManualFailover(ctx, v)
+		case stateRestoringTopology:
+			return r.handleTopologyRestoration(ctx, v, currentSts)
+		default:
+			return r.finalizeMultiReplicaRollingUpdate(ctx, v, pods)
+		}
 	}
 
 	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
@@ -1947,6 +1960,25 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 		return RollingUpdateResult{Error: fmt.Errorf("getting master pod %s: %w", masterPodName, err)}
 	}
 
+	// Skip pods that are being terminated (old pod not yet removed).
+	if masterPod.DeletionTimestamp != nil {
+		logger.Info("Master pod is being terminated, waiting for recreation", "pod", masterPodName)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Verify this is the NEW pod (recreated by the StatefulSet with the updated
+	// template) and not the old pod that a concurrent reconcile still sees. Without
+	// this check, REPLICAOF is sent to the old pod that is about to be deleted,
+	// and the new pod starts as a standalone master with no data.
+	desiredImage := v.Spec.Image
+	for _, c := range masterPod.Spec.Containers {
+		if c.Name == builder.ValkeyContainerName && c.Image != desiredImage {
+			logger.Info("Master pod still running old image, waiting for replacement",
+				"pod", masterPodName, "currentImage", c.Image, "desiredImage", desiredImage)
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+	}
+
 	if !isPodReady(masterPod) {
 		logger.Info("Master pod not yet ready after recreation", "pod", masterPodName)
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -1992,9 +2024,21 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 	masterPodName := fmt.Sprintf("%s-0", stsName)
 
 	// Verify pod-0 has finished syncing (no sync in progress).
+	// Check role, master_link_status, and master_sync_in_progress to ensure the full
+	// replication handshake completed. Right after REPLICAOF, the link may still be
+	// in CONNECT/CONNECTING state where master_sync_in_progress is 0 but no data has
+	// been transferred yet. Promoting pod-0 at that point would cause data loss.
 	info, err := checker.GetReplicationInfo(ctx, v, masterPodName)
 	if err != nil {
 		logger.Info("Cannot check replication status of pod-0, waiting", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	// Pod-0 must be a replica with a live link before we promote it back.
+	// - role=master means REPLICAOF hasn't taken effect yet.
+	// - master_link_status != "up" means the connection is still being established.
+	if info.Role == common.RoleMaster || info.MasterLinkStatus != "up" {
+		logger.Info("Pod-0 replication not yet established, waiting",
+			"role", info.Role, "linkStatus", info.MasterLinkStatus)
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 	if info.MasterSyncInProgress {
@@ -2050,13 +2094,6 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 func (r *ValkeyReconciler) finalizeMultiReplicaRollingUpdate(ctx context.Context, v *vkov1.Valkey, _ []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	currentState := r.getRollingUpdateState(v)
-
-	if currentState == stateRestoringTopology || currentState == stateManualFailover || currentState == stateReplacingMaster {
-		// Topology restoration still needed even though all pods are updated.
-		// This can happen when the reconcile detects all pods as updated before
-		// handleTopologyRestoration ran.
-		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-	}
 
 	if currentState != "" {
 		logger.Info("All pods updated, clearing rolling update state", "state", currentState)

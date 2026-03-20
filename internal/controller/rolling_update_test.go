@@ -3364,6 +3364,10 @@ func TestFinalizeMultiReplicaRollingUpdate_WaitsForTopologyRestoration(t *testin
 
 	pods := []podState{}
 	result := r.finalizeMultiReplicaRollingUpdate(context.Background(), v, pods)
-	assert.True(t, result.NeedsRequeue)
-	assert.False(t, result.Completed)
+	// State-machine transitions (stateRestoringTopology, stateManualFailover, etc.)
+	// are now dispatched directly in handleMultiReplicaRollingUpdate before reaching
+	// finalizeMultiReplicaRollingUpdate. If finalize is called with a leftover state,
+	// it clears the state and completes.
+	assert.True(t, result.Completed)
+	assert.Nil(t, result.Error)
 }
