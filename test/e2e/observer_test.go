@@ -6,13 +6,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // TestE2E_Observer tests the observer deployment lifecycle.
@@ -48,7 +46,7 @@ func TestE2E_Observer(t *testing.T) {
 		tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
 
 		t.Log("Waiting for observer Deployment")
-		tc.waitForDeploymentReady(t, ns, fmt.Sprintf("%s-observer", name), 1)
+		tc.waitForDeploymentReady(t, ns, fmt.Sprintf("%s-observer", name))
 
 		t.Run("observer deployment has correct labels", func(t *testing.T) {
 			deploy, err := tc.kube.AppsV1().Deployments(ns).Get(
@@ -117,21 +115,4 @@ func TestE2E_Observer(t *testing.T) {
 	})
 }
 
-// waitForDeploymentReady waits until a Deployment has the expected number of ready replicas.
-func (tc *testClients) waitForDeploymentReady(t *testing.T, namespace, name string, replicas int32) {
-	t.Helper()
-	ctx := context.Background()
 
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
-		deploy, err := tc.kube.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		t.Logf("Deployment %s: ready=%d/%d", name, deploy.Status.ReadyReplicas, replicas)
-		return deploy.Status.ReadyReplicas == replicas, nil
-	})
-	require.NoError(t, err, "Deployment %s/%s did not become ready with %d replicas", namespace, name, replicas)
-}
