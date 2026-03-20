@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 // Config holds the observer configuration parsed from flags/env vars.
@@ -84,7 +85,7 @@ func New(cfg Config) (*Observer, error) {
 // Run starts the observer polling loop and health server.
 // It blocks until the context is cancelled.
 func Run(ctx context.Context, cfg Config) error {
-	ctrl.SetLogger(ctrl.Log.WithName("observer"))
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 	logger := ctrl.Log.WithName("observer")
 
 	logger.Info("starting observer",

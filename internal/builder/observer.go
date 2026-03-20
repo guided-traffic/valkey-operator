@@ -58,8 +58,8 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 		{
 			Name:      "observer",
 			Image:     operatorImage,
-			Command:   []string{"/manager", "observer"},
-			Args:      args,
+			Command:   []string{"./manager"},
+			Args:      append([]string{"observer"}, args...),
 			Resources: resources,
 			Ports: []corev1.ContainerPort{
 				{

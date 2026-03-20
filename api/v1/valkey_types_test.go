@@ -726,7 +726,7 @@ func TestGetObserverResources(t *testing.T) {
 		res := v.GetObserverResources()
 		assert.Equal(t, resource.MustParse("50m"), res.Requests[corev1.ResourceCPU])
 		assert.Equal(t, resource.MustParse("64Mi"), res.Requests[corev1.ResourceMemory])
-		assert.Equal(t, resource.MustParse("128Mi"), res.Limits[corev1.ResourceMemory])
+		assert.Empty(t, res.Limits)
 	})
 
 	t.Run("custom resources", func(t *testing.T) {

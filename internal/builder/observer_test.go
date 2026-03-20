@@ -71,7 +71,8 @@ func TestBuildObserverDeployment_Standalone(t *testing.T) {
 	c := deploy.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, "observer", c.Name)
 	assert.Equal(t, testOperatorImage, c.Image)
-	assert.Equal(t, []string{"/manager", "observer"}, c.Command)
+	assert.Equal(t, []string{"./manager"}, c.Command)
+	assert.Equal(t, "observer", c.Args[0], "first arg should be observer subcommand")
 
 	// Ports.
 	require.Len(t, c.Ports, 1)
@@ -88,7 +89,7 @@ func TestBuildObserverDeployment_Standalone(t *testing.T) {
 	// Default resources.
 	assert.Equal(t, resource.MustParse("50m"), c.Resources.Requests[corev1.ResourceCPU])
 	assert.Equal(t, resource.MustParse("64Mi"), c.Resources.Requests[corev1.ResourceMemory])
-	assert.Equal(t, resource.MustParse("128Mi"), c.Resources.Limits[corev1.ResourceMemory])
+	assert.Empty(t, c.Resources.Limits)
 
 	// No TLS volumes.
 	assert.Empty(t, c.VolumeMounts)

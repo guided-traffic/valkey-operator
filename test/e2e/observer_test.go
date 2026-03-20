@@ -66,7 +66,8 @@ func TestE2E_Observer(t *testing.T) {
 			require.Len(t, deploy.Spec.Template.Spec.Containers, 1)
 			c := deploy.Spec.Template.Spec.Containers[0]
 			assert.Equal(t, "observer", c.Name)
-			assert.Equal(t, []string{"/manager", "observer"}, c.Command)
+			assert.Equal(t, []string{"./manager"}, c.Command)
+			assert.Equal(t, "observer", c.Args[0], "first arg should be observer subcommand")
 
 			// Verify sentinel args are present.
 			hasSentinelArg := false
