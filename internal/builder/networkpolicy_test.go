@@ -399,6 +399,81 @@ func TestBuildSentinelNetworkPolicy_OperatorNamespace(t *testing.T) {
 	assert.Equal(t, "database-operators", opPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"])
 }
 
+// --- Observer NetworkPolicy Tests ---
+
+func TestObserverNetworkPolicyName(t *testing.T) {
+	v := newTestValkey("my-valkey")
+	assert.Equal(t, "my-valkey-observer", ObserverNetworkPolicyName(v))
+}
+
+func TestObserverNetworkPolicyName_WithPrefix(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{
+			Enabled:    true,
+			NamePrefix: "custom",
+		}
+	})
+	assert.Equal(t, "custom-my-valkey-observer", ObserverNetworkPolicyName(v))
+}
+
+func TestBuildObserverNetworkPolicy(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+
+	np := BuildObserverNetworkPolicy(v)
+
+	assert.Equal(t, "test-observer", np.Name)
+	assert.Equal(t, "default", np.Namespace)
+
+	// Labels.
+	assert.Equal(t, ComponentObserver, np.Labels["app.kubernetes.io/component"])
+	assert.Equal(t, "test", np.Labels["app.kubernetes.io/instance"])
+
+	// Pod selector targets observer pods.
+	assert.Equal(t, ComponentObserver, np.Spec.PodSelector.MatchLabels["app.kubernetes.io/component"])
+	assert.Equal(t, "test", np.Spec.PodSelector.MatchLabels["vko.gtrfc.com/cluster"])
+
+	// PolicyTypes.
+	assert.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
+
+	// One ingress rule: health port open to all.
+	require.Len(t, np.Spec.Ingress, 1)
+	require.Len(t, np.Spec.Ingress[0].Ports, 1)
+	assert.Equal(t, intstr.FromInt32(ObserverHealthPort), *np.Spec.Ingress[0].Ports[0].Port)
+	assert.Equal(t, corev1.ProtocolTCP, *np.Spec.Ingress[0].Ports[0].Protocol)
+	assert.Empty(t, np.Spec.Ingress[0].From, "health port must be open to all sources for kubelet probes")
+}
+
+func TestBuildValkeyNetworkPolicy_WithObserver(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+
+	np := BuildValkeyNetworkPolicy(v, "")
+
+	// Valkey port rule should have 2 peers: Valkey pods + observer pods.
+	require.Len(t, np.Spec.Ingress[0].From, 2)
+	assert.Equal(t, "valkey", np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app.kubernetes.io/component"])
+	assert.Equal(t, ComponentObserver, np.Spec.Ingress[0].From[1].PodSelector.MatchLabels["app.kubernetes.io/component"])
+}
+
+func TestBuildSentinelNetworkPolicy_WithObserver(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+
+	np := BuildSentinelNetworkPolicy(v, "")
+
+	// Sentinel port rule: Sentinel + Valkey + Observer = 3 peers.
+	require.Len(t, np.Spec.Ingress[0].From, 3)
+	assert.Equal(t, "sentinel", np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app.kubernetes.io/component"])
+	assert.Equal(t, "valkey", np.Spec.Ingress[0].From[1].PodSelector.MatchLabels["app.kubernetes.io/component"])
+	assert.Equal(t, ComponentObserver, np.Spec.Ingress[0].From[2].PodSelector.MatchLabels["app.kubernetes.io/component"])
+}
+
 // TestNetworkPolicyHasChanged_OperatorNamespaceDiffers verifies that adding or
 // removing the operator namespace peer is detected as a change.
 func TestNetworkPolicyHasChanged_OperatorNamespaceDiffers(t *testing.T) {

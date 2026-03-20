@@ -65,6 +65,15 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networ
 		})
 	}
 
+	// If observer is enabled, also allow ingress from observer pods.
+	if v.IsObserverEnabled() {
+		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: ObserverSelectorLabels(v),
+			},
+		})
+	}
+
 	// Allow ingress from the operator namespace so the operator can reach Valkey
 	// pods for health checks (INFO replication). Uses the standard
 	// kubernetes.io/metadata.name namespace label (available since Kubernetes 1.21).
@@ -160,6 +169,15 @@ func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *netw
 		},
 	}
 
+	// If observer is enabled, also allow ingress from observer pods.
+	if v.IsObserverEnabled() {
+		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: ObserverSelectorLabels(v),
+			},
+		})
+	}
+
 	// Allow ingress from the operator namespace so the operator can reach Sentinel
 	// pods for health checks (SENTINEL MASTER).
 	if operatorNamespace != "" {
@@ -209,6 +227,46 @@ func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *netw
 				MatchLabels: sentinelSelector,
 			},
 			Ingress:     ingressRules,
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}
+}
+
+// ObserverNetworkPolicyName returns the name for the observer NetworkPolicy.
+func ObserverNetworkPolicyName(v *vkov1.Valkey) string {
+	prefix := networkPolicyPrefix(v)
+	return fmt.Sprintf("%s%s-observer", prefix, v.Name)
+}
+
+// BuildObserverNetworkPolicy builds the NetworkPolicy for the observer pod.
+// It only allows ingress on the health port (8084) from all sources for kubelet probes.
+func BuildObserverNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
+	labels := ObserverLabels(v)
+	observerSelector := ObserverSelectorLabels(v)
+
+	tcpProtocol := corev1.ProtocolTCP
+	healthPort := intstr.FromInt32(ObserverHealthPort)
+
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ObserverNetworkPolicyName(v),
+			Namespace: v.Namespace,
+			Labels:    labels,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: observerSelector,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						{
+							Protocol: &tcpProtocol,
+							Port:     &healthPort,
+						},
+					},
+				},
+			},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		},
 	}

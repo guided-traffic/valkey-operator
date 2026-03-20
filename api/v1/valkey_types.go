@@ -163,6 +163,23 @@ type NetworkPolicySpec struct {
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
+// ObserverSpec defines the observer configuration for cluster health monitoring.
+type ObserverSpec struct {
+	// Enabled activates the observer deployment.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// DB is the Valkey database number used for the health check key.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=15
+	// +optional
+	DB *int `json:"db,omitempty"`
+
+	// Resources defines the compute resource requirements for the observer container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
 // PersistenceSpec defines data persistence configuration.
 type PersistenceSpec struct {
 	// Enabled activates persistent storage for Valkey data.
@@ -219,6 +236,10 @@ type ValkeySpec struct {
 	// +optional
 	Persistence *PersistenceSpec `json:"persistence,omitempty"`
 
+	// Observer configures the observer deployment for cluster health monitoring.
+	// +optional
+	Observer *ObserverSpec `json:"observer,omitempty"`
+
 	// PodLabels are additional labels applied to Valkey pods.
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
@@ -252,6 +273,11 @@ type ValkeyStatus struct {
 	// OperatorVersion is the version of the operator that last reconciled this resource.
 	// +optional
 	OperatorVersion string `json:"operatorVersion,omitempty"`
+
+	// ObserverReady indicates whether the observer deployment is ready.
+	// Only set when observer is enabled.
+	// +optional
+	ObserverReady *bool `json:"observerReady,omitempty"`
 
 	// Conditions represent the latest available observations of the Valkey state.
 	// +optional
@@ -353,6 +379,35 @@ func (v *Valkey) IsSentinelUnencryptedAllowed() bool {
 func (v *Valkey) IsSentinelAuthDisabled() bool {
 	return v.IsAuthEnabled() && v.IsSentinelEnabled() &&
 		v.Spec.Sentinel.DisableAuth
+}
+
+// IsObserverEnabled returns true if the observer deployment is configured and enabled.
+func (v *Valkey) IsObserverEnabled() bool {
+	return v.Spec.Observer != nil && v.Spec.Observer.Enabled
+}
+
+// GetObserverDB returns the Valkey database number for the observer health key.
+func (v *Valkey) GetObserverDB() int {
+	if v.Spec.Observer != nil && v.Spec.Observer.DB != nil {
+		return *v.Spec.Observer.DB
+	}
+	return 15
+}
+
+// GetObserverResources returns the resource requirements for the observer container.
+func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
+	if v.Spec.Observer != nil && v.Spec.Observer.Resources != nil {
+		return *v.Spec.Observer.Resources
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+	}
 }
 
 func init() {
