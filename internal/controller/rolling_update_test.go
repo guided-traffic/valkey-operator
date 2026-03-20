@@ -3215,3 +3215,155 @@ func TestPodSpecHashFromSts_EmptyAnnotations(t *testing.T) {
 	}
 	assert.Equal(t, "", podSpecHashFromSts(sts))
 }
+
+// --- Multi-replica without Sentinel rolling update tests ---
+
+func TestFindPromotionCandidate_FindsReadyUpdatedReplica(t *testing.T) {
+	pods := []podState{
+		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+	}
+	idx := findPromotionCandidate(pods, 0)
+	assert.Equal(t, 1, idx)
+}
+
+func TestFindPromotionCandidate_SkipsMaster(t *testing.T) {
+	pods := []podState{
+		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+	}
+	idx := findPromotionCandidate(pods, 0)
+	assert.Equal(t, 2, idx)
+}
+
+func TestFindPromotionCandidate_NoCandidates(t *testing.T) {
+	pods := []podState{
+		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, ready: false, needsUpdate: false, isMaster: false},
+	}
+	idx := findPromotionCandidate(pods, 0)
+	assert.Equal(t, -1, idx)
+}
+
+func TestFindPromotionCandidate_SkipsNotExisting(t *testing.T) {
+	pods := []podState{
+		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: false, ready: false, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+	}
+	idx := findPromotionCandidate(pods, 0)
+	assert.Equal(t, 2, idx)
+}
+
+func TestMultiReplicaRollingUpdate_SkipsMasterFirst(t *testing.T) {
+	// Scenario: 3-replica cluster without Sentinel, all pods need updating.
+	// Pod-0 is master. The rolling update should delete a replica first, not the master.
+	v := newTestValkey("mr", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleReplica
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+	pod2.Labels[common.LabelInstanceRole] = common.RoleReplica
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "mr", "default")
+
+	// Now update the spec image to 9.0.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "mr", Namespace: "default"}, v))
+	v.Spec.Image = "valkey/valkey:9.0"
+	require.NoError(t, c.Update(context.Background(), v))
+
+	// Reconcile — should delete a replica, not the master.
+	reconcileOnce(t, r, "mr", "default")
+
+	// Pod-0 (master) should still exist.
+	masterPod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "mr-0", Namespace: "default"}, masterPod)
+	assert.NoError(t, err, "Master pod should NOT be deleted first")
+
+	// At least one replica should be deleted.
+	replicaExists := 0
+	for i := 1; i <= 2; i++ {
+		p := &corev1.Pod{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("mr-%d", i), Namespace: "default"}, p); err == nil {
+			replicaExists++
+		}
+	}
+	assert.Less(t, replicaExists, 2, "At least one replica should have been deleted")
+}
+
+func TestMultiReplicaRollingUpdate_RoutesToMultiReplicaHandler(t *testing.T) {
+	// Verify that multi-replica without sentinel routes to handleMultiReplicaRollingUpdate
+	// (not handleStandaloneRollingUpdate) by checking that master pod survives the first reconcile.
+	v := newTestValkey("route-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 2
+		v.Spec.Image = "valkey/valkey:9.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleReplica
+
+	r, c := newTestReconciler(v, pod0, pod1)
+	reconcileOnce(t, r, "route-test", "default")
+
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "route-test", Namespace: "default"}, v))
+	v.Spec.Image = "valkey/valkey:9.0"
+	require.NoError(t, c.Update(context.Background(), v))
+
+	reconcileOnce(t, r, "route-test", "default")
+
+	// Master pod-0 should still exist.
+	masterPod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "route-test-0", Namespace: "default"}, masterPod)
+	assert.NoError(t, err, "Master pod should still exist when using multi-replica handler")
+
+	// Replica pod-1 should have been deleted.
+	replicaPod := &corev1.Pod{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: "route-test-1", Namespace: "default"}, replicaPod)
+	assert.Error(t, err, "Replica pod should be deleted first")
+}
+
+func TestFinalizeMultiReplicaRollingUpdate_ClearsState(t *testing.T) {
+	v := newTestValkey("finalize-mr", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Annotations = map[string]string{
+			annotationRollingUpdateState: stateReplacingReplicas,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	pods := []podState{
+		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+	}
+
+	result := r.finalizeMultiReplicaRollingUpdate(context.Background(), v, pods)
+	assert.True(t, result.Completed)
+	assert.Nil(t, result.Error)
+}
+
+func TestFinalizeMultiReplicaRollingUpdate_WaitsForTopologyRestoration(t *testing.T) {
+	v := newTestValkey("finalize-wait", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Annotations = map[string]string{
+			annotationRollingUpdateState: stateRestoringTopology,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	pods := []podState{}
+	result := r.finalizeMultiReplicaRollingUpdate(context.Background(), v, pods)
+	assert.True(t, result.NeedsRequeue)
+	assert.False(t, result.Completed)
+}
