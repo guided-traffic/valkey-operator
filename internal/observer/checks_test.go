@@ -2,6 +2,7 @@ package observer
 
 import (
 	"context"
+	"crypto/tls"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -114,4 +115,61 @@ func TestCheckSentinelQuorumAndFlags_AllFail(t *testing.T) {
 	assert.False(t, quorumOK)
 	assert.True(t, flagsOK) // flags remain default true when no data
 	assert.Error(t, err)
+}
+
+func TestCheckSentinelMasterHostname_AllFail(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			SentinelMonitor: "mydb",
+			SentinelAddrList: []string{
+				"sentinel-0.invalid:26379",
+			},
+		},
+	}
+
+	err := obs.checkSentinelMasterHostname()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "master hostname check failed")
+}
+
+func TestCheckSentinelReplicaHostnames_AllFail(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			SentinelMonitor: "mydb",
+			SentinelAddrList: []string{
+				"sentinel-0.invalid:26379",
+			},
+		},
+	}
+
+	err := obs.checkSentinelReplicaHostnames()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "replica hostname check failed")
+}
+
+func TestNewSentinelClient_FallbackToTLSConfig(t *testing.T) {
+	obs := &Observer{
+		cfg:       Config{},
+		tlsConfig: nil,
+	}
+
+	// No TLS, no password.
+	c := obs.newSentinelClient("localhost:26379", "")
+	assert.NotNil(t, c)
+
+	// With password, no TLS.
+	c = obs.newSentinelClient("localhost:26379", "secret")
+	assert.NotNil(t, c)
+}
+
+func TestNewSentinelClient_WithSentinelTLSConfig(t *testing.T) {
+	obs := &Observer{
+		cfg:               Config{},
+		sentinelTLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		tlsConfig:         &tls.Config{MinVersion: tls.VersionTLS13},
+	}
+
+	// Should use sentinelTLSConfig, not tlsConfig.
+	c := obs.newSentinelClient("localhost:36379", "pass")
+	assert.NotNil(t, c)
 }

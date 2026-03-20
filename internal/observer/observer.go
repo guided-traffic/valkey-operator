@@ -53,27 +53,36 @@ type CheckResult struct {
 
 // Observer runs periodic health checks against a Valkey cluster.
 type Observer struct {
-	cfg       Config
-	tlsConfig *tls.Config
-	mu        sync.RWMutex
-	result    CheckResult
-	metrics   *observerMetrics
+	cfg               Config
+	tlsConfig         *tls.Config
+	sentinelTLSConfig *tls.Config
+	mu                sync.RWMutex
+	result            CheckResult
+	metrics           *observerMetrics
 }
 
 // New creates a new Observer with the given configuration.
 func New(cfg Config) (*Observer, error) {
 	var tlsCfg *tls.Config
+	var sentinelTLSCfg *tls.Config
 	if cfg.TLSEnabled {
 		var err error
 		tlsCfg, err = buildTLSConfig(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("building TLS config: %w", err)
 		}
+		if cfg.SentinelEnabled {
+			sentinelTLSCfg, err = buildSentinelTLSConfig(cfg)
+			if err != nil {
+				return nil, fmt.Errorf("building sentinel TLS config: %w", err)
+			}
+		}
 	}
 
 	return &Observer{
-		cfg:       cfg,
-		tlsConfig: tlsCfg,
+		cfg:               cfg,
+		tlsConfig:         tlsCfg,
+		sentinelTLSConfig: sentinelTLSCfg,
 		result: CheckResult{
 			Ready:  false,
 			Checks: make(map[string]bool),
@@ -176,7 +185,17 @@ func (o *Observer) runChecks(ctx context.Context) {
 		}
 	}
 
+	// Log every individual check failure.
+	for name, ok := range checks {
+		if !ok {
+			logger.Error(fmt.Errorf("check %s failed", name), "check failure", "check", name)
+		}
+	}
+
 	allOK := firstFailMsg == ""
+	if !allOK {
+		logger.Error(fmt.Errorf("%s", firstFailMsg), "poll cycle failed")
+	}
 	o.setResult(allOK, checks, firstFailMsg, start)
 	o.metrics.recordCycle(time.Since(start), allOK)
 }
@@ -222,7 +241,7 @@ func (o *Observer) runCoreChecks(_ context.Context, masterAddr, healthValue stri
 	return firstFailMsg
 }
 
-// runSentinelChecks runs sentinel reachability, quorum, and flag checks.
+// runSentinelChecks runs sentinel reachability, quorum, flag, and hostname checks.
 // Returns the first failure message (empty if all passed).
 func (o *Observer) runSentinelChecks(checks map[string]bool) string {
 	var firstFailMsg string
@@ -237,6 +256,15 @@ func (o *Observer) runSentinelChecks(checks map[string]bool) string {
 	if (!quorumOK || !flagsOK) && firstFailMsg == "" && sentErr != nil {
 		firstFailMsg = fmt.Sprintf("sentinel check failed: %v", sentErr)
 	}
+
+	// Hostname checks: master and replicas must be hostnames, not IPs.
+	firstFailMsg = runCheck(checks, "sentinel_master_hostname", firstFailMsg, func() error {
+		return o.checkSentinelMasterHostname()
+	})
+
+	firstFailMsg = runCheck(checks, "sentinel_replica_hostnames", firstFailMsg, func() error {
+		return o.checkSentinelReplicaHostnames()
+	})
 
 	return firstFailMsg
 }
@@ -290,6 +318,29 @@ func buildTLSConfig(cfg Config) (*tls.Config, error) {
 			return nil, fmt.Errorf("loading client certificate: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	return tlsCfg, nil
+}
+
+// buildSentinelTLSConfig creates a TLS config for Sentinel connections.
+// It loads only the CA cert for server verification — no client certificates (no mTLS).
+// Hostname verification is enabled by default (InsecureSkipVerify is not set).
+func buildSentinelTLSConfig(cfg Config) (*tls.Config, error) {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	if cfg.TLSCACert != "" {
+		caCert, err := os.ReadFile(cfg.TLSCACert)
+		if err != nil {
+			return nil, fmt.Errorf("reading CA cert: %w", err)
+		}
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+		tlsCfg.RootCAs = certPool
 	}
 
 	return tlsCfg, nil

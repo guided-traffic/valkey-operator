@@ -102,3 +102,24 @@ func TestHealthServer_Readyz_ContentType(t *testing.T) {
 
 	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
 }
+
+func TestHealthServer_Readyz_SentinelHostnameChecks(t *testing.T) {
+	obs := newTestObserver(true, map[string]bool{
+		"master_reachable":           true,
+		"sentinel_master_hostname":   true,
+		"sentinel_replica_hostnames": true,
+	}, "")
+	srv := NewHealthServer(":0", obs)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result CheckResult
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+	assert.True(t, result.Ready)
+	assert.True(t, result.Checks["sentinel_master_hostname"])
+	assert.True(t, result.Checks["sentinel_replica_hostnames"])
+}

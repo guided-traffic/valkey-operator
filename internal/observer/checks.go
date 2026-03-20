@@ -3,6 +3,7 @@ package observer
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
@@ -127,7 +128,7 @@ func (o *Observer) checkSentinelReachable() error {
 
 	var errs []string
 	for _, addr := range o.cfg.SentinelAddrList {
-		client := o.newClient(addr, password)
+		client := o.newSentinelClient(addr, password)
 		if err := client.Ping(); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", addr, err))
 		}
@@ -151,7 +152,7 @@ func (o *Observer) checkSentinelQuorumAndFlags() (quorumOK, flagsOK bool, err er
 
 	masterIPs := make([]string, 0, len(o.cfg.SentinelAddrList))
 	for _, addr := range o.cfg.SentinelAddrList {
-		client := o.newClient(addr, password)
+		client := o.newSentinelClient(addr, password)
 		info, cErr := client.SentinelMaster(o.cfg.SentinelMonitor)
 		if cErr != nil {
 			quorumOK = false
@@ -193,4 +194,78 @@ func (o *Observer) newClient(addr, password string) *valkeyclient.Client {
 		return valkeyclient.NewWithPassword(addr, password)
 	}
 	return valkeyclient.New(addr)
+}
+
+// newSentinelClient creates a valkeyclient.Client for Sentinel connections.
+// When TLS is enabled it uses the CA-only TLS config (no client certs / no mTLS),
+// falling back to the full TLS config if no sentinel-specific config was built.
+func (o *Observer) newSentinelClient(addr, password string) *valkeyclient.Client {
+	tlsCfg := o.sentinelTLSConfig
+	if tlsCfg == nil {
+		tlsCfg = o.tlsConfig
+	}
+	if tlsCfg != nil && password != "" {
+		return valkeyclient.NewTLSWithPassword(addr, tlsCfg, password)
+	}
+	if tlsCfg != nil {
+		return valkeyclient.NewTLS(addr, tlsCfg)
+	}
+	if password != "" {
+		return valkeyclient.NewWithPassword(addr, password)
+	}
+	return valkeyclient.New(addr)
+}
+
+// checkSentinelMasterHostname queries all Sentinels and verifies the master address
+// is a hostname rather than a raw IP address.
+func (o *Observer) checkSentinelMasterHostname() error {
+	password := o.cfg.Password
+	if o.cfg.SentinelDisableAuth {
+		password = ""
+	}
+
+	var errs []string
+	for _, addr := range o.cfg.SentinelAddrList {
+		client := o.newSentinelClient(addr, password)
+		info, err := client.SentinelMaster(o.cfg.SentinelMonitor)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("sentinel %s: %v", addr, err))
+			continue
+		}
+		if net.ParseIP(info.IP) != nil {
+			errs = append(errs, fmt.Sprintf("sentinel %s returned IP %s instead of hostname for master", addr, info.IP))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("master hostname check failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// checkSentinelReplicaHostnames queries all Sentinels and verifies every replica
+// address is a hostname rather than a raw IP address.
+func (o *Observer) checkSentinelReplicaHostnames() error {
+	password := o.cfg.Password
+	if o.cfg.SentinelDisableAuth {
+		password = ""
+	}
+
+	var errs []string
+	for _, addr := range o.cfg.SentinelAddrList {
+		client := o.newSentinelClient(addr, password)
+		replicas, err := client.SentinelReplicas(o.cfg.SentinelMonitor)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("sentinel %s: %v", addr, err))
+			continue
+		}
+		for _, r := range replicas {
+			if net.ParseIP(r.IP) != nil {
+				errs = append(errs, fmt.Sprintf("sentinel %s returned IP %s instead of hostname for replica", addr, r.IP))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("replica hostname check failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }

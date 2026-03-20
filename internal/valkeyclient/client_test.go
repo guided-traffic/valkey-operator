@@ -986,3 +986,97 @@ func fakeRESPServerCustom(t *testing.T, response string) (string, func()) {
 
 	return ln.Addr().String(), func() { _ = ln.Close() }
 }
+
+// --- parseSentinelReplicasInfo ---
+
+func TestParseSentinelReplicasInfo_TwoReplicas(t *testing.T) {
+	raw := "ip\nhost-1.example.com\nport\n6379\nflags\nslave\n---\nip\nhost-2.example.com\nport\n6379\nflags\nslave\n"
+	replicas := parseSentinelReplicasInfo(raw)
+	require.Len(t, replicas, 2)
+	assert.Equal(t, "host-1.example.com", replicas[0].IP)
+	assert.Equal(t, "6379", replicas[0].Port)
+	assert.Equal(t, "slave", replicas[0].Flags)
+	assert.Equal(t, "host-2.example.com", replicas[1].IP)
+}
+
+func TestParseSentinelReplicasInfo_Empty(t *testing.T) {
+	replicas := parseSentinelReplicasInfo("")
+	assert.Nil(t, replicas)
+}
+
+func TestParseSentinelReplicasInfo_SingleReplica(t *testing.T) {
+	raw := "ip\n10.0.0.5\nport\n16379\nflags\nslave\n"
+	replicas := parseSentinelReplicasInfo(raw)
+	require.Len(t, replicas, 1)
+	assert.Equal(t, "10.0.0.5", replicas[0].IP)
+	assert.Equal(t, "16379", replicas[0].Port)
+}
+
+func TestParseSentinelReplicasInfo_OddFields(t *testing.T) {
+	// Orphan key at end is silently ignored.
+	raw := "ip\nhost.example.com\norphan\n"
+	replicas := parseSentinelReplicasInfo(raw)
+	require.Len(t, replicas, 1)
+	assert.Equal(t, "host.example.com", replicas[0].IP)
+}
+
+// --- readArray nested arrays ---
+
+func TestReadArray_NestedArrays(t *testing.T) {
+	// Simulate SENTINEL REPLICAS response: outer *2, each inner *4 (2 key-value pairs).
+	inner1 := "*4\r\n$2\r\nip\r\n$6\r\nhost-1\r\n$4\r\nport\r\n$4\r\n6379\r\n"
+	inner2 := "*4\r\n$2\r\nip\r\n$6\r\nhost-2\r\n$4\r\nport\r\n$4\r\n6379\r\n"
+	data := inner1 + inner2
+	reader := bufio.NewReader(strings.NewReader(data))
+	result, err := readArray(reader, "*2")
+	assert.NoError(t, err)
+	// Should contain separator between nested arrays.
+	assert.Contains(t, result, "---")
+	assert.Contains(t, result, "host-1")
+	assert.Contains(t, result, "host-2")
+}
+
+func TestReadArray_SingleNestedArray(t *testing.T) {
+	inner := "*2\r\n$2\r\nip\r\n$7\r\n1.2.3.4\r\n"
+	reader := bufio.NewReader(strings.NewReader(inner))
+	result, err := readArray(reader, "*1")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "1.2.3.4")
+	// No separator for single element.
+	assert.NotContains(t, result, "---")
+}
+
+// --- SentinelReplicas via fake server ---
+
+func TestSentinelReplicas_Success(t *testing.T) {
+	// Build a SENTINEL REPLICAS response: outer array of 1 replica, inner array of 6 elements.
+	resp := "*1\r\n*6\r\n$2\r\nip\r\n$10\r\nhost.local\r\n$4\r\nport\r\n$4\r\n6379\r\n$5\r\nflags\r\n$5\r\nslave\r\n"
+	addr, cleanup := fakeRESPServerCustom(t, resp)
+	defer cleanup()
+
+	c := New(addr)
+	replicas, err := c.SentinelReplicas("test")
+	require.NoError(t, err)
+	require.Len(t, replicas, 1)
+	assert.Equal(t, "host.local", replicas[0].IP)
+	assert.Equal(t, "6379", replicas[0].Port)
+	assert.Equal(t, "slave", replicas[0].Flags)
+}
+
+func TestSentinelReplicas_EmptyArray(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "*0\r\n")
+	defer cleanup()
+
+	c := New(addr)
+	replicas, err := c.SentinelReplicas("test")
+	require.NoError(t, err)
+	assert.Empty(t, replicas)
+}
+
+func TestSentinelReplicas_ConnectionError(t *testing.T) {
+	c := New("127.0.0.1:1")
+	c.SetTimeout(500 * time.Millisecond)
+	replicas, err := c.SentinelReplicas("test")
+	assert.Error(t, err)
+	assert.Nil(t, replicas)
+}
