@@ -86,6 +86,132 @@ func TestE2E_RollingUpdate_Standalone(t *testing.T) {
 	})
 }
 
+// TestE2E_RollingUpdate_MultiReplicaNoSentinel tests a rolling update on a
+// multi-replica Valkey cluster without Sentinel. This verifies that the
+// non-HA rolling update path correctly restarts all pods when a CR change
+// is applied, rather than deferring the update (which should only happen
+// for true single-replica standalone instances).
+func TestE2E_RollingUpdate_MultiReplicaNoSentinel(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-rolling-multirep"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "roll-mr"
+	var replicas int32 = 3
+	initialImage := "valkey/valkey:8.0"
+	updatedImage := "valkey/valkey:8.1"
+
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(replicas),
+		"image":    initialImage,
+	})
+
+	t.Log("Creating multi-replica Valkey CR without Sentinel")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for initial deployment.
+	tc.waitForStatefulSetReady(t, ns, name, replicas)
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	// Wait for replication to establish.
+	masterPod := tc.findMasterPod(t, ns, name, int(replicas))
+	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, int(replicas)-1)
+
+	t.Run("Initial pods run expected image", func(t *testing.T) {
+		for i := int32(0); i < replicas; i++ {
+			pod := tc.getPod(t, ns, fmt.Sprintf("%s-%d", name, i))
+			assert.Equal(t, initialImage, pod.Spec.Containers[0].Image,
+				"Pod %d should run initial image", i)
+		}
+	})
+
+	t.Run("Write test data before update", func(t *testing.T) {
+		tc.valkeyMSET(t, ns, masterPod, 6379, map[string]string{
+			"mr-roll:key1": "before-update",
+			"mr-roll:key2": "important-data",
+		})
+
+		// Wait for replication to sync.
+		tc.waitForConnectedReplicas(t, ns, masterPod, 6379, int(replicas)-1)
+
+		// Verify data on a replica.
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			if podName == masterPod {
+				continue
+			}
+			require.Eventually(t, func() bool {
+				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "mr-roll:key1")
+				return resp == "before-update"
+			}, 30*time.Second, 2*time.Second, "Data should replicate to %s", podName)
+			break // one replica check is sufficient
+		}
+	})
+
+	t.Run("Update image triggers rolling update for all pods", func(t *testing.T) {
+		tc.updateValkeyImage(t, ns, name, updatedImage)
+
+		// All pods must be updated — this is the core assertion. Before the fix,
+		// multi-replica clusters without Sentinel could defer sidecar-only updates.
+		tc.waitForAllPodsImage(t, ns, name, int(replicas), updatedImage)
+		tc.waitForStatefulSetReady(t, ns, name, replicas)
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+	})
+
+	t.Run("All pods run new image after update", func(t *testing.T) {
+		for i := int32(0); i < replicas; i++ {
+			pod := tc.getPod(t, ns, fmt.Sprintf("%s-%d", name, i))
+			assert.Equal(t, updatedImage, pod.Spec.Containers[0].Image,
+				"Pod %d should run updated image", i)
+		}
+	})
+
+	t.Run("Cluster is healthy after rolling update", func(t *testing.T) {
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			resp := tc.valkeyExec(t, ns, podName, 6379, "PING")
+			assert.Equal(t, "PONG", resp, "Pod %s should respond to PING", podName)
+		}
+
+		// Exactly one master should exist.
+		masterCount := 0
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			info := tc.valkeyExec(t, ns, podName, 6379, "INFO", "replication")
+			if strings.Contains(info, "role:master") {
+				masterCount++
+			}
+		}
+		assert.Equal(t, 1, masterCount, "Exactly one master should exist after rolling update")
+	})
+
+	t.Run("Replication re-establishes after rolling update", func(t *testing.T) {
+		newMaster := tc.findMasterPod(t, ns, name, int(replicas))
+		tc.waitForConnectedReplicas(t, ns, newMaster, 6379, int(replicas)-1)
+	})
+
+	t.Run("Data survives rolling update", func(t *testing.T) {
+		newMaster := tc.findMasterPod(t, ns, name, int(replicas))
+		resp := tc.valkeyExec(t, ns, newMaster, 6379, "GET", "mr-roll:key1")
+		assert.Equal(t, "before-update", resp, "Data should survive rolling update")
+
+		resp = tc.valkeyExec(t, ns, newMaster, 6379, "GET", "mr-roll:key2")
+		assert.Equal(t, "important-data", resp)
+	})
+
+	t.Run("New data can be written after rolling update", func(t *testing.T) {
+		newMaster := tc.findMasterPod(t, ns, name, int(replicas))
+		resp := tc.valkeyExec(t, ns, newMaster, 6379, "SET", "post-mr-roll", "success")
+		assert.Equal(t, "OK", resp)
+
+		resp = tc.valkeyExec(t, ns, newMaster, 6379, "GET", "post-mr-roll")
+		assert.Equal(t, "success", resp)
+	})
+}
+
 // TestE2E_RollingUpdate_HA tests a rolling update on a 3-node HA cluster with Sentinel.
 func TestE2E_RollingUpdate_HA(t *testing.T) {
 	t.Parallel()
