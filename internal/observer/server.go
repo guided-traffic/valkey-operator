@@ -3,6 +3,7 @@ package observer
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -30,7 +31,8 @@ func NewHealthServer(addr string, obs *Observer) *http.Server {
 	mux.Handle("/metrics", promhttp.Handler())
 
 	return &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 }

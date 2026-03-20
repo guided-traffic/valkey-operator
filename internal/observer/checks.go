@@ -149,7 +149,7 @@ func (o *Observer) checkSentinelQuorumAndFlags() (quorumOK, flagsOK bool, err er
 	quorumOK = true
 	flagsOK = true
 
-	var masterIPs []string
+	masterIPs := make([]string, 0, len(o.cfg.SentinelAddrList))
 	for _, addr := range o.cfg.SentinelAddrList {
 		client := o.newClient(addr, password)
 		info, cErr := client.SentinelMaster(o.cfg.SentinelMonitor)

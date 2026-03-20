@@ -199,6 +199,15 @@
   ],
   "customManagers": [
     {
+      "description": "Update Go tool versions pinned in Makefile via renovate comments",
+      "customType": "regex",
+      "managerFilePatterns": ["/^Makefile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\n.+\\?=\\s*(?<currentValue>v[\\d.]+)"
+      ],
+      "versioningTemplate": "semver"
+    },
+    {
       "description": "Update Go version in Containerfile",
       "customType": "regex",
       "managerFilePatterns": [
