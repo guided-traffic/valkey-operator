@@ -42,6 +42,13 @@ type SentinelMasterInfo struct {
 	Flags     string
 }
 
+// SentinelReplicaInfo holds parsed info for a single replica from SENTINEL REPLICAS.
+type SentinelReplicaInfo struct {
+	IP    string
+	Port  string
+	Flags string
+}
+
 // ConnectionError is returned whenever a TCP connection to a Valkey or Sentinel
 // instance cannot be established. It always carries the target address and an
 // actionable hint so that administrators can quickly identify firewall rules or
@@ -186,6 +193,15 @@ func (c *Client) SentinelFailover(name string) error {
 	return nil
 }
 
+// SentinelReplicas sends SENTINEL REPLICAS <name> and returns info for each replica.
+func (c *Client) SentinelReplicas(name string) ([]*SentinelReplicaInfo, error) {
+	resp, err := c.exec("SENTINEL", "REPLICAS", name)
+	if err != nil {
+		return nil, fmt.Errorf("sentinel replicas %s on %s: %w", name, c.addr, err)
+	}
+	return parseSentinelReplicasInfo(resp), nil
+}
+
 // SentinelReset sends SENTINEL RESET <pattern> to reset all matching masters.
 // This clears the sentinel's internal failover cooldown state, allowing
 // a new failover to be triggered immediately. The pattern "*" matches all masters.
@@ -267,8 +283,70 @@ func (c *Client) DBSize() (int, error) {
 	return size, nil
 }
 
-// exec sends a RESP command and reads the response.
-func (c *Client) exec(args ...string) (string, error) {
+// ExecMulti executes multiple commands in a single connection. Each command
+// is a slice of strings. All responses are read and the last non-OK error is returned.
+// This is used for SELECT + SET sequences where both commands must run on the same connection.
+func (c *Client) ExecMulti(commands ...[]string) error {
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return err
+	}
+
+	if err := c.authenticate(conn); err != nil {
+		return err
+	}
+
+	for _, cmd := range commands {
+		if _, writeErr := conn.Write([]byte(formatRESP(cmd))); writeErr != nil {
+			return fmt.Errorf("sending command %v: %w", cmd[0], writeErr)
+		}
+		resp, readErr := readFullResponse(conn)
+		if readErr != nil {
+			return fmt.Errorf("command %v on %s: %w", cmd[0], c.addr, readErr)
+		}
+		_ = resp
+	}
+	return nil
+}
+
+// ExecGet executes a sequence of commands and returns the response of the last one.
+// Used for SELECT + GET sequences on a single connection.
+func (c *Client) ExecGet(commands ...[]string) (string, error) {
+	conn, err := c.dial()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return "", err
+	}
+
+	if err := c.authenticate(conn); err != nil {
+		return "", err
+	}
+
+	var lastResp string
+	for _, cmd := range commands {
+		if _, writeErr := conn.Write([]byte(formatRESP(cmd))); writeErr != nil {
+			return "", fmt.Errorf("sending command %v: %w", cmd[0], writeErr)
+		}
+		resp, readErr := readFullResponse(conn)
+		if readErr != nil {
+			return "", fmt.Errorf("command %v on %s: %w", cmd[0], c.addr, readErr)
+		}
+		lastResp = resp
+	}
+	return lastResp, nil
+}
+
+// dial establishes a TCP (or TLS) connection to the server.
+func (c *Client) dial() (net.Conn, error) {
 	var conn net.Conn
 	var err error
 
@@ -279,7 +357,35 @@ func (c *Client) exec(args ...string) (string, error) {
 		conn, err = net.DialTimeout("tcp", c.addr, c.timeout)
 	}
 	if err != nil {
-		return "", &ConnectionError{Addr: c.addr, Cause: err, Hint: connHint(c.addr, err)}
+		return nil, &ConnectionError{Addr: c.addr, Cause: err, Hint: connHint(c.addr, err)}
+	}
+	return conn, nil
+}
+
+// authenticate sends AUTH if a password is configured. Must be called after dial.
+func (c *Client) authenticate(conn net.Conn) error {
+	if c.password == "" {
+		return nil
+	}
+	authCmd := formatRESP([]string{"AUTH", c.password})
+	if _, err := conn.Write([]byte(authCmd)); err != nil {
+		return fmt.Errorf("sending AUTH: %w", err)
+	}
+	authResp, err := readFullResponse(conn)
+	if err != nil {
+		return fmt.Errorf("AUTH failed on %s: %w", c.addr, err)
+	}
+	if !strings.Contains(authResp, "OK") {
+		return fmt.Errorf("AUTH failed on %s: %s", c.addr, authResp)
+	}
+	return nil
+}
+
+// exec sends a RESP command and reads the response.
+func (c *Client) exec(args ...string) (string, error) {
+	conn, err := c.dial()
+	if err != nil {
+		return "", err
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -287,19 +393,8 @@ func (c *Client) exec(args ...string) (string, error) {
 		return "", err
 	}
 
-	// Authenticate if password is configured.
-	if c.password != "" {
-		authCmd := formatRESP([]string{"AUTH", c.password})
-		if _, err := conn.Write([]byte(authCmd)); err != nil {
-			return "", fmt.Errorf("sending AUTH: %w", err)
-		}
-		authResp, err := readFullResponse(conn)
-		if err != nil {
-			return "", fmt.Errorf("AUTH failed on %s: %w", c.addr, err)
-		}
-		if !strings.Contains(authResp, "OK") {
-			return "", fmt.Errorf("AUTH failed on %s: %s", c.addr, authResp)
-		}
+	if err := c.authenticate(conn); err != nil {
+		return "", err
 	}
 
 	// Send command in RESP format.
@@ -315,9 +410,9 @@ func (c *Client) exec(args ...string) (string, error) {
 // formatRESP formats a command into RESP array format.
 func formatRESP(args []string) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
+	fmt.Fprintf(&sb, "*%d\r\n", len(args))
 	for _, arg := range args {
-		sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
+		fmt.Fprintf(&sb, "$%d\r\n%s\r\n", len(arg), arg)
 	}
 	return sb.String()
 }
@@ -382,6 +477,7 @@ func readBulkString(reader *bufio.Reader, header string) (string, error) {
 
 // readArray reads a RESP array response from the reader.
 // The header line (e.g. "*3") must be passed in.
+// Nested arrays (e.g. SENTINEL REPLICAS) are separated by "---\n".
 func readArray(reader *bufio.Reader, header string) (string, error) {
 	count := 0
 	if _, err := fmt.Sscanf(header[1:], "%d", &count); err != nil {
@@ -396,10 +492,11 @@ func readArray(reader *bufio.Reader, header string) (string, error) {
 		}
 		elemLine = strings.TrimRight(elemLine, "\r\n")
 
-		if strings.HasPrefix(elemLine, "$") {
-			val, err := readBulkString(reader, elemLine)
-			if err != nil {
-				return "", err
+		switch {
+		case strings.HasPrefix(elemLine, "$"):
+			val, bErr := readBulkString(reader, elemLine)
+			if bErr != nil {
+				return "", bErr
 			}
 			if val == "" {
 				result.WriteString("(nil)\n")
@@ -407,6 +504,15 @@ func readArray(reader *bufio.Reader, header string) (string, error) {
 				result.WriteString(val)
 				result.WriteString("\n")
 			}
+		case strings.HasPrefix(elemLine, "*"):
+			if i > 0 {
+				result.WriteString("---\n")
+			}
+			inner, aErr := readArray(reader, elemLine)
+			if aErr != nil {
+				return "", aErr
+			}
+			result.WriteString(inner)
 		}
 	}
 	return result.String(), nil
@@ -444,6 +550,36 @@ func parseReplicationInfo(raw string) *ReplicationInfo {
 		}
 	}
 	return info
+}
+
+// parseSentinelReplicasInfo parses the SENTINEL REPLICAS response.
+// The raw string contains blocks separated by "---\n", each block being
+// alternating key-value pairs like SENTINEL MASTER.
+func parseSentinelReplicasInfo(raw string) []*SentinelReplicaInfo {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	blocks := strings.Split(raw, "---\n")
+	replicas := make([]*SentinelReplicaInfo, 0, len(blocks))
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		lines := strings.Split(block, "\n")
+		kvMap := make(map[string]string)
+		for i := 0; i+1 < len(lines); i += 2 {
+			key := strings.TrimSpace(lines[i])
+			val := strings.TrimSpace(lines[i+1])
+			kvMap[key] = val
+		}
+		replicas = append(replicas, &SentinelReplicaInfo{
+			IP:    kvMap["ip"],
+			Port:  kvMap["port"],
+			Flags: kvMap["flags"],
+		})
+	}
+	return replicas
 }
 
 // parseSentinelMasterInfo parses the SENTINEL MASTER response into structured data.

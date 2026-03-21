@@ -1474,6 +1474,49 @@ func TestReconcile_StandaloneDoesNotCreateSentinel(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err))
 }
 
+func TestReconcile_MultiReplicaWithoutSentinel_CreatesReplicaConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	cm := &corev1.ConfigMap{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-replica-config", Namespace: "default",
+	}, cm)
+
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data, builder.ValkeyConfigKey)
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "replicaof")
+}
+
+func TestReconcile_MultiReplicaWithoutSentinel_SetsMasterPod(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Simulate all replicas ready.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
+	sts.Status.ReadyReplicas = 3
+	require.NoError(t, c.Status().Update(context.Background(), sts))
+
+	// Second reconcile should report OK with master pod set.
+	reconcileOnce(t, r, "test", "default")
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	require.NoError(t, err)
+
+	assert.Equal(t, vkov1.ValkeyPhaseOK, v.Status.Phase)
+	assert.Equal(t, "test-0", v.Status.MasterPod)
+}
+
 // --- Auth Tests ---
 
 func TestReconcile_Auth_StatefulSetHasEnvVar(t *testing.T) {
@@ -2115,4 +2158,202 @@ func TestReconcile_StatusOperatorVersion_UpdatedOnVersionChange(t *testing.T) {
 	}, updated))
 	assert.Equal(t, newVersion, updated.Status.OperatorVersion,
 		"status.operatorVersion must be updated when the operator version changes")
+}
+
+// --- sentinelPassword Tests ---
+
+func TestSentinelPassword_ReturnsEmpty_WhenDisableAuthTrue(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+	r, _ := newTestReconciler(v, authSecret)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "", pwd, "sentinel password must be empty when disableAuth is true")
+}
+
+func TestSentinelPassword_ReturnsPassword_WhenDisableAuthFalse(t *testing.T) {
+	authSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"password": []byte("supersecret"),
+		},
+	}
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: false,
+		}
+	})
+	r, _ := newTestReconciler(v, authSecret)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "supersecret", pwd, "sentinel password must match secret when disableAuth is false")
+}
+
+func TestSentinelPassword_ReturnsEmpty_WhenNoAuth(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	pwd := r.sentinelPassword(context.Background(), v)
+	assert.Equal(t, "", pwd, "sentinel password must be empty when auth is not configured")
+}
+
+// --- Observer Deployment Tests ---
+
+func TestReconcile_CreatesObserverDeployment(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	deploy := &appsv1.Deployment{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ObserverDeploymentName(v), Namespace: "default",
+	}, deploy)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test-observer", deploy.Name)
+	assert.Equal(t, int32(1), *deploy.Spec.Replicas)
+	require.Len(t, deploy.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "observer", deploy.Spec.Template.Spec.Containers[0].Name)
+}
+
+func TestReconcile_ObserverDeployment_NotCreated_WhenDisabled(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	deploy := &appsv1.Deployment{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-observer", Namespace: "default",
+	}, deploy)
+
+	assert.True(t, apierrors.IsNotFound(err), "observer deployment should not exist when observer is disabled")
+}
+
+func TestReconcile_ObserverDeployment_Idempotent(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, _ := newTestReconciler(v)
+
+	// Multiple reconciles must not error.
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+	reconcileOnce(t, r, "test", "default")
+}
+
+func TestReconcile_ObserverDeployment_CleanupOnDisable(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	// First reconcile creates observer deployment.
+	reconcileOnce(t, r, "test", "default")
+
+	deploy := &appsv1.Deployment{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: "test-observer", Namespace: "default",
+	}, deploy)
+	require.NoError(t, err, "observer deployment should exist before disable")
+
+	// Disable observer.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
+	updated.Spec.Observer.Enabled = false
+	require.NoError(t, c.Update(context.Background(), updated))
+
+	// Reconcile again to trigger cleanup.
+	reconcileOnce(t, r, "test", "default")
+
+	err = c.Get(context.Background(), types.NamespacedName{
+		Name: "test-observer", Namespace: "default",
+	}, deploy)
+	assert.True(t, apierrors.IsNotFound(err), "observer deployment should be deleted after disable")
+}
+
+func TestReconcile_ObserverDeployment_WithNetworkPolicy(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	// Observer NetworkPolicy should be created.
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ObserverNetworkPolicyName(v), Namespace: "default",
+	}, np)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test-observer", np.Name)
+}
+
+func TestReconcile_ObserverStatus_FalseWhenNoReadyReplicas(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
+
+	// Observer deployment was just created, no ready replicas yet.
+	if updated.Status.ObserverReady != nil {
+		assert.False(t, *updated.Status.ObserverReady, "observer should not be ready when deployment has no ready replicas")
+	}
+}
+
+func TestReconcile_ObserverStatus_NilWhenDisabled(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, c := newTestReconciler(v)
+
+	reconcileOnce(t, r, "test", "default")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
+
+	assert.Nil(t, updated.Status.ObserverReady, "observer status should be nil when observer is disabled")
 }

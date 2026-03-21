@@ -72,6 +72,15 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	AllowUnencrypted bool `json:"allowUnencrypted,omitempty"`
+
+	// DisableAuth disables password authentication for Sentinel client connections.
+	// When true, Sentinel does not require a password from connecting clients
+	// (no requirepass directive), but still uses sentinel auth-pass to
+	// authenticate with Valkey nodes. Only effective when spec.auth is configured.
+	// Default: false (Sentinel requires the same password as Valkey).
+	// +kubebuilder:default=false
+	// +optional
+	DisableAuth bool `json:"disableAuth,omitempty"`
 }
 
 // AuthSpec defines authentication configuration for Valkey.
@@ -154,6 +163,47 @@ type NetworkPolicySpec struct {
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
+// ObserverMTLSSpec controls whether the observer presents client certificates
+// for its connections to Valkey and Sentinel. Only effective when spec.tls.enabled
+// is true. Sending a client certificate enables mutual TLS (mTLS); omitting it
+// means the observer only verifies the server certificate.
+type ObserverMTLSSpec struct {
+	// Valkey controls whether the observer sends a client certificate to Valkey pods.
+	// Set to true to enable mTLS; when nil or false, no client certificate is sent.
+	// Default: false.
+	// +optional
+	Valkey *bool `json:"valkey,omitempty"`
+
+	// Sentinel controls whether the observer sends a client certificate to Sentinel pods.
+	// When nil or false, only the CA certificate is used (no client certificate).
+	// Set to true to enable mTLS for Sentinel connections.
+	// Default: false.
+	// +optional
+	Sentinel *bool `json:"sentinel,omitempty"`
+}
+
+// ObserverSpec defines the observer configuration for cluster health monitoring.
+type ObserverSpec struct {
+	// Enabled activates the observer deployment.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// DB is the Valkey database number used for the health check key.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=15
+	// +optional
+	DB *int `json:"db,omitempty"`
+
+	// MTLS configures mutual TLS behaviour for the observer's outbound connections.
+	// Only effective when spec.tls.enabled is true.
+	// +optional
+	MTLS *ObserverMTLSSpec `json:"mtls,omitempty"`
+
+	// Resources defines the compute resource requirements for the observer container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
 // PersistenceSpec defines data persistence configuration.
 type PersistenceSpec struct {
 	// Enabled activates persistent storage for Valkey data.
@@ -210,6 +260,10 @@ type ValkeySpec struct {
 	// +optional
 	Persistence *PersistenceSpec `json:"persistence,omitempty"`
 
+	// Observer configures the observer deployment for cluster health monitoring.
+	// +optional
+	Observer *ObserverSpec `json:"observer,omitempty"`
+
 	// PodLabels are additional labels applied to Valkey pods.
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
@@ -243,6 +297,11 @@ type ValkeyStatus struct {
 	// OperatorVersion is the version of the operator that last reconciled this resource.
 	// +optional
 	OperatorVersion string `json:"operatorVersion,omitempty"`
+
+	// ObserverReady indicates whether the observer deployment is ready.
+	// Only set when observer is enabled.
+	// +optional
+	ObserverReady *bool `json:"observerReady,omitempty"`
 
 	// Conditions represent the latest available observations of the Valkey state.
 	// +optional
@@ -281,6 +340,13 @@ type ValkeyList struct {
 // IsSentinelEnabled returns true if Sentinel HA mode is configured and enabled.
 func (v *Valkey) IsSentinelEnabled() bool {
 	return v.Spec.Sentinel != nil && v.Spec.Sentinel.Enabled
+}
+
+// IsMultiReplicaWithoutSentinel returns true when more than one replica is
+// requested but Sentinel is not enabled. In this mode the operator uses a
+// simple ordinal-based init container to assign pod-0 as master.
+func (v *Valkey) IsMultiReplicaWithoutSentinel() bool {
+	return v.Spec.Replicas > 1 && !v.IsSentinelEnabled()
 }
 
 // IsAuthEnabled returns true if authentication is configured.
@@ -329,6 +395,64 @@ func (v *Valkey) IsValkeyUnencryptedAllowed() bool {
 func (v *Valkey) IsSentinelUnencryptedAllowed() bool {
 	return v.IsTLSEnabled() && v.IsSentinelEnabled() &&
 		v.Spec.Sentinel != nil && v.Spec.Sentinel.AllowUnencrypted
+}
+
+// IsSentinelAuthDisabled returns true when auth is configured but Sentinel
+// client connections should not require a password (no requirepass directive).
+// Sentinel still uses sentinel auth-pass to authenticate with Valkey nodes.
+func (v *Valkey) IsSentinelAuthDisabled() bool {
+	return v.IsAuthEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.DisableAuth
+}
+
+// IsObserverEnabled returns true if the observer deployment is configured and enabled.
+func (v *Valkey) IsObserverEnabled() bool {
+	return v.Spec.Observer != nil && v.Spec.Observer.Enabled
+}
+
+// IsObserverValkeyMTLSEnabled returns true when the observer should send client
+// certificates to Valkey pods. Defaults to false when not explicitly configured.
+func (v *Valkey) IsObserverValkeyMTLSEnabled() bool {
+	if v.Spec.Observer == nil || v.Spec.Observer.MTLS == nil || v.Spec.Observer.MTLS.Valkey == nil {
+		return false
+	}
+	return *v.Spec.Observer.MTLS.Valkey
+}
+
+// IsObserverSentinelMTLSEnabled returns true when the observer should send client
+// certificates to Sentinel pods. Defaults to false when not explicitly configured.
+func (v *Valkey) IsObserverSentinelMTLSEnabled() bool {
+	if v.Spec.Observer == nil || v.Spec.Observer.MTLS == nil || v.Spec.Observer.MTLS.Sentinel == nil {
+		return false
+	}
+	return *v.Spec.Observer.MTLS.Sentinel
+}
+
+// IsObserverMTLSActive returns true when at least one of the observer's mTLS
+// targets is enabled, meaning the TLS secret must be mounted.
+func (v *Valkey) IsObserverMTLSActive() bool {
+	return v.IsObserverValkeyMTLSEnabled() || v.IsObserverSentinelMTLSEnabled()
+}
+
+// GetObserverDB returns the Valkey database number for the observer health key.
+func (v *Valkey) GetObserverDB() int {
+	if v.Spec.Observer != nil && v.Spec.Observer.DB != nil {
+		return *v.Spec.Observer.DB
+	}
+	return 15
+}
+
+// GetObserverResources returns the resource requirements for the observer container.
+func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
+	if v.Spec.Observer != nil && v.Spec.Observer.Resources != nil {
+		return *v.Spec.Observer.Resources
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+	}
 }
 
 func init() {

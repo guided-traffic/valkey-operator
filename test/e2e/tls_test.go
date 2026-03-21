@@ -490,13 +490,16 @@ func TestE2E_TLS_Standalone(t *testing.T) {
 }
 
 // TestE2E_TLS_HACluster tests a 3-node Valkey deployment with TLS encryption
-// but WITHOUT Sentinel. All pods run as independent Valkey instances (no replication).
-// This verifies that TLS works correctly in a multi-pod StatefulSet scenario:
+// but WITHOUT Sentinel. Pod-0 is the master and pods 1-2 are replicas configured
+// via the ordinal-based init container (replicaof pod-0).
+// This verifies that TLS works correctly in a multi-pod replication scenario:
 //
 // - cert-manager creates a Certificate covering all 3 pod DNS names
-// - ConfigMap contains TLS directives but no replication config
-// - StatefulSet with 3 replicas, all with TLS volume mounts
-// - Each pod independently serves data over TLS
+// - ConfigMap contains TLS and replication directives
+// - Replica ConfigMap contains replicaof pointing to pod-0
+// - StatefulSet with 3 replicas, init container, and TLS volume mounts
+// - Pod-0 is master, pod-1 and pod-2 are replicas
+// - Data written to master replicates to replicas over TLS
 // - No Sentinel resources are created
 // - Plaintext connections are rejected on all pods
 // - Pod logs are clean of TLS errors
@@ -600,10 +603,10 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 	})
 
 	// =========================================================================
-	// Phase 3: ConfigMap — TLS without replication
+	// Phase 3: ConfigMap — TLS with replication
 	// =========================================================================
 
-	t.Run("ConfigMap has TLS directives but no replication config", func(t *testing.T) {
+	t.Run("ConfigMap has TLS and replication directives", func(t *testing.T) {
 		tc.waitForConfigMap(t, ns, fmt.Sprintf("%s-config", name))
 		cm := tc.getConfigMap(t, ns, fmt.Sprintf("%s-config", name))
 		conf := cm.Data["valkey.conf"]
@@ -616,19 +619,23 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 		assert.Contains(t, conf, "tls-ca-cert-file /tls/ca.crt")
 		assert.Contains(t, conf, "tls-replication yes")
 
-		// No replication config — no sentinel means no replicaof.
+		// Master config must NOT contain replicaof but should have replication settings.
 		assert.NotContains(t, conf, "replicaof",
-			"Config should NOT contain replicaof without sentinel")
-		assert.NotContains(t, conf, "replica-serve-stale-data",
-			"Config should NOT contain replication settings without sentinel")
+			"Master config should NOT contain replicaof")
+		assert.Contains(t, conf, "replica-serve-stale-data",
+			"Config should contain replication settings for multi-replica")
 	})
 
-	t.Run("No replica ConfigMap is created", func(t *testing.T) {
+	t.Run("Replica ConfigMap is created with replicaof", func(t *testing.T) {
 		replicaCmName := fmt.Sprintf("%s-replica-config", name)
-		_, err := tc.kube.CoreV1().ConfigMaps(ns).Get(
-			context.Background(), replicaCmName, metav1.GetOptions{})
-		assert.True(t, apierrors.IsNotFound(err),
-			"Replica ConfigMap should NOT exist without sentinel")
+		tc.waitForConfigMap(t, ns, replicaCmName)
+		cm := tc.getConfigMap(t, ns, replicaCmName)
+		conf := cm.Data["valkey.conf"]
+
+		assert.Contains(t, conf, "replicaof",
+			"Replica ConfigMap should contain replicaof")
+		assert.Contains(t, conf, "tls-replication yes",
+			"Replica ConfigMap should have TLS replication enabled")
 	})
 
 	// =========================================================================
@@ -657,9 +664,10 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 		livenessCmd := strings.Join(valkeyContainer.LivenessProbe.Exec.Command, " ")
 		assert.Contains(t, livenessCmd, "--tls")
 
-		// No init container — without sentinel there is no config selector.
-		assert.Empty(t, sts.Spec.Template.Spec.InitContainers,
-			"StatefulSet should NOT have init containers without sentinel")
+		// Init container selects master vs replica config based on ordinal.
+		require.Len(t, sts.Spec.Template.Spec.InitContainers, 1,
+			"StatefulSet should have init-config-selector for multi-replica replication")
+		assert.Equal(t, "init-config-selector", sts.Spec.Template.Spec.InitContainers[0].Name)
 	})
 
 	// =========================================================================
@@ -688,77 +696,110 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 		}
 	})
 
-	t.Run("Each pod is an independent master (no replication)", func(t *testing.T) {
-		for i := 0; i < 3; i++ {
+	t.Run("Pod-0 is master and pods 1-2 are replicas", func(t *testing.T) {
+		// Pod-0 is the master.
+		masterPod := fmt.Sprintf("%s-0", name)
+		info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
+		assert.Contains(t, info, "role:master",
+			"Pod-0 should be master")
+		assert.Contains(t, info, "connected_slaves:2",
+			"Pod-0 should have 2 connected replicas")
+
+		// Pods 1 and 2 are replicas.
+		for i := 1; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
 			info := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "INFO", "replication")
-			assert.Contains(t, info, "role:master",
-				"Pod %s should be master (no sentinel = no replication)", podName)
-			assert.Contains(t, info, "connected_slaves:0",
-				"Pod %s should have 0 connected slaves (independent)", podName)
+			assert.Contains(t, info, "role:slave",
+				"Pod %s should be a replica", podName)
 		}
 	})
 
 	// =========================================================================
-	// Phase 6: Independent data on each pod over TLS
+	// Phase 6: Replication — data written to master propagates to replicas
 	// =========================================================================
 
-	t.Run("Write unique data to each pod over TLS", func(t *testing.T) {
-		for i := 0; i < 3; i++ {
+	t.Run("Write data to master over TLS", func(t *testing.T) {
+		masterPod := fmt.Sprintf("%s-0", name)
+
+		key := "tls-nosent:master:key"
+		value := "replicated-data-🔒"
+
+		resp := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "SET", key, value)
+		assert.Equal(t, "OK", resp, "SET on master over TLS should succeed")
+
+		// Verify read-back on the master.
+		getResp := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "GET", key)
+		assert.Equal(t, value, getResp, "GET on master should return correct value")
+	})
+
+	t.Run("Replicas are read-only", func(t *testing.T) {
+		for i := 1; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
-
-			// Each pod gets its own key.
-			key := fmt.Sprintf("tls-nosent:pod%d:key", i)
-			value := fmt.Sprintf("data-from-pod-%d-🔒", i)
-
-			resp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "SET", key, value)
-			assert.Equal(t, "OK", resp, "SET on pod %s over TLS should succeed", podName)
-
-			// Verify read-back on the same pod.
-			getResp := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "GET", key)
-			assert.Equal(t, value, getResp, "GET on pod %s should return correct value", podName)
+			resp := tc.valkeyTLSExecAllowError(t, ns, podName,
+				tlsValkeyPort, "SET", "readonly-test", "should-fail")
+			assert.Contains(t, resp, "READONLY",
+				"Replica %s should reject writes with READONLY error", podName)
 		}
 	})
 
-	t.Run("Data is NOT shared between independent pods", func(t *testing.T) {
-		// Pod-0 should NOT have pod-1's key (no replication).
-		resp := tc.valkeyTLSExecAllowError(t, ns, fmt.Sprintf("%s-0", name),
-			tlsValkeyPort, "GET", "tls-nosent:pod1:key")
-		assert.Empty(t, resp, "Pod-0 should not have pod-1's data (independent instances)")
+	t.Run("Data is replicated from master to replicas", func(t *testing.T) {
+		key := "tls-nosent:master:key"
+		expectedValue := "replicated-data-🔒"
 
-		// Pod-1 should NOT have pod-0's key.
-		resp = tc.valkeyTLSExecAllowError(t, ns, fmt.Sprintf("%s-1", name),
-			tlsValkeyPort, "GET", "tls-nosent:pod0:key")
-		assert.Empty(t, resp, "Pod-1 should not have pod-0's data (independent instances)")
-
-		// Pod-2 should NOT have pod-0's key.
-		resp = tc.valkeyTLSExecAllowError(t, ns, fmt.Sprintf("%s-2", name),
-			tlsValkeyPort, "GET", "tls-nosent:pod0:key")
-		assert.Empty(t, resp, "Pod-2 should not have pod-0's data (independent instances)")
+		for i := 1; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			// Wait briefly for replication sync.
+			var resp string
+			err := wait.PollUntilContextTimeout(context.Background(),
+				500*time.Millisecond, 10*time.Second, true,
+				func(ctx context.Context) (bool, error) {
+					resp = tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "GET", key)
+					return resp == expectedValue, nil
+				})
+			require.NoError(t, err, "Replica %s should have replicated data", podName)
+			assert.Equal(t, expectedValue, resp)
+		}
 	})
 
-	t.Run("Multiple data types work on each TLS pod", func(t *testing.T) {
-		for i := 0; i < 3; i++ {
+	t.Run("Multiple data types work on master and replicate over TLS", func(t *testing.T) {
+		masterPod := fmt.Sprintf("%s-0", name)
+		prefix := "tls-nosent:master"
+
+		// List.
+		tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "RPUSH",
+			prefix+":list", "a", "b", "c")
+		assert.Equal(t, "3",
+			tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "LLEN", prefix+":list"))
+
+		// Hash.
+		tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "HSET",
+			prefix+":hash", "field", "value-master")
+		assert.Equal(t, "value-master",
+			tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "HGET", prefix+":hash", "field"))
+
+		// Set.
+		tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "SADD",
+			prefix+":set", "m1", "m2")
+		assert.Equal(t, "2",
+			tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "SCARD", prefix+":set"))
+
+		// Verify replication of all types on replicas.
+		for i := 1; i < 3; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
-			prefix := fmt.Sprintf("tls-nosent:pod%d", i)
+			err := wait.PollUntilContextTimeout(context.Background(),
+				500*time.Millisecond, 10*time.Second, true,
+				func(ctx context.Context) (bool, error) {
+					llen := tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "LLEN", prefix+":list")
+					return llen == "3", nil
+				})
+			require.NoError(t, err, "Replica %s should replicate list", podName)
 
-			// List.
-			tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "RPUSH",
-				prefix+":list", "a", "b", "c")
-			assert.Equal(t, "3",
-				tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "LLEN", prefix+":list"))
-
-			// Hash.
-			tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "HSET",
-				prefix+":hash", "field", fmt.Sprintf("value-%d", i))
-			assert.Equal(t, fmt.Sprintf("value-%d", i),
-				tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "HGET", prefix+":hash", "field"))
-
-			// Set.
-			tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "SADD",
-				prefix+":set", "m1", "m2")
+			assert.Equal(t, "value-master",
+				tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "HGET", prefix+":hash", "field"),
+				"Replica %s should replicate hash", podName)
 			assert.Equal(t, "2",
-				tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "SCARD", prefix+":set"))
+				tc.valkeyTLSExec(t, ns, podName, tlsValkeyPort, "SCARD", prefix+":set"),
+				"Replica %s should replicate set", podName)
 		}
 	})
 
@@ -1874,5 +1915,122 @@ func TestE2E_TLS_AllowUnencrypted_HA(t *testing.T) {
 	t.Run("Cleanup HA dual-port cluster", func(t *testing.T) {
 		tc.deleteValkey(t, ns, name)
 		tc.waitForDeletion(t, ns, name)
+	})
+}
+
+// TestE2E_TLS_HAClusterWithSentinel_ReplicaAnnounceIP verifies that Sentinel knows
+// replica hostnames (not IPs) from the start, thanks to replica-announce-ip.
+// After a SENTINEL FAILOVER, get-master-addr-by-name must return a hostname immediately.
+func TestE2E_TLS_HAClusterWithSentinel_ReplicaAnnounceIP(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+	ns := "e2e-tls-announce"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "announce"
+	valkey := buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    "valkey/valkey:8.0",
+		"tls":      tlsSpec(),
+		"sentinel": map[string]interface{}{
+			"enabled":  true,
+			"replicas": int64(3),
+		},
+	})
+
+	t.Log("Creating TLS HA Valkey with Sentinel for replica-announce-ip test")
+	tc.createValkey(t, ns, valkey)
+	defer tc.deleteValkey(t, ns, name)
+
+	// Wait for all components to be ready.
+	tc.waitForStatefulSetReady(t, ns, name, 3)
+	tc.waitForStatefulSetReady(t, ns, fmt.Sprintf("%s-sentinel", name), 3)
+	for i := 0; i < 3; i++ {
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-%d", name, i))
+		tc.waitForPodReady(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i))
+	}
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	// Wait for Sentinel to discover replicas.
+	masterPod := tc.findMasterPodTLS(t, ns, name, 3)
+	tc.waitForConnectedReplicasTLS(t, ns, masterPod, 2)
+
+	// =========================================================================
+	// Phase 1: Sentinel knows replica hostnames (not IPs)
+	// =========================================================================
+
+	t.Run("Sentinel replicas show hostnames not IPs", func(t *testing.T) {
+		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
+		var resp string
+		require.Eventually(t, func() bool {
+			resp = tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "replicas", name)
+			return resp != "" && !strings.Contains(resp, "ERR")
+		}, 60*time.Second, 2*time.Second, "Sentinel should report replicas")
+
+		t.Logf("SENTINEL replicas output:\n%s", truncateLogs(resp, 1000))
+
+		// The output should contain pod FQDNs, not bare IPs.
+		assert.Contains(t, resp, fmt.Sprintf("%s-headless", name),
+			"Sentinel replicas should use FQDN hostnames (containing headless service name)")
+	})
+
+	// =========================================================================
+	// Phase 2: INFO REPLICATION on master shows replica hostnames
+	// =========================================================================
+
+	t.Run("Master INFO replication shows replica hostnames", func(t *testing.T) {
+		info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
+		t.Logf("Master INFO replication:\n%s", truncateLogs(info, 800))
+
+		// slave0: ip=<hostname>,port=... should contain the headless service name.
+		assert.Contains(t, info, fmt.Sprintf("%s-headless", name),
+			"Master INFO replication should show replica FQDNs (via replica-announce-ip)")
+	})
+
+	// =========================================================================
+	// Phase 3: SENTINEL FAILOVER returns hostname immediately
+	// =========================================================================
+
+	t.Run("Sentinel failover returns hostname immediately", func(t *testing.T) {
+		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
+
+		// Trigger manual failover.
+		resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "failover", name)
+		t.Logf("SENTINEL FAILOVER response: %s", resp)
+		assert.Equal(t, "OK", resp, "SENTINEL FAILOVER should return OK")
+
+		// Wait for failover to complete (new master elected).
+		require.Eventually(t, func() bool {
+			resp := tc.valkeyTLSExecAllowError(t, ns, sentinelPod, 36379, "SENTINEL", "get-master-addr-by-name", name)
+			if resp == "" {
+				return false
+			}
+			t.Logf("get-master-addr-by-name: %s", resp)
+			// Must be a hostname, not an IP. Hostnames contain letters and dots.
+			lines := strings.Split(resp, "\n")
+			if len(lines) < 1 {
+				return false
+			}
+			addr := strings.TrimSpace(lines[0])
+			// A hostname contains the headless service service name; an IP is digits+dots.
+			return strings.Contains(addr, fmt.Sprintf("%s-headless", name))
+		}, 60*time.Second, 2*time.Second,
+			"SENTINEL get-master-addr-by-name should return a hostname (not IP) after failover")
+	})
+
+	// =========================================================================
+	// Phase 4: No TLS errors in logs after failover
+	// =========================================================================
+
+	t.Run("No TLS bad certificate errors in Valkey logs", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			podName := fmt.Sprintf("%s-%d", name, i)
+			logs := tc.getPodLogs(t, ns, podName, "valkey")
+			assert.NotContains(t, logs, "ssl/tls alert bad certificate",
+				"Pod %s should not have TLS bad certificate errors", podName)
+			assert.NotContains(t, logs, "cannot validate certificate",
+				"Pod %s should not have certificate validation errors", podName)
+		}
 	})
 }

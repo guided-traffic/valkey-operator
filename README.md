@@ -15,6 +15,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Authentication** — password from Kubernetes Secret
 - **Observability** — CRD status visible in `kubectl` and Lens, Kubernetes Events
 - **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
+- **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
@@ -254,6 +255,50 @@ spec:
       memory: 2Gi
 ```
 
+### HA — With Cluster Observer
+
+Deploy a diagnostic observer alongside the cluster. The observer continuously runs health checks (PING, write/read tests, replication sync, Sentinel quorum) and exposes results via readiness probe and Prometheus metrics on port `8084`.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: observed-cluster
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  observer:
+    enabled: true
+    db: 15              # Valkey DB for health key (default: 15)
+    # mtls:             # Optional: enable mTLS for observer connections (both default to false)
+    #   valkey: true    # Send client cert to Valkey pods
+    #   sentinel: true  # Send client cert to Sentinel pods
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+```
+
+The observer creates:
+
+| Resource | Name | Description |
+|----------|------|-------------|
+| Deployment | `observed-cluster-observer` | 1 observer pod (same image as operator) |
+| NetworkPolicy | `observed-cluster-observer` | Allows health probe ingress on port 8084 (if `networkPolicy.enabled`) |
+
+Health endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /readyz` | 200 if all checks pass, 503 otherwise (JSON body with per-check details) |
+| `GET /healthz` | Always 200 (liveness) |
+| `GET /metrics` | Prometheus metrics |
+
 ### HA — With Authentication
 
 Protect your cluster with a password stored in a Kubernetes Secret.
@@ -278,6 +323,31 @@ spec:
     secretPasswordKey: password
 ```
 
+### HA — With Authentication (Sentinel Unauthenticated)
+
+Valkey requires a password, but Sentinel accepts client connections without authentication. This is useful when Sentinel discovery clients (e.g., application frameworks) do not support Sentinel AUTH.
+
+Sentinel still uses `auth-pass` internally to connect to password-protected Valkey nodes.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: auth-nosentinel-auth
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+    disableAuth: true     # Sentinel accepts unauthenticated client connections
+  auth:
+    secretName: valkey-auth
+    secretPasswordKey: password
+```
+
+> **Security note:** `disableAuth` only affects Sentinel — Valkey itself always requires the configured password. Consider enabling TLS and/or `networkPolicy` to restrict Sentinel access when using this option.
+
 ---
 
 ## CRD Reference
@@ -294,6 +364,7 @@ spec:
 | `metrics` | `MetricsSpec` | — | Metrics exporter configuration |
 | `networkPolicy` | `NetworkPolicySpec` | — | NetworkPolicy configuration |
 | `persistence` | `PersistenceSpec` | — | Data persistence configuration |
+| `observer` | `ObserverSpec` | — | Cluster observer configuration |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -305,6 +376,7 @@ spec:
 | `enabled` | `bool` | `false` | Enable Sentinel HA mode |
 | `replicas` | `int32` | `3` | Number of Sentinel instances |
 | `allowUnencrypted` | `bool` | `false` | Keep plaintext Sentinel port (`26379`) open alongside TLS port (`36379`). Only effective when `spec.tls.enabled: true`. |
+| `disableAuth` | `bool` | `false` | Disable password authentication for Sentinel client connections. Sentinel still uses `auth-pass` to connect to Valkey nodes. Only effective when `spec.auth` is configured. |
 | `podLabels` | `map[string]string` | — | Additional labels for Sentinel pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Sentinel pods |
 
@@ -325,6 +397,26 @@ spec:
 | `issuer.name` | `string` | Name of the issuer resource |
 | `issuer.group` | `string` | API group (default: `cert-manager.io`) |
 | `extraDnsNames` | `[]string` | Additional DNS names for the certificate |
+
+### `spec.observer`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Deploy a diagnostic observer alongside the cluster |
+| `db` | `int` | `15` | Valkey database index (0–15) used for the health check key |
+| `mtls` | `ObserverMTLSSpec` | — | Controls whether the observer sends a client certificate to Valkey and/or Sentinel. Only effective when `spec.tls.enabled: true`. |
+| `resources` | `ResourceRequirements` | 50m/64Mi request, 128Mi limit | CPU/memory for the observer container |
+
+### `spec.observer.mtls`
+
+When `spec.tls.enabled: true`, the observer always verifies the server's certificate. These flags additionally enable **mutual TLS (mTLS)** by sending a client certificate. When neither flag is set, no certificate secret is mounted into the observer pod.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `valkey` | `bool` | `false` | Send client certificate to Valkey pods (mTLS). When `false`, the observer uses server-only TLS. |
+| `sentinel` | `bool` | `false` | Send client certificate to Sentinel pods (mTLS). When `false`, the observer uses server-only TLS. |
+
+> **Note:** The TLS secret is only mounted into the observer pod when at least one of `mtls.valkey` or `mtls.sentinel` is `true`. If both are `false` (the default), the observer connects using TLS without a client certificate and no volume mount is created.
 
 ### `spec.persistence`
 
@@ -348,6 +440,7 @@ spec:
 |-------|------|-------------|
 | `readyReplicas` | `int32` | Number of ready Valkey instances |
 | `masterPod` | `string` | Name of the current master pod |
+| `observerReady` | `bool` | Whether the observer deployment is ready (only set when `observer.enabled: true`) |
 | `phase` | `string` | Current lifecycle phase |
 | `message` | `string` | Human-readable status description |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions |
@@ -542,6 +635,11 @@ leaderElection:
 │  │  │ Certificate  │  │ Certificate (Sentinel)         │   │   │
 │  │  │ (Valkey TLS) │  │ (if sentinel + TLS enabled)    │   │   │
 │  │  └─────────────┘  └────────────────────────────────┘   │   │
+│  │                                                          │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ Deployment (Observer)                            │    │   │
+│  │  │ (if observer.enabled — health checks + metrics)  │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```

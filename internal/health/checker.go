@@ -196,7 +196,11 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 	}
 
 	// Read auth password for sentinel connections (Sentinel uses the same requirepass).
-	password := h.readAuthPassword(ctx, v)
+	// When sentinel auth is disabled, Sentinel does not have requirepass, so no password.
+	sentinelPassword := ""
+	if !v.IsSentinelAuthDisabled() {
+		sentinelPassword = h.readAuthPassword(ctx, v)
+	}
 
 	// Build TLS config for sentinel connections (uses sentinel TLS secret).
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
@@ -217,7 +221,7 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
 		addr := podAddress(v, podName, port)
 
-		c := h.newValkeyClient(addr, password, tlsConfig)
+		c := h.newValkeyClient(addr, sentinelPassword, tlsConfig)
 		masterInfo, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			logger.V(1).Info("Sentinel not responding", "pod", podName, "error", err)

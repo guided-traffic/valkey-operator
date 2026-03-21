@@ -223,6 +223,44 @@ func TestGenerateValkeyConf_AuthWithHA(t *testing.T) {
 	assert.Contains(t, replicaConf, "replicaof")
 }
 
+func TestGenerateValkeyConf_MultiReplicaWithoutSentinel(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	// Master config (isReplica=false) must NOT contain replicaof.
+	masterConf := GenerateValkeyConf(v, false)
+	assert.Contains(t, masterConf, "# Replication")
+	assert.Contains(t, masterConf, "replica-read-only yes")
+	assert.NotContains(t, masterConf, "replicaof")
+
+	// Replica config (isReplica=true) must contain replicaof pointing to pod-0.
+	replicaConf := GenerateValkeyConf(v, true)
+	assert.Contains(t, replicaConf, "replicaof")
+	assert.Contains(t, replicaConf, "test-0.test-headless.default.svc.cluster.local")
+}
+
+func TestGenerateValkeyConf_MultiReplicaWithoutSentinel_TLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	replicaConf := GenerateValkeyConf(v, true)
+	assert.Contains(t, replicaConf, "replicaof test-0.test-headless.default.svc.cluster.local 16379")
+	assert.Contains(t, replicaConf, "tls-replication yes")
+}
+
+func TestBuildReplicaConfigMap_MultiReplicaWithoutSentinel(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	cm := BuildReplicaConfigMap(v)
+	assert.Equal(t, "test-replica-config", cm.Name)
+	assert.Contains(t, cm.Data[ValkeyConfigKey], "replicaof")
+}
+
 func TestGenerateValkeyConf_AuthWithTLS(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Auth = &vkov1.AuthSpec{
@@ -342,4 +380,26 @@ func TestComputeConfigHash_StableWhenKnownMasterChanges(t *testing.T) {
 	})
 	assert.Equal(t, ComputeConfigHash(vBefore), ComputeConfigHash(vAfter),
 		"hash must remain stable when AnnotationKnownMaster changes (post-failover)")
+}
+
+// TestGenerateValkeyConf_HA_NoStaticReplicaAnnounceIP verifies that GenerateValkeyConf
+// does NOT include replica-announce-ip in the static config. The directive is
+// injected dynamically by the init container since it depends on the pod hostname.
+func TestGenerateValkeyConf_HA_NoStaticReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	masterConf := GenerateValkeyConf(v, false)
+	replicaConf := GenerateValkeyConf(v, true)
+
+	assert.NotContains(t, masterConf, "replica-announce-ip",
+		"static master config must not contain replica-announce-ip")
+	assert.NotContains(t, masterConf, "replica-announce-port",
+		"static master config must not contain replica-announce-port")
+	assert.NotContains(t, replicaConf, "replica-announce-ip",
+		"static replica config must not contain replica-announce-ip")
+	assert.NotContains(t, replicaConf, "replica-announce-port",
+		"static replica config must not contain replica-announce-port")
 }

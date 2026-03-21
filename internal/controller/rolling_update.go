@@ -36,7 +36,16 @@ const (
 	stateFailoverTriggered = "failover-triggered" // Sentinel failover has been triggered.
 	stateFailoverReset     = "failover-reset"     // Sentinel was reset after a timed-out failover; waiting to retrigger.
 	stateReplacingMaster   = "replacing-master"   // Replacing the former master pod.
+
+	// Multi-replica without sentinel rolling update states:
+	stateManualFailover    = "manual-failover"    // A replica was promoted to master, old master being deleted.
+	stateRestoringTopology = "restoring-topology" // Old master is back, syncing and restoring topology.
 )
+
+// annotationPromotedPod records the pod name that was promoted to temporary master
+// during a multi-replica rolling update without sentinel. Used during topology
+// restoration to know which pod to demote back to replica.
+const annotationPromotedPod = "vko.gtrfc.com/promoted-pod"
 
 // annotationReconnectResetCount tracks how many times the sentinel state has been
 // reset while waiting for replicas to connect to the new master. Used to break
@@ -128,6 +137,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
 	desiredConfigHash := builder.ComputeConfigHash(v)
+	desiredPodSpecHash := podSpecHashFromSts(currentSts)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -140,7 +150,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash, currentSts.Spec.Template.Spec.Containers) {
 			needsRollingUpdate = true
 			break
 		}
@@ -166,6 +176,9 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	if v.IsSentinelEnabled() {
 		return r.handleRollingUpdate(ctx, v, currentSts)
 	}
+	if v.IsMultiReplicaWithoutSentinel() {
+		return r.handleMultiReplicaRollingUpdate(ctx, v, currentSts)
+	}
 	return r.handleStandaloneRollingUpdate(ctx, v, currentSts)
 }
 
@@ -178,17 +191,32 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 }
 
 // podNeedsUpdate returns true if the pod needs to be replaced because its
-// valkey or sidecar container image differs from the desired image, or because
-// its config hash annotation (AnnotationConfigHash) differs from the desired hash.
+// valkey or sidecar container image differs from the desired image, because
+// its config hash annotation (AnnotationConfigHash) differs from the desired hash,
+// or because its pod spec hash annotation (AnnotationPodSpecHash) differs from the
+// desired hash (e.g. resource requests/limits changed).
 // Pass empty strings to skip the respective checks.
 //
-// Config hash check: only pods that already carry the annotation are compared —
-// pods created by an older operator version (without the annotation) are left
-// untouched until they restart for another reason and receive the annotation.
-func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash string) bool {
+// desiredContainers provides a fallback: when the pod lacks the
+// AnnotationPodSpecHash annotation (created by an older operator version),
+// the function compares container resources directly so that spec changes
+// (e.g. resources.requests.cpu) are still detected.
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash, desiredPodSpecHash string, desiredContainers []corev1.Container) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
+	if podImageChanged(pod, desiredValkeyImage, desiredSidecarImage) {
+		return true
+	}
+	if podAnnotationHashChanged(pod, desiredConfigHash) {
+		return true
+	}
+	return podSpecHashChanged(pod, desiredPodSpecHash, desiredContainers)
+}
+
+// podImageChanged returns true if any container image on the pod differs from
+// the desired images.
+func podImageChanged(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
 	for _, c := range pod.Spec.Containers {
 		switch c.Name {
 		case builder.ValkeyContainerName:
@@ -201,15 +229,69 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 			}
 		}
 	}
-	// Config hash check: trigger rolling update when the pod carries a hash that
-	// no longer matches the desired config. Pods without the annotation (created
-	// before this feature was introduced) are skipped to avoid spurious restarts.
-	if desiredConfigHash != "" {
-		if podHash := pod.Annotations[builder.AnnotationConfigHash]; podHash != "" && podHash != desiredConfigHash {
+	return false
+}
+
+// podAnnotationHashChanged returns true when the pod carries the config-hash
+// annotation with a value that differs from desiredHash. Returns false when the
+// pod lacks the annotation or desiredHash is empty.
+func podAnnotationHashChanged(pod *corev1.Pod, desiredHash string) bool {
+	if desiredHash == "" {
+		return false
+	}
+	podHash := pod.Annotations[builder.AnnotationConfigHash]
+	return podHash != "" && podHash != desiredHash
+}
+
+// podSpecHashChanged returns true when the pod's spec hash annotation differs from
+// desiredPodSpecHash. When the pod lacks the annotation, it falls back to comparing
+// container resources directly via desiredContainers.
+func podSpecHashChanged(pod *corev1.Pod, desiredPodSpecHash string, desiredContainers []corev1.Container) bool {
+	if desiredPodSpecHash == "" {
+		return false
+	}
+	podHash := pod.Annotations[builder.AnnotationPodSpecHash]
+	if podHash != "" {
+		return podHash != desiredPodSpecHash
+	}
+	return containersResourceChanged(pod.Spec.Containers, desiredContainers)
+}
+
+// containersResourceChanged returns true if the actual containers differ from
+// the desired containers in resource requests or limits.  Only containers
+// present in both slices (matched by name) are compared.
+func containersResourceChanged(actual, desired []corev1.Container) bool {
+	desiredMap := make(map[string]corev1.Container, len(desired))
+	for _, c := range desired {
+		desiredMap[c.Name] = c
+	}
+	for _, ac := range actual {
+		dc, ok := desiredMap[ac.Name]
+		if !ok {
+			continue
+		}
+		if !resourceListEqual(ac.Resources.Requests, dc.Resources.Requests) {
+			return true
+		}
+		if !resourceListEqual(ac.Resources.Limits, dc.Resources.Limits) {
 			return true
 		}
 	}
 	return false
+}
+
+// resourceListEqual returns true if two resource lists contain the same keys with equal quantities.
+func resourceListEqual(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, aVal := range a {
+		bVal, ok := b[key]
+		if !ok || aVal.Cmp(bVal) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // sidecarImageFromSts returns the sidecar container image from a StatefulSet's
@@ -221,6 +303,12 @@ func sidecarImageFromSts(sts *appsv1.StatefulSet) string {
 		}
 	}
 	return ""
+}
+
+// podSpecHashFromSts returns the pod spec hash from a StatefulSet's pod template
+// annotations, or empty string when the annotation is not present.
+func podSpecHashFromSts(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.AnnotationPodSpecHash]
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -274,7 +362,9 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	currentState := r.getRollingUpdateState(v)
 
 	// Detect and clear stale state from a previous rolling update.
-	currentState, err = r.clearStaleRollingUpdateState(ctx, v, currentState, updatedCount)
+	// Use countReplacedPods (ignores readiness) to avoid falsely clearing state
+	// when replaced pods are temporarily not ready (e.g. during failover).
+	currentState, err = r.clearStaleRollingUpdateState(ctx, v, currentState, countReplacedPods(pods))
 	if err != nil {
 		return RollingUpdateResult{Error: err}
 	}
@@ -311,12 +401,16 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 }
 
 // clearStaleRollingUpdateState detects stale state from a previous rolling update.
-// If no pods have the desired image yet (updatedCount == 0) but the state machine
+// If no pods have been replaced yet (replacedCount == 0) but the state machine
 // is past the replica-replacement phase, the state annotations are left over from
 // a prior rolling update. Clear the stale state so the new rolling update starts
 // fresh from replica replacement.
-func (r *ValkeyReconciler) clearStaleRollingUpdateState(ctx context.Context, v *vkov1.Valkey, currentState string, updatedCount int) (string, error) {
-	if updatedCount == 0 && currentState != "" && currentState != stateReplacingReplicas {
+//
+// replacedCount must count pods that do not need an update regardless of readiness.
+// Using the ready-only updatedCount would falsely clear state when replaced pods are
+// temporarily not ready (e.g. during a failover transition).
+func (r *ValkeyReconciler) clearStaleRollingUpdateState(ctx context.Context, v *vkov1.Valkey, currentState string, replacedCount int) (string, error) {
+	if replacedCount == 0 && currentState != "" && currentState != stateReplacingReplicas {
 		logger := log.FromContext(ctx)
 		logger.Info("Clearing stale rolling update state from previous update",
 			"staleState", currentState)
@@ -429,6 +523,17 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 		if !ps.isMaster {
 			continue
 		}
+		// When finalization is stalled, break any cascaded replication chains by
+		// sending SLAVEOF directly to all non-master pods. After a failover, a
+		// replica can end up connected to the old master (now itself a replica)
+		// instead of the new master — a cascaded chain: new-master → old-master-pod
+		// → replica. The cascaded replica does not appear in the new master's INFO
+		// replication, so after SENTINEL REMOVE+MONITOR sentinel cannot discover
+		// or reconfigure it. forceReplicaConnections bypasses sentinel and ensures
+		// every replica connects directly to the current master.
+		if stalled {
+			r.forceReplicaConnections(ctx, v, ps.name, pods)
+		}
 		return r.syncSentinelWithMaster(ctx, v, ps, expectedReplicas, checker, stalled)
 	}
 
@@ -447,7 +552,11 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 		if stalled {
 			logger.Info("Finalization stalled, cannot verify replication, resetting sentinel and proceeding",
 				"master", masterPS.name, "error", err)
-			r.resetSentinelState(ctx, v, "")
+			// Use the identified master's address instead of empty string to avoid
+			// the pod-0 fallback in resetSentinelState when pod-0 is not the master.
+			headlessNameOnErr := common.HeadlessServiceName(v, common.ComponentValkey)
+			masterAddrOnErr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPS.name, headlessNameOnErr, v.Namespace)
+			r.resetSentinelState(ctx, v, masterAddrOnErr)
 			return nil
 		}
 		r.ensureFinalizationTimestamp(ctx, v)
@@ -625,7 +734,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v))
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers)
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -653,6 +762,21 @@ func countUpdatedPods(pods []podState) int {
 	count := 0
 	for _, ps := range pods {
 		if !ps.needsUpdate && ps.ready {
+			count++
+		}
+	}
+	return count
+}
+
+// countReplacedPods returns how many pods have been replaced (do not need an
+// update), regardless of whether they are ready.  This is used by
+// clearStaleRollingUpdateState to distinguish "no pods replaced yet" (stale
+// state from a prior rolling update) from "pods replaced but not yet ready"
+// (current rolling update in progress).
+func countReplacedPods(pods []podState) int {
+	count := 0
+	for _, ps := range pods {
+		if !ps.needsUpdate {
 			count++
 		}
 	}
@@ -1244,7 +1368,8 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasCount := v.Annotations[annotationReconnectResetCount]
 	_, hasFinalization := v.Annotations[annotationFinalizationTimestamp]
 	_, hasSentinelAwareness := v.Annotations[annotationSentinelAwarenessStarted]
-	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness {
+	_, hasPromoted := v.Annotations[annotationPromotedPod]
+	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness && !hasPromoted {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
@@ -1252,6 +1377,7 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	delete(v.Annotations, annotationReconnectResetCount)
 	delete(v.Annotations, annotationFinalizationTimestamp)
 	delete(v.Annotations, annotationSentinelAwarenessStarted)
+	delete(v.Annotations, annotationPromotedPod)
 	return r.Update(ctx, v)
 }
 
@@ -1337,16 +1463,20 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	password := r.sentinelPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
@@ -1406,19 +1536,24 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	sentinelPwd := r.sentinelPassword(ctx, v)
+	valkeyPwd := r.readValkeyPassword(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
 			logger.V(1).Info("Could not build TLS config for sentinel reconfig", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, password, tlsConfig)
+		c := r.newValkeyClient(addr, sentinelPwd, tlsConfig)
 
 		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
 		if err := c.SentinelRemove(monitorName); err != nil {
@@ -1446,8 +1581,8 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		// Restore auth-pass so sentinel can authenticate to the monitored Valkey master.
 		// Without this, sentinel marks the master as s_down/disconnected and cannot
 		// discover replicas, causing NOGOODSLAVE on failover attempts.
-		if password != "" {
-			_ = c.SentinelSet(monitorName, "auth-pass", password)
+		if valkeyPwd != "" {
+			_ = c.SentinelSet(monitorName, "auth-pass", valkeyPwd)
 		}
 
 		logger.Info("Sentinel reconfigured successfully", "sentinel", podName, "masterAddr", masterAddr)
@@ -1464,13 +1599,12 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.readValkeyPassword(ctx, v)
+	password := r.sentinelPassword(ctx, v)
 
 	// Try each sentinel until one successfully triggers failover.
 	var lastErr error
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, builder.SentinelPort)
 
 		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 		if tlsErr != nil {
@@ -1478,6 +1612,11 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 			logger.V(1).Info("Could not build TLS config for sentinel failover", "error", tlsErr)
 			continue
 		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		if err := c.SentinelFailover(monitorName); err != nil {
@@ -1493,20 +1632,25 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	return fmt.Errorf("all sentinel failover attempts failed, last error: %w", lastErr)
 }
 
-// handleStandaloneRollingUpdate handles rolling update for standalone (non-HA) mode.
+// handleStandaloneRollingUpdate handles rolling update for non-HA (no Sentinel) mode.
 //
 // When the valkey image changes, the pod is deleted so the StatefulSet recreates it
-// with the new template. When only the sidecar image changed (operator upgrade),
-// the pod is NOT automatically restarted to avoid disrupting single-instance clusters
-// without redundancy. Instead, a SidecarUpdatePending condition is set and the
-// update is deferred to the next natural pod restart (manual delete, eviction, or
-// valkey image change).
+// with the new template. When only the sidecar image changed (operator upgrade)
+// and the cluster has only a single replica (true standalone), the pod is NOT
+// automatically restarted to avoid disrupting a single-instance cluster without
+// redundancy. Instead, a SidecarUpdatePending condition is set and the update is
+// deferred to the next natural pod restart (manual delete, eviction, or valkey
+// image change).
+//
+// For multi-replica clusters without Sentinel, sidecar-only changes ARE applied
+// via a rolling update because the remaining replicas provide redundancy.
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	desiredImage := v.Spec.Image
 	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	sidecarPending := false
+	isTrueStandalone := v.Spec.Replicas <= 1
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -1521,10 +1665,11 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v)) {
-			// For sidecar-only changes in standalone mode, defer the update to the
-			// next natural pod restart rather than auto-deleting the pod.
-			if isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
+			// For sidecar-only changes in true standalone mode (single replica),
+			// defer the update to the next natural pod restart rather than
+			// auto-deleting the only instance.
+			if isTrueStandalone && isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
 				logger.Info("Standalone pod has outdated sidecar; update deferred to next pod restart",
 					"pod", podName)
 				sidecarPending = true
@@ -1593,15 +1738,402 @@ func isSidecarOnlyChange(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImag
 	return valkeyUpToDate && sidecarFound && sidecarOutdated
 }
 
-// sentinelPodNeedsUpdate returns true when the running pod's container images
+// handleMultiReplicaRollingUpdate orchestrates a rolling update for multi-replica
+// clusters without Sentinel. It uses a state machine to safely replace all pods
+// while preserving data:
+//
+//  1. Replace replica pods one by one (skip the master).
+//  2. After all replicas are updated and synced, perform a manual failover:
+//     promote a replica to temporary master and redirect all other replicas.
+//  3. Delete the old master (pod-0).
+//  4. When pod-0 comes back, sync it from the promoted replica, then restore
+//     the original topology (pod-0 as master).
+func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
+	totalPods := int(*currentSts.Spec.Replicas)
+
+	pods, masterIdx, err := r.collectPodStates(ctx, v, currentSts)
+	if err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	updatedCount := countUpdatedPods(pods)
+	if updatedCount == totalPods {
+		// All pods are updated, but the state machine may still need to complete
+		// (e.g., post-failover handling or topology restoration). Dispatch to the
+		// correct handler before finalizing, otherwise these handlers are never
+		// reached because dispatchMultiReplicaState is only called when
+		// updatedCount != totalPods.
+		currentState := r.getRollingUpdateState(v)
+		switch currentState {
+		case stateManualFailover, stateReplacingMaster:
+			return r.handlePostManualFailover(ctx, v)
+		case stateRestoringTopology:
+			return r.handleTopologyRestoration(ctx, v, currentSts)
+		default:
+			return r.finalizeMultiReplicaRollingUpdate(ctx, v, pods)
+		}
+	}
+
+	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
+	_ = r.updatePhase(ctx, v, ValkeyPhase(phase),
+		fmt.Sprintf("Rolling update in progress: %d/%d pods updated", updatedCount, totalPods))
+
+	currentState := r.getRollingUpdateState(v)
+	currentState, err = r.clearStaleRollingUpdateState(ctx, v, currentState, countReplacedPods(pods))
+	if err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	return r.dispatchMultiReplicaState(ctx, v, currentSts, pods, masterIdx, currentState)
+}
+
+// dispatchMultiReplicaState routes the rolling update to the correct handler
+// based on the current state machine phase.
+func (r *ValkeyReconciler) dispatchMultiReplicaState(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet, pods []podState, masterIdx int, currentState string) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	if currentState == stateManualFailover || currentState == stateReplacingMaster {
+		return r.handlePostManualFailover(ctx, v)
+	}
+	if currentState == stateRestoringTopology {
+		return r.handleTopologyRestoration(ctx, v, currentSts)
+	}
+
+	// Step 1: Replace replica pods first (skip master).
+	if result := r.replaceNextReplica(ctx, v, pods); result != nil {
+		return *result
+	}
+
+	// Step 2: All replicas updated. Trigger manual failover before replacing master.
+	if masterIdx >= 0 && pods[masterIdx].needsUpdate {
+		return r.handleManualFailover(ctx, v, pods, masterIdx)
+	}
+
+	if masterIdx < 0 && hasPendingUpdates(pods) {
+		logger.Info("No master detected during rolling update, waiting for cluster to stabilize")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	return r.deleteNextPendingPod(ctx, pods)
+}
+
+// deleteNextPendingPod finds and deletes the first pod that still needs updating.
+func (r *ValkeyReconciler) deleteNextPendingPod(ctx context.Context, pods []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	for _, ps := range pods {
+		if !ps.needsUpdate || !ps.exists || !ps.ready {
+			continue
+		}
+		logger.Info("Deleting remaining pod for rolling update", "pod", ps.name)
+		if err := r.Delete(ctx, ps.pod); err != nil {
+			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
+		}
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// handleManualFailover promotes an updated replica to temporary master, redirects
+// all other replicas to it, and then deletes the old master pod.
+func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	// Ensure all replicas are ready and synced before failover.
+	if result := r.waitForReplicasReady(ctx, v, pods, masterIdx); result != nil {
+		return *result
+	}
+
+	// Use WAIT to ensure all pending writes are replicated.
+	if result := r.waitForWriteSync(ctx, v, pods, masterIdx); result != nil {
+		return *result
+	}
+
+	// Pick the first ready, updated replica as the promoted pod.
+	promotedIdx := findPromotionCandidate(pods, masterIdx)
+	if promotedIdx < 0 {
+		logger.Info("No ready updated replica available for promotion, waiting")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	promotedPod := pods[promotedIdx]
+	if err := r.promoteAndRedirect(ctx, v, pods, promotedPod, masterIdx, promotedIdx); err != nil {
+		logger.Info("Manual failover promotion failed", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Record the promoted pod and set state.
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	v.Annotations[annotationPromotedPod] = promotedPod.name
+	v.Annotations[annotationRollingUpdateState] = stateManualFailover
+	if err := r.Update(ctx, v); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("setting manual failover state: %w", err)}
+	}
+
+	// Delete the old master pod.
+	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover,
+		fmt.Sprintf("Manual failover: promoted %s, replacing master %s", promotedPod.name, pods[masterIdx].name))
+	logger.Info("Deleting old master pod after manual failover", "pod", pods[masterIdx].name)
+	if err := r.Delete(ctx, pods[masterIdx].pod); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("deleting master pod %s: %w", pods[masterIdx].name, err)}
+	}
+
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// findPromotionCandidate returns the index of the first ready, updated non-master
+// pod suitable for promotion, or -1 if none is available.
+func findPromotionCandidate(pods []podState, masterIdx int) int {
+	for i, ps := range pods {
+		if i == masterIdx || ps.needsUpdate || !ps.ready || !ps.exists {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// promoteAndRedirect promotes the selected replica to master (REPLICAOF NO ONE)
+// and redirects all other non-master replicas to replicate from the promoted pod.
+func (r *ValkeyReconciler) promoteAndRedirect(ctx context.Context, v *vkov1.Valkey, pods []podState, promotedPod podState, masterIdx, promotedIdx int) error {
+	logger := log.FromContext(ctx)
+
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		return fmt.Errorf("building TLS config: %w", err)
+	}
+
+	password := r.readValkeyPassword(ctx, v)
+	port := int(builder.ServicePort(v))
+
+	// Promote the selected replica.
+	promotedAddr := health.PodAddressForComponent(v, promotedPod.name, common.ComponentValkey, port)
+	c := r.newValkeyClient(promotedAddr, password, tlsConfig)
+	if err := c.ReplicaOf("NO", "ONE"); err != nil {
+		return fmt.Errorf("REPLICAOF NO ONE on %s: %w", promotedPod.name, err)
+	}
+	logger.Info("Promoted replica to temporary master", "pod", promotedPod.name)
+
+	// Redirect all other replicas to the promoted pod.
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	promotedHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", promotedPod.name, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", port)
+
+	for i, ps := range pods {
+		if i == masterIdx || i == promotedIdx || !ps.exists || !ps.ready {
+			continue
+		}
+		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, port)
+		rc := r.newValkeyClient(addr, password, tlsConfig)
+		if err := rc.ReplicaOf(promotedHost, portStr); err != nil {
+			logger.Info("REPLICAOF redirect failed (best-effort)", "pod", ps.name, "target", promotedHost, "error", err)
+		}
+	}
+
+	return nil
+}
+
+// handlePostManualFailover waits for the old master pod (pod-0) to come back
+// after deletion, then configures it to sync from the promoted replica.
+func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	promotedPodName := v.Annotations[annotationPromotedPod]
+	if promotedPodName == "" {
+		logger.Info("No promoted pod annotation found, clearing state")
+		if err := r.clearRollingUpdateState(ctx, v); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Check if the master pod (pod-0) is back and ready.
+	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	masterPodName := fmt.Sprintf("%s-0", stsName)
+	masterPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: masterPodName, Namespace: v.Namespace}, masterPod); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Waiting for master pod to be recreated", "pod", masterPodName)
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+		return RollingUpdateResult{Error: fmt.Errorf("getting master pod %s: %w", masterPodName, err)}
+	}
+
+	// Skip pods that are being terminated (old pod not yet removed).
+	if masterPod.DeletionTimestamp != nil {
+		logger.Info("Master pod is being terminated, waiting for recreation", "pod", masterPodName)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Verify this is the NEW pod (recreated by the StatefulSet with the updated
+	// template) and not the old pod that a concurrent reconcile still sees. Without
+	// this check, REPLICAOF is sent to the old pod that is about to be deleted,
+	// and the new pod starts as a standalone master with no data.
+	desiredImage := v.Spec.Image
+	for _, c := range masterPod.Spec.Containers {
+		if c.Name == builder.ValkeyContainerName && c.Image != desiredImage {
+			logger.Info("Master pod still running old image, waiting for replacement",
+				"pod", masterPodName, "currentImage", c.Image, "desiredImage", desiredImage)
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+	}
+
+	if !isPodReady(masterPod) {
+		logger.Info("Master pod not yet ready after recreation", "pod", masterPodName)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Pod-0 is back and ready. Make it sync from the promoted replica.
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for topology restoration", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	password := r.readValkeyPassword(ctx, v)
+	port := int(builder.ServicePort(v))
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	promotedHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", promotedPodName, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", port)
+
+	// Send REPLICAOF <promoted> to pod-0 so it syncs data from the promoted replica.
+	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
+	c := r.newValkeyClient(masterAddr, password, tlsConfig)
+	if err := c.ReplicaOf(promotedHost, portStr); err != nil {
+		logger.Info("REPLICAOF command failed on new pod-0", "pod", masterPodName, "target", promotedHost, "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	logger.Info("Configured pod-0 as replica of promoted pod", "pod", masterPodName, "master", promotedHost)
+
+	// Move to topology restoration state.
+	if err := r.setRollingUpdateState(ctx, v, stateRestoringTopology); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// handleTopologyRestoration waits for pod-0 to finish syncing from the promoted
+// replica, then restores the original topology: pod-0 as master, all others as replicas.
+func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	checker := r.getInstanceChecker()
+
+	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	masterPodName := fmt.Sprintf("%s-0", stsName)
+
+	// Verify pod-0 has finished syncing (no sync in progress).
+	// Check role, master_link_status, and master_sync_in_progress to ensure the full
+	// replication handshake completed. Right after REPLICAOF, the link may still be
+	// in CONNECT/CONNECTING state where master_sync_in_progress is 0 but no data has
+	// been transferred yet. Promoting pod-0 at that point would cause data loss.
+	info, err := checker.GetReplicationInfo(ctx, v, masterPodName)
+	if err != nil {
+		logger.Info("Cannot check replication status of pod-0, waiting", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	// Pod-0 must be a replica with a live link before we promote it back.
+	// - role=master means REPLICAOF hasn't taken effect yet.
+	// - master_link_status != "up" means the connection is still being established.
+	if info.Role == common.RoleMaster || info.MasterLinkStatus != "up" {
+		logger.Info("Pod-0 replication not yet established, waiting",
+			"role", info.Role, "linkStatus", info.MasterLinkStatus)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	if info.MasterSyncInProgress {
+		logger.Info("Pod-0 is still syncing from promoted replica, waiting")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if tlsErr != nil {
+		logger.Info("Could not build TLS config for topology restoration", "error", tlsErr)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	password := r.readValkeyPassword(ctx, v)
+	port := int(builder.ServicePort(v))
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", port)
+
+	// Promote pod-0 back to master.
+	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
+	c := r.newValkeyClient(masterAddr, password, tlsConfig)
+	if err := c.ReplicaOf("NO", "ONE"); err != nil {
+		logger.Info("REPLICAOF NO ONE failed on pod-0", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	logger.Info("Promoted pod-0 back to master", "pod", masterPodName)
+
+	// Redirect all other pods to replicate from pod-0.
+	totalPods := int(*currentSts.Spec.Replicas)
+	for i := 1; i < totalPods; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		addr := health.PodAddressForComponent(v, podName, common.ComponentValkey, port)
+		rc := r.newValkeyClient(addr, password, tlsConfig)
+		if err := rc.ReplicaOf(masterHost, portStr); err != nil {
+			logger.Info("REPLICAOF redirect failed (best-effort)", "pod", podName, "master", masterHost, "error", err)
+		} else {
+			logger.Info("Redirected replica to pod-0", "pod", podName, "master", masterHost)
+		}
+	}
+
+	// Clear rolling update state.
+	if err := r.clearRollingUpdateState(ctx, v); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	logger.Info("Multi-replica rolling update completed, topology restored")
+	return RollingUpdateResult{Completed: true}
+}
+
+// finalizeMultiReplicaRollingUpdate handles the case where all pods are updated
+// but the rolling update state may still be present (e.g., mid topology restoration).
+func (r *ValkeyReconciler) finalizeMultiReplicaRollingUpdate(ctx context.Context, v *vkov1.Valkey, _ []podState) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	currentState := r.getRollingUpdateState(v)
+
+	if currentState != "" {
+		logger.Info("All pods updated, clearing rolling update state", "state", currentState)
+		if err := r.clearRollingUpdateState(ctx, v); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
+	}
+
+	return RollingUpdateResult{Completed: true}
+}
+
 // differ from what the sentinel StatefulSet template specifies.
 func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	// Check container images.
 	desired := make(map[string]string, len(desiredTemplate.Spec.Containers))
 	for _, c := range desiredTemplate.Spec.Containers {
 		desired[c.Name] = c.Image
 	}
 	for _, c := range pod.Spec.Containers {
 		if want, ok := desired[c.Name]; ok && c.Image != want {
+			return true
+		}
+	}
+	// Check pod spec hash annotation: trigger update when the pod carries a hash
+	// that no longer matches the desired template (e.g. resources changed).
+	// Fallback: when the pod lacks the annotation, compare container resources
+	// directly so that genuine spec changes are still detected.
+	if desiredHash, ok := desiredTemplate.Annotations[builder.AnnotationPodSpecHash]; ok && desiredHash != "" {
+		podHash := pod.Annotations[builder.AnnotationPodSpecHash]
+		if podHash != "" {
+			if podHash != desiredHash {
+				return true
+			}
+		} else if containersResourceChanged(pod.Spec.Containers, desiredTemplate.Spec.Containers) {
+			return true
+		}
+	}
+	// Check config hash annotation.
+	if desiredHash, ok := desiredTemplate.Annotations[builder.AnnotationConfigHash]; ok && desiredHash != "" {
+		if podHash := pod.Annotations[builder.AnnotationConfigHash]; podHash != "" && podHash != desiredHash {
 			return true
 		}
 	}

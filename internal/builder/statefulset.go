@@ -1,7 +1,9 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -68,6 +70,7 @@ func BuildStatefulSet(v *vkov1.Valkey, operatorImage string) *appsv1.StatefulSet
 		podAnnotations = make(map[string]string)
 	}
 	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+	podAnnotations[AnnotationPodSpecHash] = ComputePodSpecHash(v, operatorImage)
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -163,7 +166,17 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			cliTLSFlags = fmt.Sprintf("--tls --cacert %s/ca.crt", TLSMountPath)
 		}
 
-		initContainers = append(initContainers, corev1.Container{
+		// When auth is enabled AND sentinel auth is not disabled, Sentinel requires
+		// a password (requirepass). The init container must authenticate before issuing
+		// SENTINEL commands, otherwise Sentinel returns "NOAUTH Authentication required."
+		// which gets mistakenly written as the replicaof hostname, causing Valkey to crash.
+		// When sentinel auth IS disabled, Sentinel does not have requirepass, so no auth flags.
+		cliAuthFlags := ""
+		if v.IsAuthEnabled() && !v.IsSentinelAuthDisabled() {
+			cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
+		}
+
+		initContainer := corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
 			Command: []string{
@@ -179,9 +192,16 @@ MASTER_ADDR=""
 # Try each sentinel pod to get the master address.
 for i in 0 1 2; do
   SHOST="%[5]s-${i}.${SENTINEL_HOST}"
-  RESULT=$(timeout 3 valkey-cli %[12]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
+  RESULT=$(timeout 3 valkey-cli %[12]s %[13]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
   if [ -n "$RESULT" ]; then
-    MASTER_ADDR=$(echo "$RESULT" | head -1)
+    CANDIDATE=$(echo "$RESULT" | head -1)
+    # Guard against Sentinel returning an error string (e.g. NOAUTH, ERR, WRONGPASS)
+    # instead of a hostname — those must never end up in a replicaof directive.
+    if echo "$CANDIDATE" | grep -qE "^(NOAUTH|ERR |WRONGPASS|-)"; then
+      echo "Sentinel $SHOST returned error: $CANDIDATE — skipping"
+      continue
+    fi
+    MASTER_ADDR="$CANDIDATE"
     echo "Sentinel returned master: $MASTER_ADDR"
     break
   fi
@@ -208,7 +228,13 @@ else
   else
     cp %[11]s/%[8]s %[9]s/%[8]s
   fi
-fi`,
+fi
+
+# Announce this pod's FQDN to Sentinel so it uses hostnames instead of IPs.
+echo "" >> %[9]s/%[8]s
+echo "# Announce hostname for Sentinel discovery (injected by init container)" >> %[9]s/%[8]s
+echo "replica-announce-ip $MY_HOST" >> %[9]s/%[8]s
+echo "replica-announce-port %[10]d" >> %[9]s/%[8]s`,
 					sentinelHeadless, // 1: sentinel headless service
 					v.Namespace,      // 2: namespace
 					monitorName,      // 3: sentinel monitor name
@@ -221,10 +247,92 @@ fi`,
 					replicationPort,         // 10: replication port
 					ReplicaConfigMountPath,  // 11: replica config mount
 					cliTLSFlags,             // 12: optional TLS flags for valkey-cli
+					cliAuthFlags,            // 13: optional auth flags for valkey-cli
 				),
 			},
 			VolumeMounts: buildInitContainerVolumeMounts(v),
-		})
+		}
+
+		// Inject the password env var so the shell script can use $VALKEY_PASSWORD.
+		if v.IsAuthEnabled() {
+			initContainer.Env = append(initContainer.Env, corev1.EnvVar{
+				Name: AuthSecretEnvName,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: v.Spec.Auth.SecretName,
+						},
+						Key: v.Spec.Auth.SecretPasswordKey,
+					},
+				},
+			})
+		}
+
+		initContainers = append(initContainers, initContainer)
+	}
+
+	// In multi-replica mode without Sentinel, use a simple ordinal-based init
+	// container to select master or replica config. Pod-0 gets the master config,
+	// all other pods get the replica config (which contains `replicaof`).
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: ReplicaConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: ReplicaConfigMapName(v),
+						},
+					},
+				},
+			},
+			corev1.Volume{
+				Name: WritableConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
+
+		replicationPort := ValkeyPort
+		if v.IsTLSEnabled() {
+			replicationPort = TLSPort
+		}
+
+		initContainer := corev1.Container{
+			Name:  "init-config-selector",
+			Image: v.Spec.Image,
+			Command: []string{
+				"sh", "-c",
+				fmt.Sprintf(
+					`# Ordinal-based config selection for non-Sentinel replication.
+MY_HOST="$HOSTNAME.%[5]s.%[6]s.svc.cluster.local"
+ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
+if [ "$ORDINAL" = "0" ]; then
+  echo "Pod ordinal 0 — using master config"
+  cp %[1]s/%[3]s %[2]s/%[3]s
+else
+  echo "Pod ordinal $ORDINAL — using replica config"
+  cp %[4]s/%[3]s %[2]s/%[3]s
+fi
+
+# Announce this pod's FQDN so replication info shows hostnames instead of IPs.
+echo "" >> %[2]s/%[3]s
+echo "# Announce hostname for replication discovery (injected by init container)" >> %[2]s/%[3]s
+echo "replica-announce-ip $MY_HOST" >> %[2]s/%[3]s
+echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
+					ConfigMountPath,         // 1: master config mount (readonly)
+					WritableConfigMountPath, // 2: writable config mount
+					ValkeyConfigKey,         // 3: config file name
+					ReplicaConfigMountPath,  // 4: replica config mount (readonly)
+					common.HeadlessServiceName(v, common.ComponentValkey), // 5: valkey headless service
+					v.Namespace,     // 6: namespace
+					replicationPort, // 7: replication port
+				),
+			},
+			VolumeMounts: buildInitContainerVolumeMounts(v),
+		}
+		initContainers = append(initContainers, initContainer)
 	}
 
 	// If persistence is NOT enabled, use an emptyDir for data.
@@ -270,11 +378,17 @@ fi`,
 	return spec
 }
 
+// needsInitContainer returns true when the pod spec requires an init container
+// to select the correct configuration (master vs replica).
+func needsInitContainer(v *vkov1.Valkey) bool {
+	return v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel()
+}
+
 // configMountForContainer returns the config mount path used by the valkey container.
-// In HA mode, this is the writable config directory (populated by init container).
+// In multi-replica mode, this is the writable config directory (populated by init container).
 // In standalone mode, this is the readonly ConfigMap mount.
 func configMountForContainer(v *vkov1.Valkey) string {
-	if v.IsSentinelEnabled() {
+	if needsInitContainer(v) {
 		return WritableConfigMountPath
 	}
 	return ConfigMountPath
@@ -282,7 +396,7 @@ func configMountForContainer(v *vkov1.Valkey) string {
 
 // configVolumeNameForContainer returns the volume name to mount for the valkey config.
 func configVolumeNameForContainer(v *vkov1.Valkey) string {
-	if v.IsSentinelEnabled() {
+	if needsInitContainer(v) {
 		return WritableConfigVolumeName
 	}
 	return ConfigVolumeName
@@ -297,7 +411,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		{
 			Name:      cfgVolume,
 			MountPath: cfgMount,
-			ReadOnly:  !v.IsSentinelEnabled(), // Writable in HA mode (init container writes here).
+			ReadOnly:  !needsInitContainer(v), // Writable when init container populates config.
 		},
 		{
 			Name:      DataVolumeName,
@@ -445,6 +559,9 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 		args = append(args, "--sentinel-enabled=true")
 		args = append(args, fmt.Sprintf("--sentinel-monitor=%s", SentinelMonitorName(v)))
 		args = append(args, fmt.Sprintf("--sentinel-addrs=%s", buildSentinelAddrList(v)))
+		if v.IsSentinelAuthDisabled() {
+			args = append(args, "--sentinel-disable-auth=true")
+		}
 	}
 
 	// Headless service and replica count for drain handler replica discovery.
@@ -616,6 +733,19 @@ func buildVolumeClaimTemplates(v *vkov1.Valkey) []corev1.PersistentVolumeClaim {
 	}
 
 	return []corev1.PersistentVolumeClaim{pvc}
+}
+
+// ComputePodSpecHash returns a short hex digest of the pod spec built for
+// this Valkey CR. It is embedded in the StatefulSet pod template annotations so
+// that any change to the pod specification (resources, probes, volumes, env
+// vars, etc.) is detected by the rolling update logic — even though the
+// StatefulSet uses the OnDelete update strategy.
+func ComputePodSpecHash(v *vkov1.Valkey, operatorImage string) string {
+	spec := buildPodSpec(v, operatorImage)
+	data, _ := json.Marshal(spec)
+	h := fnv.New32a()
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%08x", h.Sum32())
 }
 
 // StatefulSetHasChanged returns true if the live StatefulSet differs from the desired spec

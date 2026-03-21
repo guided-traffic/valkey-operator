@@ -14,6 +14,7 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/cmd/migrate"
+	observercmd "github.com/guided-traffic/valkey-operator/cmd/observer"
 	"github.com/guided-traffic/valkey-operator/cmd/sidecar"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
@@ -46,6 +47,13 @@ func main() {
 	// Used by the Helm pre-upgrade hook Job to apply field defaults to existing Valkey CRs.
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		migrate.Run()
+		return
+	}
+
+	// Dispatch to observer mode if first argument is "observer".
+	if len(os.Args) > 1 && os.Args[1] == "observer" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		observercmd.Run()
 		return
 	}
 

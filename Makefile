@@ -44,12 +44,11 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: lint
-lint: ## Run linting.
+lint: golangci-lint ## Run linting.
 	@echo "Running static analysis..."
 	go vet ./...
 	$(GOFMT) -l .
-	@which golangci-lint > /dev/null || (echo "Installing golangci-lint..." && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION))
-	golangci-lint run --timeout=5m
+	$(GOLANGCI_LINT) run --timeout=5m
 
 .PHONY: cyclo
 cyclo: ## Run cyclomatic complexity analysis.
@@ -205,7 +204,7 @@ coverage-json: ## Generate coverage badge JSON for shields.io.
 .PHONY: gosec
 gosec: ## Run gosec security scan.
 	@echo "Running gosec security scan..."
-	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@v2.22.0)
+	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION))
 	GOFLAGS="-buildvcs=false" gosec ./...
 
 .PHONY: vuln
@@ -296,11 +295,18 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
+# renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
 KUSTOMIZE_VERSION ?= v5.3.0
-CONTROLLER_GEN_VERSION ?= v0.17.3
+# renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
+CONTROLLER_GEN_VERSION ?= v0.20.1
+# renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.19
-GOLANGCI_LINT_VERSION ?= v2.1.6
+# renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+GOLANGCI_LINT_VERSION ?= v2.11.3
+# renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
+# renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
+GOSEC_VERSION ?= v2.25.0
 
 # Cyclomatic complexity threshold (recommended: 10-15)
 CYCLO_THRESHOLD ?= 15

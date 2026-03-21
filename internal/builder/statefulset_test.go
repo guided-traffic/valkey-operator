@@ -172,6 +172,41 @@ func TestBuildStatefulSet_MultipleReplicas(t *testing.T) {
 	sts := BuildStatefulSet(v, testOperatorImage)
 
 	assert.Equal(t, int32(3), *sts.Spec.Replicas)
+
+	// Multi-replica without Sentinel must have an init container.
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	initC := sts.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "init-config-selector", initC.Name)
+
+	// Must have replica-config and writable-config volumes.
+	volNames := make([]string, 0, len(sts.Spec.Template.Spec.Volumes))
+	for _, vol := range sts.Spec.Template.Spec.Volumes {
+		volNames = append(volNames, vol.Name)
+	}
+	assert.Contains(t, volNames, ReplicaConfigVolumeName)
+	assert.Contains(t, volNames, WritableConfigVolumeName)
+
+	// Valkey container must use the writable config mount.
+	valkeyContainer := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, ValkeyContainerName, valkeyContainer.Name)
+	foundWritableMount := false
+	for _, vm := range valkeyContainer.VolumeMounts {
+		if vm.Name == WritableConfigVolumeName {
+			assert.Equal(t, WritableConfigMountPath, vm.MountPath)
+			assert.False(t, vm.ReadOnly)
+			foundWritableMount = true
+		}
+	}
+	assert.True(t, foundWritableMount, "valkey container must mount writable config volume")
+}
+
+func TestBuildStatefulSet_SingleReplica_NoInitContainer(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	// Single replica (standalone) must NOT have an init container.
+	assert.Empty(t, sts.Spec.Template.Spec.InitContainers)
 }
 
 func TestBuildStatefulSet_ConfigMapReference(t *testing.T) {
@@ -1083,6 +1118,54 @@ func TestBuildStatefulSet_PreservesUserAnnotationsAlongsideConfigHash(t *testing
 	assert.NotEmpty(t, sts.Spec.Template.Annotations[AnnotationConfigHash])
 }
 
+// --- BuildStatefulSet: pod spec hash annotation ---
+
+func TestBuildStatefulSet_InjectsPodSpecHashAnnotation(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	hash, ok := sts.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.True(t, ok, "pod template must carry the pod spec hash annotation")
+	assert.NotEmpty(t, hash, "pod spec hash must not be empty")
+}
+
+func TestBuildStatefulSet_PodSpecHashChangesWithResources(t *testing.T) {
+	v1 := newTestValkey("test")
+	sts1 := BuildStatefulSet(v1, testOperatorImage)
+
+	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Resources = corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("512Mi"),
+			},
+		}
+	})
+	sts2 := BuildStatefulSet(v2, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationPodSpecHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.NotEqual(t, hash1, hash2, "pod spec hash must differ when resources change")
+}
+
+func TestBuildStatefulSet_PodSpecHashStableForSameSpec(t *testing.T) {
+	v := newTestValkey("test")
+	sts1 := BuildStatefulSet(v, testOperatorImage)
+	sts2 := BuildStatefulSet(v, testOperatorImage)
+
+	hash1 := sts1.Spec.Template.Annotations[AnnotationPodSpecHash]
+	hash2 := sts2.Spec.Template.Annotations[AnnotationPodSpecHash]
+	assert.Equal(t, hash1, hash2, "pod spec hash must be stable for the same spec")
+}
+
+func TestComputePodSpecHash_ChangesWithOperatorImage(t *testing.T) {
+	v := newTestValkey("test")
+	hash1 := ComputePodSpecHash(v, "operator:v1.0")
+	hash2 := ComputePodSpecHash(v, "operator:v2.0")
+	assert.NotEqual(t, hash1, hash2, "pod spec hash must change when operator image changes")
+}
+
 // --- Valkey container ports ---
 
 // TestBuildStatefulSet_TLSOnly_SinglePort16379 verifies that when TLS is enabled
@@ -1193,6 +1276,159 @@ func TestBuildStatefulSet_HA_InitContainer_NoTLS_UsesPlainPort26379(t *testing.T
 		"Init container script must NOT use --tls flag when TLS is disabled")
 }
 
+// TestBuildStatefulSet_HA_InitContainer_Auth_PassesCredentials verifies that when
+// auth is enabled the init container script passes -a "$VALKEY_PASSWORD" to
+// valkey-cli so Sentinel does not return "NOAUTH Authentication required."
+// and the VALKEY_PASSWORD env var is injected into the init container.
+func TestBuildStatefulSet_HA_InitContainer_Auth_PassesCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.Contains(t, script, "-a \"$VALKEY_PASSWORD\"",
+		"Init container script must pass -a flag with password when auth is enabled")
+	assert.Contains(t, script, "--no-auth-warning",
+		"Init container script must suppress auth warning")
+	assert.Contains(t, script, "NOAUTH",
+		"Init container script must guard against NOAUTH error responses from Sentinel")
+
+	// The VALKEY_PASSWORD env var must be injected so the shell can expand it.
+	require.Len(t, init.Env, 1, "Init container must have VALKEY_PASSWORD env var")
+	assert.Equal(t, AuthSecretEnvName, init.Env[0].Name)
+	assert.Equal(t, "my-secret", init.Env[0].ValueFrom.SecretKeyRef.Name)
+	assert.Equal(t, "password", init.Env[0].ValueFrom.SecretKeyRef.Key)
+}
+
+// TestBuildStatefulSet_HA_InitContainer_NoAuth_NoCredentials verifies that when
+// auth is disabled the init container script does not include auth flags.
+func TestBuildStatefulSet_HA_InitContainer_NoAuth_NoCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1, "HA should have init container")
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.NotContains(t, script, "-a ",
+		"Init container script must NOT include -a flag when auth is disabled")
+	assert.Empty(t, init.Env,
+		"Init container must have no env vars when auth is disabled")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_AuthDisabled_NoCredentials verifies that when
+// auth is enabled but sentinel disableAuth is true, the init container script does NOT
+// include auth flags for Sentinel queries (since Sentinel has no requirepass).
+func TestBuildStatefulSet_HA_InitContainer_AuthDisabled_NoCredentials(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	init := sts.Spec.Template.Spec.InitContainers[0]
+	script := init.Command[2]
+
+	assert.NotContains(t, script, "-a ",
+		"Init container script must NOT include -a flag when sentinel auth is disabled")
+
+	// The VALKEY_PASSWORD env var must still be injected because the main Valkey
+	// container still needs it for --requirepass/--masterauth.
+}
+
+// TestBuildStatefulSet_Sidecar_SentinelDisableAuth verifies that the sidecar container
+// receives --sentinel-disable-auth=true when sentinel disableAuth is enabled.
+func TestBuildStatefulSet_Sidecar_SentinelDisableAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:     true,
+			Replicas:    3,
+			DisableAuth: true,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	var sidecar *corev1.Container
+	for i := range sts.Spec.Template.Spec.Containers {
+		if sts.Spec.Template.Spec.Containers[i].Name == SidecarContainerName {
+			sidecar = &sts.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	require.NotNil(t, sidecar, "sidecar container must exist")
+
+	hasDisableAuth := false
+	for _, arg := range sidecar.Args {
+		if arg == "--sentinel-disable-auth=true" {
+			hasDisableAuth = true
+			break
+		}
+	}
+	assert.True(t, hasDisableAuth, "sidecar must have --sentinel-disable-auth=true arg")
+}
+
+// TestBuildStatefulSet_Sidecar_NoSentinelDisableAuth verifies that --sentinel-disable-auth
+// is NOT present when sentinel disableAuth is false (default).
+func TestBuildStatefulSet_Sidecar_NoSentinelDisableAuth(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	var sidecar *corev1.Container
+	for i := range sts.Spec.Template.Spec.Containers {
+		if sts.Spec.Template.Spec.Containers[i].Name == SidecarContainerName {
+			sidecar = &sts.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	require.NotNil(t, sidecar, "sidecar container must exist")
+
+	for _, arg := range sidecar.Args {
+		assert.NotContains(t, arg, "sentinel-disable-auth",
+			"sidecar must NOT have --sentinel-disable-auth when not set")
+	}
+}
+
 // TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume verifies that the init
 // container mounts the TLS secret volume when TLS is enabled.
 func TestBuildInitContainerVolumeMounts_TLS_MountsTLSVolume(t *testing.T) {
@@ -1221,4 +1457,104 @@ func TestBuildInitContainerVolumeMounts_NoTLS_NoTLSMount(t *testing.T) {
 		assert.NotEqual(t, TLSVolumeName, m.Name,
 			"Init container must not mount TLS volume when TLS is disabled")
 	}
+}
+
+// --- replica-announce-ip / replica-announce-port ---
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, `replica-announce-ip $MY_HOST`,
+		"Sentinel init container must inject replica-announce-ip")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnouncePort_TLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 16379",
+		"Sentinel init container must announce TLS port when TLS is enabled")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_InjectsReplicaAnnouncePort_Plain(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 6379",
+		"Sentinel init container must announce plain port when TLS is disabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnounceIP(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, `replica-announce-ip $MY_HOST`,
+		"Non-Sentinel init container must inject replica-announce-ip")
+	assert.Contains(t, script, "replica-announce-port 6379",
+		"Non-Sentinel init container must announce plain port")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnouncePort_TLS(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	assert.Contains(t, script, "replica-announce-port 16379",
+		"Non-Sentinel init container must announce TLS port when TLS is enabled")
+}
+
+func TestBuildStatefulSet_Standalone_NoReplicaAnnounce(t *testing.T) {
+	v := newTestValkey("test")
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	// Standalone has no init container — no replica-announce-ip injection.
+	assert.Empty(t, sts.Spec.Template.Spec.InitContainers,
+		"Standalone must not have init containers")
+}
+
+func TestBuildStatefulSet_HA_InitContainer_ReplicaAnnounceUsesCorrectFQDN(t *testing.T) {
+	v := newTestValkey("myapp", func(v *vkov1.Valkey) {
+		v.Namespace = "production"
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+	// MY_HOST must use the correct headless service and namespace.
+	assert.Contains(t, script, `MY_HOST="$HOSTNAME.myapp-headless.production.svc.cluster.local"`,
+		"MY_HOST must use correct headless service name and namespace")
 }

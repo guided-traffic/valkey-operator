@@ -61,6 +61,50 @@ func TestIsSentinelEnabled(t *testing.T) {
 	}
 }
 
+func TestIsMultiReplicaWithoutSentinel(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int32
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{
+			name:     "single replica, no sentinel",
+			replicas: 1,
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "multi replica, no sentinel",
+			replicas: 3,
+			sentinel: nil,
+			expected: true,
+		},
+		{
+			name:     "multi replica, sentinel enabled",
+			replicas: 3,
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3},
+			expected: false,
+		},
+		{
+			name:     "multi replica, sentinel disabled",
+			replicas: 3,
+			sentinel: &SentinelSpec{Enabled: false},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expected, v.IsMultiReplicaWithoutSentinel())
+		})
+	}
+}
+
 func TestIsAuthEnabled(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -423,6 +467,62 @@ func TestIsSentinelUnencryptedAllowed(t *testing.T) {
 
 // --- Full CRD Struct Construction ---
 
+func TestIsSentinelAuthDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		auth     *AuthSpec
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{
+			name:     "no auth, no sentinel",
+			auth:     nil,
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "auth enabled, no sentinel",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: nil,
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel enabled, disableAuth false",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: false},
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel enabled, disableAuth true",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: true},
+			expected: true,
+		},
+		{
+			name:     "no auth, sentinel disableAuth true",
+			auth:     nil,
+			sentinel: &SentinelSpec{Enabled: true, Replicas: 3, DisableAuth: true},
+			expected: false,
+		},
+		{
+			name:     "auth enabled, sentinel disabled, disableAuth true",
+			auth:     &AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"},
+			sentinel: &SentinelSpec{Enabled: false, DisableAuth: true},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Auth = tt.auth
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expected, v.IsSentinelAuthDisabled())
+		})
+	}
+}
+
 func TestValkeySpec_FullConfiguration(t *testing.T) {
 	v := newValkey("full-test", func(v *Valkey) {
 		v.Spec = ValkeySpec{
@@ -547,10 +647,221 @@ func TestValkeyStatus_ConditionsSlice(t *testing.T) {
 	assert.Equal(t, "Ready", v.Status.Conditions[0].Type)
 }
 
+// --- Observer Helper Tests ---
+
+func TestIsObserverEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		observer *ObserverSpec
+		expected bool
+	}{
+		{
+			name:     "nil observer spec",
+			observer: nil,
+			expected: false,
+		},
+		{
+			name:     "observer disabled",
+			observer: &ObserverSpec{Enabled: false},
+			expected: false,
+		},
+		{
+			name:     "observer enabled",
+			observer: &ObserverSpec{Enabled: true},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Observer = tt.observer
+			})
+			assert.Equal(t, tt.expected, v.IsObserverEnabled())
+		})
+	}
+}
+
+func TestGetObserverDB(t *testing.T) {
+	tests := []struct {
+		name     string
+		observer *ObserverSpec
+		expected int
+	}{
+		{
+			name:     "nil observer spec returns default 15",
+			observer: nil,
+			expected: 15,
+		},
+		{
+			name:     "observer spec with nil DB returns default 15",
+			observer: &ObserverSpec{Enabled: true},
+			expected: 15,
+		},
+		{
+			name:     "observer spec with explicit DB",
+			observer: &ObserverSpec{Enabled: true, DB: intPtr(3)},
+			expected: 3,
+		},
+		{
+			name:     "observer spec with DB 0",
+			observer: &ObserverSpec{Enabled: true, DB: intPtr(0)},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Observer = tt.observer
+			})
+			assert.Equal(t, tt.expected, v.GetObserverDB())
+		})
+	}
+}
+
+func TestGetObserverResources(t *testing.T) {
+	t.Run("nil observer spec returns defaults", func(t *testing.T) {
+		v := newValkey("test")
+		res := v.GetObserverResources()
+		assert.Equal(t, resource.MustParse("50m"), res.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("64Mi"), res.Requests[corev1.ResourceMemory])
+		assert.Empty(t, res.Limits)
+	})
+
+	t.Run("custom resources", func(t *testing.T) {
+		customRes := &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true, Resources: customRes}
+		})
+		res := v.GetObserverResources()
+		assert.Equal(t, resource.MustParse("100m"), res.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("128Mi"), res.Requests[corev1.ResourceMemory])
+		assert.Equal(t, resource.MustParse("256Mi"), res.Limits[corev1.ResourceMemory])
+	})
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
 // --- PersistenceMode ---
 
 func TestPersistenceMode_Values(t *testing.T) {
 	assert.Equal(t, PersistenceMode("rdb"), PersistenceModeRDB)
 	assert.Equal(t, PersistenceMode("aof"), PersistenceModeAOF)
 	assert.Equal(t, PersistenceMode("both"), PersistenceModeBoth)
+}
+
+func TestIsObserverValkeyMTLSEnabled(t *testing.T) {
+	t.Run("nil Observer defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("Observer set MTLS nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("MTLS set Valkey nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{}}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("explicitly false", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &f}}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("explicitly true", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &tr}}
+		})
+		assert.True(t, v.IsObserverValkeyMTLSEnabled())
+	})
+}
+
+func TestIsObserverMTLSActive(t *testing.T) {
+	t.Run("both nil defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("valkey true activates", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &tr}}
+		})
+		assert.True(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("sentinel true activates", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &tr}}
+		})
+		assert.True(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("both false not active", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &f, Sentinel: &f}}
+		})
+		assert.False(t, v.IsObserverMTLSActive())
+	})
+}
+
+func TestIsObserverSentinelMTLSEnabled(t *testing.T) {
+	t.Run("nil Observer defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("Observer set MTLS nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("MTLS set Sentinel nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{}}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("explicitly true", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &tr}}
+		})
+		assert.True(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("explicitly false", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &f}}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
 }

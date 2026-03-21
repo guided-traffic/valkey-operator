@@ -29,12 +29,13 @@ type Config struct {
 	TLSKey     string
 
 	// Drain/failover settings.
-	SentinelEnabled bool
-	SentinelMonitor string
-	SentinelAddrs   string // comma-separated sentinel addresses
-	HeadlessSvc     string // headless service FQDN for replica discovery
-	Replicas        int    // number of Valkey replicas in the StatefulSet
-	FailoverTimeout time.Duration
+	SentinelEnabled     bool
+	SentinelMonitor     string
+	SentinelAddrs       string // comma-separated sentinel addresses
+	SentinelDisableAuth bool   // sentinel does not require password from clients
+	HeadlessSvc         string // headless service FQDN for replica discovery
+	Replicas            int    // number of Valkey replicas in the StatefulSet
+	FailoverTimeout     time.Duration
 }
 
 // Run starts the sidecar polling loop and health server. It blocks until

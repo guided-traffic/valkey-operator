@@ -1,7 +1,9 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -158,13 +160,24 @@ func generateSentinelConf(v *vkov1.Valkey, useKnownMaster bool) string {
 	// AUTH command with "ERR AUTH called without any password configured for the default user",
 	// which causes the operator health checker to permanently fail Sentinel connectivity checks.
 	// sentinel auth-pass is the separate credential Sentinel uses to connect to Valkey nodes.
+	// When DisableAuth is set on the Sentinel spec, requirepass is omitted so that clients
+	// can connect to Sentinel without authentication — but auth-pass is still emitted so
+	// that Sentinel can authenticate with password-protected Valkey nodes.
 	if v.IsAuthEnabled() {
-		lines = append(lines,
-			"# Auth",
-			"requirepass %VALKEY_PASSWORD%",
-			fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
-			"",
-		)
+		if v.IsSentinelAuthDisabled() {
+			lines = append(lines,
+				"# Auth (sentinel client auth disabled, auth-pass only)",
+				fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
+				"",
+			)
+		} else {
+			lines = append(lines,
+				"# Auth",
+				"requirepass %VALKEY_PASSWORD%",
+				fmt.Sprintf("sentinel auth-pass %s %%VALKEY_PASSWORD%%", monitorName),
+				"",
+			)
+		}
 	}
 
 	return strings.Join(lines, "\n")
@@ -209,6 +222,7 @@ func BuildSentinelStatefulSet(v *vkov1.Valkey) *appsv1.StatefulSet {
 		podAnnotations = make(map[string]string)
 	}
 	podAnnotations[AnnotationConfigHash] = ComputeConfigHash(v)
+	podAnnotations[AnnotationPodSpecHash] = ComputeSentinelPodSpecHash(v)
 
 	replicas := int32(3)
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
@@ -285,15 +299,33 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		})
 	}
 
-	// Build the init container command. If auth is enabled, replace the password placeholder.
-	initCommand := fmt.Sprintf("cp /etc/sentinel-readonly/%s %s/%s", SentinelConfigKey, SentinelConfigMountPath, SentinelConfigKey)
-	if v.IsAuthEnabled() {
-		// After copying, replace the placeholder with the actual password from the env var.
-		initCommand = fmt.Sprintf(
-			"cp /etc/sentinel-readonly/%s %s/%s && sed -i \"s|%%VALKEY_PASSWORD%%|$%s|g\" %s/%s",
-			SentinelConfigKey, SentinelConfigMountPath, SentinelConfigKey,
-			AuthSecretEnvName, SentinelConfigMountPath, SentinelConfigKey,
-		)
+	// Build the init container command.
+	// 1. Copy the read-only ConfigMap config to the writable volume.
+	// 2. If auth is enabled, replace the password placeholder with the actual password.
+	// 3. Validate the configured master by probing Valkey pods with the ROLE command.
+	//    If the configured master is not reachable or is not actually a master,
+	//    scan all known Valkey pods to find the real master and rewrite sentinel.conf.
+	//    This prevents a stale master entry after a simultaneous restart of all pods.
+	initCommand := buildSentinelInitCommand(v)
+
+	initVolumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "sentinel-config-readonly",
+			MountPath: "/etc/sentinel-readonly",
+			ReadOnly:  true,
+		},
+		{
+			Name:      SentinelConfigVolumeName,
+			MountPath: SentinelConfigMountPath,
+		},
+	}
+	// The init container needs TLS certs to probe Valkey nodes when TLS is enabled.
+	if v.IsTLSEnabled() {
+		initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
 	}
 
 	initContainer := corev1.Container{
@@ -303,17 +335,7 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 			"sh", "-c",
 			initCommand,
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "sentinel-config-readonly",
-				MountPath: "/etc/sentinel-readonly",
-				ReadOnly:  true,
-			},
-			{
-				Name:      SentinelConfigVolumeName,
-				MountPath: SentinelConfigMountPath,
-			},
-		},
+		VolumeMounts: initVolumeMounts,
 	}
 
 	// Inject auth env var into the init container if auth is enabled.
@@ -362,7 +384,10 @@ func SentinelProbeCommand(v *vkov1.Valkey) []string {
 		port = fmt.Sprintf("%d", SentinelPort)
 	}
 
-	if v.IsAuthEnabled() {
+	// When auth is enabled AND sentinel auth is not disabled, the probe must authenticate.
+	sentinelNeedsAuth := v.IsAuthEnabled() && !v.IsSentinelAuthDisabled()
+
+	if sentinelNeedsAuth {
 		var cmdStr string
 		if v.IsTLSEnabled() {
 			cmdStr = fmt.Sprintf(
@@ -413,13 +438,15 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 		})
 	}
 
-	// Build probe handler. When TLS or auth is enabled, use an exec probe with
-	// valkey-cli so that the probe speaks the correct protocol. A bare tcpSocket
-	// probe against a TLS-only port causes the Sentinel to log continuous
+	// Build probe handler. When TLS is enabled or sentinel requires auth, use an exec
+	// probe with valkey-cli so that the probe speaks the correct protocol. A bare
+	// tcpSocket probe against a TLS-only port causes the Sentinel to log continuous
 	// "SSL routines::unexpected eof while reading" errors because kubelet
 	// opens the TCP connection without performing a TLS handshake.
+	// When sentinel auth is disabled, the probe still needs exec for TLS but not for auth.
+	sentinelNeedsAuth := v.IsAuthEnabled() && !v.IsSentinelAuthDisabled()
 	var probeHandler corev1.ProbeHandler
-	if v.IsTLSEnabled() || v.IsAuthEnabled() {
+	if v.IsTLSEnabled() || sentinelNeedsAuth {
 		probeHandler = corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
 				Command: SentinelProbeCommand(v),
@@ -484,8 +511,10 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 	}
 
 	// Inject auth password env var into the main Sentinel container when auth
-	// is enabled, so the probe command can reference $VALKEY_PASSWORD.
-	if v.IsAuthEnabled() {
+	// is enabled AND sentinel auth is not disabled, so the probe command can
+	// reference $VALKEY_PASSWORD. When sentinel auth is disabled, the probe
+	// does not authenticate and the env var is not needed in the main container.
+	if v.IsAuthEnabled() && !v.IsSentinelAuthDisabled() {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name: AuthSecretEnvName,
 			ValueFrom: &corev1.EnvVarSource{
@@ -513,4 +542,114 @@ func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 		}
 	}
 	return podTemplateChanged(desired.Spec.Template, current.Spec.Template)
+}
+
+// ComputeSentinelPodSpecHash returns a short hex digest of the sentinel pod spec
+// built for this Valkey CR. Works identically to ComputePodSpecHash but for
+// sentinel pods.
+func ComputeSentinelPodSpecHash(v *vkov1.Valkey) string {
+	spec := buildSentinelPodSpec(v)
+	data, _ := json.Marshal(spec)
+	h := fnv.New32a()
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+// buildSentinelInitCommand constructs the shell script for the init-sentinel-config
+// init container. The script:
+//  1. Copies the read-only ConfigMap sentinel.conf to the writable volume.
+//  2. Replaces the %VALKEY_PASSWORD% placeholder (when auth is enabled).
+//  3. Validates the configured master by probing Valkey pods via the ROLE command.
+//     If the configured master is unreachable or not actually a master, the script
+//     scans all known Valkey pods to discover the real master and rewrites the
+//     "sentinel monitor" line in sentinel.conf. This prevents stale master entries
+//     after a simultaneous restart of all pods in the namespace.
+func buildSentinelInitCommand(v *vkov1.Valkey) string {
+	// Port used to connect to Valkey nodes for ROLE check.
+	valkeyPort := ValkeyPort
+	if v.IsTLSEnabled() {
+		valkeyPort = TLSPort
+	}
+
+	// CLI flags for connecting to Valkey nodes.
+	cliTLSFlags := ""
+	if v.IsTLSEnabled() {
+		cliTLSFlags = fmt.Sprintf("--tls --cacert %s/ca.crt", TLSMountPath)
+	}
+	cliAuthFlags := ""
+	if v.IsAuthEnabled() {
+		cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
+	}
+
+	valkeySTSName := common.StatefulSetName(v, common.ComponentValkey)
+	valkeyHeadless := common.HeadlessServiceName(v, common.ComponentValkey)
+
+	return fmt.Sprintf(
+		`# Step 1: Copy read-only config to writable volume.
+cp /etc/sentinel-readonly/%[1]s %[2]s/%[1]s
+%[3]s
+# Step 2: Validate the configured master.
+# Extract the current master host from the sentinel monitor line.
+CONFIGURED_MASTER=$(grep "^sentinel monitor" %[2]s/%[1]s | awk '{print $4}')
+MONITOR_NAME=$(grep "^sentinel monitor" %[2]s/%[1]s | awk '{print $3}')
+MONITOR_PORT=$(grep "^sentinel monitor" %[2]s/%[1]s | awk '{print $5}')
+MONITOR_QUORUM=$(grep "^sentinel monitor" %[2]s/%[1]s | awk '{print $6}')
+
+echo "Configured master: $CONFIGURED_MASTER (port=$MONITOR_PORT, quorum=$MONITOR_QUORUM)"
+
+# Check if the configured master is actually a master.
+MASTER_OK=false
+ROLE_RESULT=$(timeout 3 valkey-cli %[4]s %[5]s -h "$CONFIGURED_MASTER" -p %[6]d ROLE 2>/dev/null | head -1)
+if [ "$ROLE_RESULT" = "master" ]; then
+  echo "Configured master $CONFIGURED_MASTER confirmed as master"
+  MASTER_OK=true
+fi
+
+if [ "$MASTER_OK" = "false" ]; then
+  echo "Configured master $CONFIGURED_MASTER is not reachable or not a master (role=$ROLE_RESULT), scanning pods..."
+  ACTUAL_MASTER=""
+  VALKEY_HEADLESS="%[7]s.%[8]s.svc.cluster.local"
+
+  for i in $(seq 0 %[9]d); do
+    POD_HOST="%[10]s-${i}.${VALKEY_HEADLESS}"
+    ROLE_RESULT=$(timeout 3 valkey-cli %[4]s %[5]s -h "$POD_HOST" -p %[6]d ROLE 2>/dev/null | head -1)
+    echo "  Pod $POD_HOST role=$ROLE_RESULT"
+    if [ "$ROLE_RESULT" = "master" ]; then
+      ACTUAL_MASTER="$POD_HOST"
+      echo "Found actual master: $ACTUAL_MASTER"
+      break
+    fi
+  done
+
+  if [ -n "$ACTUAL_MASTER" ]; then
+    # Rewrite the sentinel monitor line with the correct master.
+    sed -i "s|^sentinel monitor $MONITOR_NAME .*|sentinel monitor $MONITOR_NAME $ACTUAL_MASTER $MONITOR_PORT $MONITOR_QUORUM|" %[2]s/%[1]s
+    echo "Updated sentinel.conf to point to $ACTUAL_MASTER"
+  else
+    echo "No master found among Valkey pods (cold start). Using configured master."
+  fi
+fi`,
+		SentinelConfigKey,       // 1: sentinel.conf filename
+		SentinelConfigMountPath, // 2: writable config path /etc/sentinel
+		buildSentinelSedStep(v), // 3: sed replacement (empty string if no auth)
+		cliTLSFlags,             // 4: TLS flags for valkey-cli
+		cliAuthFlags,            // 5: auth flags for valkey-cli
+		valkeyPort,              // 6: Valkey port to probe
+		valkeyHeadless,          // 7: Valkey headless service name
+		v.Namespace,             // 8: namespace
+		v.Spec.Replicas-1,       // 9: max pod ordinal (replicas - 1)
+		valkeySTSName,           // 10: Valkey StatefulSet name
+	)
+}
+
+// buildSentinelSedStep returns the sed command that replaces the password
+// placeholder, or an empty string when auth is not enabled.
+func buildSentinelSedStep(v *vkov1.Valkey) string {
+	if !v.IsAuthEnabled() {
+		return ""
+	}
+	return fmt.Sprintf(
+		`sed -i "s|%%VALKEY_PASSWORD%%|$%s|g" %s/%s`,
+		AuthSecretEnvName, SentinelConfigMountPath, SentinelConfigKey,
+	)
 }

@@ -86,8 +86,8 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 		)
 	}
 
-	// Replication configuration (HA mode).
-	if v.IsSentinelEnabled() {
+	// Replication configuration (multi-replica mode).
+	if v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel() {
 		lines = append(lines, replicationConfig(v, isReplica)...)
 	}
 
@@ -118,10 +118,12 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 	return strings.Join(lines, "\n")
 }
 
-// replicationConfig returns replication-related config lines for HA mode.
+// replicationConfig returns replication-related config lines for multi-replica mode.
 func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
 	var lines []string
 
+	// replica-announce-ip and replica-announce-port are injected dynamically
+	// by the init container, as they depend on the pod's hostname.
 	lines = append(lines, "# Replication")
 
 	// Use TLS port for replication when TLS is enabled.
@@ -131,7 +133,8 @@ func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
 	}
 
 	if isReplica {
-		// Replicas connect to the master. Sentinel will reconfigure this dynamically.
+		// Replicas connect to pod-0 (the master).
+		// In Sentinel mode, Sentinel reconfigures this dynamically after failover.
 		lines = append(lines,
 			fmt.Sprintf("replicaof %s %d", MasterAddress(v), replicationPort),
 		)
