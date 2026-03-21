@@ -1004,7 +1004,7 @@ func (r *ValkeyReconciler) recordEvent(v *vkov1.Valkey, eventType, reason, messa
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Eventf(v, eventType, reason, messageFmt, args...)
+	r.Recorder.Eventf(v, nil, eventType, reason, reason, messageFmt, args...)
 }
 
 // handleMasterFailover checks if the master needs updating, verifies all replicas
