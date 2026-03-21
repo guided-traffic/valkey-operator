@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func TestNew_WithoutTLS(t *testing.T) {
@@ -187,12 +188,20 @@ func TestRunSentinelChecks_IncludesHostnameChecks(t *testing.T) {
 			SentinelAddrList: []string{
 				"sentinel-0.invalid:26379",
 			},
+			UnreadyWhen: UnreadyWhenConfig{
+				SentinelUnreachable:             true,
+				SentinelQuorumFailure:           true,
+				SentinelMasterDown:              true,
+				SentinelMasterHostnameInvalid:   true,
+				SentinelReplicaHostnamesInvalid: true,
+			},
 		},
 		metrics: newObserverMetrics(),
 	}
 
+	logger := ctrl.Log.WithName("test")
 	checks := make(map[string]bool)
-	msg := obs.runSentinelChecks(checks)
+	msg := obs.runSentinelChecks(logger, checks)
 
 	// All checks should be present in the map.
 	_, hasMasterHostname := checks["sentinel_master_hostname"]

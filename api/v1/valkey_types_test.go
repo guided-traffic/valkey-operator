@@ -865,3 +865,79 @@ func TestIsObserverSentinelMTLSEnabled(t *testing.T) {
 		assert.False(t, v.IsObserverSentinelMTLSEnabled())
 	})
 }
+
+func TestGetObserverLogLevel(t *testing.T) {
+	t.Run("nil observer returns info default", func(t *testing.T) {
+		v := newValkey("test")
+		assert.Equal(t, "info", v.GetObserverLogLevel())
+	})
+
+	t.Run("empty log level returns info default", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.Equal(t, "info", v.GetObserverLogLevel())
+	})
+
+	t.Run("debug level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelDebug}
+		})
+		assert.Equal(t, "debug", v.GetObserverLogLevel())
+	})
+
+	t.Run("warn level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelWarn}
+		})
+		assert.Equal(t, "warn", v.GetObserverLogLevel())
+	})
+
+	t.Run("error level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelError}
+		})
+		assert.Equal(t, "error", v.GetObserverLogLevel())
+	})
+}
+func TestUnreadyWhenDefault(t *testing.T) {
+	tr := true
+	fa := false
+
+	assert.True(t, UnreadyWhenDefault(nil), "nil pointer should default to true")
+	assert.True(t, UnreadyWhenDefault(&tr), "explicit true remains true")
+	assert.False(t, UnreadyWhenDefault(&fa), "explicit false returns false")
+}
+
+func TestGetObserverUnreadyWhen_NoObserver(t *testing.T) {
+	v := newValkey("test")
+	uw := v.GetObserverUnreadyWhen()
+	// All fields nil → all effective values are true.
+	assert.True(t, UnreadyWhenDefault(uw.MasterUnreachable))
+	assert.True(t, UnreadyWhenDefault(uw.WriteTestFailure))
+	assert.True(t, UnreadyWhenDefault(uw.ReplicaSyncFailure))
+	assert.True(t, UnreadyWhenDefault(uw.SentinelUnreachable))
+}
+
+func TestGetObserverUnreadyWhen_NilUnreadyWhenSpec(t *testing.T) {
+	v := newValkey("test", func(v *Valkey) {
+		v.Spec.Observer = &ObserverSpec{Enabled: true}
+	})
+	uw := v.GetObserverUnreadyWhen()
+	assert.True(t, UnreadyWhenDefault(uw.MasterUnreachable))
+}
+
+func TestGetObserverUnreadyWhen_PartialOverride(t *testing.T) {
+	f := false
+	v := newValkey("test", func(v *Valkey) {
+		v.Spec.Observer = &ObserverSpec{
+			Enabled: true,
+			UnreadyWhen: &ObserverUnreadyWhenSpec{
+				ReplicaSyncFailure: &f,
+			},
+		}
+	})
+	uw := v.GetObserverUnreadyWhen()
+	assert.True(t, UnreadyWhenDefault(uw.MasterUnreachable), "unset field defaults to true")
+	assert.False(t, UnreadyWhenDefault(uw.ReplicaSyncFailure), "explicitly false field is false")
+}

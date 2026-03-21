@@ -65,6 +65,21 @@ func parseFlags() observer.Config {
 	// Observer DB.
 	flag.IntVar(&cfg.ObserverDB, "observer-db", envInt("OBSERVER_DB", 15), "Valkey DB for health key (0-15)")
 
+	// Log level.
+	flag.StringVar(&cfg.LogLevel, "log-level", envString("LOG_LEVEL", "info"), "Log verbosity: debug, info, warn, error")
+
+	// UnreadyWhen flags — all default to true.
+	flag.BoolVar(&cfg.UnreadyWhen.MasterUnreachable, "unready-when-master-unreachable", envBoolTrue("UNREADY_WHEN_MASTER_UNREACHABLE"), "Master unreachable causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.WriteTestFailure, "unready-when-write-test-failure", envBoolTrue("UNREADY_WHEN_WRITE_TEST_FAILURE"), "Write test failure causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.ReadTestFailure, "unready-when-read-test-failure", envBoolTrue("UNREADY_WHEN_READ_TEST_FAILURE"), "Read test failure causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.ReplicaSyncFailure, "unready-when-replica-sync-failure", envBoolTrue("UNREADY_WHEN_REPLICA_SYNC_FAILURE"), "Replica sync failure causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.ReplicaReadTestFailure, "unready-when-replica-read-test-failure", envBoolTrue("UNREADY_WHEN_REPLICA_READ_TEST_FAILURE"), "Replica read test failure causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.SentinelUnreachable, "unready-when-sentinel-unreachable", envBoolTrue("UNREADY_WHEN_SENTINEL_UNREACHABLE"), "Sentinel unreachable causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.SentinelQuorumFailure, "unready-when-sentinel-quorum-failure", envBoolTrue("UNREADY_WHEN_SENTINEL_QUORUM_FAILURE"), "Sentinel quorum failure causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.SentinelMasterDown, "unready-when-sentinel-master-down", envBoolTrue("UNREADY_WHEN_SENTINEL_MASTER_DOWN"), "Sentinel master down causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.SentinelMasterHostnameInvalid, "unready-when-sentinel-master-hostname-invalid", envBoolTrue("UNREADY_WHEN_SENTINEL_MASTER_HOSTNAME_INVALID"), "Sentinel master hostname invalid causes unReady")
+	flag.BoolVar(&cfg.UnreadyWhen.SentinelReplicaHostnamesInvalid, "unready-when-sentinel-replica-hostnames-invalid", envBoolTrue("UNREADY_WHEN_SENTINEL_REPLICA_HOSTNAMES_INVALID"), "Sentinel replica hostnames invalid causes unReady")
+
 	flag.Parse()
 
 	// Read auth password from environment.
@@ -87,6 +102,15 @@ func envString(key, def string) string {
 
 func envBool(key string) bool {
 	v := os.Getenv(key)
+	return v == "true" || v == "1" || v == "yes"
+}
+
+// envBoolTrue reads a bool env var that defaults to true when unset.
+func envBoolTrue(key string) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return true
+	}
 	return v == "true" || v == "1" || v == "yes"
 }
 

@@ -461,3 +461,77 @@ func TestBuildObserverDeployment_NoTLS_NoMTLSArgs(t *testing.T) {
 		assert.NotContains(t, arg, "sentinel-mtls")
 	}
 }
+
+func TestBuildObserverDeployment_LogLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		level    vkov1.ObserverLogLevel
+		expected string
+	}{
+		{name: "nil level defaults to info", expected: "--log-level=info"},
+		{name: "debug level", level: vkov1.ObserverLogLevelDebug, expected: "--log-level=debug"},
+		{name: "info level", level: vkov1.ObserverLogLevelInfo, expected: "--log-level=info"},
+		{name: "warn level", level: vkov1.ObserverLogLevelWarn, expected: "--log-level=warn"},
+		{name: "error level", level: vkov1.ObserverLogLevelError, expected: "--log-level=error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newTestValkey("test", func(v *vkov1.Valkey) {
+				v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true, LogLevel: tt.level}
+			})
+			deploy := BuildObserverDeployment(v, testOperatorImage)
+			args := deploy.Spec.Template.Spec.Containers[0].Args
+			assert.Contains(t, args, tt.expected)
+		})
+	}
+}
+
+func TestBuildObserverDeployment_UnreadyWhen_Defaults(t *testing.T) {
+	// Without any unreadyWhen config, all flags default to true.
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	expected := []string{
+		"--unready-when-master-unreachable=true",
+		"--unready-when-write-test-failure=true",
+		"--unready-when-read-test-failure=true",
+		"--unready-when-replica-sync-failure=true",
+		"--unready-when-replica-read-test-failure=true",
+		"--unready-when-sentinel-unreachable=true",
+		"--unready-when-sentinel-quorum-failure=true",
+		"--unready-when-sentinel-master-down=true",
+		"--unready-when-sentinel-master-hostname-invalid=true",
+		"--unready-when-sentinel-replica-hostnames-invalid=true",
+	}
+	for _, e := range expected {
+		assert.Contains(t, args, e)
+	}
+}
+
+func TestBuildObserverDeployment_UnreadyWhen_PartialFalse(t *testing.T) {
+	// When some fields are explicitly false, the corresponding flags must be false.
+	f := false
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{
+			Enabled: true,
+			UnreadyWhen: &vkov1.ObserverUnreadyWhenSpec{
+				ReplicaSyncFailure:              &f,
+				SentinelUnreachable:             &f,
+				SentinelReplicaHostnamesInvalid: &f,
+			},
+		}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	assert.Contains(t, args, "--unready-when-master-unreachable=true")
+	assert.Contains(t, args, "--unready-when-replica-sync-failure=false")
+	assert.Contains(t, args, "--unready-when-sentinel-unreachable=false")
+	assert.Contains(t, args, "--unready-when-sentinel-replica-hostnames-invalid=false")
+}

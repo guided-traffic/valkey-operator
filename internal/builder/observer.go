@@ -164,6 +164,22 @@ func buildObserverArgs(v *vkov1.Valkey) []string {
 		}
 	}
 
+	args = append(args, fmt.Sprintf("--log-level=%s", v.GetObserverLogLevel()))
+
+	uw := v.GetObserverUnreadyWhen()
+	args = append(args,
+		fmt.Sprintf("--unready-when-master-unreachable=%v", vkov1.UnreadyWhenDefault(uw.MasterUnreachable)),
+		fmt.Sprintf("--unready-when-write-test-failure=%v", vkov1.UnreadyWhenDefault(uw.WriteTestFailure)),
+		fmt.Sprintf("--unready-when-read-test-failure=%v", vkov1.UnreadyWhenDefault(uw.ReadTestFailure)),
+		fmt.Sprintf("--unready-when-replica-sync-failure=%v", vkov1.UnreadyWhenDefault(uw.ReplicaSyncFailure)),
+		fmt.Sprintf("--unready-when-replica-read-test-failure=%v", vkov1.UnreadyWhenDefault(uw.ReplicaReadTestFailure)),
+		fmt.Sprintf("--unready-when-sentinel-unreachable=%v", vkov1.UnreadyWhenDefault(uw.SentinelUnreachable)),
+		fmt.Sprintf("--unready-when-sentinel-quorum-failure=%v", vkov1.UnreadyWhenDefault(uw.SentinelQuorumFailure)),
+		fmt.Sprintf("--unready-when-sentinel-master-down=%v", vkov1.UnreadyWhenDefault(uw.SentinelMasterDown)),
+		fmt.Sprintf("--unready-when-sentinel-master-hostname-invalid=%v", vkov1.UnreadyWhenDefault(uw.SentinelMasterHostnameInvalid)),
+		fmt.Sprintf("--unready-when-sentinel-replica-hostnames-invalid=%v", vkov1.UnreadyWhenDefault(uw.SentinelReplicaHostnamesInvalid)),
+	)
+
 	return args
 }
 

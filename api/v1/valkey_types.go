@@ -170,6 +170,21 @@ type NetworkPolicySpec struct {
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
+// ObserverLogLevel defines the log verbosity for the observer process.
+// +kubebuilder:validation:Enum=debug;info;warn;error
+type ObserverLogLevel string
+
+const (
+	// ObserverLogLevelDebug enables verbose logging including stack traces for all errors.
+	ObserverLogLevelDebug ObserverLogLevel = "debug"
+	// ObserverLogLevelInfo is the default level; expected check failures are logged without stack traces.
+	ObserverLogLevelInfo ObserverLogLevel = "info"
+	// ObserverLogLevelWarn suppresses info-level messages.
+	ObserverLogLevelWarn ObserverLogLevel = "warn"
+	// ObserverLogLevelError only emits error-level messages.
+	ObserverLogLevelError ObserverLogLevel = "error"
+)
+
 // ObserverMTLSSpec controls whether the observer presents client certificates
 // for its connections to Valkey and Sentinel. Only effective when spec.tls.enabled
 // is true. Sending a client certificate enables mutual TLS (mTLS); omitting it
@@ -187,6 +202,64 @@ type ObserverMTLSSpec struct {
 	// Default: false.
 	// +optional
 	Sentinel *bool `json:"sentinel,omitempty"`
+}
+
+// ObserverUnreadyWhenSpec controls which check failures cause the observer
+// to report unReady. When a field is false, the failure is still logged but
+// the ready state is not affected by that check.
+// All fields default to true.
+type ObserverUnreadyWhenSpec struct {
+	// MasterUnreachable: PING to the master node fails.
+	// +kubebuilder:default=true
+	// +optional
+	MasterUnreachable *bool `json:"masterUnreachable,omitempty"`
+
+	// WriteTestFailure: health key cannot be written to the master.
+	// +kubebuilder:default=true
+	// +optional
+	WriteTestFailure *bool `json:"writeTestFailure,omitempty"`
+
+	// ReadTestFailure: health key cannot be read back from the master.
+	// +kubebuilder:default=true
+	// +optional
+	ReadTestFailure *bool `json:"readTestFailure,omitempty"`
+
+	// ReplicaSyncFailure: a replica is disconnected or bulk sync is in progress.
+	// +kubebuilder:default=true
+	// +optional
+	ReplicaSyncFailure *bool `json:"replicaSyncFailure,omitempty"`
+
+	// ReplicaReadTestFailure: a replica returns stale or missing health key data.
+	// +kubebuilder:default=true
+	// +optional
+	ReplicaReadTestFailure *bool `json:"replicaReadTestFailure,omitempty"`
+
+	// SentinelUnreachable: one or more Sentinel instances do not respond to PING.
+	// +kubebuilder:default=true
+	// +optional
+	SentinelUnreachable *bool `json:"sentinelUnreachable,omitempty"`
+
+	// SentinelQuorumFailure: Sentinels disagree on the current master address.
+	// +kubebuilder:default=true
+	// +optional
+	SentinelQuorumFailure *bool `json:"sentinelQuorumFailure,omitempty"`
+
+	// SentinelMasterDown: Sentinel reports s_down or o_down flags on the master.
+	// +kubebuilder:default=true
+	// +optional
+	SentinelMasterDown *bool `json:"sentinelMasterDown,omitempty"`
+
+	// SentinelMasterHostnameInvalid: Sentinel reports a bare IP instead of a
+	// DNS hostname for the master.
+	// +kubebuilder:default=true
+	// +optional
+	SentinelMasterHostnameInvalid *bool `json:"sentinelMasterHostnameInvalid,omitempty"`
+
+	// SentinelReplicaHostnamesInvalid: Sentinel reports bare IPs instead of
+	// DNS hostnames for one or more replicas.
+	// +kubebuilder:default=true
+	// +optional
+	SentinelReplicaHostnamesInvalid *bool `json:"sentinelReplicaHostnamesInvalid,omitempty"`
 }
 
 // ObserverSpec defines the observer configuration for cluster health monitoring.
@@ -209,6 +282,20 @@ type ObserverSpec struct {
 	// Resources defines the compute resource requirements for the observer container.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// LogLevel sets the verbosity of observer log output.
+	// At debug level, stack traces are included for all errors.
+	// At info, warn, and error levels, stack traces are suppressed.
+	// +kubebuilder:validation:Enum=debug;info;warn;error
+	// +kubebuilder:default=info
+	// +optional
+	LogLevel ObserverLogLevel `json:"logLevel,omitempty"`
+
+	// UnreadyWhen configures which check failures cause the observer to report
+	// unReady. Omitting a field is equivalent to true (failure causes unReady).
+	// Failures are always logged regardless of this setting.
+	// +optional
+	UnreadyWhen *ObserverUnreadyWhenSpec `json:"unreadyWhen,omitempty"`
 }
 
 // PersistenceSpec defines data persistence configuration.
@@ -462,6 +549,14 @@ func (v *Valkey) GetObserverDB() int {
 	return 15
 }
 
+// GetObserverLogLevel returns the configured observer log level, defaulting to "info".
+func (v *Valkey) GetObserverLogLevel() string {
+	if v.Spec.Observer != nil && v.Spec.Observer.LogLevel != "" {
+		return string(v.Spec.Observer.LogLevel)
+	}
+	return "info"
+}
+
 // GetObserverResources returns the resource requirements for the observer container.
 func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
 	if v.Spec.Observer != nil && v.Spec.Observer.Resources != nil {
@@ -482,6 +577,25 @@ func (v *Valkey) GetSyncTimeout() time.Duration {
 		return v.Spec.RollingUpdate.SyncTimeout.Duration
 	}
 	return 5 * time.Minute
+}
+
+// UnreadyWhenDefault returns the effective bool value for an unreadyWhen field.
+// A nil pointer means "use default", which is true.
+func UnreadyWhenDefault(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
+}
+
+// GetObserverUnreadyWhen returns the effective UnreadyWhen config,
+// never nil — falls back to all-true defaults when spec.observer.unreadyWhen
+// is not set.
+func (v *Valkey) GetObserverUnreadyWhen() ObserverUnreadyWhenSpec {
+	if v.Spec.Observer == nil || v.Spec.Observer.UnreadyWhen == nil {
+		return ObserverUnreadyWhenSpec{} // all nil = all default true
+	}
+	return *v.Spec.Observer.UnreadyWhen
 }
 
 func init() {

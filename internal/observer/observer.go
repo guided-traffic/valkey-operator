@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap/zapcore"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
@@ -32,6 +34,12 @@ type Config struct {
 	TLSCert    string
 	TLSKey     string
 
+	// LogLevel sets the verbosity of observer log output.
+	// Supported: debug, info, warn, error. Default: info.
+	// At debug level, stack traces are included for all errors.
+	// At info, warn, and error levels, stack traces are suppressed.
+	LogLevel string
+
 	// ValkeyMTLS controls whether the observer sends a client certificate to Valkey pods.
 	// Default: true (mTLS enabled).
 	ValkeyMTLS bool
@@ -48,6 +56,24 @@ type Config struct {
 
 	// Observer DB for health key.
 	ObserverDB int
+
+	// UnreadyWhen holds per-check unReady behaviour. True = failure causes unReady.
+	UnreadyWhen UnreadyWhenConfig
+}
+
+// UnreadyWhenConfig holds the effective per-check unReady flags.
+// All fields default to true when not explicitly set.
+type UnreadyWhenConfig struct {
+	MasterUnreachable               bool
+	WriteTestFailure                bool
+	ReadTestFailure                 bool
+	ReplicaSyncFailure              bool
+	ReplicaReadTestFailure          bool
+	SentinelUnreachable             bool
+	SentinelQuorumFailure           bool
+	SentinelMasterDown              bool
+	SentinelMasterHostnameInvalid   bool
+	SentinelReplicaHostnamesInvalid bool
 }
 
 // CheckResult holds the outcome of a single check cycle.
@@ -97,10 +123,30 @@ func New(cfg Config) (*Observer, error) {
 	}, nil
 }
 
+// buildObserverLogger creates a logr.Logger configured for the given log level.
+// At debug level, stack traces are included for all errors (dev mode).
+// At info, warn, and error levels, stack traces are suppressed so that
+// expected check failures do not pollute logs with call stacks.
+func buildObserverLogger(logLevel string) {
+	switch logLevel {
+	case "debug":
+		ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	case "warn":
+		lvl := zapcore.WarnLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	case "error":
+		lvl := zapcore.ErrorLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	default: // info
+		lvl := zapcore.InfoLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	}
+}
+
 // Run starts the observer polling loop and health server.
 // It blocks until the context is cancelled.
 func Run(ctx context.Context, cfg Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	buildObserverLogger(cfg.LogLevel)
 	logger := ctrl.Log.WithName("observer")
 
 	logger.Info("starting observer",
@@ -174,27 +220,21 @@ func (o *Observer) runChecks(ctx context.Context) {
 	// 1. Identify master address.
 	masterAddr, err := o.discoverMaster(ctx)
 	if err != nil {
-		logger.Error(err, "failed to discover master")
-		o.setResult(false, map[string]bool{"master_reachable": false}, fmt.Sprintf("master discovery failed: %v", err), start)
+		logger.Error(err, "check failed", "check", "masterUnreachable")
+		o.setResult(false, map[string]bool{"master_reachable": false},
+			fmt.Sprintf("[masterUnreachable] master discovery failed: %v", err), start)
 		o.metrics.recordCycle(time.Since(start), false)
 		return
 	}
 
 	// 2-6. Core checks.
 	healthValue := fmt.Sprintf("%d", time.Now().UnixNano())
-	firstFailMsg = o.runCoreChecks(ctx, masterAddr, healthValue, checks)
+	firstFailMsg = o.runCoreChecks(ctx, logger, masterAddr, healthValue, checks)
 
 	// 7-8. Sentinel checks.
 	if o.cfg.SentinelEnabled {
-		if msg := o.runSentinelChecks(checks); msg != "" && firstFailMsg == "" {
+		if msg := o.runSentinelChecks(logger, checks); msg != "" && firstFailMsg == "" {
 			firstFailMsg = msg
-		}
-	}
-
-	// Log every individual check failure.
-	for name, ok := range checks {
-		if !ok {
-			logger.Error(fmt.Errorf("check %s failed", name), "check failure", "check", name)
 		}
 	}
 
@@ -208,40 +248,46 @@ func (o *Observer) runChecks(ctx context.Context) {
 
 // runCoreChecks runs PING, replica sync, write, read, and replica read checks.
 // Returns the first failure message (empty if all passed).
-func (o *Observer) runCoreChecks(_ context.Context, masterAddr, healthValue string, checks map[string]bool) string {
+func (o *Observer) runCoreChecks(_ context.Context, logger logr.Logger, masterAddr, healthValue string, checks map[string]bool) string {
 	var firstFailMsg string
+	uw := o.cfg.UnreadyWhen
 
 	// PING master.
-	firstFailMsg = runCheck(checks, "master_reachable", firstFailMsg, func() error {
-		return o.pingHost(masterAddr)
-	})
+	firstFailMsg = runCheck(logger, checks, "master_reachable", "masterUnreachable",
+		firstFailMsg, uw.MasterUnreachable, func() error {
+			return o.pingHost(masterAddr)
+		})
 
 	// Replica sync (only multi-replica).
 	if o.cfg.Replicas > 1 {
-		firstFailMsg = runCheck(checks, "replica_sync", firstFailMsg, func() error {
-			return o.checkReplicaSync(masterAddr)
-		})
+		firstFailMsg = runCheck(logger, checks, "replica_sync", "replicaSyncFailure",
+			firstFailMsg, uw.ReplicaSyncFailure, func() error {
+				return o.checkReplicaSync(masterAddr)
+			})
 	}
 
 	// Write test on master.
-	firstFailMsg = runCheck(checks, "write_test", firstFailMsg, func() error {
-		return o.writeHealthKey(masterAddr, healthValue)
-	})
+	firstFailMsg = runCheck(logger, checks, "write_test", "writeTestFailure",
+		firstFailMsg, uw.WriteTestFailure, func() error {
+			return o.writeHealthKey(masterAddr, healthValue)
+		})
 
 	// Read test on master (only if write succeeded).
 	if checks["write_test"] {
-		firstFailMsg = runCheck(checks, "read_test", firstFailMsg, func() error {
-			return o.readHealthKey(masterAddr, healthValue)
-		})
+		firstFailMsg = runCheck(logger, checks, "read_test", "readTestFailure",
+			firstFailMsg, uw.ReadTestFailure, func() error {
+				return o.readHealthKey(masterAddr, healthValue)
+			})
 	} else {
 		checks["read_test"] = false
 	}
 
 	// Replica read test (only multi-replica and write succeeded).
 	if o.cfg.Replicas > 1 && checks["write_test"] {
-		firstFailMsg = runCheck(checks, "replica_read_test", firstFailMsg, func() error {
-			return o.checkReplicaRead(healthValue)
-		})
+		firstFailMsg = runCheck(logger, checks, "replica_read_test", "replicaReadTestFailure",
+			firstFailMsg, uw.ReplicaReadTestFailure, func() error {
+				return o.checkReplicaRead(healthValue)
+			})
 	}
 
 	return firstFailMsg
@@ -249,38 +295,63 @@ func (o *Observer) runCoreChecks(_ context.Context, masterAddr, healthValue stri
 
 // runSentinelChecks runs sentinel reachability, quorum, flag, and hostname checks.
 // Returns the first failure message (empty if all passed).
-func (o *Observer) runSentinelChecks(checks map[string]bool) string {
+func (o *Observer) runSentinelChecks(logger logr.Logger, checks map[string]bool) string {
 	var firstFailMsg string
+	uw := o.cfg.UnreadyWhen
 
-	firstFailMsg = runCheck(checks, "sentinel_reachable", firstFailMsg, func() error {
-		return o.checkSentinelReachable()
-	})
+	firstFailMsg = runCheck(logger, checks, "sentinel_reachable", "sentinelUnreachable",
+		firstFailMsg, uw.SentinelUnreachable, func() error {
+			return o.checkSentinelReachable()
+		})
 
 	quorumOK, flagsOK, sentErr := o.checkSentinelQuorumAndFlags()
 	checks["sentinel_quorum"] = quorumOK
 	checks["sentinel_flags"] = flagsOK
-	if (!quorumOK || !flagsOK) && firstFailMsg == "" && sentErr != nil {
-		firstFailMsg = fmt.Sprintf("sentinel check failed: %v", sentErr)
+	if !quorumOK && uw.SentinelQuorumFailure && firstFailMsg == "" && sentErr != nil {
+		firstFailMsg = fmt.Sprintf("[sentinelQuorumFailure] %v", sentErr)
+	}
+	if !flagsOK && uw.SentinelMasterDown && firstFailMsg == "" && sentErr != nil {
+		firstFailMsg = fmt.Sprintf("[sentinelMasterDown] %v", sentErr)
+	}
+	if !quorumOK {
+		logger.Error(sentErr, "check failed", "check", "sentinelQuorumFailure")
+	}
+	if !flagsOK {
+		logger.Error(sentErr, "check failed", "check", "sentinelMasterDown")
 	}
 
-	// Hostname checks: master and replicas must be hostnames, not IPs.
-	firstFailMsg = runCheck(checks, "sentinel_master_hostname", firstFailMsg, func() error {
-		return o.checkSentinelMasterHostname()
-	})
+	firstFailMsg = runCheck(logger, checks, "sentinel_master_hostname", "sentinelMasterHostnameInvalid",
+		firstFailMsg, uw.SentinelMasterHostnameInvalid, func() error {
+			return o.checkSentinelMasterHostname()
+		})
 
-	firstFailMsg = runCheck(checks, "sentinel_replica_hostnames", firstFailMsg, func() error {
-		return o.checkSentinelReplicaHostnames()
-	})
+	firstFailMsg = runCheck(logger, checks, "sentinel_replica_hostnames", "sentinelReplicaHostnamesInvalid",
+		firstFailMsg, uw.SentinelReplicaHostnamesInvalid, func() error {
+			return o.checkSentinelReplicaHostnames()
+		})
 
 	return firstFailMsg
 }
 
-// runCheck executes a single check, records the result, and returns the updated first failure message.
-func runCheck(checks map[string]bool, name, firstFailMsg string, fn func() error) string {
-	if err := fn(); err != nil {
+// runCheck executes a single check and records the result.
+// label is the canonical unreadyWhen field name (e.g. "masterUnreachable").
+// causesUnready controls whether a failure updates firstFailMsg.
+// Failures are always logged regardless of causesUnready.
+func runCheck(
+	logger logr.Logger,
+	checks map[string]bool,
+	name string,
+	label string,
+	firstFailMsg string,
+	causesUnready bool,
+	fn func() error,
+) string {
+	err := fn()
+	if err != nil {
 		checks[name] = false
-		if firstFailMsg == "" {
-			return fmt.Sprintf("%s failed: %v", name, err)
+		logger.Error(err, "check failed", "check", label)
+		if causesUnready && firstFailMsg == "" {
+			return fmt.Sprintf("[%s] %v", label, err)
 		}
 		return firstFailMsg
 	}
