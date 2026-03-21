@@ -408,6 +408,43 @@ spec:
 | `logLevel` | `string` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. At `debug`, stack traces are included for all errors. At `info` and above, stack traces are suppressed. |
 | `mtls` | `ObserverMTLSSpec` | — | Controls whether the observer sends a client certificate to Valkey and/or Sentinel. Only effective when `spec.tls.enabled: true`. |
 | `resources` | `ResourceRequirements` | 50m/64Mi request, 128Mi limit | CPU/memory for the observer container |
+| `unreadyWhen` | `ObserverUnreadyWhenSpec` | all `true` | Per-check control over whether a failure causes the observer to report unReady. Failures are always logged regardless of this setting. |
+
+### `spec.observer.unreadyWhen`
+
+Each field controls whether the corresponding check failure flips the observer to unReady.
+When a field is `false`, failures are still logged but do not affect the ready state.
+Omitting a field is equivalent to `true`.
+
+| Field | Default | Check description |
+|-------|---------|-------------------|
+| `masterUnreachable` | `true` | PING to the current master fails |
+| `writeTestFailure` | `true` | Health key cannot be written to the master |
+| `readTestFailure` | `true` | Health key cannot be read back from the master |
+| `replicaSyncFailure` | `true` | A replica is disconnected or bulk sync is in progress (_replicas > 1 only_) |
+| `replicaReadTestFailure` | `true` | A replica returns stale or missing health key data (_replicas > 1 only_) |
+| `sentinelUnreachable` | `true` | One or more Sentinel instances do not respond to PING (_sentinel only_) |
+| `sentinelQuorumFailure` | `true` | Sentinels disagree on the current master address (_sentinel only_) |
+| `sentinelMasterDown` | `true` | Sentinel reports `s_down` or `o_down` flags on the master (_sentinel only_) |
+| `sentinelMasterHostnameInvalid` | `true` | Sentinel reports a bare IP instead of a DNS hostname for the master (_sentinel only_) |
+| `sentinelReplicaHostnamesInvalid` | `true` | Sentinel reports bare IPs for one or more replicas (_sentinel only_) |
+
+**Minimal operation mode** — observer signals unReady only when the master itself is unavailable;
+replica lag and Sentinel issues are logged but tolerated:
+
+```yaml
+spec:
+  observer:
+    enabled: true
+    unreadyWhen:
+      replicaSyncFailure: false
+      replicaReadTestFailure: false
+      sentinelUnreachable: false
+      sentinelQuorumFailure: false
+      sentinelMasterDown: false
+      sentinelMasterHostnameInvalid: false
+      sentinelReplicaHostnamesInvalid: false
+```
 
 ### `spec.observer.mtls`
 
