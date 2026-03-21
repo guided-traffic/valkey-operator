@@ -927,6 +927,16 @@ func TestHandleRollingUpdate_HA_PartiallyUpdated(t *testing.T) {
 	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
 
 	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	// Provide replication info so the sync check on the already-replaced pod-0 passes.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{
+				Role:                 "slave",
+				MasterSyncInProgress: false,
+				MasterLinkStatus:     "up",
+			}, nil
+		},
+	}
 	reconcileOnce(t, r, "ha-test", "default")
 
 	sts := &appsv1.StatefulSet{}
@@ -3370,4 +3380,326 @@ func TestFinalizeMultiReplicaRollingUpdate_WaitsForTopologyRestoration(t *testin
 	// it clears the state and completes.
 	assert.True(t, result.Completed)
 	assert.Nil(t, result.Error)
+}
+
+// --- Graceful Rolling Update Unit Tests ---
+
+func TestSortReplicaCandidates_YoungestFirst(t *testing.T) {
+	now := time.Now()
+	pods := []podState{
+		{name: "pod-0", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute))}}},
+		{name: "pod-1", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Minute))}}},
+		{name: "pod-2", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute))}}},
+	}
+
+	candidates := sortReplicaCandidates(pods)
+
+	require.Len(t, candidates, 3)
+	assert.Equal(t, "pod-1", candidates[0].name, "Youngest pod should be first")
+	assert.Equal(t, "pod-2", candidates[1].name, "Middle-aged pod should be second")
+	assert.Equal(t, "pod-0", candidates[2].name, "Oldest pod should be last")
+}
+
+func TestSortReplicaCandidates_NonExistentFirst(t *testing.T) {
+	now := time.Now()
+	pods := []podState{
+		{name: "pod-0", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now)}}},
+		{name: "pod-1", exists: false, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute))}}},
+	}
+
+	candidates := sortReplicaCandidates(pods)
+
+	require.Len(t, candidates, 3)
+	assert.Equal(t, "pod-1", candidates[0].name, "Non-existent pod should be first")
+}
+
+func TestSortReplicaCandidates_ExcludesMaster(t *testing.T) {
+	now := time.Now()
+	pods := []podState{
+		{name: "pod-0", exists: true, needsUpdate: true, isMaster: true,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now)}}},
+		{name: "pod-1", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now)}}},
+	}
+
+	candidates := sortReplicaCandidates(pods)
+
+	require.Len(t, candidates, 1)
+	assert.Equal(t, "pod-1", candidates[0].name, "Only non-master pods should be candidates")
+}
+
+func TestSortReplicaCandidates_ExcludesAlreadyUpdated(t *testing.T) {
+	now := time.Now()
+	pods := []podState{
+		{name: "pod-0", exists: true, needsUpdate: false, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now)}}},
+		{name: "pod-1", exists: true, needsUpdate: true, isMaster: false,
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now)}}},
+	}
+
+	candidates := sortReplicaCandidates(pods)
+
+	require.Len(t, candidates, 1)
+	assert.Equal(t, "pod-1", candidates[0].name, "Only pods needing update should be candidates")
+}
+
+func TestVerifyReplacedReplicasSynced_AllSynced(t *testing.T) {
+	v := newTestValkey("sync-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{
+				Role:                 "slave",
+				MasterSyncInProgress: false,
+				MasterLinkStatus:     "up",
+			}, nil
+		},
+	}
+
+	pods := []podState{
+		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	assert.Nil(t, result, "Should return nil when all replaced replicas are synced")
+}
+
+func TestVerifyReplacedReplicasSynced_SyncInProgress(t *testing.T) {
+	v := newTestValkey("sync-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{
+				Role:                 "slave",
+				MasterSyncInProgress: true,
+				MasterLinkStatus:     "up",
+			}, nil
+		},
+	}
+
+	pods := []podState{
+		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	require.NotNil(t, result, "Should return requeue when sync is in progress")
+	assert.True(t, result.NeedsRequeue)
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+}
+
+func TestVerifyReplacedReplicasSynced_SkipsMasterAndPendingPods(t *testing.T) {
+	v := newTestValkey("sync-test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+	// Default mock returns error — should not matter because all pods are skipped.
+
+	pods := []podState{
+		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},    // master: skip
+		{name: "sync-test-1", exists: true, ready: true, needsUpdate: true, isMaster: false},    // needs update: skip
+		{name: "sync-test-2", exists: false, ready: false, needsUpdate: false, isMaster: false}, // not exists: skip
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	assert.Nil(t, result, "Should return nil when no pods qualify for sync check")
+}
+
+func TestVerifyReplacedReplicasSynced_ErrorRequeues(t *testing.T) {
+	v := newTestValkey("sync-err", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return nil, fmt.Errorf("connection refused")
+		},
+	}
+
+	pods := []podState{
+		{name: "sync-err-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-err-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "sync-err-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	require.NotNil(t, result, "Should return requeue when GetReplicationInfo fails")
+	assert.True(t, result.NeedsRequeue)
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+	// Verify that the sync-wait-started annotation was set.
+	assert.NotEmpty(t, v.Annotations[annotationSyncWaitStarted])
+}
+
+func TestVerifyReplacedReplicasSynced_TimeoutPausesUpdate(t *testing.T) {
+	v := newTestValkey("sync-timeout", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		// Set the sync-wait-started annotation to a time in the past (>5 min default timeout).
+		v.Annotations = map[string]string{
+			annotationSyncWaitStarted: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	})
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return nil, fmt.Errorf("connection refused")
+		},
+	}
+
+	pods := []podState{
+		{name: "sync-timeout-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-timeout-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "sync-timeout-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	require.NotNil(t, result, "Should return a pause result on timeout")
+	// Paused: no requeue (operator waits for spec change).
+	assert.False(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+}
+
+func TestSyncWaitTimestamp_SetAndCheck(t *testing.T) {
+	v := newTestValkey("ts-test", "default")
+	r, _ := newTestReconciler(v)
+	reconcileOnce(t, r, "ts-test", "default")
+
+	// Initially not timed out.
+	assert.False(t, r.isSyncWaitTimedOut(v))
+
+	// Set a timestamp.
+	r.ensureSyncWaitTimestamp(context.Background(), v)
+	assert.NotEmpty(t, v.Annotations[annotationSyncWaitStarted])
+
+	// Should not be timed out immediately.
+	assert.False(t, r.isSyncWaitTimedOut(v))
+
+	// Simulate a timestamp in the past beyond the default 5 min timeout.
+	v.Annotations[annotationSyncWaitStarted] = time.Now().Add(-6 * time.Minute).UTC().Format(time.RFC3339)
+	assert.True(t, r.isSyncWaitTimedOut(v))
+
+	// Clear the timestamp.
+	r.clearSyncWaitTimestamp(context.Background(), v)
+	_, exists := v.Annotations[annotationSyncWaitStarted]
+	assert.False(t, exists, "Sync wait annotation should be removed")
+}
+
+func TestSyncWaitTimestamp_CorruptedTreatedAsTimedOut(t *testing.T) {
+	v := newTestValkey("ts-corrupt", "default", func(v *vkov1.Valkey) {
+		v.Annotations = map[string]string{
+			annotationSyncWaitStarted: "not-a-valid-timestamp",
+		}
+	})
+	r, _ := newTestReconciler(v)
+
+	assert.True(t, r.isSyncWaitTimedOut(v), "Corrupted timestamp should be treated as timed out")
+}
+
+func TestGetSyncTimeout_Default(t *testing.T) {
+	v := newTestValkey("timeout-default", "default")
+	assert.Equal(t, 5*time.Minute, v.GetSyncTimeout())
+}
+
+func TestGetSyncTimeout_Custom(t *testing.T) {
+	v := newTestValkey("timeout-custom", "default", func(v *vkov1.Valkey) {
+		v.Spec.RollingUpdate = &vkov1.RollingUpdateSpec{
+			SyncTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+		}
+	})
+	assert.Equal(t, 10*time.Minute, v.GetSyncTimeout())
+}
+
+func TestReplaceNextReplica_DeletesYoungestFirst(t *testing.T) {
+	v := newTestValkey("youngest", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	now := time.Now()
+	// pod-1 is older than pod-2 — pod-2 should be deleted first.
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.CreationTimestamp = metav1.NewTime(now.Add(-10 * time.Minute))
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+	pod2.CreationTimestamp = metav1.NewTime(now.Add(-2 * time.Minute))
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "youngest", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "youngest", Namespace: "default"}, sts))
+
+	result := r.handleRollingUpdate(context.Background(), v, sts)
+	assert.True(t, result.NeedsRequeue)
+	assert.Nil(t, result.Error)
+
+	// pod-2 (youngest) should be deleted; pod-1 (oldest) should still exist.
+	pod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "youngest-2", Namespace: "default"}, pod)
+	assert.Error(t, err, "Youngest pod (pod-2) should have been deleted first")
+
+	err = c.Get(context.Background(), types.NamespacedName{Name: "youngest-1", Namespace: "default"}, pod)
+	assert.NoError(t, err, "Oldest pod (pod-1) should still exist")
+}
+
+func TestReplaceNextReplica_WaitsForSyncBeforeDeleting(t *testing.T) {
+	v := newTestValkey("sync-wait", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// Pod-0 is master (old), pod-1 is already updated and syncing, pod-2 is old.
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:9.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	// pod-1 is still syncing — should block the next deletion.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "sync-wait-1" {
+				return &valkeyclient.ReplicationInfo{
+					Role:                 "slave",
+					MasterSyncInProgress: true,
+					MasterLinkStatus:     "up",
+				}, nil
+			}
+			return nil, fmt.Errorf("mock: no info for %s", podName)
+		},
+	}
+	reconcileOnce(t, r, "sync-wait", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "sync-wait", Namespace: "default"}, sts))
+
+	result := r.handleRollingUpdate(context.Background(), v, sts)
+	assert.True(t, result.NeedsRequeue, "Should requeue while waiting for sync")
+	assert.Nil(t, result.Error)
+
+	// pod-2 should NOT have been deleted because pod-1 hasn't synced yet.
+	pod := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "sync-wait-2", Namespace: "default"}, pod)
+	assert.NoError(t, err, "Pod-2 should still exist because sync check blocked deletion")
 }

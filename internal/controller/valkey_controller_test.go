@@ -37,8 +37,9 @@ func testScheme() *runtime.Scheme {
 
 // mockInstanceChecker implements InstanceChecker for unit tests.
 type mockInstanceChecker struct {
-	pingErr      error
-	clusterState *health.ClusterState
+	pingErr           error
+	clusterState      *health.ClusterState
+	replicationInfoFn func(podName string) (*valkeyclient.ReplicationInfo, error)
 }
 
 func (m *mockInstanceChecker) PingPod(_ context.Context, _ *vkov1.Valkey, _ string) error {
@@ -59,9 +60,14 @@ func (m *mockInstanceChecker) CheckCluster(_ context.Context, v *vkov1.Valkey) *
 	}
 }
 
-func (m *mockInstanceChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valkey, _ string) (*valkeyclient.ReplicationInfo, error) {
-	// Return an error: no real Valkey is running in unit tests.
-	return nil, fmt.Errorf("mock: no Valkey instance available")
+func (m *mockInstanceChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error) {
+	if m.replicationInfoFn != nil {
+		return m.replicationInfoFn(podName)
+	}
+	// Default: return an error so that collectPodStates falls back to pod labels
+	// for master detection. Tests that need sync-check behaviour should set
+	// replicationInfoFn explicitly.
+	return nil, fmt.Errorf("mock: no replication info for %s", podName)
 }
 
 func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client) {

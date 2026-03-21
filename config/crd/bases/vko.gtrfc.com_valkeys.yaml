@@ -122,6 +122,25 @@ spec:
                     default: false
                     description: Enabled activates the observer deployment.
                     type: boolean
+                  mtls:
+                    description: |-
+                      MTLS configures mutual TLS behaviour for the observer's outbound connections.
+                      Only effective when spec.tls.enabled is true.
+                    properties:
+                      sentinel:
+                        description: |-
+                          Sentinel controls whether the observer sends a client certificate to Sentinel pods.
+                          When nil or false, only the CA certificate is used (no client certificate).
+                          Set to true to enable mTLS for Sentinel connections.
+                          Default: false.
+                        type: boolean
+                      valkey:
+                        description: |-
+                          Valkey controls whether the observer sends a client certificate to Valkey pods.
+                          Set to true to enable mTLS; when nil or false, no client certificate is sent.
+                          Default: false.
+                        type: boolean
+                    type: object
                   resources:
                     description: Resources defines the compute resource requirements
                       for the observer container.
@@ -288,6 +307,16 @@ spec:
                       otherwise to an implementation-defined value. Requests cannot exceed Limits.
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
+                type: object
+              rollingUpdate:
+                description: RollingUpdate configures rolling update behaviour.
+                properties:
+                  syncTimeout:
+                    description: |-
+                      SyncTimeout is the maximum duration to wait for a replaced pod to
+                      complete replication sync before pausing the rolling update.
+                      Default: 5m.
+                    type: string
                 type: object
               sentinel:
                 description: Sentinel configures Sentinel-based HA mode.
