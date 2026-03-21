@@ -404,7 +404,7 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 	// Allow 3 minutes — after a rolling update replicas need time to reconnect and
 	// complete the initial replication sync, which can be slow on a loaded Kind cluster.
 	require.Eventually(t, func() bool {
-		info := tc.valkeyExecAllowError(t, namespace, masterPod, port, "INFO", "replication")
+		info := tc.valkeyExecQuick(t, namespace, masterPod, port, "INFO", "replication")
 		if !strings.Contains(info, expectedStr) {
 			return false
 		}
@@ -448,7 +448,7 @@ func (tc *testClients) waitForSentinelSlaves(t *testing.T, namespace, valkeyName
 	t.Helper()
 	sentinelPod := fmt.Sprintf("%s-sentinel-0", valkeyName)
 	require.Eventually(t, func() bool {
-		raw := tc.valkeyExecAllowError(t, namespace, sentinelPod, 26379,
+		raw := tc.valkeyExecQuick(t, namespace, sentinelPod, 26379,
 			"SENTINEL", "MASTER", valkeyName)
 		// SENTINEL MASTER returns alternating key/value lines with --raw.
 		// Find "num-slaves" and read the following line as the count.

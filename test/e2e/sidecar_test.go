@@ -514,7 +514,7 @@ func TestE2E_SidecarDrainReplica(t *testing.T) {
 		// Use valkeyExecAllowError because the recreated replica may still be
 		// starting its valkey container (kubectl exec can fail transiently).
 		require.Eventually(t, func() bool {
-			resp := tc.valkeyExecAllowError(t, ns, replicaPod, 6379, "GET", "replica-drain-key")
+			resp := tc.valkeyExecQuick(t, ns, replicaPod, 6379, "GET", "replica-drain-key")
 			return resp == "test-value"
 		}, 60*time.Second, 2*time.Second,
 			"Data should replicate to recreated replica %s", replicaPod)
