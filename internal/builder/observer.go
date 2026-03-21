@@ -237,13 +237,23 @@ func buildObserverVolumes(v *vkov1.Valkey) []corev1.Volume {
 	}
 
 	secretName := observerTLSSecretName(v)
+	secretVolume := &corev1.SecretVolumeSource{
+		SecretName: secretName,
+	}
+
+	// Without mTLS the observer only needs the CA certificate for server
+	// verification — do not expose the private key unnecessarily.
+	if !v.IsObserverMTLSActive() {
+		secretVolume.Items = []corev1.KeyToPath{
+			{Key: "ca.crt", Path: "ca.crt"},
+		}
+	}
+
 	return []corev1.Volume{
 		{
 			Name: TLSVolumeName,
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: secretName,
-				},
+				Secret: secretVolume,
 			},
 		},
 	}

@@ -3,6 +3,7 @@ package valkeyclient
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"strings"
@@ -233,6 +234,37 @@ func TestConnHint_NonOpError(t *testing.T) {
 	err := fmt.Errorf("generic error")
 	hint := connHint("10.0.0.1:6379", err)
 	assert.Contains(t, hint, "10.0.0.1:6379")
+}
+
+func TestConnHint_TLS_UnknownAuthority(t *testing.T) {
+	err := &x509.UnknownAuthorityError{}
+	hint := connHint("10.0.0.1:16379", err)
+	assert.Contains(t, hint, "TLS handshake")
+	assert.Contains(t, hint, "CA certificate")
+	assert.NotContains(t, hint, "firewall")
+}
+
+func TestConnHint_TLS_CertificateInvalid(t *testing.T) {
+	err := &x509.CertificateInvalidError{Reason: x509.Expired}
+	hint := connHint("10.0.0.1:16379", err)
+	assert.Contains(t, hint, "TLS handshake")
+	assert.NotContains(t, hint, "firewall")
+}
+
+func TestConnHint_TLS_RecordHeaderError(t *testing.T) {
+	err := &tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}
+	hint := connHint("10.0.0.1:16379", err)
+	assert.Contains(t, hint, "TLS handshake")
+	assert.NotContains(t, hint, "firewall")
+}
+
+func TestConnHint_TLS_StringMatch(t *testing.T) {
+	// Simulates errors like "remote error: tls: bad certificate" which are
+	// not exported Go types but contain the "tls:" prefix.
+	err := fmt.Errorf("remote error: tls: bad certificate")
+	hint := connHint("10.0.0.1:16379", err)
+	assert.Contains(t, hint, "TLS handshake")
+	assert.NotContains(t, hint, "firewall")
 }
 
 // timeoutError is a net.Error that reports Timeout() == true.

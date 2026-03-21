@@ -158,8 +158,14 @@ func TestBuildObserverDeployment_WithTLS(t *testing.T) {
 	assert.Equal(t, TLSMountPath, c.VolumeMounts[0].MountPath)
 	assert.True(t, c.VolumeMounts[0].ReadOnly)
 
+	// Volume projects only ca.crt when mTLS is inactive.
 	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	require.NotNil(t, secretVol.Items)
+	require.Len(t, secretVol.Items, 1)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Key)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Path)
 }
 
 func TestBuildObserverDeployment_WithTLS_WithMTLS(t *testing.T) {
@@ -194,9 +200,11 @@ func TestBuildObserverDeployment_WithTLS_WithMTLS(t *testing.T) {
 	assert.Equal(t, TLSMountPath, c.VolumeMounts[0].MountPath)
 	assert.True(t, c.VolumeMounts[0].ReadOnly)
 
-	// TLS volume present.
+	// TLS volume present — full secret, no Items projection with mTLS.
 	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	assert.Nil(t, secretVol.Items)
 }
 
 func TestBuildObserverDeployment_WithSentinel(t *testing.T) {
@@ -401,6 +409,11 @@ func TestBuildObserverDeployment_WithTLS_DefaultMTLSArgs(t *testing.T) {
 	assert.Equal(t, TLSVolumeName, c.VolumeMounts[0].Name)
 	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	// Only ca.crt projected.
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	require.NotNil(t, secretVol.Items)
+	require.Len(t, secretVol.Items, 1)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Key)
 }
 
 func TestBuildObserverDeployment_WithTLS_ExplicitMTLSArgs(t *testing.T) {
