@@ -7,18 +7,20 @@ import (
 )
 
 type observerMetrics struct {
-	masterReachable    prometheus.Gauge
-	replicaSyncOK      prometheus.Gauge
-	writeTestOK        prometheus.Gauge
-	readTestOK         prometheus.Gauge
-	replicaReadTestOK  prometheus.Gauge
-	sentinelReachable  prometheus.Gauge
-	sentinelQuorumOK   prometheus.Gauge
-	sentinelFlagsOK    prometheus.Gauge
-	healthy            prometheus.Gauge
-	checkDuration      prometheus.Histogram
-	checksTotal        prometheus.Counter
-	checkFailuresTotal prometheus.Counter
+	masterReachable            prometheus.Gauge
+	replicaSyncOK              prometheus.Gauge
+	writeTestOK                prometheus.Gauge
+	readTestOK                 prometheus.Gauge
+	replicaReadTestOK          prometheus.Gauge
+	sentinelReachable          prometheus.Gauge
+	sentinelQuorumOK           prometheus.Gauge
+	sentinelFlagsOK            prometheus.Gauge
+	sentinelMasterHostnameOK   prometheus.Gauge
+	sentinelReplicaHostnamesOK prometheus.Gauge
+	healthy                    prometheus.Gauge
+	checkDuration              prometheus.Histogram
+	checksTotal                prometheus.Counter
+	checkFailuresTotal         prometheus.Counter
 }
 
 func newObserverMetrics() *observerMetrics {
@@ -55,6 +57,14 @@ func newObserverMetrics() *observerMetrics {
 			Name: "valkey_observer_sentinel_flags_ok",
 			Help: "Whether sentinel master flags are clean (1=yes, 0=no)",
 		}),
+		sentinelMasterHostnameOK: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "valkey_observer_sentinel_master_hostname_ok",
+			Help: "Whether the master address from Sentinel is a hostname (1=yes, 0=no)",
+		}),
+		sentinelReplicaHostnamesOK: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "valkey_observer_sentinel_replica_hostnames_ok",
+			Help: "Whether all replica addresses from Sentinel are hostnames (1=yes, 0=no)",
+		}),
 		healthy: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "valkey_observer_healthy",
 			Help: "Whether all checks passed (1=yes, 0=no)",
@@ -85,6 +95,8 @@ func (m *observerMetrics) collectors() []prometheus.Collector {
 		m.sentinelReachable,
 		m.sentinelQuorumOK,
 		m.sentinelFlagsOK,
+		m.sentinelMasterHostnameOK,
+		m.sentinelReplicaHostnamesOK,
 		m.healthy,
 		m.checkDuration,
 		m.checksTotal,
@@ -118,6 +130,8 @@ func (m *observerMetrics) updateGauges(checks map[string]bool, healthy bool) {
 	setGauge(m.sentinelReachable, "sentinel_reachable")
 	setGauge(m.sentinelQuorumOK, "sentinel_quorum")
 	setGauge(m.sentinelFlagsOK, "sentinel_flags")
+	setGauge(m.sentinelMasterHostnameOK, "sentinel_master_hostname")
+	setGauge(m.sentinelReplicaHostnamesOK, "sentinel_replica_hostnames")
 
 	if healthy {
 		m.healthy.Set(1)

@@ -124,6 +124,7 @@ func TestBuildObserverDeployment_Args_Standalone(t *testing.T) {
 }
 
 func TestBuildObserverDeployment_WithTLS(t *testing.T) {
+	// TLS enabled, but both mTLS=false (default): no cert mount, no cert path args.
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
 		v.Spec.TLS = &vkov1.TLSSpec{
@@ -137,11 +138,48 @@ func TestBuildObserverDeployment_WithTLS(t *testing.T) {
 	deploy := BuildObserverDeployment(v, testOperatorImage)
 	c := deploy.Spec.Template.Spec.Containers[0]
 
-	// TLS args present.
+	// TLS enabled flag present, mTLS flags at default false.
+	assert.Contains(t, c.Args, "--tls-enabled=true")
+	assert.Contains(t, c.Args, "--valkey-mtls=false")
+	assert.Contains(t, c.Args, "--sentinel-mtls=false")
+
+	// No cert path args when mTLS is inactive.
+	for _, arg := range c.Args {
+		assert.NotContains(t, arg, "--tls-ca-cert")
+		assert.NotContains(t, arg, "--tls-cert")
+		assert.NotContains(t, arg, "--tls-key")
+	}
+
+	// No volume or volume mount when mTLS is inactive.
+	assert.Empty(t, c.VolumeMounts)
+	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
+}
+
+func TestBuildObserverDeployment_WithTLS_WithMTLS(t *testing.T) {
+	// TLS enabled + Valkey mTLS=true: cert must be mounted and cert path args present.
+	tr := true
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{
+			Enabled: true,
+			MTLS:    &vkov1.ObserverMTLSSpec{Valkey: &tr},
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+			},
+		}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	c := deploy.Spec.Template.Spec.Containers[0]
+
+	// Cert path args present.
 	assert.Contains(t, c.Args, "--tls-enabled=true")
 	assert.Contains(t, c.Args, fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath))
 	assert.Contains(t, c.Args, fmt.Sprintf("--tls-cert=%s/tls.crt", TLSMountPath))
 	assert.Contains(t, c.Args, fmt.Sprintf("--tls-key=%s/tls.key", TLSMountPath))
+	assert.Contains(t, c.Args, "--valkey-mtls=true")
 
 	// TLS volume mounted.
 	require.Len(t, c.VolumeMounts, 1)
@@ -306,8 +344,13 @@ func TestObserverDeploymentHasChanged_DifferentResources(t *testing.T) {
 // --- Observer with TLS secret (not cert-manager) ---
 
 func TestBuildObserverDeployment_WithTLSSecret(t *testing.T) {
+	// TLS secret + mTLS active: secret must be mounted as the source volume.
+	tr := true
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
-		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+		v.Spec.Observer = &vkov1.ObserverSpec{
+			Enabled: true,
+			MTLS:    &vkov1.ObserverMTLSSpec{Valkey: &tr},
+		}
 		v.Spec.TLS = &vkov1.TLSSpec{
 			Enabled:    true,
 			SecretName: "my-tls-secret",
@@ -317,4 +360,73 @@ func TestBuildObserverDeployment_WithTLSSecret(t *testing.T) {
 	deploy := BuildObserverDeployment(v, testOperatorImage)
 	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, "my-tls-secret", deploy.Spec.Template.Spec.Volumes[0].Secret.SecretName)
+}
+
+// --- Observer mTLS args ---
+
+func TestBuildObserverDeployment_WithTLS_DefaultMTLSArgs(t *testing.T) {
+	// No MTLS spec = defaults: both false, no cert mount.
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+			},
+		}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	c := deploy.Spec.Template.Spec.Containers[0]
+
+	assert.Contains(t, c.Args, "--valkey-mtls=false")
+	assert.Contains(t, c.Args, "--sentinel-mtls=false")
+	assert.Empty(t, c.VolumeMounts)
+	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
+}
+
+func TestBuildObserverDeployment_WithTLS_ExplicitMTLSArgs(t *testing.T) {
+	// Explicit: Valkey=false, Sentinel=true — mTLS active via sentinel → cert is mounted.
+	f := false
+	tr := true
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{
+			Enabled: true,
+			MTLS:    &vkov1.ObserverMTLSSpec{Valkey: &f, Sentinel: &tr},
+		}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+			},
+		}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	c := deploy.Spec.Template.Spec.Containers[0]
+
+	assert.Contains(t, c.Args, "--valkey-mtls=false")
+	assert.Contains(t, c.Args, "--sentinel-mtls=true")
+	assert.Contains(t, c.Args, fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath))
+	assert.Contains(t, c.Args, fmt.Sprintf("--tls-cert=%s/tls.crt", TLSMountPath))
+	assert.Contains(t, c.Args, fmt.Sprintf("--tls-key=%s/tls.key", TLSMountPath))
+	require.Len(t, c.VolumeMounts, 1)
+	assert.Equal(t, TLSVolumeName, c.VolumeMounts[0].Name)
+	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
+	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+}
+
+func TestBuildObserverDeployment_NoTLS_NoMTLSArgs(t *testing.T) {
+	// Without TLS, mTLS flags must not appear in args
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+
+	deploy := BuildObserverDeployment(v, testOperatorImage)
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	for _, arg := range args {
+		assert.NotContains(t, arg, "valkey-mtls")
+		assert.NotContains(t, arg, "sentinel-mtls")
+	}
 }
