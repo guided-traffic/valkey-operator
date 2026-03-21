@@ -3,6 +3,9 @@ on:
   release:
     types: [published]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
   pages: write
@@ -37,7 +40,7 @@ jobs:
 
       - name: Docker meta
         id: tag_names
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             guidedtraffic/valkey-operator

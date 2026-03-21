@@ -9,6 +9,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write  # For PR comments
@@ -17,6 +21,7 @@ permissions:
 env:
   GO_VERSION: '1.26.1'
   KUBERNETES_VERSION: '1.33.4'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   e2e-tests:
