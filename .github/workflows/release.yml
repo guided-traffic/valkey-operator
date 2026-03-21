@@ -17,6 +17,7 @@ permissions:
 env:
   GO_VERSION: '1.26.1'
   KUBERNETES_VERSION: '1.33.4'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   e2e-tests:
