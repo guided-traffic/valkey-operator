@@ -760,3 +760,108 @@ func TestPersistenceMode_Values(t *testing.T) {
 	assert.Equal(t, PersistenceMode("aof"), PersistenceModeAOF)
 	assert.Equal(t, PersistenceMode("both"), PersistenceModeBoth)
 }
+
+func TestIsObserverValkeyMTLSEnabled(t *testing.T) {
+	t.Run("nil Observer defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("Observer set MTLS nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("MTLS set Valkey nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{}}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("explicitly false", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &f}}
+		})
+		assert.False(t, v.IsObserverValkeyMTLSEnabled())
+	})
+
+	t.Run("explicitly true", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &tr}}
+		})
+		assert.True(t, v.IsObserverValkeyMTLSEnabled())
+	})
+}
+
+func TestIsObserverMTLSActive(t *testing.T) {
+	t.Run("both nil defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("valkey true activates", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &tr}}
+		})
+		assert.True(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("sentinel true activates", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &tr}}
+		})
+		assert.True(t, v.IsObserverMTLSActive())
+	})
+
+	t.Run("both false not active", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Valkey: &f, Sentinel: &f}}
+		})
+		assert.False(t, v.IsObserverMTLSActive())
+	})
+}
+
+func TestIsObserverSentinelMTLSEnabled(t *testing.T) {
+	t.Run("nil Observer defaults to false", func(t *testing.T) {
+		v := newValkey("test")
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("Observer set MTLS nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("MTLS set Sentinel nil defaults to false", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{}}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("explicitly true", func(t *testing.T) {
+		tr := true
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &tr}}
+		})
+		assert.True(t, v.IsObserverSentinelMTLSEnabled())
+	})
+
+	t.Run("explicitly false", func(t *testing.T) {
+		f := false
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{MTLS: &ObserverMTLSSpec{Sentinel: &f}}
+		})
+		assert.False(t, v.IsObserverSentinelMTLSEnabled())
+	})
+}

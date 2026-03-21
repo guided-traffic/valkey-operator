@@ -201,3 +201,55 @@ func TestRunSentinelChecks_IncludesHostnameChecks(t *testing.T) {
 	assert.True(t, hasReplicaHostnames, "sentinel_replica_hostnames check must be present")
 	assert.NotEmpty(t, msg)
 }
+
+func TestNew_TLS_ValkeyMTLSFalse_SkipsClientCert(t *testing.T) {
+	// ValkeyMTLS=false → client cert loading skipped → no error even with missing cert paths
+	cfg := Config{
+		Namespace:   "default",
+		ClusterName: "test",
+		TLSEnabled:  true,
+		TLSCACert:   "/nonexistent/ca.crt",
+		TLSCert:     "/nonexistent/tls.crt",
+		TLSKey:      "/nonexistent/tls.key",
+		ValkeyMTLS:  false,
+	}
+
+	obs, err := New(cfg)
+
+	// CA cert is still required → should fail on CA cert loading
+	assert.Error(t, err)
+	assert.Nil(t, obs)
+}
+
+func TestNew_TLS_ValkeyMTLSTrue_RequiresClientCert(t *testing.T) {
+	// ValkeyMTLS=true (default) → client cert loading attempted → error on missing cert
+	cfg := Config{
+		Namespace:   "default",
+		ClusterName: "test",
+		TLSEnabled:  true,
+		TLSCACert:   "/nonexistent/ca.crt",
+		TLSCert:     "/nonexistent/tls.crt",
+		TLSKey:      "/nonexistent/tls.key",
+		ValkeyMTLS:  true,
+	}
+
+	obs, err := New(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, obs)
+}
+
+func TestNew_TLS_SentinelMTLSFlags(t *testing.T) {
+	// Without TLS, SentinelMTLS flag has no effect
+	cfg := Config{
+		Namespace:       "default",
+		ClusterName:     "test",
+		SentinelEnabled: true,
+		TLSEnabled:      false,
+		SentinelMTLS:    true,
+	}
+
+	obs, err := New(cfg)
+	require.NoError(t, err)
+	assert.Nil(t, obs.sentinelTLSConfig)
+}

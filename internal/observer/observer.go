@@ -32,6 +32,13 @@ type Config struct {
 	TLSCert    string
 	TLSKey     string
 
+	// ValkeyMTLS controls whether the observer sends a client certificate to Valkey pods.
+	// Default: true (mTLS enabled).
+	ValkeyMTLS bool
+	// SentinelMTLS controls whether the observer sends a client certificate to Sentinel pods.
+	// Default: false (server-only TLS verification).
+	SentinelMTLS bool
+
 	// Sentinel settings.
 	SentinelEnabled     bool
 	SentinelAddrs       string
@@ -63,16 +70,15 @@ type Observer struct {
 
 // New creates a new Observer with the given configuration.
 func New(cfg Config) (*Observer, error) {
-	var tlsCfg *tls.Config
-	var sentinelTLSCfg *tls.Config
+	var tlsCfg, sentinelTLSCfg *tls.Config
 	if cfg.TLSEnabled {
 		var err error
-		tlsCfg, err = buildTLSConfig(cfg)
+		tlsCfg, err = buildTLSConfig(cfg, cfg.ValkeyMTLS)
 		if err != nil {
 			return nil, fmt.Errorf("building TLS config: %w", err)
 		}
 		if cfg.SentinelEnabled {
-			sentinelTLSCfg, err = buildSentinelTLSConfig(cfg)
+			sentinelTLSCfg, err = buildTLSConfig(cfg, cfg.SentinelMTLS)
 			if err != nil {
 				return nil, fmt.Errorf("building sentinel TLS config: %w", err)
 			}
@@ -295,7 +301,11 @@ func (o *Observer) setResult(ready bool, checks map[string]bool, message string,
 	o.metrics.updateGauges(checks, ready)
 }
 
-func buildTLSConfig(cfg Config) (*tls.Config, error) {
+// buildTLSConfig builds a TLS config for the observer.
+// When withClientCert is true, the client certificate and key are loaded
+// for mutual TLS (mTLS). When false, only the CA certificate is loaded
+// for server-only verification.
+func buildTLSConfig(cfg Config, withClientCert bool) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 	}
@@ -312,35 +322,12 @@ func buildTLSConfig(cfg Config) (*tls.Config, error) {
 		tlsCfg.RootCAs = certPool
 	}
 
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+	if withClientCert && cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 		if err != nil {
 			return nil, fmt.Errorf("loading client certificate: %w", err)
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	return tlsCfg, nil
-}
-
-// buildSentinelTLSConfig creates a TLS config for Sentinel connections.
-// It loads only the CA cert for server verification — no client certificates (no mTLS).
-// Hostname verification is enabled by default (InsecureSkipVerify is not set).
-func buildSentinelTLSConfig(cfg Config) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	}
-
-	if cfg.TLSCACert != "" {
-		caCert, err := os.ReadFile(cfg.TLSCACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert: %w", err)
-		}
-		certPool := x509.NewCertPool()
-		if !certPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA certificate")
-		}
-		tlsCfg.RootCAs = certPool
 	}
 
 	return tlsCfg, nil

@@ -273,6 +273,9 @@ spec:
   observer:
     enabled: true
     db: 15              # Valkey DB for health key (default: 15)
+    # mtls:             # Optional: enable mTLS for observer connections (both default to false)
+    #   valkey: true    # Send client cert to Valkey pods
+    #   sentinel: true  # Send client cert to Sentinel pods
     resources:
       requests:
         cpu: 50m
@@ -401,7 +404,19 @@ spec:
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Deploy a diagnostic observer alongside the cluster |
 | `db` | `int` | `15` | Valkey database index (0–15) used for the health check key |
+| `mtls` | `ObserverMTLSSpec` | — | Controls whether the observer sends a client certificate to Valkey and/or Sentinel. Only effective when `spec.tls.enabled: true`. |
 | `resources` | `ResourceRequirements` | 50m/64Mi request, 128Mi limit | CPU/memory for the observer container |
+
+### `spec.observer.mtls`
+
+When `spec.tls.enabled: true`, the observer always verifies the server's certificate. These flags additionally enable **mutual TLS (mTLS)** by sending a client certificate. When neither flag is set, no certificate secret is mounted into the observer pod.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `valkey` | `bool` | `false` | Send client certificate to Valkey pods (mTLS). When `false`, the observer uses server-only TLS. |
+| `sentinel` | `bool` | `false` | Send client certificate to Sentinel pods (mTLS). When `false`, the observer uses server-only TLS. |
+
+> **Note:** The TLS secret is only mounted into the observer pod when at least one of `mtls.valkey` or `mtls.sentinel` is `true`. If both are `false` (the default), the observer connects using TLS without a client certificate and no volume mount is created.
 
 ### `spec.persistence`
 
