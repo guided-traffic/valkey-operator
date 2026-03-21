@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +30,11 @@ const (
 	// Standalone pods are not automatically restarted for sidecar-only changes;
 	// the update will occur on the next pod restart (manual delete or image change).
 	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
+
+	// ConditionTypeRollingUpdatePaused is set when a rolling update is paused
+	// because a replaced pod failed to sync within the configured timeout.
+	// The operator will not resume until the user applies a new spec change.
+	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -225,6 +232,15 @@ type PersistenceSpec struct {
 	Size resource.Quantity `json:"size,omitempty"`
 }
 
+// RollingUpdateSpec configures the behaviour of rolling updates.
+type RollingUpdateSpec struct {
+	// SyncTimeout is the maximum duration to wait for a replaced pod to
+	// complete replication sync before pausing the rolling update.
+	// Default: 5m.
+	// +optional
+	SyncTimeout *metav1.Duration `json:"syncTimeout,omitempty"`
+}
+
 // ValkeySpec defines the desired state of Valkey.
 type ValkeySpec struct {
 	// Replicas is the number of Valkey instances to run.
@@ -275,6 +291,10 @@ type ValkeySpec struct {
 	// Resources defines the compute resource requirements for Valkey containers.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// RollingUpdate configures rolling update behaviour.
+	// +optional
+	RollingUpdate *RollingUpdateSpec `json:"rollingUpdate,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -453,6 +473,15 @@ func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: resource.MustParse("64Mi"),
 		},
 	}
+}
+
+// GetSyncTimeout returns the configured sync timeout for rolling updates,
+// defaulting to 5 minutes if not set.
+func (v *Valkey) GetSyncTimeout() time.Duration {
+	if v.Spec.RollingUpdate != nil && v.Spec.RollingUpdate.SyncTimeout != nil {
+		return v.Spec.RollingUpdate.SyncTimeout.Duration
+	}
+	return 5 * time.Minute
 }
 
 func init() {

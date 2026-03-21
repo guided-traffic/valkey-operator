@@ -100,6 +100,7 @@ func main() {
 	if err = (&controller.ValkeyReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorderFor("valkey-operator"),
 		OperatorImage:     operatorImage,
 		OperatorNamespace: operatorNamespace,
 		OperatorVersion:   version,

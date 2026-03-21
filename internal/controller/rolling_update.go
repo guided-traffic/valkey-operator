@@ -5,11 +5,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -57,6 +59,11 @@ const annotationReconnectResetCount = "vko.gtrfc.com/reconnect-reset-count"
 // finalization has stalled (e.g., because GetReplicationInfo is flaky in CI) and
 // allow the rolling update to complete despite incomplete topology information.
 const annotationFinalizationTimestamp = "vko.gtrfc.com/finalization-started"
+
+// annotationSyncWaitStarted records when the operator began waiting for a
+// specific replaced pod to complete replication sync. Used with the configurable
+// syncTimeout to detect when sync has stalled and the rolling update should be paused.
+const annotationSyncWaitStarted = "vko.gtrfc.com/sync-wait-started"
 
 // annotationSentinelAwarenessStarted records when we first started waiting for
 // sentinel to discover the expected number of replicas before triggering a
@@ -484,10 +491,18 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 	}
 
 	logger.Info("Rolling update complete, all pods running new image")
+	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
+		"Rolling update completed successfully, all pods running desired version")
 	// Clean up state annotation.
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
 	}
+	// Clear the paused condition if it was set by a previous failed attempt.
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeRollingUpdatePaused,
+		metav1.ConditionFalse,
+		"Completed",
+		"Rolling update completed successfully")
 	return RollingUpdateResult{Completed: true}
 }
 
@@ -784,40 +799,212 @@ func countReplacedPods(pods []podState) int {
 }
 
 // replaceNextReplica finds the next replica pod that needs updating and deletes it.
+// Pods are sorted by creation timestamp descending (youngest replica first) to
+// minimize the risk window: the youngest replica has the least unique data.
+// After each replacement, the operator waits for full replication sync before
+// proceeding to the next pod, ensuring at least floor(n/2) synced replicas at all times.
 // Returns nil if no replica needs replacement (all replicas are done).
 func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valkey, pods []podState) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
-	for i, ps := range pods {
-		if !ps.needsUpdate || ps.isMaster {
-			continue
-		}
+	// Before deleting the next replica, verify that all already-replaced replicas
+	// have completed replication sync. This ensures we never have multiple
+	// replicas in an un-synced state simultaneously.
+	if result := r.verifyReplacedReplicasSynced(ctx, v, pods); result != nil {
+		return result
+	}
 
-		if !ps.exists {
-			logger.Info("Waiting for pod to be recreated", "pod", ps.name)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-		}
+	// Build a list of replica pods that need updating, sorted youngest-first.
+	candidates := sortReplicaCandidates(pods)
 
-		if !ps.ready {
-			logger.Info("Waiting for replaced pod to become ready", "pod", ps.name)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-		}
+	if len(candidates) == 0 {
+		return nil
+	}
 
-		// Set state to replacing-replicas if not already set.
-		if r.getRollingUpdateState(v) == "" {
-			if err := r.setRollingUpdateState(ctx, v, stateReplacingReplicas); err != nil {
-				return &RollingUpdateResult{Error: err}
-			}
-		}
+	ps := candidates[0]
 
-		logger.Info("Deleting replica pod for rolling update", "pod", ps.name, "ordinal", i)
-		if err := r.Delete(ctx, ps.pod); err != nil {
-			return &RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
-		}
+	if !ps.exists {
+		logger.Info("Waiting for pod to be recreated", "pod", ps.name)
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
+	if !ps.ready {
+		logger.Info("Waiting for replaced pod to become ready", "pod", ps.name)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Set state to replacing-replicas if not already set.
+	if r.getRollingUpdateState(v) == "" {
+		if err := r.setRollingUpdateState(ctx, v, stateReplacingReplicas); err != nil {
+			return &RollingUpdateResult{Error: err}
+		}
+	}
+
+	totalPods := len(pods)
+	updatedCount := countUpdatedPods(pods)
+	phase := fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
+	_ = r.updatePhase(ctx, v, ValkeyPhase(phase),
+		fmt.Sprintf("Replacing pod %s", ps.name))
+
+	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdate",
+		"Deleting replica pod %s for rolling update (youngest-first)", ps.name)
+
+	logger.Info("Deleting replica pod for rolling update", "pod", ps.name)
+	if err := r.Delete(ctx, ps.pod); err != nil {
+		return &RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
+	}
+	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// sortReplicaCandidates returns replica pods needing updates, sorted by creation
+// timestamp descending (youngest first). Non-existent pods are placed first
+// (they need recreation and are the youngest by definition).
+func sortReplicaCandidates(pods []podState) []podState {
+	var candidates []podState
+	for _, ps := range pods {
+		if ps.needsUpdate && !ps.isMaster {
+			candidates = append(candidates, ps)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		// Non-existent pods first (waiting for recreation).
+		if !candidates[i].exists {
+			return true
+		}
+		if !candidates[j].exists {
+			return false
+		}
+		// Youngest (most recent creation timestamp) first.
+		ti := candidates[i].pod.CreationTimestamp.Time
+		tj := candidates[j].pod.CreationTimestamp.Time
+		return ti.After(tj)
+	})
+	return candidates
+}
+
+// verifyReplacedReplicasSynced checks that all already-replaced (updated, ready)
+// non-master replicas have completed replication sync. This is called before
+// deleting the next replica to ensure the cluster always has sufficient synced
+// replicas for high availability.
+// Returns nil when all replaced replicas are synced, or a requeue/pause result otherwise.
+func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *vkov1.Valkey, pods []podState) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	checker := r.getInstanceChecker()
+
+	for _, ps := range pods {
+		// Only check already-replaced replicas (updated, ready, not the master).
+		if ps.needsUpdate || ps.isMaster || !ps.exists || !ps.ready {
+			continue
+		}
+
+		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
+		if err != nil {
+			logger.Info("Cannot verify replication sync on replaced pod, waiting", "pod", ps.name, "error", err)
+			r.ensureSyncWaitTimestamp(ctx, v)
+			if r.isSyncWaitTimedOut(v) {
+				return r.pauseRollingUpdate(ctx, v,
+					fmt.Sprintf("Pod %s failed to respond to replication check within timeout", ps.name))
+			}
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+
+		if info.MasterSyncInProgress {
+			logger.Info("Replication sync still in progress on replaced pod, waiting", "pod", ps.name)
+			r.ensureSyncWaitTimestamp(ctx, v)
+
+			totalPods := len(pods)
+			updatedCount := countUpdatedPods(pods)
+			phase := fmt.Sprintf("%s %d/%d (syncing)", vkov1.ValkeyPhaseRollingUpdate, updatedCount, totalPods)
+			_ = r.updatePhase(ctx, v, ValkeyPhase(phase),
+				fmt.Sprintf("Waiting for replication sync on pod %s", ps.name))
+
+			if r.isSyncWaitTimedOut(v) {
+				return r.pauseRollingUpdate(ctx, v,
+					fmt.Sprintf("Pod %s replication sync timed out after %v", ps.name, v.GetSyncTimeout()))
+			}
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+	}
+
+	// All replaced replicas are synced — clear the wait timestamp and proceed.
+	r.clearSyncWaitTimestamp(ctx, v)
 	return nil
+}
+
+// pauseRollingUpdate pauses the rolling update by setting a status condition
+// and recording a warning event. The operator will not resume until the user
+// applies a new spec change.
+func (r *ValkeyReconciler) pauseRollingUpdate(ctx context.Context, v *vkov1.Valkey, reason string) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	logger.Info("Pausing rolling update due to sync failure", "reason", reason)
+
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeRollingUpdatePaused,
+		metav1.ConditionTrue,
+		"SyncTimeout",
+		reason)
+
+	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError,
+		fmt.Sprintf("Rolling update paused: %s", reason))
+
+	r.recordEvent(v, corev1.EventTypeWarning, "RollingUpdatePaused", reason)
+
+	// Clear rolling update state so the next spec change triggers a fresh start.
+	if err := r.clearRollingUpdateState(ctx, v); err != nil {
+		return &RollingUpdateResult{Error: err}
+	}
+
+	// Return completed=false, no requeue — the operator waits for a new spec change.
+	return &RollingUpdateResult{}
+}
+
+// ensureSyncWaitTimestamp sets the sync-wait-started annotation if not already present.
+func (r *ValkeyReconciler) ensureSyncWaitTimestamp(ctx context.Context, v *vkov1.Valkey) {
+	if v.Annotations == nil {
+		v.Annotations = make(map[string]string)
+	}
+	if _, ok := v.Annotations[annotationSyncWaitStarted]; ok {
+		return
+	}
+	v.Annotations[annotationSyncWaitStarted] = time.Now().UTC().Format(time.RFC3339)
+	_ = r.Update(ctx, v)
+}
+
+// clearSyncWaitTimestamp removes the sync-wait-started annotation.
+func (r *ValkeyReconciler) clearSyncWaitTimestamp(ctx context.Context, v *vkov1.Valkey) {
+	if v.Annotations == nil {
+		return
+	}
+	if _, ok := v.Annotations[annotationSyncWaitStarted]; !ok {
+		return
+	}
+	delete(v.Annotations, annotationSyncWaitStarted)
+	_ = r.Update(ctx, v)
+}
+
+// isSyncWaitTimedOut returns true if the sync wait has exceeded the configured timeout.
+func (r *ValkeyReconciler) isSyncWaitTimedOut(v *vkov1.Valkey) bool {
+	if v.Annotations == nil {
+		return false
+	}
+	tsStr, ok := v.Annotations[annotationSyncWaitStarted]
+	if !ok || tsStr == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true // corrupted timestamp — treat as timed out to recover
+	}
+	return time.Since(ts) > v.GetSyncTimeout()
+}
+
+// recordEvent emits a Kubernetes Event on the Valkey CR if an EventRecorder
+// is configured. It is a no-op when Recorder is nil (e.g., in unit tests).
+func (r *ValkeyReconciler) recordEvent(v *vkov1.Valkey, eventType, reason, messageFmt string, args ...interface{}) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(v, eventType, reason, messageFmt, args...)
 }
 
 // handleMasterFailover checks if the master needs updating, verifies all replicas
@@ -882,6 +1069,9 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 		return &RollingUpdateResult{Error: err}
 	}
 	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover, "Triggering Sentinel failover before updating master pod")
+
+	r.recordEvent(v, corev1.EventTypeNormal, "FailoverTriggered",
+		"Triggering Sentinel failover before updating master pod")
 
 	if err := r.triggerSentinelFailover(ctx, v); err != nil {
 		logger.Info("Sentinel failover command failed, will retry via post-failover handler", "error", err)
@@ -1369,7 +1559,8 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasFinalization := v.Annotations[annotationFinalizationTimestamp]
 	_, hasSentinelAwareness := v.Annotations[annotationSentinelAwarenessStarted]
 	_, hasPromoted := v.Annotations[annotationPromotedPod]
-	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness && !hasPromoted {
+	_, hasSyncWait := v.Annotations[annotationSyncWaitStarted]
+	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness && !hasPromoted && !hasSyncWait {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
@@ -1378,6 +1569,7 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	delete(v.Annotations, annotationFinalizationTimestamp)
 	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	delete(v.Annotations, annotationPromotedPod)
+	delete(v.Annotations, annotationSyncWaitStarted)
 	return r.Update(ctx, v)
 }
 
@@ -1874,6 +2066,8 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 	// Delete the old master pod.
 	_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseFailover,
 		fmt.Sprintf("Manual failover: promoted %s, replacing master %s", promotedPod.name, pods[masterIdx].name))
+	r.recordEvent(v, corev1.EventTypeNormal, "ManualFailover",
+		"Promoted %s to temporary master, deleting old master %s", promotedPod.name, pods[masterIdx].name)
 	logger.Info("Deleting old master pod after manual failover", "pod", pods[masterIdx].name)
 	if err := r.Delete(ctx, pods[masterIdx].pod); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("deleting master pod %s: %w", pods[masterIdx].name, err)}
@@ -2086,6 +2280,8 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 	}
 
 	logger.Info("Multi-replica rolling update completed, topology restored")
+	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
+		"Multi-replica rolling update completed, topology restored")
 	return RollingUpdateResult{Completed: true}
 }
 

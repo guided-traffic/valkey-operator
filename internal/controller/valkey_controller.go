@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,6 +54,7 @@ type ValkeyReconciler struct {
 	client.Client
 	Scheme            *runtime.Scheme
 	InstanceChecker   InstanceChecker
+	Recorder          record.EventRecorder
 	OperatorImage     string
 	OperatorNamespace string
 	OperatorVersion   string
