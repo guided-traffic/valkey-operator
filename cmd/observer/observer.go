@@ -65,6 +65,9 @@ func parseFlags() observer.Config {
 	// Observer DB.
 	flag.IntVar(&cfg.ObserverDB, "observer-db", envInt("OBSERVER_DB", 15), "Valkey DB for health key (0-15)")
 
+	// Log level.
+	flag.StringVar(&cfg.LogLevel, "log-level", envString("LOG_LEVEL", "info"), "Log verbosity: debug, info, warn, error")
+
 	flag.Parse()
 
 	// Read auth password from environment.

@@ -170,6 +170,21 @@ type NetworkPolicySpec struct {
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
+// ObserverLogLevel defines the log verbosity for the observer process.
+// +kubebuilder:validation:Enum=debug;info;warn;error
+type ObserverLogLevel string
+
+const (
+	// ObserverLogLevelDebug enables verbose logging including stack traces for all errors.
+	ObserverLogLevelDebug ObserverLogLevel = "debug"
+	// ObserverLogLevelInfo is the default level; expected check failures are logged without stack traces.
+	ObserverLogLevelInfo ObserverLogLevel = "info"
+	// ObserverLogLevelWarn suppresses info-level messages.
+	ObserverLogLevelWarn ObserverLogLevel = "warn"
+	// ObserverLogLevelError only emits error-level messages.
+	ObserverLogLevelError ObserverLogLevel = "error"
+)
+
 // ObserverMTLSSpec controls whether the observer presents client certificates
 // for its connections to Valkey and Sentinel. Only effective when spec.tls.enabled
 // is true. Sending a client certificate enables mutual TLS (mTLS); omitting it
@@ -209,6 +224,14 @@ type ObserverSpec struct {
 	// Resources defines the compute resource requirements for the observer container.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// LogLevel sets the verbosity of observer log output.
+	// At debug level, stack traces are included for all errors.
+	// At info, warn, and error levels, stack traces are suppressed.
+	// +kubebuilder:validation:Enum=debug;info;warn;error
+	// +kubebuilder:default=info
+	// +optional
+	LogLevel ObserverLogLevel `json:"logLevel,omitempty"`
 }
 
 // PersistenceSpec defines data persistence configuration.
@@ -460,6 +483,14 @@ func (v *Valkey) GetObserverDB() int {
 		return *v.Spec.Observer.DB
 	}
 	return 15
+}
+
+// GetObserverLogLevel returns the configured observer log level, defaulting to "info".
+func (v *Valkey) GetObserverLogLevel() string {
+	if v.Spec.Observer != nil && v.Spec.Observer.LogLevel != "" {
+		return string(v.Spec.Observer.LogLevel)
+	}
+	return "info"
 }
 
 // GetObserverResources returns the resource requirements for the observer container.

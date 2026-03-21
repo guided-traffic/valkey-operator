@@ -865,3 +865,38 @@ func TestIsObserverSentinelMTLSEnabled(t *testing.T) {
 		assert.False(t, v.IsObserverSentinelMTLSEnabled())
 	})
 }
+
+func TestGetObserverLogLevel(t *testing.T) {
+	t.Run("nil observer returns info default", func(t *testing.T) {
+		v := newValkey("test")
+		assert.Equal(t, "info", v.GetObserverLogLevel())
+	})
+
+	t.Run("empty log level returns info default", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{Enabled: true}
+		})
+		assert.Equal(t, "info", v.GetObserverLogLevel())
+	})
+
+	t.Run("debug level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelDebug}
+		})
+		assert.Equal(t, "debug", v.GetObserverLogLevel())
+	})
+
+	t.Run("warn level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelWarn}
+		})
+		assert.Equal(t, "warn", v.GetObserverLogLevel())
+	})
+
+	t.Run("error level", func(t *testing.T) {
+		v := newValkey("test", func(v *Valkey) {
+			v.Spec.Observer = &ObserverSpec{LogLevel: ObserverLogLevelError}
+		})
+		assert.Equal(t, "error", v.GetObserverLogLevel())
+	})
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap/zapcore"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
@@ -31,6 +32,12 @@ type Config struct {
 	TLSCACert  string
 	TLSCert    string
 	TLSKey     string
+
+	// LogLevel sets the verbosity of observer log output.
+	// Supported: debug, info, warn, error. Default: info.
+	// At debug level, stack traces are included for all errors.
+	// At info, warn, and error levels, stack traces are suppressed.
+	LogLevel string
 
 	// ValkeyMTLS controls whether the observer sends a client certificate to Valkey pods.
 	// Default: true (mTLS enabled).
@@ -97,10 +104,30 @@ func New(cfg Config) (*Observer, error) {
 	}, nil
 }
 
+// buildObserverLogger creates a logr.Logger configured for the given log level.
+// At debug level, stack traces are included for all errors (dev mode).
+// At info, warn, and error levels, stack traces are suppressed so that
+// expected check failures do not pollute logs with call stacks.
+func buildObserverLogger(logLevel string) {
+	switch logLevel {
+	case "debug":
+		ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	case "warn":
+		lvl := zapcore.WarnLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	case "error":
+		lvl := zapcore.ErrorLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	default: // info
+		lvl := zapcore.InfoLevel
+		ctrl.SetLogger(zap.New(zap.Level(&lvl), zap.StacktraceLevel(zapcore.DPanicLevel)))
+	}
+}
+
 // Run starts the observer polling loop and health server.
 // It blocks until the context is cancelled.
 func Run(ctx context.Context, cfg Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	buildObserverLogger(cfg.LogLevel)
 	logger := ctrl.Log.WithName("observer")
 
 	logger.Info("starting observer",

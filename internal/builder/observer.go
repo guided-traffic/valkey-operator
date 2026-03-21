@@ -164,6 +164,8 @@ func buildObserverArgs(v *vkov1.Valkey) []string {
 		}
 	}
 
+	args = append(args, fmt.Sprintf("--log-level=%s", v.GetObserverLogLevel()))
+
 	return args
 }
 

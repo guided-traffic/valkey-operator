@@ -273,6 +273,7 @@ spec:
   observer:
     enabled: true
     db: 15              # Valkey DB for health key (default: 15)
+    logLevel: info      # Log verbosity: debug, info, warn, error (default: info)
     # mtls:             # Optional: enable mTLS for observer connections (both default to false)
     #   valkey: true    # Send client cert to Valkey pods
     #   sentinel: true  # Send client cert to Sentinel pods
@@ -404,6 +405,7 @@ spec:
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Deploy a diagnostic observer alongside the cluster |
 | `db` | `int` | `15` | Valkey database index (0–15) used for the health check key |
+| `logLevel` | `string` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. At `debug`, stack traces are included for all errors. At `info` and above, stack traces are suppressed. |
 | `mtls` | `ObserverMTLSSpec` | — | Controls whether the observer sends a client certificate to Valkey and/or Sentinel. Only effective when `spec.tls.enabled: true`. |
 | `resources` | `ResourceRequirements` | 50m/64Mi request, 128Mi limit | CPU/memory for the observer container |
 
