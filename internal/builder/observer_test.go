@@ -124,7 +124,7 @@ func TestBuildObserverDeployment_Args_Standalone(t *testing.T) {
 }
 
 func TestBuildObserverDeployment_WithTLS(t *testing.T) {
-	// TLS enabled, but both mTLS=false (default): no cert mount, no cert path args.
+	// TLS enabled, but both mTLS=false (default): CA cert mounted, no client cert args.
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
 		v.Spec.TLS = &vkov1.TLSSpec{
@@ -143,16 +143,29 @@ func TestBuildObserverDeployment_WithTLS(t *testing.T) {
 	assert.Contains(t, c.Args, "--valkey-mtls=false")
 	assert.Contains(t, c.Args, "--sentinel-mtls=false")
 
-	// No cert path args when mTLS is inactive.
+	// CA cert path arg present for server verification.
+	assert.Contains(t, c.Args, fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath))
+
+	// No client cert path args when mTLS is inactive.
 	for _, arg := range c.Args {
-		assert.NotContains(t, arg, "--tls-ca-cert")
 		assert.NotContains(t, arg, "--tls-cert")
 		assert.NotContains(t, arg, "--tls-key")
 	}
 
-	// No volume or volume mount when mTLS is inactive.
-	assert.Empty(t, c.VolumeMounts)
-	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
+	// TLS volume and mount present (needed for CA cert).
+	require.Len(t, c.VolumeMounts, 1)
+	assert.Equal(t, TLSVolumeName, c.VolumeMounts[0].Name)
+	assert.Equal(t, TLSMountPath, c.VolumeMounts[0].MountPath)
+	assert.True(t, c.VolumeMounts[0].ReadOnly)
+
+	// Volume projects only ca.crt when mTLS is inactive.
+	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
+	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	require.NotNil(t, secretVol.Items)
+	require.Len(t, secretVol.Items, 1)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Key)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Path)
 }
 
 func TestBuildObserverDeployment_WithTLS_WithMTLS(t *testing.T) {
@@ -187,9 +200,11 @@ func TestBuildObserverDeployment_WithTLS_WithMTLS(t *testing.T) {
 	assert.Equal(t, TLSMountPath, c.VolumeMounts[0].MountPath)
 	assert.True(t, c.VolumeMounts[0].ReadOnly)
 
-	// TLS volume present.
+	// TLS volume present — full secret, no Items projection with mTLS.
 	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	assert.Nil(t, secretVol.Items)
 }
 
 func TestBuildObserverDeployment_WithSentinel(t *testing.T) {
@@ -365,7 +380,7 @@ func TestBuildObserverDeployment_WithTLSSecret(t *testing.T) {
 // --- Observer mTLS args ---
 
 func TestBuildObserverDeployment_WithTLS_DefaultMTLSArgs(t *testing.T) {
-	// No MTLS spec = defaults: both false, no cert mount.
+	// No MTLS spec = defaults: both mTLS false, but CA cert + volume always mounted for server verification.
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
 		v.Spec.TLS = &vkov1.TLSSpec{
@@ -381,8 +396,24 @@ func TestBuildObserverDeployment_WithTLS_DefaultMTLSArgs(t *testing.T) {
 
 	assert.Contains(t, c.Args, "--valkey-mtls=false")
 	assert.Contains(t, c.Args, "--sentinel-mtls=false")
-	assert.Empty(t, c.VolumeMounts)
-	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
+	assert.Contains(t, c.Args, fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath))
+
+	// No client cert args when mTLS is inactive.
+	for _, arg := range c.Args {
+		assert.NotContains(t, arg, "--tls-cert")
+		assert.NotContains(t, arg, "--tls-key")
+	}
+
+	// TLS volume and mount present for CA cert.
+	require.Len(t, c.VolumeMounts, 1)
+	assert.Equal(t, TLSVolumeName, c.VolumeMounts[0].Name)
+	require.Len(t, deploy.Spec.Template.Spec.Volumes, 1)
+	assert.Equal(t, TLSVolumeName, deploy.Spec.Template.Spec.Volumes[0].Name)
+	// Only ca.crt projected.
+	secretVol := deploy.Spec.Template.Spec.Volumes[0].Secret
+	require.NotNil(t, secretVol.Items)
+	require.Len(t, secretVol.Items, 1)
+	assert.Equal(t, "ca.crt", secretVol.Items[0].Key)
 }
 
 func TestBuildObserverDeployment_WithTLS_ExplicitMTLSArgs(t *testing.T) {

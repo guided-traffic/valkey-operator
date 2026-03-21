@@ -404,7 +404,7 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 	// Allow 3 minutes — after a rolling update replicas need time to reconnect and
 	// complete the initial replication sync, which can be slow on a loaded Kind cluster.
 	require.Eventually(t, func() bool {
-		info := tc.valkeyExecAllowError(t, namespace, masterPod, port, "INFO", "replication")
+		info := tc.valkeyExecQuick(t, namespace, masterPod, port, "INFO", "replication")
 		if !strings.Contains(info, expectedStr) {
 			return false
 		}
@@ -412,6 +412,30 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 		return !strings.Contains(info, "master_sync_in_progress:1")
 	}, 3*time.Minute, 3*time.Second, "Master %s should have %d connected replicas", masterPod, expectedReplicas)
 	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
+}
+
+// valkeyExecQuick is a fast, no-retry kubectl exec helper intended for use inside
+// require.Eventually polling loops. It uses a short timeout (5s) and returns ""
+// on any error, so a slow or unreachable pod never stalls the polling budget.
+func (tc *testClients) valkeyExecQuick(t *testing.T, namespace, podName string, port int, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cliArgs := []string{
+		"exec", podName,
+		"-n", namespace,
+		"--", "valkey-cli",
+		"--raw",
+		"-p", fmt.Sprintf("%d", port),
+	}
+	cliArgs = append(cliArgs, args...)
+	cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stdout.String())
 }
 
 // waitForSentinelSlaves waits until a sentinel instance reports knowing about the
@@ -424,7 +448,7 @@ func (tc *testClients) waitForSentinelSlaves(t *testing.T, namespace, valkeyName
 	t.Helper()
 	sentinelPod := fmt.Sprintf("%s-sentinel-0", valkeyName)
 	require.Eventually(t, func() bool {
-		raw := tc.valkeyExecAllowError(t, namespace, sentinelPod, 26379,
+		raw := tc.valkeyExecQuick(t, namespace, sentinelPod, 26379,
 			"SENTINEL", "MASTER", valkeyName)
 		// SENTINEL MASTER returns alternating key/value lines with --raw.
 		// Find "num-slaves" and read the following line as the count.

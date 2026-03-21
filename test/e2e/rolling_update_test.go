@@ -144,7 +144,7 @@ func TestE2E_RollingUpdate_MultiReplicaNoSentinel(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "mr-roll:key1")
+				resp := tc.valkeyExecQuick(t, ns, podName, 6379, "GET", "mr-roll:key1")
 				return resp == "before-update"
 			}, 30*time.Second, 2*time.Second, "Data should replicate to %s", podName)
 			break // one replica check is sufficient
@@ -289,7 +289,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
+				resp := tc.valkeyExecQuick(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
 			}, 30*time.Second, 2*time.Second, "Data should replicate to %s", podName)
 		}
@@ -373,7 +373,7 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 				continue
 			}
 			require.Eventually(t, func() bool {
-				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "GET", "rolling:key1")
+				resp := tc.valkeyExecQuick(t, ns, podName, 6379, "GET", "rolling:key1")
 				return resp == "value-before-update"
 			}, 60*time.Second, 3*time.Second, "Data should replicate to %s after rolling update", podName)
 		}
@@ -663,7 +663,7 @@ func (tc *testClients) findMasterPod(t *testing.T, namespace, name string, repli
 	require.Eventually(t, func() bool {
 		for i := 0; i < replicas; i++ {
 			podName := fmt.Sprintf("%s-%d", name, i)
-			info := tc.valkeyExecAllowError(t, namespace, podName, 6379, "INFO", "replication")
+			info := tc.valkeyExecQuick(t, namespace, podName, 6379, "INFO", "replication")
 			if strings.Contains(info, "role:master") {
 				masterPod = podName
 				return true

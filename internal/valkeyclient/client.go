@@ -5,6 +5,7 @@ package valkeyclient
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -75,6 +76,13 @@ func (e *ConnectionError) Unwrap() error {
 // connHint inspects a connection error and returns a human-readable description
 // of the probable cause together with a concrete remediation suggestion.
 func connHint(addr string, err error) string {
+	if isTLSError(err) {
+		return fmt.Sprintf(
+			"TLS handshake with %s failed — verify that the CA certificate is correct and that the server's TLS certificate is valid (%v)",
+			addr, err,
+		)
+	}
+
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) {
 		return fmt.Sprintf("unexpected error — verify that %s is reachable and that firewall rules allow TCP access", addr)
@@ -107,6 +115,34 @@ func connHint(addr string, err error) string {
 		"cannot reach %s — verify that the service is running and that firewall rules allow TCP access to this port",
 		addr,
 	)
+}
+
+// isTLSError returns true when the error originates from TLS negotiation
+// (e.g. certificate verification failure, handshake error, or TLS alert).
+func isTLSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var recordErr *tls.RecordHeaderError
+	var certErr *x509.CertificateInvalidError
+	var unknownAuth x509.UnknownAuthorityError
+	var hostErr *x509.HostnameError
+
+	switch {
+	case errors.As(err, &recordErr),
+		errors.As(err, &certErr),
+		errors.As(err, &unknownAuth),
+		errors.As(err, &hostErr):
+		return true
+	}
+
+	// tls.AlertError and "remote error: tls: ..." are not exported types;
+	// detect them by message prefix.
+	msg := err.Error()
+	if strings.Contains(msg, "tls:") || strings.Contains(msg, "x509:") {
+		return true
+	}
+	return false
 }
 
 // New creates a new Valkey client for the given address (host:port).

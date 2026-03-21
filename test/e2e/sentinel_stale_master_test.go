@@ -84,7 +84,7 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 			masters := []string{}
 			for i := 0; i < 3; i++ {
 				podName := fmt.Sprintf("%s-%d", name, i)
-				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
+				info := tc.valkeyExecQuick(t, ns, podName, 6379, "INFO", "replication")
 				if strings.Contains(info, "role:master") {
 					masters = append(masters, podName)
 				}
@@ -98,7 +98,7 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 				return false
 			}
 			// Also verify replication settled (2 connected slaves).
-			info := tc.valkeyExecAllowError(t, ns, masters[0], 6379, "INFO", "replication")
+			info := tc.valkeyExecQuick(t, ns, masters[0], 6379, "INFO", "replication")
 			if !strings.Contains(info, "connected_slaves:2") {
 				t.Logf("Master %s does not yet have 2 connected slaves", masters[0])
 				return false
@@ -138,7 +138,7 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 	t.Run("sentinel reports healthy master", func(t *testing.T) {
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", name)
 		require.Eventually(t, func() bool {
-			raw := tc.valkeyExecAllowError(t, ns, sentinelPod, 26379,
+			raw := tc.valkeyExecQuick(t, ns, sentinelPod, 26379,
 				"SENTINEL", "MASTER", name)
 			// Check that flags do NOT contain s_down or o_down.
 			lines := strings.Split(raw, "\n")
