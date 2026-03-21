@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -280,10 +281,6 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 		}, 30*time.Second, time.Second, "Master should have 2 connected replicas")
 	})
 
-	// Record DBSIZE before drain.
-	dbsizeBefore := tc.valkeyExec(t, ns, initialMaster, 6379, "DBSIZE")
-	t.Logf("DBSIZE before drain: %s", dbsizeBefore)
-
 	// Delete the master pod — triggers SIGTERM → sidecar drain handler.
 	t.Run("delete master pod triggers failover", func(t *testing.T) {
 		t.Logf("Deleting master pod %s", initialMaster)
@@ -299,13 +296,12 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 		}
 
 		// Wait for exactly one master to exist (failover may take a moment to settle).
-		// Use valkeyExecAllowError because pods may still be starting and kubectl exec
-		// can fail transiently with "container not found" during pod restarts in CI.
+		// Use valkeyExecQuick (5s timeout, no retries) so a slow pod never stalls the poll.
 		require.Eventually(t, func() bool {
 			masterCount := 0
 			for i := 0; i < 3; i++ {
 				podName := fmt.Sprintf("%s-%d", name, i)
-				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
+				info := tc.valkeyExecQuick(t, ns, podName, 6379, "INFO", "replication")
 				if strings.Contains(info, "role:master") {
 					masterCount++
 				}
@@ -317,41 +313,58 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 
 	// Verify data survived the failover.
 	t.Run("data survives failover", func(t *testing.T) {
-		// Combine master-detection and data-verification in one retry loop.
+		// Find the stable new master by looking for a pod that is master AND holds
+		// our test keys. Uses valkeyExecQuick (5s timeout, no retries) so that slow
+		// or restarting pods never stall the polling budget.
 		// The deleted pod restarts fast (no PVC) and may briefly report role:master
-		// before Sentinel reconfigures it as a replica, resulting in a transient master
-		// with DBSIZE=0.  By accepting only the pod that is master AND already holds
-		// the expected data we avoid acting on that transient state.
+		// before Sentinel reconfigures it as a replica. By requiring both role:master
+		// AND the presence of our test keys we avoid acting on that transient state.
 		var newMaster string
 		require.Eventually(t, func() bool {
 			for i := 0; i < 3; i++ {
 				podName := fmt.Sprintf("%s-%d", name, i)
-				info := tc.valkeyExecAllowError(t, ns, podName, 6379, "INFO", "replication")
+				info := tc.valkeyExecQuick(t, ns, podName, 6379, "INFO", "replication")
 				if !strings.Contains(info, "role:master") {
 					continue
 				}
-				dbsize := tc.valkeyExecAllowError(t, ns, podName, 6379, "DBSIZE")
-				t.Logf("Pod %s: role=master DBSIZE=%s (want %s)", podName, dbsize, dbsizeBefore)
-				if dbsize == dbsizeBefore {
+				// Verify the master actually holds data (not a transient empty master).
+				resp := tc.valkeyExecQuick(t, ns, podName, 6379, "EXISTS", "drain:key:0")
+				t.Logf("Pod %s: role=master EXISTS drain:key:0=%s", podName, resp)
+				if resp == "1" {
 					newMaster = podName
 					return true
 				}
 			}
 			return false
-		}, 90*time.Second, 3*time.Second,
-			"New master with DBSIZE=%s should be found after failover", dbsizeBefore)
+		}, 120*time.Second, 3*time.Second,
+			"New master with test data should be found after failover")
 
-		t.Logf("New master after failover: %s (DBSIZE=%s confirmed)", newMaster, dbsizeBefore)
+		t.Logf("New master after failover: %s", newMaster)
 
-		// Wait for all replicas to reconnect so the cluster is fully stable before
-		// spot-checking individual keys.
-		tc.waitForConnectedReplicas(t, ns, newMaster, 6379, 2)
+		// Verify DBSIZE: all 50 keys must be present (no data loss).
+		dbsizeStr := tc.valkeyExec(t, ns, newMaster, 6379, "DBSIZE")
+		dbsize, err := strconv.Atoi(dbsizeStr)
+		require.NoError(t, err, "DBSIZE should return an integer, got %q", dbsizeStr)
+		require.GreaterOrEqual(t, dbsize, 50,
+			"Master should have at least 50 keys after failover (got %d)", dbsize)
+		t.Logf("DBSIZE after failover: %d", dbsize)
 
-		// Spot-check keys exist.
-		for i := 0; i < 50; i += 5 {
-			key := fmt.Sprintf("drain:key:%d", i)
-			resp := tc.valkeyExec(t, ns, newMaster, 6379, "EXISTS", key)
-			assert.Equal(t, "1", resp, "Key %s should exist after failover", key)
+		// Verify all 50 key values in a single MGET call for thoroughness + speed.
+		mgetArgs := make([]string, 0, 51)
+		mgetArgs = append(mgetArgs, "MGET")
+		for i := 0; i < 50; i++ {
+			mgetArgs = append(mgetArgs, fmt.Sprintf("drain:key:%d", i))
+		}
+		raw := tc.valkeyExec(t, ns, newMaster, 6379, mgetArgs...)
+		values := strings.Split(raw, "\n")
+		for i := 0; i < 50; i++ {
+			expected := fmt.Sprintf("value-%d", i)
+			if i < len(values) {
+				assert.Equal(t, expected, values[i],
+					"drain:key:%d should have value %q after failover", i, expected)
+			} else {
+				t.Errorf("drain:key:%d missing from MGET response (only %d values returned)", i, len(values))
+			}
 		}
 	})
 
@@ -390,6 +403,9 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 	// Verify the cluster is fully functional after failover.
 	t.Run("cluster functional after failover", func(t *testing.T) {
 		newMaster := tc.findMasterPod(t, ns, name, 3)
+
+		// Wait for all replicas to reconnect so the cluster is fully stable.
+		tc.waitForConnectedReplicas(t, ns, newMaster, 6379, 2)
 
 		// Write new data.
 		resp := tc.valkeyExec(t, ns, newMaster, 6379, "SET", "post-drain-key", "works")

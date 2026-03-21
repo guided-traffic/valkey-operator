@@ -414,6 +414,30 @@ func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterP
 	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
 }
 
+// valkeyExecQuick is a fast, no-retry kubectl exec helper intended for use inside
+// require.Eventually polling loops. It uses a short timeout (5s) and returns ""
+// on any error, so a slow or unreachable pod never stalls the polling budget.
+func (tc *testClients) valkeyExecQuick(t *testing.T, namespace, podName string, port int, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cliArgs := []string{
+		"exec", podName,
+		"-n", namespace,
+		"--", "valkey-cli",
+		"--raw",
+		"-p", fmt.Sprintf("%d", port),
+	}
+	cliArgs = append(cliArgs, args...)
+	cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stdout.String())
+}
+
 // waitForSentinelSlaves waits until a sentinel instance reports knowing about the
 // expected number of slaves for the given Valkey cluster. This must be called after
 // waitForConnectedReplicas to ensure sentinel has also re-discovered the topology
