@@ -136,10 +136,12 @@ func buildObserverArgs(v *vkov1.Valkey) []string {
 	}
 
 	if v.IsTLSEnabled() {
-		args = append(args, "--tls-enabled=true")
+		args = append(args,
+			"--tls-enabled=true",
+			fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath),
+		)
 		if v.IsObserverMTLSActive() {
 			args = append(args,
-				fmt.Sprintf("--tls-ca-cert=%s/ca.crt", TLSMountPath),
 				fmt.Sprintf("--tls-cert=%s/tls.crt", TLSMountPath),
 				fmt.Sprintf("--tls-key=%s/tls.key", TLSMountPath),
 			)
@@ -217,7 +219,7 @@ func buildObserverEnv(v *vkov1.Valkey) []corev1.EnvVar {
 }
 
 func buildObserverVolumeMounts(v *vkov1.Valkey) []corev1.VolumeMount {
-	if !v.IsTLSEnabled() || !v.IsObserverMTLSActive() {
+	if !v.IsTLSEnabled() {
 		return nil
 	}
 	return []corev1.VolumeMount{
@@ -230,7 +232,7 @@ func buildObserverVolumeMounts(v *vkov1.Valkey) []corev1.VolumeMount {
 }
 
 func buildObserverVolumes(v *vkov1.Valkey) []corev1.Volume {
-	if !v.IsTLSEnabled() || !v.IsObserverMTLSActive() {
+	if !v.IsTLSEnabled() {
 		return nil
 	}
 
