@@ -42,6 +42,13 @@ type SentinelMasterInfo struct {
 	Flags     string
 }
 
+// SentinelReplicaInfo holds parsed info for a single replica from SENTINEL REPLICAS.
+type SentinelReplicaInfo struct {
+	IP    string
+	Port  string
+	Flags string
+}
+
 // ConnectionError is returned whenever a TCP connection to a Valkey or Sentinel
 // instance cannot be established. It always carries the target address and an
 // actionable hint so that administrators can quickly identify firewall rules or
@@ -184,6 +191,15 @@ func (c *Client) SentinelFailover(name string) error {
 		return fmt.Errorf("sentinel failover %s on %s: %w", name, c.addr, err)
 	}
 	return nil
+}
+
+// SentinelReplicas sends SENTINEL REPLICAS <name> and returns info for each replica.
+func (c *Client) SentinelReplicas(name string) ([]*SentinelReplicaInfo, error) {
+	resp, err := c.exec("SENTINEL", "REPLICAS", name)
+	if err != nil {
+		return nil, fmt.Errorf("sentinel replicas %s on %s: %w", name, c.addr, err)
+	}
+	return parseSentinelReplicasInfo(resp), nil
 }
 
 // SentinelReset sends SENTINEL RESET <pattern> to reset all matching masters.
@@ -461,6 +477,7 @@ func readBulkString(reader *bufio.Reader, header string) (string, error) {
 
 // readArray reads a RESP array response from the reader.
 // The header line (e.g. "*3") must be passed in.
+// Nested arrays (e.g. SENTINEL REPLICAS) are separated by "---\n".
 func readArray(reader *bufio.Reader, header string) (string, error) {
 	count := 0
 	if _, err := fmt.Sscanf(header[1:], "%d", &count); err != nil {
@@ -475,10 +492,11 @@ func readArray(reader *bufio.Reader, header string) (string, error) {
 		}
 		elemLine = strings.TrimRight(elemLine, "\r\n")
 
-		if strings.HasPrefix(elemLine, "$") {
-			val, err := readBulkString(reader, elemLine)
-			if err != nil {
-				return "", err
+		switch {
+		case strings.HasPrefix(elemLine, "$"):
+			val, bErr := readBulkString(reader, elemLine)
+			if bErr != nil {
+				return "", bErr
 			}
 			if val == "" {
 				result.WriteString("(nil)\n")
@@ -486,6 +504,15 @@ func readArray(reader *bufio.Reader, header string) (string, error) {
 				result.WriteString(val)
 				result.WriteString("\n")
 			}
+		case strings.HasPrefix(elemLine, "*"):
+			if i > 0 {
+				result.WriteString("---\n")
+			}
+			inner, aErr := readArray(reader, elemLine)
+			if aErr != nil {
+				return "", aErr
+			}
+			result.WriteString(inner)
 		}
 	}
 	return result.String(), nil
@@ -523,6 +550,36 @@ func parseReplicationInfo(raw string) *ReplicationInfo {
 		}
 	}
 	return info
+}
+
+// parseSentinelReplicasInfo parses the SENTINEL REPLICAS response.
+// The raw string contains blocks separated by "---\n", each block being
+// alternating key-value pairs like SENTINEL MASTER.
+func parseSentinelReplicasInfo(raw string) []*SentinelReplicaInfo {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	blocks := strings.Split(raw, "---\n")
+	replicas := make([]*SentinelReplicaInfo, 0, len(blocks))
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		lines := strings.Split(block, "\n")
+		kvMap := make(map[string]string)
+		for i := 0; i+1 < len(lines); i += 2 {
+			key := strings.TrimSpace(lines[i])
+			val := strings.TrimSpace(lines[i+1])
+			kvMap[key] = val
+		}
+		replicas = append(replicas, &SentinelReplicaInfo{
+			IP:    kvMap["ip"],
+			Port:  kvMap["port"],
+			Flags: kvMap["flags"],
+		})
+	}
+	return replicas
 }
 
 // parseSentinelMasterInfo parses the SENTINEL MASTER response into structured data.

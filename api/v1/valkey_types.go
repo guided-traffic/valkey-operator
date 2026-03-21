@@ -163,6 +163,25 @@ type NetworkPolicySpec struct {
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
+// ObserverMTLSSpec controls whether the observer presents client certificates
+// for its connections to Valkey and Sentinel. Only effective when spec.tls.enabled
+// is true. Sending a client certificate enables mutual TLS (mTLS); omitting it
+// means the observer only verifies the server certificate.
+type ObserverMTLSSpec struct {
+	// Valkey controls whether the observer sends a client certificate to Valkey pods.
+	// Set to true to enable mTLS; when nil or false, no client certificate is sent.
+	// Default: false.
+	// +optional
+	Valkey *bool `json:"valkey,omitempty"`
+
+	// Sentinel controls whether the observer sends a client certificate to Sentinel pods.
+	// When nil or false, only the CA certificate is used (no client certificate).
+	// Set to true to enable mTLS for Sentinel connections.
+	// Default: false.
+	// +optional
+	Sentinel *bool `json:"sentinel,omitempty"`
+}
+
 // ObserverSpec defines the observer configuration for cluster health monitoring.
 type ObserverSpec struct {
 	// Enabled activates the observer deployment.
@@ -174,6 +193,11 @@ type ObserverSpec struct {
 	// +kubebuilder:validation:Maximum=15
 	// +optional
 	DB *int `json:"db,omitempty"`
+
+	// MTLS configures mutual TLS behaviour for the observer's outbound connections.
+	// Only effective when spec.tls.enabled is true.
+	// +optional
+	MTLS *ObserverMTLSSpec `json:"mtls,omitempty"`
 
 	// Resources defines the compute resource requirements for the observer container.
 	// +optional
@@ -384,6 +408,30 @@ func (v *Valkey) IsSentinelAuthDisabled() bool {
 // IsObserverEnabled returns true if the observer deployment is configured and enabled.
 func (v *Valkey) IsObserverEnabled() bool {
 	return v.Spec.Observer != nil && v.Spec.Observer.Enabled
+}
+
+// IsObserverValkeyMTLSEnabled returns true when the observer should send client
+// certificates to Valkey pods. Defaults to false when not explicitly configured.
+func (v *Valkey) IsObserverValkeyMTLSEnabled() bool {
+	if v.Spec.Observer == nil || v.Spec.Observer.MTLS == nil || v.Spec.Observer.MTLS.Valkey == nil {
+		return false
+	}
+	return *v.Spec.Observer.MTLS.Valkey
+}
+
+// IsObserverSentinelMTLSEnabled returns true when the observer should send client
+// certificates to Sentinel pods. Defaults to false when not explicitly configured.
+func (v *Valkey) IsObserverSentinelMTLSEnabled() bool {
+	if v.Spec.Observer == nil || v.Spec.Observer.MTLS == nil || v.Spec.Observer.MTLS.Sentinel == nil {
+		return false
+	}
+	return *v.Spec.Observer.MTLS.Sentinel
+}
+
+// IsObserverMTLSActive returns true when at least one of the observer's mTLS
+// targets is enabled, meaning the TLS secret must be mounted.
+func (v *Valkey) IsObserverMTLSActive() bool {
+	return v.IsObserverValkeyMTLSEnabled() || v.IsObserverSentinelMTLSEnabled()
 }
 
 // GetObserverDB returns the Valkey database number for the observer health key.

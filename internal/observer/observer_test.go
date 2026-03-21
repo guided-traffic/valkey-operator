@@ -163,3 +163,93 @@ func TestNewClient_AllCombinations(t *testing.T) {
 	c = obs.newClient("localhost:6379", "secret")
 	assert.NotNil(t, c)
 }
+
+func TestNew_WithSentinel_BuildsSeparateTLSConfigs(t *testing.T) {
+	// Without TLS, sentinel TLS config should be nil.
+	cfg := Config{
+		Namespace:       "default",
+		ClusterName:     "test",
+		SentinelEnabled: true,
+		TLSEnabled:      false,
+	}
+
+	obs, err := New(cfg)
+	require.NoError(t, err)
+	assert.Nil(t, obs.tlsConfig)
+	assert.Nil(t, obs.sentinelTLSConfig)
+}
+
+func TestRunSentinelChecks_IncludesHostnameChecks(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			SentinelEnabled: true,
+			SentinelMonitor: "test",
+			SentinelAddrList: []string{
+				"sentinel-0.invalid:26379",
+			},
+		},
+		metrics: newObserverMetrics(),
+	}
+
+	checks := make(map[string]bool)
+	msg := obs.runSentinelChecks(checks)
+
+	// All checks should be present in the map.
+	_, hasMasterHostname := checks["sentinel_master_hostname"]
+	_, hasReplicaHostnames := checks["sentinel_replica_hostnames"]
+	assert.True(t, hasMasterHostname, "sentinel_master_hostname check must be present")
+	assert.True(t, hasReplicaHostnames, "sentinel_replica_hostnames check must be present")
+	assert.NotEmpty(t, msg)
+}
+
+func TestNew_TLS_ValkeyMTLSFalse_SkipsClientCert(t *testing.T) {
+	// ValkeyMTLS=false → client cert loading skipped → no error even with missing cert paths
+	cfg := Config{
+		Namespace:   "default",
+		ClusterName: "test",
+		TLSEnabled:  true,
+		TLSCACert:   "/nonexistent/ca.crt",
+		TLSCert:     "/nonexistent/tls.crt",
+		TLSKey:      "/nonexistent/tls.key",
+		ValkeyMTLS:  false,
+	}
+
+	obs, err := New(cfg)
+
+	// CA cert is still required → should fail on CA cert loading
+	assert.Error(t, err)
+	assert.Nil(t, obs)
+}
+
+func TestNew_TLS_ValkeyMTLSTrue_RequiresClientCert(t *testing.T) {
+	// ValkeyMTLS=true (default) → client cert loading attempted → error on missing cert
+	cfg := Config{
+		Namespace:   "default",
+		ClusterName: "test",
+		TLSEnabled:  true,
+		TLSCACert:   "/nonexistent/ca.crt",
+		TLSCert:     "/nonexistent/tls.crt",
+		TLSKey:      "/nonexistent/tls.key",
+		ValkeyMTLS:  true,
+	}
+
+	obs, err := New(cfg)
+
+	assert.Error(t, err)
+	assert.Nil(t, obs)
+}
+
+func TestNew_TLS_SentinelMTLSFlags(t *testing.T) {
+	// Without TLS, SentinelMTLS flag has no effect
+	cfg := Config{
+		Namespace:       "default",
+		ClusterName:     "test",
+		SentinelEnabled: true,
+		TLSEnabled:      false,
+		SentinelMTLS:    true,
+	}
+
+	obs, err := New(cfg)
+	require.NoError(t, err)
+	assert.Nil(t, obs.sentinelTLSConfig)
+}

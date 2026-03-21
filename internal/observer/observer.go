@@ -32,6 +32,13 @@ type Config struct {
 	TLSCert    string
 	TLSKey     string
 
+	// ValkeyMTLS controls whether the observer sends a client certificate to Valkey pods.
+	// Default: true (mTLS enabled).
+	ValkeyMTLS bool
+	// SentinelMTLS controls whether the observer sends a client certificate to Sentinel pods.
+	// Default: false (server-only TLS verification).
+	SentinelMTLS bool
+
 	// Sentinel settings.
 	SentinelEnabled     bool
 	SentinelAddrs       string
@@ -53,27 +60,35 @@ type CheckResult struct {
 
 // Observer runs periodic health checks against a Valkey cluster.
 type Observer struct {
-	cfg       Config
-	tlsConfig *tls.Config
-	mu        sync.RWMutex
-	result    CheckResult
-	metrics   *observerMetrics
+	cfg               Config
+	tlsConfig         *tls.Config
+	sentinelTLSConfig *tls.Config
+	mu                sync.RWMutex
+	result            CheckResult
+	metrics           *observerMetrics
 }
 
 // New creates a new Observer with the given configuration.
 func New(cfg Config) (*Observer, error) {
-	var tlsCfg *tls.Config
+	var tlsCfg, sentinelTLSCfg *tls.Config
 	if cfg.TLSEnabled {
 		var err error
-		tlsCfg, err = buildTLSConfig(cfg)
+		tlsCfg, err = buildTLSConfig(cfg, cfg.ValkeyMTLS)
 		if err != nil {
 			return nil, fmt.Errorf("building TLS config: %w", err)
+		}
+		if cfg.SentinelEnabled {
+			sentinelTLSCfg, err = buildTLSConfig(cfg, cfg.SentinelMTLS)
+			if err != nil {
+				return nil, fmt.Errorf("building sentinel TLS config: %w", err)
+			}
 		}
 	}
 
 	return &Observer{
-		cfg:       cfg,
-		tlsConfig: tlsCfg,
+		cfg:               cfg,
+		tlsConfig:         tlsCfg,
+		sentinelTLSConfig: sentinelTLSCfg,
 		result: CheckResult{
 			Ready:  false,
 			Checks: make(map[string]bool),
@@ -176,7 +191,17 @@ func (o *Observer) runChecks(ctx context.Context) {
 		}
 	}
 
+	// Log every individual check failure.
+	for name, ok := range checks {
+		if !ok {
+			logger.Error(fmt.Errorf("check %s failed", name), "check failure", "check", name)
+		}
+	}
+
 	allOK := firstFailMsg == ""
+	if !allOK {
+		logger.Error(fmt.Errorf("%s", firstFailMsg), "poll cycle failed")
+	}
 	o.setResult(allOK, checks, firstFailMsg, start)
 	o.metrics.recordCycle(time.Since(start), allOK)
 }
@@ -222,7 +247,7 @@ func (o *Observer) runCoreChecks(_ context.Context, masterAddr, healthValue stri
 	return firstFailMsg
 }
 
-// runSentinelChecks runs sentinel reachability, quorum, and flag checks.
+// runSentinelChecks runs sentinel reachability, quorum, flag, and hostname checks.
 // Returns the first failure message (empty if all passed).
 func (o *Observer) runSentinelChecks(checks map[string]bool) string {
 	var firstFailMsg string
@@ -237,6 +262,15 @@ func (o *Observer) runSentinelChecks(checks map[string]bool) string {
 	if (!quorumOK || !flagsOK) && firstFailMsg == "" && sentErr != nil {
 		firstFailMsg = fmt.Sprintf("sentinel check failed: %v", sentErr)
 	}
+
+	// Hostname checks: master and replicas must be hostnames, not IPs.
+	firstFailMsg = runCheck(checks, "sentinel_master_hostname", firstFailMsg, func() error {
+		return o.checkSentinelMasterHostname()
+	})
+
+	firstFailMsg = runCheck(checks, "sentinel_replica_hostnames", firstFailMsg, func() error {
+		return o.checkSentinelReplicaHostnames()
+	})
 
 	return firstFailMsg
 }
@@ -267,7 +301,11 @@ func (o *Observer) setResult(ready bool, checks map[string]bool, message string,
 	o.metrics.updateGauges(checks, ready)
 }
 
-func buildTLSConfig(cfg Config) (*tls.Config, error) {
+// buildTLSConfig builds a TLS config for the observer.
+// When withClientCert is true, the client certificate and key are loaded
+// for mutual TLS (mTLS). When false, only the CA certificate is loaded
+// for server-only verification.
+func buildTLSConfig(cfg Config, withClientCert bool) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 	}
@@ -284,7 +322,7 @@ func buildTLSConfig(cfg Config) (*tls.Config, error) {
 		tlsCfg.RootCAs = certPool
 	}
 
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+	if withClientCert && cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 		if err != nil {
 			return nil, fmt.Errorf("loading client certificate: %w", err)

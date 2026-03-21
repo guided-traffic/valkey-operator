@@ -53,6 +53,8 @@ func parseFlags() observer.Config {
 	flag.StringVar(&cfg.TLSCACert, "tls-ca-cert", envString("TLS_CA_CERT", ""), "CA certificate path")
 	flag.StringVar(&cfg.TLSCert, "tls-cert", envString("TLS_CERT", ""), "Client certificate path")
 	flag.StringVar(&cfg.TLSKey, "tls-key", envString("TLS_KEY", ""), "Client key path")
+	flag.BoolVar(&cfg.ValkeyMTLS, "valkey-mtls", envBool("VALKEY_MTLS"), "Send client certificate to Valkey (mTLS)")
+	flag.BoolVar(&cfg.SentinelMTLS, "sentinel-mtls", envBool("SENTINEL_MTLS"), "Send client certificate to Sentinel (mTLS)")
 
 	// Sentinel flags.
 	flag.BoolVar(&cfg.SentinelEnabled, "sentinel-enabled", envBool("SENTINEL_ENABLED"), "Sentinel mode active")
