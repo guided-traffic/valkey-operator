@@ -892,9 +892,18 @@ func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *
 	checker := r.getInstanceChecker()
 
 	for _, ps := range pods {
-		// Only check already-replaced replicas (updated, ready, not the master).
-		if ps.needsUpdate || ps.isMaster || !ps.exists || !ps.ready {
+		// Skip pods that still need updating, the master, and non-existent pods.
+		if ps.needsUpdate || ps.isMaster || !ps.exists {
 			continue
+		}
+
+		// A replaced pod that exists but is not yet ready must block the next
+		// deletion. Without this guard, the operator would skip the not-ready
+		// pod and immediately delete the next candidate, resulting in multiple
+		// replicas being replaced simultaneously.
+		if !ps.ready {
+			logger.Info("Replaced pod not yet ready, waiting before replacing next", "pod", ps.name)
+			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
 		info, err := checker.GetReplicationInfo(ctx, v, ps.name)

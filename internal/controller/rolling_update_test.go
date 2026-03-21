@@ -3518,6 +3518,25 @@ func TestVerifyReplacedReplicasSynced_SkipsMasterAndPendingPods(t *testing.T) {
 	assert.Nil(t, result, "Should return nil when no pods qualify for sync check")
 }
 
+func TestVerifyReplacedReplicasSynced_NotReadyBlocksNextDeletion(t *testing.T) {
+	v := newTestValkey("sync-notready", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	r, _ := newTestReconciler(v)
+
+	pods := []podState{
+		{name: "sync-notready-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		// Pod-1 was replaced (needsUpdate=false) but is not yet ready — must block.
+		{name: "sync-notready-1", exists: true, ready: false, needsUpdate: false, isMaster: false},
+		{name: "sync-notready-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+	}
+
+	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
+	require.NotNil(t, result, "Should return requeue when a replaced pod is not yet ready")
+	assert.True(t, result.NeedsRequeue)
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+}
+
 func TestVerifyReplacedReplicasSynced_ErrorRequeues(t *testing.T) {
 	v := newTestValkey("sync-err", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
