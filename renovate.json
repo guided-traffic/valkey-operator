@@ -4,8 +4,7 @@
     "config:recommended",
     ":assignee(hans-fischer)",
     ":semanticCommits",
-    ":automergeDigest",
-    ":automergeBranch"
+    ":automergeDigest"
   ],
   "schedule": ["at any time"],
   "timezone": "Europe/Berlin",
