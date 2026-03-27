@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -151,10 +152,23 @@ func (h *Checker) GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podNa
 	return c.InfoReplication()
 }
 
+// masterCandidate represents a pod reporting role=master during findMaster discovery.
+type masterCandidate struct {
+	podName         string
+	addr            string
+	connectedSlaves int
+}
+
 // findMaster iterates over all Valkey pods and finds the one reporting role=master.
+// When multiple pods report as master (split-brain), a warning is logged and the
+// one with the most connected slaves is preferred (it is the active master serving
+// real data).
 func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string, tlsConfig *tls.Config) (string, string, error) {
+	logger := log.FromContext(ctx)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	port := int(builder.ServicePort(v))
+
+	var candidates []masterCandidate
 
 	for i := int32(0); i < v.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -177,11 +191,38 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		}
 
 		if info.Role == "master" {
-			return podName, addr, nil
+			candidates = append(candidates, masterCandidate{
+				podName:         podName,
+				addr:            addr,
+				connectedSlaves: info.ConnectedSlaves,
+			})
 		}
 	}
 
-	return "", "", fmt.Errorf("no master found among %d pods", v.Spec.Replicas)
+	if len(candidates) == 0 {
+		return "", "", fmt.Errorf("no master found among %d pods", v.Spec.Replicas)
+	}
+
+	if len(candidates) > 1 {
+		logger.Info("WARNING: Multiple masters detected (split-brain)",
+			"count", len(candidates), "candidates", masterCandidateNames(candidates))
+		// Return the one with the most connected slaves — it is the active master
+		// serving real replicas and preserving client data.
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].connectedSlaves > candidates[j].connectedSlaves
+		})
+	}
+
+	return candidates[0].podName, candidates[0].addr, nil
+}
+
+// masterCandidateNames returns the pod names from a slice of masterCandidates.
+func masterCandidateNames(candidates []masterCandidate) []string {
+	names := make([]string, len(candidates))
+	for i, c := range candidates {
+		names[i] = c.podName
+	}
+	return names
 }
 
 // checkSentinel checks if sentinel instances are monitoring the cluster correctly.

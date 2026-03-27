@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -83,6 +85,17 @@ func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client)
 		Scheme:          s,
 		InstanceChecker: &mockInstanceChecker{},
 		OperatorImage:   "ghcr.io/guided-traffic/valkey-operator:test",
+		// Redirect all Valkey client connections to localhost so unit tests
+		// get instant "connection refused" instead of DNS/TCP timeouts.
+		// The original port is preserved so tests that verify port selection
+		// (e.g., TLS vs plain) still see the expected port in error messages.
+		NewValkeyClientFn: func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client {
+			_, port, _ := net.SplitHostPort(addr)
+			if port == "" {
+				port = "1"
+			}
+			return valkeyclient.New("127.0.0.1:" + port)
+		},
 	}, fakeClient
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -352,6 +353,12 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	if err != nil {
 		return RollingUpdateResult{Error: err}
 	}
+
+	// Detect and resolve split-brain before proceeding with the rolling update.
+	// This is critical to break the deadlock where a rogue master prevents
+	// replaceNextReplica from finding candidates and blocks waitForReplicasReady.
+	sentinelMaster := r.getSentinelMasterPodName(ctx, v)
+	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, sentinelMaster)
 
 	// Count how many pods have been updated.
 	updatedCount := countUpdatedPods(pods)
@@ -702,6 +709,182 @@ func countMasters(pods []podState) int {
 		}
 	}
 	return count
+}
+
+// detectAndResolveSplitBrain checks for multiple masters in the pod states and
+// resolves the split-brain by demoting rogue masters. This breaks the rolling
+// update deadlock where a rogue master is treated as a master (skipped by
+// replaceNextReplica) but also blocks waitForReplicasReady because it needs
+// updating.
+//
+// The real master is determined by:
+//  1. Using the sentinelMaster name (authoritative Sentinel view, may be empty).
+//  2. Falling back to the master with the most connected slaves (preserves data).
+//
+// Returns the updated pod states and the corrected master index.
+func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int, sentinelMaster string) ([]podState, int) {
+	logger := log.FromContext(ctx)
+
+	// Count pods reporting as master.
+	var masterIndices []int
+	for i, ps := range pods {
+		if ps.isMaster {
+			masterIndices = append(masterIndices, i)
+		}
+	}
+
+	if len(masterIndices) <= 1 {
+		return pods, masterIdx // No split-brain.
+	}
+
+	logger.Info("Split-brain detected: multiple masters found",
+		"masterCount", len(masterIndices), "masterIndices", masterIndices)
+	r.recordEvent(v, corev1.EventTypeWarning, "SplitBrainDetected",
+		"Split-brain detected: %d pods report master role", len(masterIndices))
+
+	// Determine the real master by asking Sentinel (authoritative source).
+	realMasterIdx := -1
+	var rogueIndices []int
+
+	if sentinelMaster != "" {
+		for _, idx := range masterIndices {
+			if pods[idx].name == sentinelMaster {
+				realMasterIdx = idx
+			} else {
+				rogueIndices = append(rogueIndices, idx)
+			}
+		}
+	}
+
+	// Fallback: if Sentinel doesn't know any of them, prefer the one with the
+	// most connected slaves (the one actively serving replicas has the real data).
+	if realMasterIdx < 0 {
+		checker := r.getInstanceChecker()
+		bestIdx := masterIndices[0]
+		bestSlaves := -1
+		for _, idx := range masterIndices {
+			info, err := checker.GetReplicationInfo(ctx, v, pods[idx].name)
+			if err != nil {
+				continue
+			}
+			if info.ConnectedSlaves > bestSlaves {
+				bestSlaves = info.ConnectedSlaves
+				bestIdx = idx
+			}
+		}
+		realMasterIdx = bestIdx
+		rogueIndices = nil
+		for _, idx := range masterIndices {
+			if idx != realMasterIdx {
+				rogueIndices = append(rogueIndices, idx)
+			}
+		}
+	}
+
+	logger.Info("Split-brain resolution: identified real master",
+		"realMaster", pods[realMasterIdx].name, "rogueCount", len(rogueIndices))
+
+	// Demote all rogue masters via REPLICAOF.
+	for _, rogueIdx := range rogueIndices {
+		if err := r.demoteRogueMaster(ctx, v, pods[rogueIdx], pods[realMasterIdx].name); err != nil {
+			logger.Info("Failed to demote rogue master (will retry next reconcile)",
+				"pod", pods[rogueIdx].name, "error", err)
+		}
+		// Mark the pod as non-master in the local state regardless of whether
+		// REPLICAOF succeeded. This breaks the deadlock: the pod becomes a replica
+		// candidate for replaceNextReplica, and when deleted+recreated, the init
+		// container queries Sentinel for the correct role.
+		pods[rogueIdx].isMaster = false
+	}
+
+	return pods, realMasterIdx
+}
+
+// getSentinelMasterPodName queries Sentinel for the authoritative master and
+// returns the pod name (e.g., "myvalkey-1"). Returns an empty string if no
+// sentinel is reachable or sentinel is not enabled.
+func (r *ValkeyReconciler) getSentinelMasterPodName(ctx context.Context, v *vkov1.Valkey) string {
+	if !v.IsSentinelEnabled() {
+		return ""
+	}
+
+	logger := log.FromContext(ctx)
+	monitorName := builder.SentinelMonitorName(v)
+	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
+
+	sentinelReplicas := int32(3)
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
+		sentinelReplicas = v.Spec.Sentinel.Replicas
+	}
+	password := r.sentinelPassword(ctx, v)
+
+	for i := int32(0); i < sentinelReplicas; i++ {
+		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
+
+		tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
+		if tlsErr != nil {
+			continue
+		}
+		sentinelPort := builder.SentinelPort
+		if tlsConfig != nil {
+			sentinelPort = builder.SentinelTLSPort
+		}
+		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
+
+		c := r.newValkeyClient(addr, password, tlsConfig)
+		info, err := c.SentinelMaster(monitorName)
+		if err != nil {
+			logger.V(1).Info("Could not query sentinel for master", "sentinel", podName, "error", err)
+			continue
+		}
+
+		// The IP field contains the FQDN when announce-hostnames is enabled.
+		// Extract the pod name (first segment before the first dot).
+		masterFQDN := info.IP
+		if idx := strings.Index(masterFQDN, "."); idx > 0 {
+			return masterFQDN[:idx]
+		}
+		return masterFQDN
+	}
+
+	return ""
+}
+
+// demoteRogueMaster sends a REPLICAOF command to a rogue master pod, instructing
+// it to become a replica of the real master. This is a best-effort operation:
+// even if it fails, the caller may still mark the pod as non-master in local state
+// so that the rolling update can proceed (deletion+recreation fixes the role).
+func (r *ValkeyReconciler) demoteRogueMaster(ctx context.Context, v *vkov1.Valkey, roguePod podState, realMasterPodName string) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Demoting rogue master to replica",
+		"roguePod", roguePod.name, "realMaster", realMasterPodName)
+
+	if !roguePod.exists || !roguePod.ready {
+		return fmt.Errorf("rogue pod %s is not ready for demotion", roguePod.name)
+	}
+
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		return fmt.Errorf("building TLS config: %w", err)
+	}
+
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", realMasterPodName, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", builder.ServicePort(v))
+	password := r.readValkeyPassword(ctx, v)
+
+	addr := health.PodAddressForComponent(v, roguePod.name, common.ComponentValkey, int(builder.ServicePort(v)))
+	c := r.newValkeyClient(addr, password, tlsConfig)
+	if err := c.ReplicaOf(masterHost, portStr); err != nil {
+		return fmt.Errorf("REPLICAOF command failed on %s: %w", roguePod.name, err)
+	}
+
+	r.recordEvent(v, corev1.EventTypeWarning, "SplitBrainResolved",
+		"Demoted rogue master %s to replica of %s", roguePod.name, realMasterPodName)
+
+	logger.Info("Successfully demoted rogue master",
+		"roguePod", roguePod.name, "realMaster", realMasterPodName)
+	return nil
 }
 
 // hasPendingUpdates returns true if any pod still needs an update.
