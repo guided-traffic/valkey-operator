@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +34,13 @@ type PodPatcher interface {
 	PatchLabel(ctx context.Context, namespace, name, labelKey, labelValue string) error
 }
 
+// SentinelMasterQuerier queries Sentinel for the current master address.
+// This interface allows mocking in tests.
+type SentinelMasterQuerier interface {
+	// GetMasterAddress returns the hostname/FQDN of the current master as known by Sentinel.
+	GetMasterAddress(monitor string) (string, error)
+}
+
 // Labeler polls the local Valkey instance and patches the pod's role label.
 type Labeler struct {
 	detector     RoleDetector
@@ -41,6 +49,11 @@ type Labeler struct {
 	podNamespace string
 	pollInterval time.Duration
 	lastRole     string
+
+	// Sentinel cross-check (defense in depth against split-brain).
+	sentinelQuerier SentinelMasterQuerier
+	sentinelMonitor string
+	myFQDN          string
 }
 
 // NewLabeler creates a new Labeler from the sidecar config.
@@ -55,13 +68,23 @@ func NewLabeler(cfg Config) (*Labeler, error) {
 		return nil, err
 	}
 
-	return &Labeler{
+	l := &Labeler{
 		detector:     detector,
 		patcher:      patcher,
 		podName:      cfg.PodName,
 		podNamespace: cfg.PodNamespace,
 		pollInterval: cfg.PollInterval,
-	}, nil
+	}
+
+	if cfg.SentinelEnabled && cfg.SentinelAddrs != "" {
+		querier, err := newSentinelMasterQuerier(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating sentinel master querier: %w", err)
+		}
+		l.SetSentinelCrossCheck(querier, cfg.SentinelMonitor, cfg.PodName+"."+cfg.HeadlessSvc)
+	}
+
+	return l, nil
 }
 
 // NewLabelerWithDeps creates a Labeler with injected dependencies (for testing).
@@ -73,6 +96,15 @@ func NewLabelerWithDeps(detector RoleDetector, patcher PodPatcher, podName, podN
 		podNamespace: podNamespace,
 		pollInterval: pollInterval,
 	}
+}
+
+// SetSentinelCrossCheck enables Sentinel cross-checking for the labeler.
+// When enabled, the labeler verifies with Sentinel before labeling a pod as master.
+// If Sentinel reports a different master, the pod is labeled as replica instead.
+func (l *Labeler) SetSentinelCrossCheck(querier SentinelMasterQuerier, monitor, myFQDN string) {
+	l.sentinelQuerier = querier
+	l.sentinelMonitor = monitor
+	l.myFQDN = myFQDN
 }
 
 // Run starts the polling loop. It blocks until the context is done.
@@ -110,6 +142,18 @@ func (l *Labeler) poll(ctx context.Context, logger interface {
 	// Mark ready once we know the role.
 	if health != nil {
 		health.SetReady()
+	}
+
+	// Cross-check: if local Valkey says "master" but Sentinel disagrees, trust Sentinel.
+	// This prevents the rw Service from having two master endpoints during split-brain.
+	if role == common.RoleMaster && l.sentinelQuerier != nil {
+		sentinelMaster, sqErr := l.sentinelQuerier.GetMasterAddress(l.sentinelMonitor)
+		if sqErr == nil && sentinelMaster != l.myFQDN {
+			logger.Info("local Valkey reports master but Sentinel disagrees, labeling as replica",
+				"sentinelMaster", sentinelMaster, "myFQDN", l.myFQDN)
+			role = common.RoleReplica
+		}
+		// If Sentinel is unreachable (sqErr != nil), trust the local role.
 	}
 
 	// Only patch if role changed.
@@ -256,4 +300,66 @@ func buildSidecarTLSConfig(cfg Config) (*tls.Config, error) {
 	}
 
 	return tlsCfg, nil
+}
+
+// --- sentinelMasterQuerier ---
+
+// sentinelMasterQuerier queries multiple Sentinel instances for the current master.
+type sentinelMasterQuerier struct {
+	addrs    []string
+	password string
+	tlsCfg   *tls.Config
+}
+
+// newSentinelMasterQuerier creates a production querier from the sidecar config.
+func newSentinelMasterQuerier(cfg Config) (*sentinelMasterQuerier, error) {
+	q := &sentinelMasterQuerier{}
+
+	if cfg.SentinelAddrs != "" {
+		q.addrs = strings.Split(cfg.SentinelAddrs, ",")
+	}
+
+	// When sentinel auth is disabled, clients connect to Sentinel without AUTH.
+	if !cfg.SentinelDisableAuth {
+		q.password = cfg.Password
+	}
+
+	if cfg.TLSEnabled {
+		tlsCfg, err := buildSidecarTLSConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("building TLS config for sentinel querier: %w", err)
+		}
+		q.tlsCfg = tlsCfg
+	}
+
+	return q, nil
+}
+
+// GetMasterAddress queries Sentinel instances in order and returns the master hostname.
+func (q *sentinelMasterQuerier) GetMasterAddress(monitor string) (string, error) {
+	var lastErr error
+	for _, addr := range q.addrs {
+		var client *valkeyclient.Client
+		switch {
+		case q.tlsCfg != nil && q.password != "":
+			client = valkeyclient.NewTLSWithPassword(addr, q.tlsCfg, q.password)
+		case q.tlsCfg != nil:
+			client = valkeyclient.NewTLS(addr, q.tlsCfg)
+		case q.password != "":
+			client = valkeyclient.NewWithPassword(addr, q.password)
+		default:
+			client = valkeyclient.New(addr)
+		}
+
+		info, err := client.SentinelMaster(monitor)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return info.IP, nil
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("all sentinels unreachable: %w", lastErr)
+	}
+	return "", fmt.Errorf("no sentinel addresses configured")
 }
