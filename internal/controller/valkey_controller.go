@@ -58,6 +58,9 @@ type ValkeyReconciler struct {
 	OperatorImage     string
 	OperatorNamespace string
 	OperatorVersion   string
+	// NewValkeyClientFn overrides the default Valkey client factory.
+	// Used in unit tests to avoid real TCP connections.
+	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -102,7 +105,11 @@ func (r *ValkeyReconciler) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, 
 }
 
 // newValkeyClient creates a Valkey RESP client, using TLS if tlsConfig is non-nil.
+// If NewValkeyClientFn is set on the reconciler (e.g. in tests), it is used instead.
 func (r *ValkeyReconciler) newValkeyClient(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if r.NewValkeyClientFn != nil {
+		return r.NewValkeyClientFn(addr, password, tlsConfig)
+	}
 	if tlsConfig != nil && password != "" {
 		return valkeyclient.NewTLSWithPassword(addr, tlsConfig, password)
 	}

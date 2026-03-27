@@ -513,3 +513,27 @@ func TestClusterState_PartiallyReady(t *testing.T) {
 	assert.False(t, state.AllSynced)
 	assert.True(t, state.SentinelMonitoring)
 }
+
+// --- masterCandidateNames ---
+
+func TestMasterCandidateNames(t *testing.T) {
+	candidates := []masterCandidate{
+		{podName: "test-0", addr: "test-0:6379", connectedSlaves: 0},
+		{podName: "test-1", addr: "test-1:6379", connectedSlaves: 2},
+	}
+	names := masterCandidateNames(candidates)
+	assert.Equal(t, []string{"test-0", "test-1"}, names)
+}
+
+func TestMasterCandidateNames_Empty(t *testing.T) {
+	names := masterCandidateNames(nil)
+	assert.Empty(t, names)
+}
+
+func TestMasterCandidateNames_Single(t *testing.T) {
+	candidates := []masterCandidate{
+		{podName: "test-0", addr: "test-0:6379", connectedSlaves: 1},
+	}
+	names := masterCandidateNames(candidates)
+	assert.Equal(t, []string{"test-0"}, names)
+}

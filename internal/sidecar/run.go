@@ -67,6 +67,17 @@ func Run(ctx context.Context, cfg Config) error {
 
 	labeler := NewLabelerWithDeps(detector, patcher, cfg.PodName, cfg.PodNamespace, cfg.PollInterval)
 
+	// Enable Sentinel cross-check for split-brain defense in depth.
+	if cfg.SentinelEnabled && cfg.SentinelAddrs != "" {
+		querier, err := newSentinelMasterQuerier(cfg)
+		if err != nil {
+			return fmt.Errorf("creating sentinel master querier: %w", err)
+		}
+		myFQDN := cfg.PodName + "." + cfg.HeadlessSvc
+		labeler.SetSentinelCrossCheck(querier, cfg.SentinelMonitor, myFQDN)
+		logger.Info("sentinel cross-check enabled", "monitor", cfg.SentinelMonitor, "myFQDN", myFQDN)
+	}
+
 	drainHandler, err := buildDrainHandler(cfg, detector, patcher)
 	if err != nil {
 		return fmt.Errorf("creating drain handler: %w", err)

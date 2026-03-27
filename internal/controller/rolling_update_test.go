@@ -3722,3 +3722,368 @@ func TestReplaceNextReplica_WaitsForSyncBeforeDeleting(t *testing.T) {
 	err := c.Get(context.Background(), types.NamespacedName{Name: "sync-wait-2", Namespace: "default"}, pod)
 	assert.NoError(t, err, "Pod-2 should still exist because sync check blocked deletion")
 }
+
+// --- Split-Brain Detection and Resolution Tests ---
+
+func TestDetectAndResolveSplitBrain_NoSplitBrain_SingleMaster(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	pods := []podState{
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
+	assert.Equal(t, 1, masterIdx, "Master index should remain unchanged")
+	assert.True(t, resultPods[1].isMaster, "Pod-1 should still be master")
+	assert.False(t, resultPods[0].isMaster, "Pod-0 should still be non-master")
+}
+
+func TestDetectAndResolveSplitBrain_NoSplitBrain_NoMaster(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	pods := []podState{
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
+		{name: "test-1", isMaster: false, needsUpdate: true, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, -1, "")
+	assert.Equal(t, -1, masterIdx, "Master index should remain -1")
+	for _, ps := range resultPods {
+		assert.False(t, ps.isMaster, "No pod should be master")
+	}
+}
+
+func TestDetectAndResolveSplitBrain_TwoMasters_FallbackToConnectedSlaves(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	// Mock: pod-0 reports master with 0 slaves, pod-1 reports master with 1 slave.
+	// Sentinel is unreachable (unit test, no real sentinel), so fallback to slave count.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "test-0":
+				return &valkeyclient.ReplicationInfo{
+					Role:            "master",
+					ConnectedSlaves: 0,
+				}, nil
+			case "test-1":
+				return &valkeyclient.ReplicationInfo{
+					Role:            "master",
+					ConnectedSlaves: 1,
+				}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{
+					Role:             "slave",
+					MasterLinkStatus: "up",
+				}, nil
+			}
+		},
+	}
+
+	pods := []podState{
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true,
+			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
+	assert.Equal(t, 1, masterIdx, "Pod-1 should be identified as the real master (more slaves)")
+	assert.True(t, resultPods[1].isMaster, "Pod-1 should remain master")
+	assert.False(t, resultPods[0].isMaster, "Pod-0 should be demoted (rogue master)")
+}
+
+func TestDetectAndResolveSplitBrain_SentinelBasedResolution(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+		},
+	}
+
+	pods := []podState{
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+	}
+
+	// Sentinel says test-0 is the real master — should override connected slaves fallback.
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "test-0")
+	assert.Equal(t, 0, masterIdx, "Sentinel authority should pick test-0 as real master")
+	assert.True(t, resultPods[0].isMaster, "test-0 should remain master (sentinel authority)")
+	assert.False(t, resultPods[1].isMaster, "test-1 should be demoted (rogue)")
+}
+
+func TestDetectAndResolveSplitBrain_ThreeMasters(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "test-0":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			case "test-1":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			case "test-2":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			default:
+				return nil, fmt.Errorf("unknown pod")
+			}
+		},
+	}
+
+	pods := []podState{
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
+		{name: "test-2", isMaster: true, needsUpdate: false, exists: true, ready: true,
+			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 2, "")
+	assert.GreaterOrEqual(t, masterIdx, 0, "Should have identified a real master")
+
+	masterCount := 0
+	for _, ps := range resultPods {
+		if ps.isMaster {
+			masterCount++
+		}
+	}
+	assert.Equal(t, 1, masterCount, "Exactly one pod should remain master after resolution")
+}
+
+func TestDetectAndResolveSplitBrain_ReplicationInfoUnavailable(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	// All replication info calls fail — fallback picks the first master index.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return nil, fmt.Errorf("connection refused")
+		},
+	}
+
+	pods := []podState{
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
+	// When replication info is unavailable, the first master index is chosen.
+	assert.GreaterOrEqual(t, masterIdx, 0)
+
+	masterCount := 0
+	for _, ps := range resultPods {
+		if ps.isMaster {
+			masterCount++
+		}
+	}
+	assert.Equal(t, 1, masterCount, "Should resolve to exactly one master")
+}
+
+func TestDetectAndResolveSplitBrain_RoguePodNotReady(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "test-1" {
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 1}, nil
+			}
+			return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+		},
+	}
+
+	pods := []podState{
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: false,
+			pod: createPodForSts(v, 0, "valkey/valkey:8.0", false)},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+	}
+
+	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
+	assert.Equal(t, 1, masterIdx, "Pod-1 should be the real master (more slaves)")
+	// Pod-0 is marked as non-master even though demoteRogueMaster fails (not ready).
+	assert.False(t, resultPods[0].isMaster, "Rogue pod should be marked as non-master")
+}
+
+func TestGetSentinelMasterPodName_NoSentinel(t *testing.T) {
+	v := newTestValkey("test", "default")
+	// No sentinel configured.
+	r, _ := newTestReconciler(v)
+
+	result := r.getSentinelMasterPodName(context.Background(), v)
+	assert.Equal(t, "", result, "Should return empty when sentinel is not enabled")
+}
+
+func TestGetSentinelMasterPodName_SentinelUnreachable(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	r, _ := newTestReconciler(v)
+
+	// Sentinels are not reachable in unit tests.
+	result := r.getSentinelMasterPodName(context.Background(), v)
+	assert.Equal(t, "", result, "Should return empty when sentinels are unreachable")
+}
+
+func TestHandleRollingUpdate_HA_SplitBrain_BreaksDeadlock(t *testing.T) {
+	// This test reproduces the exact deadlock scenario from the split-brain analysis:
+	// - Pod-0 and Pod-1 both report as master (split-brain)
+	// - Pod-2 is already updated
+	// - Without split-brain detection, replaceNextReplica skips pod-0 (isMaster=true)
+	//   and waitForReplicasReady blocks because pod-0 needsUpdate=true
+	// - With split-brain detection, the rogue master is demoted and the update proceeds.
+	v := newTestValkey("ha-split", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:9.0"
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	// Pod-0: old image, reports master (rogue), 0 connected slaves
+	// Pod-1: old image, reports master (real), 1 connected slave
+	// Pod-2: new image, ready, reports replica
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod2 := createPodForSts(v, 2, "valkey/valkey:9.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "ha-split-0":
+				return &valkeyclient.ReplicationInfo{
+					Role:            "master",
+					ConnectedSlaves: 0,
+				}, nil
+			case "ha-split-1":
+				return &valkeyclient.ReplicationInfo{
+					Role:            "master",
+					ConnectedSlaves: 1,
+				}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{
+					Role:                 "slave",
+					MasterSyncInProgress: false,
+					MasterLinkStatus:     "up",
+				}, nil
+			}
+		},
+	}
+	reconcileOnce(t, r, "ha-split", "default")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "ha-split", Namespace: "default"}, sts))
+
+	result := r.handleRollingUpdate(context.Background(), v, sts)
+	assert.True(t, result.NeedsRequeue, "Should requeue to continue rolling update")
+	assert.Nil(t, result.Error, "Should not error")
+
+	// The rogue master pod (pod-0) should have been deleted because it was
+	// demoted to non-master status and became a valid candidate for replaceNextReplica.
+	deletedPod0 := false
+	pod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "ha-split-0", Namespace: "default"}, pod); err != nil {
+		deletedPod0 = true
+	}
+	assert.True(t, deletedPod0, "Rogue master pod-0 should be deleted after split-brain resolution")
+
+	// Pod-1 (real master) should still exist.
+	err := c.Get(context.Background(), types.NamespacedName{Name: "ha-split-1", Namespace: "default"}, pod)
+	assert.NoError(t, err, "Real master pod-1 should still exist")
+}
+
+func TestCountMasters_MultipleMasters(t *testing.T) {
+	pods := []podState{
+		{name: "test-0", isMaster: true},
+		{name: "test-1", isMaster: true},
+		{name: "test-2", isMaster: false},
+	}
+	assert.Equal(t, 2, countMasters(pods))
+}
+
+func TestCountMasters_NoMasters(t *testing.T) {
+	pods := []podState{
+		{name: "test-0", isMaster: false},
+		{name: "test-1", isMaster: false},
+	}
+	assert.Equal(t, 0, countMasters(pods))
+}
+
+func TestCountMasters_SingleMaster(t *testing.T) {
+	pods := []podState{
+		{name: "test-0", isMaster: false},
+		{name: "test-1", isMaster: true},
+		{name: "test-2", isMaster: false},
+	}
+	assert.Equal(t, 1, countMasters(pods))
+}
