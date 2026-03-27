@@ -382,6 +382,153 @@ func TestComputeConfigHash_StableWhenKnownMasterChanges(t *testing.T) {
 		"hash must remain stable when AnnotationKnownMaster changes (post-failover)")
 }
 
+// --- Dynamic master address (Phase 2: Prevention Hardening) ---
+
+// TestGenerateValkeyConf_ReplicaUsesKnownMaster verifies that GenerateValkeyConf
+// uses the AnnotationKnownMaster annotation for the replicaof directive when the
+// annotation is set, instead of always using the default pod-0 address.
+func TestGenerateValkeyConf_ReplicaUsesKnownMaster(t *testing.T) {
+	overrideMaster := "test-2.test-headless.default.svc.cluster.local"
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	replicaConf := GenerateValkeyConf(v, true)
+
+	assert.Contains(t, replicaConf, "replicaof "+overrideMaster,
+		"replica config must use the AnnotationKnownMaster address when annotation is set")
+	assert.NotContains(t, replicaConf, "test-0.test-headless",
+		"replica config must NOT contain the default pod-0 address when AnnotationKnownMaster overrides it")
+}
+
+// TestGenerateValkeyConf_ReplicaFallsBackToPod0WhenNoAnnotation verifies that
+// GenerateValkeyConf falls back to the default pod-0 address when the
+// AnnotationKnownMaster annotation is not set.
+func TestGenerateValkeyConf_ReplicaFallsBackToPod0WhenNoAnnotation(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	replicaConf := GenerateValkeyConf(v, true)
+
+	assert.Contains(t, replicaConf, "replicaof test-0.test-headless.default.svc.cluster.local",
+		"replica config must fall back to pod-0 when no annotation is set")
+}
+
+// TestGenerateValkeyConf_ReplicaFallsBackToPod0WhenAnnotationEmpty verifies that
+// an empty AnnotationKnownMaster annotation is treated like no annotation.
+func TestGenerateValkeyConf_ReplicaFallsBackToPod0WhenAnnotationEmpty(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "",
+		}
+	})
+
+	replicaConf := GenerateValkeyConf(v, true)
+
+	assert.Contains(t, replicaConf, "replicaof test-0.test-headless.default.svc.cluster.local",
+		"replica config must fall back to pod-0 when annotation is empty")
+}
+
+// TestGenerateValkeyConfForHash_IgnoresKnownMaster verifies that
+// GenerateValkeyConfForHash does NOT use the AnnotationKnownMaster annotation,
+// ensuring the hash remains stable when the annotation changes.
+func TestGenerateValkeyConfForHash_IgnoresKnownMaster(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "test-2.test-headless.default.svc.cluster.local",
+		}
+	})
+
+	replicaConf := GenerateValkeyConfForHash(v, true)
+
+	assert.Contains(t, replicaConf, "replicaof test-0.test-headless.default.svc.cluster.local",
+		"hash variant must always use default pod-0 address, ignoring AnnotationKnownMaster")
+	assert.NotContains(t, replicaConf, "test-2.test-headless",
+		"hash variant must NOT use the AnnotationKnownMaster address")
+}
+
+// TestBuildReplicaConfigMap_UsesKnownMaster verifies that BuildReplicaConfigMap
+// uses the AnnotationKnownMaster for the replicaof directive, so the init
+// container's ConfigMap fallback points to the correct post-failover master.
+func TestBuildReplicaConfigMap_UsesKnownMaster(t *testing.T) {
+	overrideMaster := "test-1.test-headless.default.svc.cluster.local"
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: overrideMaster,
+		}
+	})
+
+	cm := BuildReplicaConfigMap(v)
+	confData := cm.Data[ValkeyConfigKey]
+
+	assert.Contains(t, confData, "replicaof "+overrideMaster,
+		"replica ConfigMap must use the AnnotationKnownMaster address")
+}
+
+// TestGenerateValkeyConf_MasterConfUnaffectedByKnownMaster verifies that the
+// master config (isReplica=false) is not affected by the AnnotationKnownMaster
+// annotation, since master config has no replicaof directive.
+func TestGenerateValkeyConf_MasterConfUnaffectedByKnownMaster(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "test-2.test-headless.default.svc.cluster.local",
+		}
+	})
+
+	masterConf := GenerateValkeyConf(v, false)
+
+	assert.NotContains(t, masterConf, "replicaof",
+		"master config must never contain replicaof, even with AnnotationKnownMaster set")
+}
+
+// TestComputeConfigHash_StableWhenKnownMasterChanges_ReplicaConfig verifies that
+// the config hash remains stable when AnnotationKnownMaster changes, even though
+// the replica config's replicaof now uses the annotation. The hash computation
+// must use GenerateValkeyConfForHash which ignores the annotation.
+func TestComputeConfigHash_StableWhenKnownMasterChanges_ReplicaConfig(t *testing.T) {
+	vNoAnnotation := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	vWithAnnotation := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "test-1.test-headless.default.svc.cluster.local",
+		}
+	})
+	vWithDifferentAnnotation := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Annotations = map[string]string{
+			AnnotationKnownMaster: "test-2.test-headless.default.svc.cluster.local",
+		}
+	})
+
+	hash1 := ComputeConfigHash(vNoAnnotation)
+	hash2 := ComputeConfigHash(vWithAnnotation)
+	hash3 := ComputeConfigHash(vWithDifferentAnnotation)
+
+	assert.Equal(t, hash1, hash2,
+		"hash must be identical regardless of AnnotationKnownMaster")
+	assert.Equal(t, hash2, hash3,
+		"hash must be identical regardless of which master is annotated")
+}
+
 // TestGenerateValkeyConf_HA_NoStaticReplicaAnnounceIP verifies that GenerateValkeyConf
 // does NOT include replica-announce-ip in the static config. The directive is
 // injected dynamically by the init container since it depends on the pod hostname.

@@ -176,6 +176,10 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
 		}
 
+		// Generate sentinel pod indices (e.g. "0 1 2" for 3 replicas) for the
+		// init container's retry loop. This adapts to non-standard sentinel replica counts.
+		sentinelIndices := sentinelPodIndices(v.Spec.Sentinel.Replicas)
+
 		initContainer := corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
@@ -184,45 +188,69 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 				fmt.Sprintf(
 					`# Query Sentinel for the actual master address.
 # This is critical for rolling updates: after failover, the master may not be pod-0.
+# Uses a retry loop with exponential backoff to handle concurrent pod/sentinel restarts.
 SENTINEL_HOST="%[1]s.%[2]s.svc.cluster.local"
 MONITOR="%[3]s"
 MY_HOST="$HOSTNAME.%[4]s.%[2]s.svc.cluster.local"
 MASTER_ADDR=""
 
-# Try each sentinel pod to get the master address.
-for i in 0 1 2; do
-  SHOST="%[5]s-${i}.${SENTINEL_HOST}"
-  RESULT=$(timeout 3 valkey-cli %[12]s %[13]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
-  if [ -n "$RESULT" ]; then
-    CANDIDATE=$(echo "$RESULT" | head -1)
-    # Guard against Sentinel returning an error string (e.g. NOAUTH, ERR, WRONGPASS)
-    # instead of a hostname — those must never end up in a replicaof directive.
-    if echo "$CANDIDATE" | grep -qE "^(NOAUTH|ERR |WRONGPASS|-)"; then
-      echo "Sentinel $SHOST returned error: $CANDIDATE — skipping"
-      continue
+# Phase 1: Retry Sentinel queries with exponential backoff (up to 30s).
+# This prevents the race condition where pods and sentinels restart simultaneously
+# and the pod falls through to ordinal fallback before sentinel is ready.
+MAX_WAIT=30
+WAITED=0
+SLEEP=1
+while [ "$WAITED" -lt "$MAX_WAIT" ] && [ -z "$MASTER_ADDR" ]; do
+  for i in %[14]s; do
+    SHOST="%[5]s-${i}.${SENTINEL_HOST}"
+    RESULT=$(timeout 3 valkey-cli %[12]s %[13]s -h "$SHOST" -p %[6]d SENTINEL get-master-addr-by-name "$MONITOR" 2>/dev/null)
+    if [ -n "$RESULT" ]; then
+      CANDIDATE=$(echo "$RESULT" | head -1)
+      # Guard against Sentinel returning an error string (e.g. NOAUTH, ERR, WRONGPASS)
+      # instead of a hostname — those must never end up in a replicaof directive.
+      if echo "$CANDIDATE" | grep -qE "^(NOAUTH|ERR |WRONGPASS|-)"; then
+        echo "Sentinel $SHOST returned error: $CANDIDATE — skipping"
+        continue
+      fi
+      MASTER_ADDR="$CANDIDATE"
+      echo "Sentinel returned master: $MASTER_ADDR"
+      break 2
     fi
-    MASTER_ADDR="$CANDIDATE"
-    echo "Sentinel returned master: $MASTER_ADDR"
-    break
-  fi
+  done
+  echo "No Sentinel responded (waited ${WAITED}s/${MAX_WAIT}s), retrying in ${SLEEP}s..."
+  sleep $SLEEP
+  WAITED=$((WAITED + SLEEP))
+  SLEEP=$((SLEEP * 2))
+  [ "$SLEEP" -gt 8 ] && SLEEP=8
 done
 
+# Phase 2: If Sentinel is still unavailable, use the known master from the replica
+# ConfigMap as a fallback. The operator updates this ConfigMap with the actual master
+# address (via the known-master annotation), so it reflects post-failover state.
+if [ -z "$MASTER_ADDR" ]; then
+  REPLICA_CONF_MASTER=$(grep '^replicaof ' %[11]s/%[8]s 2>/dev/null | awk '{print $2}')
+  if [ -n "$REPLICA_CONF_MASTER" ]; then
+    echo "Sentinel unavailable, using known master from replica config: $REPLICA_CONF_MASTER"
+    MASTER_ADDR="$REPLICA_CONF_MASTER"
+  fi
+fi
+
 if [ -n "$MASTER_ADDR" ]; then
-  # Sentinel is available — use the actual master address.
+  # Master address resolved (from Sentinel or replica ConfigMap).
   if echo "$MASTER_ADDR" | grep -q "$MY_HOST"; then
-    echo "This pod IS the master per Sentinel, using master config"
+    echo "This pod IS the master, using master config"
     cp %[7]s/%[8]s %[9]s/%[8]s
   else
-    echo "This pod is a replica per Sentinel, master=$MASTER_ADDR"
+    echo "This pod is a replica, master=$MASTER_ADDR"
     cp %[7]s/%[8]s %[9]s/%[8]s
     echo "" >> %[9]s/%[8]s
-    echo "# Replication (configured by init container via Sentinel discovery)" >> %[9]s/%[8]s
+    echo "# Replication (configured by init container via Sentinel/ConfigMap discovery)" >> %[9]s/%[8]s
     echo "replicaof $MASTER_ADDR %[10]d" >> %[9]s/%[8]s
   fi
 else
-  # Sentinel not available (first boot). Use ordinal-based fallback.
+  # Phase 3: Last resort — ordinal-based fallback (fresh installation only).
   ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
-  echo "Sentinel not available, using ordinal-based config (ordinal=$ORDINAL)"
+  echo "All discovery methods exhausted, using ordinal-based config (ordinal=$ORDINAL)"
   if [ "$ORDINAL" = "0" ]; then
     cp %[7]s/%[8]s %[9]s/%[8]s
   else
@@ -248,6 +276,7 @@ echo "replica-announce-port %[10]d" >> %[9]s/%[8]s`,
 					ReplicaConfigMountPath,  // 11: replica config mount
 					cliTLSFlags,             // 12: optional TLS flags for valkey-cli
 					cliAuthFlags,            // 13: optional auth flags for valkey-cli
+					sentinelIndices,         // 14: sentinel pod indices (e.g. "0 1 2")
 				),
 			},
 			VolumeMounts: buildInitContainerVolumeMounts(v),
@@ -376,6 +405,17 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 	}
 
 	return spec
+}
+
+// sentinelPodIndices generates a space-separated list of sentinel pod ordinal
+// indices (e.g. "0 1 2" for 3 replicas) for use in the init container's shell
+// script. This adapts to non-standard sentinel replica counts.
+func sentinelPodIndices(replicas int32) string {
+	indices := make([]string, replicas)
+	for i := int32(0); i < replicas; i++ {
+		indices[i] = fmt.Sprintf("%d", i)
+	}
+	return strings.Join(indices, " ")
 }
 
 // needsInitContainer returns true when the pod spec requires an init container

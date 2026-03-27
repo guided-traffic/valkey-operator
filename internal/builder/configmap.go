@@ -40,7 +40,26 @@ func MasterAddress(v *vkov1.Valkey) string {
 
 // GenerateValkeyConf generates the valkey.conf content based on the CRD spec.
 // The isReplica parameter controls whether replicaof directives are included.
+// When the Valkey CR carries the AnnotationKnownMaster annotation (set after
+// a sentinel failover), the replica config's replicaof directive uses that
+// address instead of the default pod-0 address.
 func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
+	return generateValkeyConf(v, isReplica, true)
+}
+
+// GenerateValkeyConfForHash generates the valkey.conf content without using the
+// AnnotationKnownMaster override. Use this when computing the config hash for
+// pod update detection. The AnnotationKnownMaster changes during rolling-update
+// failovers (set by persistKnownMaster) and must NOT affect the hash — including
+// it would cause all pods to appear outdated immediately after a failover,
+// triggering an infinite restart loop.
+func GenerateValkeyConfForHash(v *vkov1.Valkey, isReplica bool) string {
+	return generateValkeyConf(v, isReplica, false)
+}
+
+// generateValkeyConf is the internal implementation shared by GenerateValkeyConf
+// and GenerateValkeyConfForHash.
+func generateValkeyConf(v *vkov1.Valkey, isReplica bool, useKnownMaster bool) string {
 	var lines []string
 
 	// Network configuration.
@@ -88,7 +107,7 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 
 	// Replication configuration (multi-replica mode).
 	if v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel() {
-		lines = append(lines, replicationConfig(v, isReplica)...)
+		lines = append(lines, replicationConfig(v, isReplica, useKnownMaster)...)
 	}
 
 	// Persistence configuration.
@@ -119,7 +138,12 @@ func GenerateValkeyConf(v *vkov1.Valkey, isReplica bool) string {
 }
 
 // replicationConfig returns replication-related config lines for multi-replica mode.
-func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
+// When useKnownMaster is true and the Valkey CR carries the AnnotationKnownMaster
+// annotation, the replicaof directive uses the annotated address instead of the
+// default pod-0 address. This ensures the replica ConfigMap reflects the actual
+// post-failover master, so pods that restart when Sentinel is unavailable connect
+// to the correct master via the init container's ConfigMap fallback.
+func replicationConfig(v *vkov1.Valkey, isReplica bool, useKnownMaster bool) []string {
 	var lines []string
 
 	// replica-announce-ip and replica-announce-port are injected dynamically
@@ -133,10 +157,17 @@ func replicationConfig(v *vkov1.Valkey, isReplica bool) []string {
 	}
 
 	if isReplica {
-		// Replicas connect to pod-0 (the master).
-		// In Sentinel mode, Sentinel reconfigures this dynamically after failover.
+		// Determine the master address. When useKnownMaster is true and the CR
+		// has been annotated with the actual post-failover master, use that address.
+		// Otherwise fall back to the default pod-0 address.
+		masterAddr := MasterAddress(v)
+		if useKnownMaster && v.Annotations != nil {
+			if override, ok := v.Annotations[AnnotationKnownMaster]; ok && override != "" {
+				masterAddr = override
+			}
+		}
 		lines = append(lines,
-			fmt.Sprintf("replicaof %s %d", MasterAddress(v), replicationPort),
+			fmt.Sprintf("replicaof %s %d", masterAddr, replicationPort),
 		)
 	}
 
@@ -261,12 +292,13 @@ func BuildReplicaConfigMap(v *vkov1.Valkey) *corev1.ConfigMap {
 // forced to restart until they are replaced for another reason.
 func ComputeConfigHash(v *vkov1.Valkey) string {
 	h := fnv.New32a()
-	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, false))
-	_, _ = fmt.Fprint(h, GenerateValkeyConf(v, true))
+	// Use GenerateValkeyConfForHash (no AnnotationKnownMaster) so that a
+	// post-failover master-address change does not alter the hash and trigger
+	// an unwanted rolling restart of all Valkey pods.
+	_, _ = fmt.Fprint(h, GenerateValkeyConfForHash(v, false))
+	_, _ = fmt.Fprint(h, GenerateValkeyConfForHash(v, true))
 	if v.IsSentinelEnabled() {
-		// Use GenerateSentinelConfForHash (no AnnotationKnownMaster) so that a
-		// post-failover master-address change does not alter the hash and trigger
-		// an unwanted rolling restart of all Valkey pods.
+		// Same reasoning for the sentinel config hash.
 		_, _ = fmt.Fprint(h, GenerateSentinelConfForHash(v))
 	}
 	return fmt.Sprintf("%08x", h.Sum32())

@@ -1558,3 +1558,107 @@ func TestBuildStatefulSet_HA_InitContainer_ReplicaAnnounceUsesCorrectFQDN(t *tes
 	assert.Contains(t, script, `MY_HOST="$HOSTNAME.myapp-headless.production.svc.cluster.local"`,
 		"MY_HOST must use correct headless service name and namespace")
 }
+
+// --- Init container retry loop and known-master fallback (Phase 2: Prevention Hardening) ---
+
+// TestBuildStatefulSet_HA_InitContainer_RetryLoop verifies that the init container
+// script contains a retry loop with exponential backoff for Sentinel queries.
+func TestBuildStatefulSet_HA_InitContainer_RetryLoop(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "MAX_WAIT=30",
+		"Init container must retry Sentinel queries for up to 30 seconds")
+	assert.Contains(t, script, "SLEEP=$((SLEEP * 2))",
+		"Init container must use exponential backoff")
+	assert.Contains(t, script, "break 2",
+		"Init container must break out of both loops when Sentinel responds")
+	assert.Contains(t, script, `while [ "$WAITED" -lt "$MAX_WAIT" ]`,
+		"Init container must have a retry while-loop")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_KnownMasterFallback verifies that the init
+// container reads the known master from the replica ConfigMap when Sentinel is
+// unavailable, before falling back to ordinal-based selection.
+func TestBuildStatefulSet_HA_InitContainer_KnownMasterFallback(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	// Phase 2 fallback: read known master from replica ConfigMap.
+	assert.Contains(t, script, "grep '^replicaof '",
+		"Init container must parse replica ConfigMap for known master address")
+	assert.Contains(t, script, "REPLICA_CONF_MASTER",
+		"Init container must store the parsed master address")
+	assert.Contains(t, script, "known master from replica config",
+		"Init container must log when using replica config fallback")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_OrdinalFallbackIsLastResort verifies that
+// the ordinal-based fallback is the last resort, only used when both Sentinel and
+// the replica ConfigMap fail to provide a master address.
+func TestBuildStatefulSet_HA_InitContainer_OrdinalFallbackIsLastResort(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "All discovery methods exhausted",
+		"Ordinal fallback must clearly indicate it is the last resort")
+}
+
+// TestBuildStatefulSet_HA_InitContainer_DynamicSentinelIndices verifies that the
+// init container script uses the correct sentinel pod indices based on the
+// sentinel replica count, instead of hardcoding "0 1 2".
+func TestBuildStatefulSet_HA_InitContainer_DynamicSentinelIndices(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int32
+		expected string
+	}{
+		{"3 sentinels", 3, "for i in 0 1 2; do"},
+		{"5 sentinels", 5, "for i in 0 1 2 3 4; do"},
+		{"1 sentinel", 1, "for i in 0; do"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newTestValkey("test", func(v *vkov1.Valkey) {
+				v.Spec.Replicas = 3
+				v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: tt.replicas}
+			})
+
+			sts := BuildStatefulSet(v, testOperatorImage)
+
+			require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+			script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+			assert.Contains(t, script, tt.expected,
+				"Init container must iterate over correct sentinel indices")
+		})
+	}
+}
+
+// TestSentinelPodIndices verifies the sentinel pod indices helper.
+func TestSentinelPodIndices(t *testing.T) {
+	assert.Equal(t, "0 1 2", sentinelPodIndices(3))
+	assert.Equal(t, "0 1 2 3 4", sentinelPodIndices(5))
+	assert.Equal(t, "0", sentinelPodIndices(1))
+}
