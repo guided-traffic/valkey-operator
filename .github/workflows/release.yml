@@ -99,6 +99,42 @@ jobs:
           kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=300s
           echo "kube-system pods ready."
 
+      - name: Verify in-cluster API connectivity
+        run: |
+          # kube-proxy pods being Ready does NOT mean their iptables DNAT rules for
+          # ClusterIPs (e.g. kubernetes.default.svc -> 10.96.0.1:443) are applied yet.
+          # In DinD this race causes "dial tcp 10.96.0.1:443: i/o timeout" inside pods.
+          # Fix: probe from inside the cluster; if it fails, restart kube-proxy to force
+          # a full iptables resync, then verify again.
+          echo "Probing in-cluster kubernetes service connectivity..."
+          PROBE_OK=false
+          for attempt in 1 2 3; do
+            kubectl run api-probe \
+              --image=busybox:1.36 \
+              --restart=Never \
+              -- sleep 60
+            kubectl wait --for=condition=Ready pod/api-probe --timeout=60s
+
+            if kubectl exec api-probe -- \
+                timeout 20 sh -c \
+                'until nc -z -w 2 kubernetes.default.svc 443 2>/dev/null; do sleep 2; done'; then
+              echo "In-cluster API connectivity OK (attempt ${attempt})"
+              PROBE_OK=true
+              kubectl delete pod api-probe --force --grace-period=0
+              break
+            fi
+
+            echo "Connectivity check failed on attempt ${attempt} — restarting kube-proxy to force iptables resync..."
+            kubectl delete pod api-probe --force --grace-period=0 || true
+            kubectl -n kube-system rollout restart daemonset/kube-proxy
+            kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=60s
+          done
+
+          if [ "$PROBE_OK" = "false" ]; then
+            echo "ERROR: In-cluster API connectivity could not be established after 3 attempts"
+            exit 1
+          fi
+
       - name: Build and load operator image
         run: |
           make docker-build IMG=valkey-operator:test
