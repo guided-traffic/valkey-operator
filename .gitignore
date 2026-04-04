@@ -36,3 +36,4 @@ go.work.sum
 node_modules/
 main
 tmp/
+.claude/
