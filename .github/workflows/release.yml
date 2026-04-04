@@ -96,7 +96,9 @@ jobs:
       - name: Build and load operator image
         run: |
           make docker-build IMG=valkey-operator:test
-          kind load docker-image valkey-operator:test --name valkey-operator-test
+          # Manual ctr import without --all-platforms/--snapshotter flags
+          # to avoid "no unpack platforms defined" error with native snapshotter in DinD
+          docker save valkey-operator:test | docker exec -i valkey-operator-test-control-plane ctr --namespace=k8s.io images import -
 
       - name: Verify image in cluster
         run: |
