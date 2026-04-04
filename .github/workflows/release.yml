@@ -93,6 +93,12 @@ jobs:
           kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
 
+      - name: Wait for kube-system pods
+        run: |
+          echo "Waiting for kube-system pods (coredns, kube-proxy) to be Ready..."
+          kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=300s
+          echo "kube-system pods ready."
+
       - name: Build and load operator image
         run: |
           make docker-build IMG=valkey-operator:test
@@ -125,6 +131,26 @@ jobs:
           kubectl get namespaces
           echo "=== Storage classes ==="
           kubectl get storageclass
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
+          echo "Waiting for cert-manager deployments to be available..."
+          kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=300s
+          kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=300s
+          kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=300s
+          echo "Waiting for all cert-manager pods to be Ready..."
+          kubectl -n cert-manager wait --for=condition=Ready pods --all --timeout=300s
+          echo "Creating self-signed ClusterIssuer..."
+          # Retry in case the webhook TLS isn't fully initialised yet
+          for i in 1 2 3 4 5; do
+            if kubectl apply -f test/e2e/testdata/cert-manager-issuer.yaml; then
+              echo "ClusterIssuer created successfully on attempt $i"
+              break
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Install operator via Helm
         id: helm-install
@@ -184,17 +210,6 @@ jobs:
           kubectl describe clusterrolebinding valkey-operator || true
 
           exit 1
-
-      - name: Install cert-manager
-        run: |
-          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
-          echo "Waiting for cert-manager to be ready..."
-          kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
-          kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
-          kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
-          echo "Creating self-signed ClusterIssuer..."
-          sleep 5
-          kubectl apply -f test/e2e/testdata/cert-manager-issuer.yaml
 
       - name: Wait for operator
         run: kubectl -n valkey-operator-system wait --for=condition=available --timeout=120s deployment/valkey-operator
