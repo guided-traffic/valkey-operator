@@ -173,3 +173,72 @@ func TestNewSentinelClient_WithSentinelTLSConfig(t *testing.T) {
 	c := obs.newSentinelClient("localhost:36379", "pass")
 	assert.NotNil(t, c)
 }
+
+// --- discoverMasterViaProbe tests ---
+
+func TestDiscoverMasterViaProbe_AllUnreachable_FallsBackToHeadless(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			ClusterName:       "mydb",
+			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			Replicas:          3,
+			SentinelEnabled:   false,
+			TLSEnabled:        false,
+		},
+	}
+
+	// All pods unreachable → discoverMasterViaProbe fails →
+	// discoverMaster falls back to masterAddressFromHeadless (pod-0).
+	addr, err := obs.discoverMaster(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:6379", addr,
+		"When probe fails, should fall back to pod-0 headless address")
+}
+
+func TestDiscoverMasterViaProbe_AllUnreachable_TLS(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			ClusterName:       "mydb",
+			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			Replicas:          3,
+			SentinelEnabled:   false,
+			TLSEnabled:        true,
+		},
+	}
+
+	addr, err := obs.discoverMaster(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:16379", addr,
+		"When probe fails with TLS, should fall back to pod-0 headless TLS address")
+}
+
+func TestDiscoverMasterViaProbe_ReturnsError_WhenAllUnreachable(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			ClusterName:       "mydb",
+			ValkeyHeadlessSvc: "mydb-headless.invalid.svc.cluster.local",
+			Replicas:          3,
+		},
+	}
+
+	_, err := obs.discoverMasterViaProbe()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no master found among 3 pods")
+}
+
+func TestDiscoverMaster_SingleReplica_SkipsProbe(t *testing.T) {
+	obs := &Observer{
+		cfg: Config{
+			ClusterName:       "mydb",
+			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			Replicas:          1,
+			SentinelEnabled:   false,
+			TLSEnabled:        false,
+		},
+	}
+
+	// Replicas=1 → should not attempt probe, go directly to headless.
+	addr, err := obs.discoverMaster(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:6379", addr)
+}
