@@ -10,12 +10,49 @@ import (
 )
 
 // discoverMaster identifies the current master address.
-// If Sentinel is enabled, it queries Sentinel; otherwise it uses pod-0 of the headless service.
+// If Sentinel is enabled, it queries Sentinel; for multi-replica non-Sentinel
+// setups, it probes all pods via INFO REPLICATION to find the actual master
+// (preventing false positives after manual failover). Falls back to pod-0.
 func (o *Observer) discoverMaster(_ context.Context) (string, error) {
 	if o.cfg.SentinelEnabled && len(o.cfg.SentinelAddrList) > 0 {
 		return o.discoverMasterViaSentinel()
 	}
+	if o.cfg.Replicas > 1 {
+		if addr, err := o.discoverMasterViaProbe(); err == nil {
+			return addr, nil
+		}
+	}
 	return o.masterAddressFromHeadless(), nil
+}
+
+// discoverMasterViaProbe queries all pods for INFO REPLICATION and returns
+// the address of the master with the most connected replicas.
+// This prevents the observer from writing to a stale pod-0 after failover.
+func (o *Observer) discoverMasterViaProbe() (string, error) {
+	port := 6379
+	if o.cfg.TLSEnabled {
+		port = 16379
+	}
+
+	var bestAddr string
+	bestSlaves := -1
+
+	for i := 0; i < o.cfg.Replicas; i++ {
+		addr := fmt.Sprintf("%s-%d.%s:%d", o.cfg.ClusterName, i, o.cfg.ValkeyHeadlessSvc, port)
+		client := o.newClient(addr, o.cfg.Password)
+		info, err := client.InfoReplication()
+		if err != nil {
+			continue
+		}
+		if info.Role == "master" && info.ConnectedSlaves > bestSlaves {
+			bestAddr = addr
+			bestSlaves = info.ConnectedSlaves
+		}
+	}
+	if bestAddr == "" {
+		return "", fmt.Errorf("no master found among %d pods", o.cfg.Replicas)
+	}
+	return bestAddr, nil
 }
 
 func (o *Observer) discoverMasterViaSentinel() (string, error) {

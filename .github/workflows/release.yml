@@ -82,26 +82,28 @@ jobs:
           version: v0.30.0
           node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
           cluster_name: valkey-operator-test
-          wait: 120s
+          wait: 180s
           ignore_failed_clean: true
           config: kind-config.yaml
 
       - name: Verify Kind cluster
         run: |
+          set -euo pipefail
           kubectl cluster-info
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
 
       - name: Build and load operator image
         run: |
           make docker-build IMG=valkey-operator:test
-          # Import image - containerd will automatically use the native snapshotter from config
-          # Don't specify --snapshotter flag to avoid platform unpacking issues
+          # Manual ctr import without --all-platforms/--snapshotter flags
+          # to avoid "no unpack platforms defined" error with native snapshotter in DinD
           docker save valkey-operator:test | docker exec -i valkey-operator-test-control-plane ctr --namespace=k8s.io images import -
 
       - name: Verify image in cluster
         run: |
           echo "=== Verifying image is available in Kind cluster ==="
-          docker exec valkey-operator-test-control-plane crictl images | grep valkey-operator || {
+          docker exec valkey-operator-test-control-plane crictl images | grep -E 'valkey-operator\s+test|valkey-operator:test' || {
             echo "ERROR: Image not found in cluster!"
             echo "Available images:"
             docker exec valkey-operator-test-control-plane crictl images

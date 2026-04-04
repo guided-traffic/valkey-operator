@@ -1662,3 +1662,174 @@ func TestSentinelPodIndices(t *testing.T) {
 	assert.Equal(t, "0 1 2 3 4", sentinelPodIndices(5))
 	assert.Equal(t, "0", sentinelPodIndices(1))
 }
+
+// --- Non-Sentinel multi-replica master discovery init container ---
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_MasterDiscovery(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "Master discovery for non-Sentinel replication",
+		"Init container must use master discovery")
+	assert.Contains(t, script, "INFO replication",
+		"Init container must query peer pods for replication info")
+	assert.Contains(t, script, "connected_slaves",
+		"Init container must check connected_slaves to find the real master")
+	assert.Contains(t, script, "Discovered existing master",
+		"Init container must log when a master is discovered")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_OrdinalFallback(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "No existing master discovered, using ordinal-based config",
+		"Init container must fall back to ordinal-based config when no master found")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_RetryLoop(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "MAX_WAIT=15",
+		"Init container must retry peer queries for up to 15 seconds")
+	assert.Contains(t, script, "SLEEP=$((SLEEP * 2))",
+		"Init container must use exponential backoff")
+	assert.Contains(t, script, "break 2",
+		"Init container must break out of both loops when master discovered")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_UsesCorrectFQDN(t *testing.T) {
+	v := newTestValkey("myapp", func(v *vkov1.Valkey) {
+		v.Namespace = "production"
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, `HEADLESS="myapp-headless.production.svc.cluster.local"`,
+		"Init container must use correct headless service name and namespace")
+	assert.Contains(t, script, `STS_NAME="myapp"`,
+		"Init container must use correct StatefulSet name")
+	assert.Contains(t, script, "REPLICAS=3",
+		"Init container must use correct replica count")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_TLSFlags(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, "--tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt",
+		"Init container must include TLS flags when TLS is enabled")
+	assert.Contains(t, script, "PORT=16379",
+		"Init container must use TLS port when TLS is enabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_NoTLSFlags(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.NotContains(t, script, "--tls",
+		"Init container must not include TLS flags when TLS is disabled")
+	assert.Contains(t, script, "PORT=6379",
+		"Init container must use plain port when TLS is disabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_AuthEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Auth = &vkov1.AuthSpec{
+			SecretName:        "my-secret",
+			SecretPasswordKey: "password",
+		}
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	initC := sts.Spec.Template.Spec.InitContainers[0]
+
+	// Auth env var must be injected.
+	var hasAuthEnv bool
+	for _, env := range initC.Env {
+		if env.Name == AuthSecretEnvName {
+			require.NotNil(t, env.ValueFrom)
+			require.NotNil(t, env.ValueFrom.SecretKeyRef)
+			assert.Equal(t, "my-secret", env.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, "password", env.ValueFrom.SecretKeyRef.Key)
+			hasAuthEnv = true
+		}
+	}
+	assert.True(t, hasAuthEnv, "Init container must have VALKEY_PASSWORD env var when auth enabled")
+
+	// Script must include auth flags.
+	script := initC.Command[2]
+	assert.Contains(t, script, "--no-auth-warning",
+		"Init container must use auth flags for valkey-cli when auth enabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_NoAuthEnvVar(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	initC := sts.Spec.Template.Spec.InitContainers[0]
+
+	assert.Empty(t, initC.Env,
+		"Init container must not have env vars when auth is disabled")
+
+	script := initC.Command[2]
+	assert.NotContains(t, script, "no-auth-warning",
+		"Init container must not use auth flags when auth is disabled")
+}
+
+func TestBuildStatefulSet_MultiReplica_InitContainer_SkipsSelf(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	sts := BuildStatefulSet(v, testOperatorImage)
+
+	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+	script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+	assert.Contains(t, script, `if [ "$PEER" = "$MY_HOST" ]; then`,
+		"Init container must skip querying itself")
+}

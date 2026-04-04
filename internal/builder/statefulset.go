@@ -300,9 +300,11 @@ echo "replica-announce-port %[10]d" >> %[9]s/%[8]s`,
 		initContainers = append(initContainers, initContainer)
 	}
 
-	// In multi-replica mode without Sentinel, use a simple ordinal-based init
-	// container to select master or replica config. Pod-0 gets the master config,
-	// all other pods get the replica config (which contains `replicaof`).
+	// In multi-replica mode without Sentinel, use a master-discovery init container
+	// that queries peer pods before falling back to ordinal-based config selection.
+	// This prevents split-brain after a manual failover by the drain handler:
+	// without discovery, pod-0 would always restart as master even when another
+	// pod was already promoted.
 	if v.IsMultiReplicaWithoutSentinel() {
 		volumes = append(volumes,
 			corev1.Volume{
@@ -328,21 +330,85 @@ echo "replica-announce-port %[10]d" >> %[9]s/%[8]s`,
 			replicationPort = TLSPort
 		}
 
+		// Build CLI flags for connecting to peer Valkey pods.
+		cliTLSFlags := ""
+		if v.IsTLSEnabled() {
+			cliTLSFlags = fmt.Sprintf("--tls --cert %s/tls.crt --key %s/tls.key --cacert %s/ca.crt",
+				TLSMountPath, TLSMountPath, TLSMountPath)
+		}
+		cliAuthFlags := ""
+		if v.IsAuthEnabled() {
+			cliAuthFlags = fmt.Sprintf("-a \"$%s\" --no-auth-warning", AuthSecretEnvName)
+		}
+
 		initContainer := corev1.Container{
 			Name:  "init-config-selector",
 			Image: v.Spec.Image,
 			Command: []string{
 				"sh", "-c",
 				fmt.Sprintf(
-					`# Ordinal-based config selection for non-Sentinel replication.
-MY_HOST="$HOSTNAME.%[5]s.%[6]s.svc.cluster.local"
+					`# Master discovery for non-Sentinel replication.
+# Prevents split-brain after manual failover by the drain handler.
+STS_NAME="%[8]s"
+HEADLESS="%[5]s.%[6]s.svc.cluster.local"
+MY_HOST="$HOSTNAME.$HEADLESS"
 ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
-if [ "$ORDINAL" = "0" ]; then
-  echo "Pod ordinal 0 — using master config"
+REPLICAS=%[9]d
+PORT=%[7]d
+MASTER_ADDR=""
+
+# Phase 1: Discover existing master by querying peer pods.
+# Uses a retry loop to handle the case where peers are still starting.
+MAX_WAIT=15
+WAITED=0
+SLEEP=1
+while [ "$WAITED" -lt "$MAX_WAIT" ] && [ -z "$MASTER_ADDR" ]; do
+  PEERS_RESPONDING=0
+  for i in $(seq 0 $((REPLICAS - 1))); do
+    PEER="${STS_NAME}-${i}.$HEADLESS"
+    if [ "$PEER" = "$MY_HOST" ]; then
+      continue
+    fi
+    RESULT=$(timeout 2 valkey-cli %[10]s %[11]s -h "$PEER" -p $PORT INFO replication 2>/dev/null)
+    if [ -z "$RESULT" ]; then
+      continue
+    fi
+    PEERS_RESPONDING=$((PEERS_RESPONDING + 1))
+    ROLE=$(echo "$RESULT" | grep "^role:" | tr -d '\r' | cut -d: -f2)
+    SLAVES=$(echo "$RESULT" | grep "^connected_slaves:" | tr -d '\r' | cut -d: -f2)
+    if [ "$ROLE" = "master" ] && [ "${SLAVES:-0}" -gt 0 ] 2>/dev/null; then
+      MASTER_ADDR="$PEER"
+      echo "Discovered existing master with $SLAVES connected replicas: $MASTER_ADDR"
+      break 2
+    fi
+  done
+  # If peers responded but no master with connected replicas found,
+  # stop waiting — the cluster state is determined.
+  if [ "$PEERS_RESPONDING" -gt 0 ]; then
+    echo "Queried $PEERS_RESPONDING peers but no master with connected replicas found"
+    break
+  fi
+  echo "No peers responding yet (waited ${WAITED}s/${MAX_WAIT}s), retrying in ${SLEEP}s..."
+  sleep $SLEEP
+  WAITED=$((WAITED + SLEEP))
+  SLEEP=$((SLEEP * 2))
+  [ "$SLEEP" -gt 4 ] && SLEEP=4
+done
+
+# Phase 2: Apply discovery result or fall back to ordinal-based config.
+if [ -n "$MASTER_ADDR" ]; then
+  echo "This pod is a replica, discovered master=$MASTER_ADDR"
   cp %[1]s/%[3]s %[2]s/%[3]s
+  echo "" >> %[2]s/%[3]s
+  echo "# Replication (configured by init container via master discovery)" >> %[2]s/%[3]s
+  echo "replicaof $MASTER_ADDR %[7]d" >> %[2]s/%[3]s
 else
-  echo "Pod ordinal $ORDINAL — using replica config"
-  cp %[4]s/%[3]s %[2]s/%[3]s
+  echo "No existing master discovered, using ordinal-based config (ordinal=$ORDINAL)"
+  if [ "$ORDINAL" = "0" ]; then
+    cp %[1]s/%[3]s %[2]s/%[3]s
+  else
+    cp %[4]s/%[3]s %[2]s/%[3]s
+  fi
 fi
 
 # Announce this pod's FQDN so replication info shows hostnames instead of IPs.
@@ -357,10 +423,30 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 					common.HeadlessServiceName(v, common.ComponentValkey), // 5: valkey headless service
 					v.Namespace,     // 6: namespace
 					replicationPort, // 7: replication port
+					common.StatefulSetName(v, common.ComponentValkey), // 8: statefulset name
+					v.Spec.Replicas, // 9: replica count
+					cliTLSFlags,     // 10: optional TLS flags for valkey-cli
+					cliAuthFlags,    // 11: optional auth flags for valkey-cli
 				),
 			},
 			VolumeMounts: buildInitContainerVolumeMounts(v),
 		}
+
+		// Inject the password env var so the shell script can use $VALKEY_PASSWORD.
+		if v.IsAuthEnabled() {
+			initContainer.Env = append(initContainer.Env, corev1.EnvVar{
+				Name: AuthSecretEnvName,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: v.Spec.Auth.SecretName,
+						},
+						Key: v.Spec.Auth.SecretPasswordKey,
+					},
+				},
+			})
+		}
+
 		initContainers = append(initContainers, initContainer)
 	}
 
