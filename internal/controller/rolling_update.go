@@ -2529,8 +2529,7 @@ func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.
 		r.recordEvent(v, corev1.EventTypeWarning, "TopologyRestoreIncomplete",
 			"Topology restore incomplete: %d rogue master(s) still present", rogueCount)
 
-		pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, "")
-		_ = masterIdx
+		r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, "")
 
 		r.ensureFinalizationTimestamp(ctx, v)
 		if !r.isFinalizationStalled(v) {
