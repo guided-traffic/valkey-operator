@@ -2281,9 +2281,14 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 
 // findPromotionCandidate returns the index of the first ready, updated non-master
 // pod suitable for promotion, or -1 if none is available.
+//
+// Pod-0 (index 0) is explicitly excluded: the rest of the state machine
+// (handlePostManualFailover, handleTopologyRestoration) hardcodes pod-0 as the
+// permanent-master target. Promoting pod-0 to temporary master would cause
+// handlePostManualFailover to send it REPLICAOF <pod-0> — an infinite self-loop.
 func findPromotionCandidate(pods []podState, masterIdx int) int {
 	for i, ps := range pods {
-		if i == masterIdx || ps.needsUpdate || !ps.ready || !ps.exists {
+		if i == 0 || i == masterIdx || ps.needsUpdate || !ps.ready || !ps.exists {
 			continue
 		}
 		return i
@@ -2433,6 +2438,17 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	masterPodName := fmt.Sprintf("%s-0", stsName)
 
+	// Self-loop guard: if the promoted pod is pod-0 itself (caused by
+	// findPromotionCandidate selecting pod-0 when the master was not pod-0),
+	// handlePostManualFailover sent REPLICAOF <pod-0> to pod-0 → the link is
+	// permanently down. Skip the sync-wait, promote pod-0 directly and recover.
+	promotedPodName := v.Annotations[annotationPromotedPod]
+	if promotedPodName == masterPodName {
+		logger.Info("Self-loop detected: promoted pod is pod-0, recovering by promoting pod-0 directly",
+			"pod", masterPodName)
+		return r.promotePod0AndRedirect(ctx, v, currentSts, masterPodName)
+	}
+
 	// Verify pod-0 has finished syncing (no sync in progress).
 	// Check role, master_link_status, and master_sync_in_progress to ensure the full
 	// replication handshake completed. Right after REPLICAOF, the link may still be
@@ -2456,6 +2472,16 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
+	return r.promotePod0AndRedirect(ctx, v, currentSts, masterPodName)
+}
+
+// promotePod0AndRedirect promotes pod-0 to master via REPLICAOF NO ONE, redirects
+// all other pods to replicate from it, and transitions to stateVerifyingTopology.
+// It is the shared final step of both the normal topology restoration path and the
+// self-loop recovery path.
+func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet, masterPodName string) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
 	tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if tlsErr != nil {
 		logger.Info("Could not build TLS config for topology restoration", "error", tlsErr)
@@ -2464,11 +2490,12 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 
 	password := r.readValkeyPassword(ctx, v)
 	port := int(builder.ServicePort(v))
+	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
 	portStr := fmt.Sprintf("%d", port)
 
-	// Promote pod-0 back to master.
+	// Promote pod-0 to master.
 	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
 	c := r.newValkeyClient(masterAddr, password, tlsConfig)
 	if err := c.ReplicaOf("NO", "ONE"); err != nil {

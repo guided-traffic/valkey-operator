@@ -4385,3 +4385,89 @@ func TestIsFinalizationStalled_UsedForTopologyVerification(t *testing.T) {
 		Add(-finalizationStallTimeout - time.Second).Format(time.RFC3339)
 	assert.True(t, r.isFinalizationStalled(v))
 }
+
+// --- findPromotionCandidate excludes pod-0 ---
+
+// TestFindPromotionCandidate_SkipsPod0 verifies that pod-0 is never selected as the
+// temporary master even when the current master is a higher-ordinal pod. Promoting
+// pod-0 would cause handlePostManualFailover to send REPLICAOF <pod-0> to pod-0 itself
+// (self-loop), leaving master_link_status permanently "down".
+func TestFindPromotionCandidate_SkipsPod0(t *testing.T) {
+	// masterIdx=2 (pod-2 is master); pod-0 and pod-1 are updated replicas.
+	pods := []podState{
+		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
+		{name: "test-1", isMaster: false, needsUpdate: false, ready: true, exists: true},
+		{name: "test-2", isMaster: true, needsUpdate: true, ready: true, exists: true},
+	}
+	candidate := findPromotionCandidate(pods, 2)
+	assert.Equal(t, 1, candidate, "Should pick pod-1, never pod-0")
+}
+
+func TestFindPromotionCandidate_Pod0IsOnlyCandidate_ReturnsNegative(t *testing.T) {
+	// Only pod-0 is available as a non-master updated replica → no valid candidate.
+	pods := []podState{
+		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, ready: true, exists: true},
+	}
+	candidate := findPromotionCandidate(pods, 1)
+	assert.Equal(t, -1, candidate, "Should return -1 when only pod-0 is available")
+}
+
+// --- Self-loop recovery in handleTopologyRestoration ---
+
+// TestHandleTopologyRestoration_SelfLoopRecovery verifies that when the promoted pod
+// annotation equals pod-0 (the self-loop bug), handleTopologyRestoration skips the
+// sync-wait and directly promotes pod-0 via REPLICAOF NO ONE, then transitions to
+// stateVerifyingTopology. Without this guard the operator waits forever for
+// master_link_status=up on a self-referencing REPLICAOF.
+func TestHandleTopologyRestoration_SelfLoopRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	v := newTestValkey("selfloop", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "selfloop", "default")
+
+	// Simulate the self-loop state: promoted pod == pod-0.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "selfloop", Namespace: "default"}, v))
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateRestoringTopology,
+		annotationPromotedPod:        "selfloop-0", // self-loop: pod-0 was promoted
+	}
+	require.NoError(t, c.Update(context.Background(), v))
+
+	// GetReplicationInfo returns role=slave, link=down (the stuck self-loop state).
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{
+				Role:             "slave",
+				MasterLinkStatus: "down",
+			}, nil
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "selfloop", Namespace: "default"}, sts))
+
+	result := r.handleTopologyRestoration(context.Background(), v, sts)
+
+	// Must requeue (transition to stateVerifyingTopology), not complete, not error.
+	assert.True(t, result.NeedsRequeue, "Should requeue after self-loop recovery")
+	assert.False(t, result.Completed, "Should not complete in Phase 1")
+	assert.Nil(t, result.Error)
+
+	// State must have advanced to stateVerifyingTopology.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "selfloop", Namespace: "default"}, updated))
+	assert.Equal(t, stateVerifyingTopology, updated.Annotations[annotationRollingUpdateState],
+		"State should advance to stateVerifyingTopology after self-loop recovery")
+}
