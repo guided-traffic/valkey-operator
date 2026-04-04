@@ -43,6 +43,7 @@ const (
 	// Multi-replica without sentinel rolling update states:
 	stateManualFailover    = "manual-failover"    // A replica was promoted to master, old master being deleted.
 	stateRestoringTopology = "restoring-topology" // Old master is back, syncing and restoring topology.
+	stateVerifyingTopology = "verifying-topology" // Pod-0 was promoted back; verifying all replicas reconnected.
 )
 
 // annotationPromotedPod records the pod name that was promoted to temporary master
@@ -2140,6 +2141,11 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 		return RollingUpdateResult{Error: err}
 	}
 
+	// Detect and resolve split-brain before proceeding. This mirrors the sentinel
+	// path and ensures a rogue master left over from a prior failed topology
+	// restoration is demoted before the rolling update makes further decisions.
+	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, "")
+
 	updatedCount := countUpdatedPods(pods)
 	if updatedCount == totalPods {
 		// All pods are updated, but the state machine may still need to complete
@@ -2153,6 +2159,8 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 			return r.handlePostManualFailover(ctx, v)
 		case stateRestoringTopology:
 			return r.handleTopologyRestoration(ctx, v, currentSts)
+		case stateVerifyingTopology:
+			return r.verifyTopologyRestored(ctx, v, currentSts)
 		default:
 			return r.finalizeMultiReplicaRollingUpdate(ctx, v, pods)
 		}
@@ -2181,6 +2189,9 @@ func (r *ValkeyReconciler) dispatchMultiReplicaState(ctx context.Context, v *vko
 	}
 	if currentState == stateRestoringTopology {
 		return r.handleTopologyRestoration(ctx, v, currentSts)
+	}
+	if currentState == stateVerifyingTopology {
+		return r.verifyTopologyRestored(ctx, v, currentSts)
 	}
 
 	// Step 1: Replace replica pods first (skip master).
@@ -2402,10 +2413,23 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 
 // handleTopologyRestoration waits for pod-0 to finish syncing from the promoted
 // replica, then restores the original topology: pod-0 as master, all others as replicas.
+//
+// This runs in two phases, tracked via annotationRollingUpdateState:
+//
+//   - stateRestoringTopology: Wait for pod-0 to sync as replica, promote it back
+//     to master, send REPLICAOF to all other pods, transition to stateVerifyingTopology.
+//   - stateVerifyingTopology (verifyTopologyRestored): Verify all replicas reconnected
+//     to pod-0 via detectAndResolveSplitBrain. Retry REPLICAOF on any remaining rogue
+//     masters. Complete when clean or after finalizationStallTimeout.
+//
+// Splitting into two phases prevents an infinite wait loop: once pod-0 is promoted back
+// to master its role is "master", so the Phase 1 sync-check must not run again.
 func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	checker := r.getInstanceChecker()
 
+	// Phase 1: Wait for pod-0 to sync as a replica of the promoted pod, then
+	// promote it back to master and redirect all other replicas.
+	checker := r.getInstanceChecker()
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	masterPodName := fmt.Sprintf("%s-0", stsName)
 
@@ -2460,13 +2484,62 @@ func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vko
 		addr := health.PodAddressForComponent(v, podName, common.ComponentValkey, port)
 		rc := r.newValkeyClient(addr, password, tlsConfig)
 		if err := rc.ReplicaOf(masterHost, portStr); err != nil {
-			logger.Info("REPLICAOF redirect failed (best-effort)", "pod", podName, "master", masterHost, "error", err)
+			logger.Info("REPLICAOF redirect failed (will verify in Phase 2)",
+				"pod", podName, "master", masterHost, "error", err)
 		} else {
 			logger.Info("Redirected replica to pod-0", "pod", podName, "master", masterHost)
 		}
 	}
 
-	// Clear rolling update state.
+	// Transition to Phase 2: verify replicas reconnected on next reconcile.
+	if err := r.setRollingUpdateState(ctx, v, stateVerifyingTopology); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
+	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// verifyTopologyRestored is Phase 2 of handleTopologyRestoration (stateVerifyingTopology).
+// It checks whether all replicas have reconnected to pod-0. If rogue masters are still
+// present, it retries REPLICAOF via detectAndResolveSplitBrain. The rolling update
+// completes once the cluster is clean or after finalizationStallTimeout to prevent an
+// indefinite stall. The stall timeout is tracked via annotationFinalizationTimestamp,
+// which is already part of the rolling update state and cleared by clearRollingUpdateState.
+func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	pods, masterIdx, err := r.collectPodStates(ctx, v, currentSts)
+	if err != nil {
+		logger.Info("Cannot verify topology, will retry", "error", err)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	// Count rogue masters before attempting resolution.
+	rogueCount := 0
+	for _, ps := range pods {
+		if ps.isMaster {
+			rogueCount++
+		}
+	}
+	rogueCount-- // subtract the real master
+
+	if rogueCount > 0 {
+		logger.Info("Rogue masters detected after topology restoration, attempting REPLICAOF",
+			"count", rogueCount)
+		r.recordEvent(v, corev1.EventTypeWarning, "TopologyRestoreIncomplete",
+			"Topology restore incomplete: %d rogue master(s) still present", rogueCount)
+
+		pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, "")
+		_ = masterIdx
+
+		r.ensureFinalizationTimestamp(ctx, v)
+		if !r.isFinalizationStalled(v) {
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
+		logger.Info("Topology restore stalled, completing rolling update despite rogue masters",
+			"timeout", finalizationStallTimeout)
+	}
+
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
 	}

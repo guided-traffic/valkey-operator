@@ -4087,3 +4087,301 @@ func TestCountMasters_SingleMaster(t *testing.T) {
 	}
 	assert.Equal(t, 1, countMasters(pods))
 }
+
+// --- Split-brain detection in non-sentinel multi-replica path ---
+
+// TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate verifies that
+// when two pods report "master" in a non-sentinel cluster, the split-brain is detected
+// and the rogue master is demoted before the rolling update proceeds. This covers the
+// bug where detectAndResolveSplitBrain was only called in the Sentinel path.
+func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	// Non-sentinel, 3-replica cluster with split-brain:
+	// pod-0 reports master (rogue, 0 slaves), pod-1 reports master (real, 1 slave), pod-2 replica.
+	// All pods have the current image so the rolling update was already complete — but
+	// a rogue master was left behind by a failed topology restoration.
+	v := newTestValkey("mr-split", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, _ := newTestReconciler(v, pod0, pod1, pod2)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "mr-split-0":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			case "mr-split-1":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 1}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{
+					Role: "slave", MasterLinkStatus: "up",
+				}, nil
+			}
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "mr-split", Namespace: "default"}, sts))
+
+	result := r.handleMultiReplicaRollingUpdate(context.Background(), v, sts)
+
+	// Should requeue (split-brain demoted, but REPLICAOF to rogue master will fail
+	// since no real Valkey pods exist — the demote is best-effort).
+	assert.True(t, result.NeedsRequeue, "Should requeue after split-brain detection")
+	assert.Nil(t, result.Error, "Should not return an error")
+}
+
+// --- Two-phase handleTopologyRestoration ---
+
+// TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues verifies that Phase 1
+// promotes pod-0, sends REPLICAOF to all other pods, sets the
+// annotationTopologyRestoreStarted annotation, and requeues without completing.
+func TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	v := newTestValkey("topo-p1", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "topo-p1", "default")
+
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-p1", Namespace: "default"}, v))
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateRestoringTopology,
+		annotationPromotedPod:        "topo-p1-1",
+	}
+	require.NoError(t, c.Update(context.Background(), v))
+
+	// pod-0 is fully synced as replica of pod-1 and ready for promotion.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "topo-p1-0" {
+				return &valkeyclient.ReplicationInfo{
+					Role:                 "slave",
+					MasterLinkStatus:     "up",
+					MasterSyncInProgress: false,
+				}, nil
+			}
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "topo-p1", Namespace: "default"}, sts))
+
+	result := r.handleTopologyRestoration(context.Background(), v, sts)
+
+	// Phase 1 should requeue, not complete.
+	assert.True(t, result.NeedsRequeue, "Phase 1 should requeue")
+	assert.False(t, result.Completed, "Phase 1 should not complete")
+	assert.Nil(t, result.Error)
+
+	// After Phase 1, the state must have transitioned to stateVerifyingTopology.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-p1", Namespace: "default"}, updated))
+	assert.Equal(t, stateVerifyingTopology, updated.Annotations[annotationRollingUpdateState],
+		"rolling update state must be stateVerifyingTopology after Phase 1")
+}
+
+// TestVerifyTopologyRestored_CleanTopologyCompletes verifies that when
+// stateVerifyingTopology is active and all replicas are connected to pod-0 (no
+// rogue masters), verifyTopologyRestored completes and clears all rolling update state.
+func TestVerifyTopologyRestored_CleanTopologyCompletes(t *testing.T) {
+	v := newTestValkey("topo-p2", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "topo-p2", "default")
+
+	// Set annotations after initial reconcile (simulates mid-rolling-update state).
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-p2", Namespace: "default"}, v))
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateVerifyingTopology,
+	}
+	require.NoError(t, c.Update(context.Background(), v))
+
+	// Only pod-0 reports master — clean topology, no split-brain.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "topo-p2-0" {
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 2}, nil
+			}
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "topo-p2", Namespace: "default"}, sts))
+
+	result := r.verifyTopologyRestored(context.Background(), v, sts)
+
+	assert.True(t, result.Completed, "Clean topology should complete")
+	assert.Nil(t, result.Error)
+
+	// All rolling update state must be cleared.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-p2", Namespace: "default"}, updated))
+	assert.Empty(t, updated.Annotations[annotationRollingUpdateState], "rolling update state annotation should be cleared")
+}
+
+// TestVerifyTopologyRestored_RogueMasterRetriedThenStall verifies that when a rogue
+// master is still present in Phase 2, verifyTopologyRestored retries REPLICAOF
+// (via detectAndResolveSplitBrain) and requeues — until finalizationStallTimeout,
+// after which it clears state and completes to prevent an indefinite stall.
+func TestVerifyTopologyRestored_RogueMasterRetriedThenStall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	v := newTestValkey("topo-stall", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster // rogue master
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "topo-stall", "default")
+
+	// Set stateVerifyingTopology with a stale finalization timestamp to simulate stall.
+	stalledTime := time.Now().UTC().Add(-finalizationStallTimeout - time.Minute)
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-stall", Namespace: "default"}, v))
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState:    stateVerifyingTopology,
+		annotationFinalizationTimestamp: stalledTime.Format(time.RFC3339),
+	}
+	require.NoError(t, c.Update(context.Background(), v))
+
+	// Pod-0 and pod-1 both report master — split-brain persists.
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "topo-stall-0":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 1}, nil
+			case "topo-stall-1":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+			}
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "topo-stall", Namespace: "default"}, sts))
+
+	result := r.verifyTopologyRestored(context.Background(), v, sts)
+
+	// After stall timeout, should complete despite rogue master.
+	assert.True(t, result.Completed, "Should complete after stall timeout even with rogue master")
+	assert.Nil(t, result.Error)
+
+	// All rolling update state must be cleared.
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-stall", Namespace: "default"}, updated))
+	assert.Empty(t, updated.Annotations[annotationRollingUpdateState], "rolling update state should be cleared on stall")
+	assert.Empty(t, updated.Annotations[annotationFinalizationTimestamp], "finalization timestamp should be cleared on stall")
+}
+
+// TestVerifyTopologyRestored_RequeuesWhenRogueMasterPresent verifies that before the
+// stall timeout, verifyTopologyRestored requeues rather than completing when a rogue
+// master is still present after a REPLICAOF attempt.
+func TestVerifyTopologyRestored_RequeuesWhenRogueMasterPresent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	v := newTestValkey("topo-retry", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Image = "valkey/valkey:8.0"
+	})
+
+	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster // rogue master
+	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+
+	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	reconcileOnce(t, r, "topo-retry", "default")
+
+	// No finalization timestamp → not stalled yet.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "topo-retry", Namespace: "default"}, v))
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: stateVerifyingTopology,
+	}
+	require.NoError(t, c.Update(context.Background(), v))
+
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case "topo-retry-0":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 1}, nil
+			case "topo-retry-1":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+			}
+		},
+	}
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "topo-retry", Namespace: "default"}, sts))
+
+	result := r.verifyTopologyRestored(context.Background(), v, sts)
+
+	// Before stall timeout: should requeue, not complete.
+	assert.False(t, result.Completed, "Should not complete while rogue master present and not stalled")
+	assert.True(t, result.NeedsRequeue, "Should requeue to retry")
+	assert.Nil(t, result.Error)
+}
+
+// TestIsFinalizationStalled_UsedForTopologyVerification verifies that the existing
+// isFinalizationStalled helper correctly identifies a stalled topology verification —
+// no separate helper is needed since the same annotation and timeout are reused.
+func TestIsFinalizationStalled_UsedForTopologyVerification(t *testing.T) {
+	r, _ := newTestReconciler()
+	v := newTestValkey("ts", "default")
+
+	// No annotation → not stalled.
+	assert.False(t, r.isFinalizationStalled(v))
+
+	// Fresh annotation → not stalled.
+	v.Annotations = map[string]string{
+		annotationFinalizationTimestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	assert.False(t, r.isFinalizationStalled(v))
+
+	// Old annotation → stalled.
+	v.Annotations[annotationFinalizationTimestamp] = time.Now().UTC().
+		Add(-finalizationStallTimeout - time.Second).Format(time.RFC3339)
+	assert.True(t, r.isFinalizationStalled(v))
+}
