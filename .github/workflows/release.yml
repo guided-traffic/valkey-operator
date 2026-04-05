@@ -61,12 +61,12 @@ jobs:
           name: valkey-operator-test
           nodes:
           - role: control-plane
-          # Use native snapshotter to avoid nested overlay issues in DinD
-          containerdConfigPatches:
-          - |-
-            [plugins."io.containerd.grpc.v1.cri".containerd]
-              snapshotter = "native"
-              disable_snapshot_annotations = false
+            # Use native snapshotter to avoid nested overlay issues in DinD
+            containerdConfigPatches:
+            - |-
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                snapshotter = "native"
+                disable_snapshot_annotations = false
           EOF
 
       - name: Setup kubectl

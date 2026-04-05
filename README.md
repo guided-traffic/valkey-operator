@@ -2,7 +2,7 @@
 
 A Kubernetes operator for deploying and managing production-grade [Valkey](https://valkey.io/) instances — standalone or highly available with Sentinel.
 
-[![Build Status](https://github.com/guided-traffic/valkey-operator/actions/workflows/release.yml/badge.svg)](https://github.com/guided-traffic/valkey-operator/actions)
+[![Testing](https://github.com/guided-traffic/valkey-operator/actions/workflows/release.yml/badge.svg)](https://github.com/guided-traffic/valkey-operator/actions/workflows/release.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/guided-traffic/valkey-operator/main/.github/badges/coverage.json)](https://github.com/guided-traffic/valkey-operator)
 [![Go Report Card](https://goreportcard.com/badge/github.com/guided-traffic/valkey-operator)](https://goreportcard.com/report/github.com/guided-traffic/valkey-operator)
 
