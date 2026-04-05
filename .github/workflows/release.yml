@@ -126,23 +126,23 @@ jobs:
           echo "Probing in-cluster kubernetes service connectivity..."
           PROBE_OK=false
           for attempt in 1 2 3; do
-            kubectl run api-probe \
+            kubectl run api-probe -n default \
               --image=busybox:1.36 \
               --restart=Never \
               -- sleep 60
-            kubectl wait --for=condition=Ready pod/api-probe --timeout=60s
+            kubectl wait -n default --for=condition=Ready pod/api-probe --timeout=60s
 
-            if kubectl exec api-probe -- \
+            if kubectl exec -n default api-probe -- \
                 timeout 20 sh -c \
                 'until nc -z -w 2 kubernetes.default.svc 443 2>/dev/null; do sleep 2; done'; then
               echo "In-cluster API connectivity OK (attempt ${attempt})"
               PROBE_OK=true
-              kubectl delete pod api-probe --force --grace-period=0
+              kubectl delete -n default pod api-probe --force --grace-period=0
               break
             fi
 
             echo "Connectivity check failed on attempt ${attempt} — restarting kube-proxy to force iptables resync..."
-            kubectl delete pod api-probe --force --grace-period=0 || true
+            kubectl delete -n default pod api-probe --force --grace-period=0 || true
             kubectl -n kube-system rollout restart daemonset/kube-proxy
             kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=60s
           done
