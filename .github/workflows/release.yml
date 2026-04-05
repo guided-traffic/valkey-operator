@@ -59,6 +59,8 @@ jobs:
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
           name: valkey-operator-test
+          networking:
+            kubeProxyMode: "iptables"
           nodes:
           - role: control-plane
           # Use native snapshotter to avoid nested overlay issues in DinD
