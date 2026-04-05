@@ -61,12 +61,12 @@ jobs:
           name: valkey-operator-test
           nodes:
           - role: control-plane
-            # Use native snapshotter to avoid nested overlay issues in DinD
-            containerdConfigPatches:
-            - |-
-              [plugins."io.containerd.grpc.v1.cri".containerd]
-                snapshotter = "native"
-                disable_snapshot_annotations = false
+          # Use native snapshotter to avoid nested overlay issues in DinD
+          containerdConfigPatches:
+          - |-
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "native"
+              disable_snapshot_annotations = false
           EOF
 
       - name: Setup kubectl
@@ -95,8 +95,25 @@ jobs:
 
       - name: Wait for kube-system pods
         run: |
-          echo "Waiting for kube-system pods (coredns, kube-proxy) to be Ready..."
-          kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=300s
+          set -euo pipefail
+          echo "=== kube-system pod status before wait ==="
+          kubectl -n kube-system get pods -o wide
+          echo ""
+          echo "=== containerd info inside Kind node ==="
+          docker exec valkey-operator-test-control-plane ctr version || true
+          echo ""
+
+          # Wait for each workload individually so we can pinpoint which one fails
+          echo "Waiting for kube-proxy..."
+          kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=120s
+          echo "Waiting for kindnet..."
+          kubectl -n kube-system rollout status daemonset/kindnet --timeout=120s
+          echo "Waiting for coredns..."
+          kubectl -n kube-system rollout status deployment/coredns --timeout=120s
+
+          echo ""
+          echo "=== Final pod status ==="
+          kubectl -n kube-system get pods -o wide
           echo "kube-system pods ready."
 
       - name: Verify in-cluster API connectivity
