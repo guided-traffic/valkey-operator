@@ -205,7 +205,7 @@ coverage-json: ## Generate coverage badge JSON for shields.io.
 gosec: ## Run gosec security scan.
 	@echo "Running gosec security scan..."
 	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION))
-	GOFLAGS="-buildvcs=false" gosec -timeout 5m ./...
+	GOFLAGS="-buildvcs=false" gosec ./...
 
 .PHONY: vuln
 vuln: ## Check for vulnerabilities.

@@ -331,6 +331,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Run GoSec security scan
+        timeout-minutes: 10
         run: make gosec
 
 
