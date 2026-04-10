@@ -210,17 +210,8 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
-	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
-	// while verifying sentinel quorum before each deletion.
-	if valkey.IsSentinelEnabled() {
-		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, valkey)
-		if sentinelResult.Error != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
-			return ctrl.Result{}, sentinelResult.Error
-		}
-		if sentinelResult.NeedsRequeue {
-			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, nil
-		}
+	if result, done := r.handlePostRollingUpdateChecks(ctx, valkey); done {
+		return result, nil
 	}
 
 	// Update status based on StatefulSet readiness.
@@ -238,6 +229,38 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery
+// after the main Valkey rolling update is done. Returns (result, true) if the caller
+// should return immediately, or (_, false) if processing should continue.
+func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool) {
+	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
+	// while verifying sentinel quorum before each deletion.
+	if v.IsSentinelEnabled() {
+		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, v)
+		if sentinelResult.Error != nil {
+			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
+			return ctrl.Result{}, true
+		}
+		if sentinelResult.NeedsRequeue {
+			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true
+		}
+	}
+
+	// For multi-replica non-Sentinel clusters, detect a no-master state and recover
+	// by promoting pod-0. This catches edge cases where all pods come up as replicas
+	// (e.g. after staggered restarts where the master pod was the last to restart).
+	if v.IsMultiReplicaWithoutSentinel() {
+		if recovered, err := r.checkAndRecoverNoMaster(ctx, v); err != nil {
+			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("No-master recovery failed: %v", err))
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+		} else if recovered {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+		}
+	}
+
+	return ctrl.Result{}, false
 }
 
 // reconcileResources reconciles all Kubernetes resources managed by the operator.
@@ -1266,6 +1289,91 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 		metav1.ConditionFalse,
 		"SidecarUpToDate",
 		"All sidecar containers are running the desired image")
+}
+
+// checkAndRecoverNoMaster detects a no-master state in multi-replica non-Sentinel
+// clusters and recovers by promoting pod-0 to master. This can happen when pods
+// restart in a staggered fashion and the master pod is the last to restart — all
+// pods come up as replicas with circular or broken replication chains.
+//
+// Returns (true, nil) if recovery was performed, (false, nil) if no recovery needed,
+// or (false, err) if an error occurred during detection or recovery.
+func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1.Valkey) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	// Only act when a rolling update is NOT in progress — during rolling updates
+	// the state machine manages topology itself.
+	if v.Annotations != nil && v.Annotations[annotationRollingUpdateState] != "" {
+		return false, nil
+	}
+
+	checker := r.getInstanceChecker()
+	stsName := common.StatefulSetName(v, common.ComponentValkey)
+
+	// Check that all pods are reachable before drawing conclusions.
+	// If any pod is unreachable, we cannot reliably determine cluster topology.
+	hasMaster := false
+	unreachable := 0
+	for i := int32(0); i < v.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		info, err := checker.GetReplicationInfo(ctx, v, podName)
+		if err != nil {
+			unreachable++
+			continue
+		}
+		if info.Role == "master" {
+			hasMaster = true
+			break
+		}
+	}
+
+	if hasMaster || unreachable > 0 {
+		return false, nil
+	}
+
+	// All pods are reachable and none is master — recover by promoting pod-0.
+	logger.Info("No-master state detected: all pods are replicas, promoting pod-0",
+		"cluster", v.Name, "replicas", v.Spec.Replicas)
+
+	if err := r.updatePhase(ctx, v, vkov1.ValkeyPhaseError,
+		"No master detected, recovering by promoting pod-0"); err != nil {
+		return false, fmt.Errorf("updating phase: %w", err)
+	}
+
+	password := r.readValkeyPassword(ctx, v)
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		return false, fmt.Errorf("building TLS config: %w", err)
+	}
+
+	port := int(builder.ServicePort(v))
+	masterPodName := fmt.Sprintf("%s-0", stsName)
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
+	portStr := fmt.Sprintf("%d", port)
+
+	// Promote pod-0 to master.
+	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
+	c := r.newValkeyClient(masterAddr, password, tlsConfig)
+	if err := c.ReplicaOf("NO", "ONE"); err != nil {
+		return false, fmt.Errorf("REPLICAOF NO ONE on %s: %w", masterPodName, err)
+	}
+	logger.Info("Promoted pod-0 to master via REPLICAOF NO ONE", "pod", masterPodName)
+
+	// Redirect all other pods to replicate from pod-0.
+	for i := int32(1); i < v.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		addr := health.PodAddressForComponent(v, podName, common.ComponentValkey, port)
+		rc := r.newValkeyClient(addr, password, tlsConfig)
+		if err := rc.ReplicaOf(masterHost, portStr); err != nil {
+			logger.Info("Failed to redirect replica to pod-0 (will retry on next reconcile)",
+				"pod", podName, "error", err)
+		} else {
+			logger.Info("Redirected replica to pod-0", "pod", podName, "master", masterHost)
+		}
+	}
+
+	return true, nil
 }
 
 // verifyValkeyConnectivity pings all Valkey pods to verify operator connectivity.

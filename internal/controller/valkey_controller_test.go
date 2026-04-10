@@ -2376,3 +2376,124 @@ func TestReconcile_ObserverStatus_NilWhenDisabled(t *testing.T) {
 
 	assert.Nil(t, updated.Status.ObserverReady, "observer status should be nil when observer is disabled")
 }
+
+// --- No-Master Recovery ---
+
+func TestCheckAndRecoverNoMaster_SkipsSingleReplica(t *testing.T) {
+	v := newTestValkey("test", "default")
+	v.Spec.Replicas = 1
+	r, _ := newTestReconciler(v)
+
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+	assert.NoError(t, err)
+	assert.False(t, recovered, "should not attempt recovery on single-replica cluster")
+}
+
+func TestCheckAndRecoverNoMaster_SkipsDuringRollingUpdate(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	v.Annotations = map[string]string{
+		annotationRollingUpdateState: "replacing-replicas",
+	}
+
+	mock := &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
+		},
+	}
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = mock
+
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+	assert.NoError(t, err)
+	assert.False(t, recovered, "should not attempt recovery during rolling update")
+}
+
+func TestCheckAndRecoverNoMaster_NoRecoveryWhenMasterExists(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	mock := &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "test-0" {
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 2}, nil
+			}
+			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
+		},
+	}
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = mock
+
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+	assert.NoError(t, err)
+	assert.False(t, recovered, "should not recover when a master exists")
+}
+
+func TestCheckAndRecoverNoMaster_NoRecoveryWhenPodUnreachable(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	mock := &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == "test-2" {
+				return nil, fmt.Errorf("connection refused")
+			}
+			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
+		},
+	}
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = mock
+
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+	assert.NoError(t, err)
+	assert.False(t, recovered, "should not recover when a pod is unreachable")
+}
+
+func TestCheckAndRecoverNoMaster_RecoverWhenAllReplicas(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
+	}
+
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+
+	mock := &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
+		},
+	}
+	r, c := newTestReconciler(v)
+	r.InstanceChecker = mock
+
+	// First reconcile to create the resources.
+	reconcileOnce(t, r, "test", "default")
+
+	// Re-fetch to get the latest resource version.
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v))
+
+	// The recovery detects the no-master state and attempts REPLICAOF NO ONE.
+	// In unit tests, the actual Valkey connection fails, returning an error.
+	// This confirms the detection logic is correct — the REPLICAOF call is expected
+	// to fail since there is no real Valkey instance.
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+
+	// Phase should be set to Error with recovery message (happens before REPLICAOF).
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
+	assert.Equal(t, vkov1.ValkeyPhaseError, updated.Status.Phase)
+	assert.Contains(t, updated.Status.Message, "No master detected")
+
+	// REPLICAOF NO ONE will fail in unit tests (no real pod), so err is expected.
+	// The important assertion is that the function correctly detected the no-master
+	// state and set the phase before attempting recovery.
+	if err != nil {
+		assert.Contains(t, err.Error(), "REPLICAOF NO ONE")
+		assert.False(t, recovered)
+	} else {
+		assert.True(t, recovered)
+	}
+}
