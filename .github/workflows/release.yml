@@ -109,6 +109,14 @@ jobs:
           kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
 
+      - name: Fix inotify limits inside Kind node
+        run: |
+          # Since Linux 5.13, inotify limits are user-namespace-aware.
+          # Host sysctl settings are NOT inherited by containers.
+          # kube-proxy crashes with "too many open files" without this.
+          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_watches=1048576
+          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_instances=8192
+
       - name: Wait for kube-system pods
         run: |
           set -euo pipefail
