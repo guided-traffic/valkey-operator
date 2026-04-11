@@ -19,7 +19,7 @@ permissions:
   issues: write         # For issue comments
 
 env:
-  GO_VERSION: '1.26.1'
+  GO_VERSION: '1.26.2'
   KUBERNETES_VERSION: '1.33.4'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -53,6 +53,21 @@ jobs:
           username: guidedtraffic
           password: ${{ secrets.DOCKERHUB_PAT }}
 
+      - name: Prepare host for DinD networking
+        run: |
+          # kube-proxy in iptables mode requires specific kernel modules.
+          # On self-hosted DinD runners these may not be loaded, causing
+          # kube-proxy to crash with "Error" immediately.
+          for mod in br_netfilter nf_conntrack nf_conntrack_ipv4 xt_conntrack \
+                     ip_tables ip6_tables iptable_nat iptable_filter; do
+            sudo modprobe "$mod" 2>/dev/null || true
+          done
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1  2>/dev/null || true
+          sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1 2>/dev/null || true
+          sudo sysctl -w net.ipv4.ip_forward=1                 2>/dev/null || true
+          echo "Loaded kernel modules:"
+          lsmod | grep -E 'br_netfilter|nf_conntrack|ip_tables|ip6_tables' || true
+
       - name: Create Kind config for DinD
         run: |
           cat << EOF > kind-config.yaml
@@ -78,13 +93,12 @@ jobs:
 
       - name: Create Kind cluster
         id: kind-cluster
-        continue-on-error: true
         uses: helm/kind-action@v1.14.0
         with:
           version: v0.30.0
           node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
           cluster_name: valkey-operator-test
-          wait: 180s
+          wait: 300s
           ignore_failed_clean: true
           config: kind-config.yaml
 
@@ -94,6 +108,14 @@ jobs:
           kubectl cluster-info
           kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
+
+      - name: Fix inotify limits inside Kind node
+        run: |
+          # Since Linux 5.13, inotify limits are user-namespace-aware.
+          # Host sysctl settings are NOT inherited by containers.
+          # kube-proxy crashes with "too many open files" without this.
+          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_watches=1048576
+          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_instances=8192
 
       - name: Wait for kube-system pods
         run: |
@@ -105,11 +127,44 @@ jobs:
           docker exec valkey-operator-test-control-plane ctr version || true
           echo ""
 
-          # Wait for each workload individually so we can pinpoint which one fails
-          echo "Waiting for kube-proxy..."
-          kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=120s
-          echo "Waiting for kindnet..."
-          kubectl -n kube-system rollout status daemonset/kindnet --timeout=120s
+          # ---------- helper: resilient daemonset wait ----------
+          # kube-proxy can crash on DinD runners when iptables kernel modules
+          # are slow to initialise. This helper detects Error/CrashLoopBackOff
+          # pods, collects logs for diagnosis, deletes them so the DaemonSet
+          # controller recreates them, and retries.
+          wait_daemonset() {
+            local ds_name="$1" label="$2" max_attempts=5
+            for attempt in $(seq 1 $max_attempts); do
+              echo "[${ds_name}] attempt ${attempt}/${max_attempts}"
+              if kubectl -n kube-system rollout status daemonset/"${ds_name}" --timeout=60s 2>/dev/null; then
+                echo "[${ds_name}] ready."
+                return 0
+              fi
+              # Collect diagnostics from broken pods
+              bad_pods=$(kubectl -n kube-system get pods -l "${label}" --no-headers 2>/dev/null \
+                         | grep -E 'Error|CrashLoopBackOff|Init:Error' | awk '{print $1}') || true
+              if [ -n "$bad_pods" ]; then
+                for pod in $bad_pods; do
+                  echo "[${ds_name}] logs from ${pod}:"
+                  kubectl -n kube-system logs "$pod" --tail=30 2>&1 || true
+                  echo "[${ds_name}] deleting ${pod} to trigger recreation..."
+                  kubectl -n kube-system delete pod "$pod" --force --grace-period=0 2>/dev/null || true
+                done
+                sleep 10
+              else
+                echo "[${ds_name}] no error pods found, pods may still be starting..."
+                sleep 15
+              fi
+            done
+            echo "ERROR: daemonset ${ds_name} not ready after ${max_attempts} attempts"
+            kubectl -n kube-system describe daemonset/"${ds_name}" || true
+            kubectl -n kube-system describe pods -l "${label}" || true
+            return 1
+          }
+
+          wait_daemonset "kube-proxy" "k8s-app=kube-proxy"
+          wait_daemonset "kindnet"    "app=kindnet"
+
           echo "Waiting for coredns..."
           kubectl -n kube-system rollout status deployment/coredns --timeout=120s
 
