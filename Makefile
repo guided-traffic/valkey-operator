@@ -326,8 +326,9 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects, then sync into the Helm chart.
 	$(CONTROLLER_GEN) rbac:roleName=valkey-operator-role crd paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac
+	$(MAKE) sync-helm-crd
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.

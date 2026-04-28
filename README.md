@@ -228,6 +228,10 @@ spec:
       prometheus.io/scrape: "true"
   tls:
     enabled: true
+    # unifiedCertificate: true   # Recommended for go-redis Sentinel mode and
+                                 # other clients that share a tls.Config across
+                                 # Sentinel discovery and master connection.
+                                 # See "Unified TLS Certificate" in TLS Details.
     certManager:
       issuer:
         kind: ClusterIssuer
@@ -387,6 +391,7 @@ spec:
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Enable TLS encryption |
 | `allowUnencrypted` | `bool` | `false` | Keep plaintext Valkey port (`6379`) open alongside TLS port (`16379`). Replication always uses TLS. |
+| `unifiedCertificate` | `bool` | `false` | Make Valkey and Sentinel share one TLS Secret covering both sets of hostnames. Under cert-manager, one `Certificate` is issued instead of two; under a user-provided Secret, the flag is informational. See [Unified TLS Certificate](#unified-tls-certificate-valkey--sentinel). |
 | `certManager` | `CertManagerSpec` | — | cert-manager integration (mutually exclusive with `secretName`) |
 | `secretName` | `string` | — | Name of existing TLS Secret (must contain `tls.crt`, `tls.key`, `ca.crt`) |
 
@@ -566,6 +571,71 @@ valkey-cli --tls \
   --cacert /tls/ca.crt \
   -h my-valkey -p 16379 PING
 ```
+
+### Unified TLS Certificate (Valkey + Sentinel)
+
+By default the operator issues **two** `Certificate` resources when cert-manager
+is enabled together with Sentinel:
+
+| Certificate | Secret | Covers |
+|-------------|--------|--------|
+| `<name>-tls` | `<name>-tls` | Valkey pod / service hostnames |
+| `<name>-sentinel-tls` | `<name>-sentinel-tls` | Sentinel pod / headless hostnames |
+
+Some Sentinel-aware clients (e.g. **`go-redis`**) reuse the same `tls.Config` for
+both the Sentinel discovery connection and the subsequent master connection.
+That client validates the Valkey master certificate against the Sentinel
+hostname (or vice versa) and fails with an error like:
+
+```
+x509: certificate is valid for oauth2-valkey-0.oauth2-valkey-headless.iam..., 
+not oauth2-valkey-sentinel-2.oauth2-valkey-sentinel-headless.iam...
+```
+
+To fix this, set `spec.tls.unifiedCertificate: true`. With cert-manager, the
+operator then issues a **single** `Certificate` whose SAN list covers both
+Valkey and Sentinel hostnames, and both StatefulSets mount the same Secret.
+With a user-provided Secret, the flag is informational — the same Secret is
+already mounted by both StatefulSets.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: oauth2-valkey
+spec:
+  replicas: 3
+  sentinel:
+    enabled: true
+    replicas: 3
+  tls:
+    enabled: true
+    unifiedCertificate: true
+    certManager:
+      issuer:
+        kind: ClusterIssuer
+        name: cluster-ca
+```
+
+Resulting layout:
+
+| Certificate | Secret | Covers |
+|-------------|--------|--------|
+| `<name>-tls` | `<name>-tls` | Valkey **and** Sentinel hostnames |
+
+**Migration of an existing cluster** is automatic and safe:
+
+1. The operator updates `<name>-tls` so its SAN list now also includes the
+   Sentinel hostnames (cert-manager re-issues the Secret in place).
+2. The Sentinel `StatefulSet` spec is patched to mount `<name>-tls` instead
+   of `<name>-sentinel-tls`, triggering a rolling restart of the Sentinel
+   pods onto the shared Secret.
+3. Once every Sentinel pod runs against `<name>-tls`, the operator deletes
+   the legacy `<name>-sentinel-tls` `Certificate` and `Secret`.
+
+The deletion in step 3 is gated on the StatefulSet already referencing the
+unified Secret, so a pod restart between steps cannot land on a missing
+volume. The migration completes in at most two reconcile passes.
 
 ---
 
