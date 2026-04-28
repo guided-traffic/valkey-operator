@@ -907,10 +907,10 @@ func newTestValkeyUnified() *vkov1.Valkey {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
 		v.Spec.TLS = &vkov1.TLSSpec{
-			Enabled: true,
+			Enabled:            true,
+			UnifiedCertificate: true,
 			CertManager: &vkov1.CertManagerSpec{
-				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
-				UnifiedCertificate: true,
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
 			},
 		}
 	})

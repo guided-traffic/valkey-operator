@@ -124,6 +124,24 @@ spec:
                     default: false
                     description: Enabled activates the observer deployment.
                     type: boolean
+                  logLevel:
+                    allOf:
+                    - enum:
+                      - debug
+                      - info
+                      - warn
+                      - error
+                    - enum:
+                      - debug
+                      - info
+                      - warn
+                      - error
+                    default: info
+                    description: |-
+                      LogLevel sets the verbosity of observer log output.
+                      At debug level, stack traces are included for all errors.
+                      At info, warn, and error levels, stack traces are suppressed.
+                    type: string
                   mtls:
                     description: |-
                       MTLS configures mutual TLS behaviour for the observer's outbound connections.
@@ -202,6 +220,64 @@ spec:
                           otherwise to an implementation-defined value. Requests cannot exceed Limits.
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
+                    type: object
+                  unreadyWhen:
+                    description: |-
+                      UnreadyWhen configures which check failures cause the observer to report
+                      unReady. Omitting a field is equivalent to true (failure causes unReady).
+                      Failures are always logged regardless of this setting.
+                    properties:
+                      masterUnreachable:
+                        default: true
+                        description: 'MasterUnreachable: PING to the master node fails.'
+                        type: boolean
+                      readTestFailure:
+                        default: true
+                        description: 'ReadTestFailure: health key cannot be read back
+                          from the master.'
+                        type: boolean
+                      replicaReadTestFailure:
+                        default: true
+                        description: 'ReplicaReadTestFailure: a replica returns stale
+                          or missing health key data.'
+                        type: boolean
+                      replicaSyncFailure:
+                        default: true
+                        description: 'ReplicaSyncFailure: a replica is disconnected
+                          or bulk sync is in progress.'
+                        type: boolean
+                      sentinelMasterDown:
+                        default: true
+                        description: 'SentinelMasterDown: Sentinel reports s_down
+                          or o_down flags on the master.'
+                        type: boolean
+                      sentinelMasterHostnameInvalid:
+                        default: true
+                        description: |-
+                          SentinelMasterHostnameInvalid: Sentinel reports a bare IP instead of a
+                          DNS hostname for the master.
+                        type: boolean
+                      sentinelQuorumFailure:
+                        default: true
+                        description: 'SentinelQuorumFailure: Sentinels disagree on
+                          the current master address.'
+                        type: boolean
+                      sentinelReplicaHostnamesInvalid:
+                        default: true
+                        description: |-
+                          SentinelReplicaHostnamesInvalid: Sentinel reports bare IPs instead of
+                          DNS hostnames for one or more replicas.
+                        type: boolean
+                      sentinelUnreachable:
+                        default: true
+                        description: 'SentinelUnreachable: one or more Sentinel instances
+                          do not respond to PING.'
+                        type: boolean
+                      writeTestFailure:
+                        default: true
+                        description: 'WriteTestFailure: health key cannot be written
+                          to the master.'
+                        type: boolean
                     type: object
                 type: object
               persistence:
@@ -418,6 +494,20 @@ spec:
                       The Secret must contain keys: tls.crt, tls.key, and ca.crt.
                       Mutually exclusive with CertManager.
                     type: string
+                  unifiedCertificate:
+                    default: false
+                    description: |-
+                      UnifiedCertificate, when true, makes Valkey and Sentinel share a single
+                      TLS certificate / Secret that covers both sets of hostnames. With
+                      cert-manager, the operator issues one Certificate (instead of one per
+                      component) and migrates existing clusters by deleting the legacy
+                      <name>-sentinel-tls Certificate and Secret once the Sentinel StatefulSet
+                      has switched to the unified Secret. With a user-provided Secret, both
+                      StatefulSets already mount that Secret, so the flag is informational.
+                      This avoids TLS verification errors in clients (e.g., go-redis Sentinel
+                      mode) that share one tls.Config across the Sentinel discovery and the
+                      Valkey master connection.
+                    type: boolean
                 type: object
             required:
             - image

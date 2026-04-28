@@ -226,7 +226,7 @@ func TestIsUnifiedCertificateEnabled(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "cert-manager without unified flag",
+			name: "TLS enabled without unified flag",
 			tls: &TLSSpec{
 				Enabled: true,
 				CertManager: &CertManagerSpec{
@@ -236,32 +236,30 @@ func TestIsUnifiedCertificateEnabled(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "cert-manager with unified flag",
+			name: "cert-manager + unified flag",
 			tls: &TLSSpec{
-				Enabled: true,
+				Enabled:            true,
+				UnifiedCertificate: true,
 				CertManager: &CertManagerSpec{
-					Issuer:             CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
-					UnifiedCertificate: true,
+					Issuer: CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
 				},
 			},
 			expected: true,
 		},
 		{
-			name: "unified flag without cert-manager (user secret) is ignored",
+			name: "user secret + unified flag",
 			tls: &TLSSpec{
-				Enabled:    true,
-				SecretName: "my-secret",
+				Enabled:            true,
+				UnifiedCertificate: true,
+				SecretName:         "my-secret",
 			},
-			expected: false,
+			expected: true,
 		},
 		{
 			name: "TLS disabled but unified flag set",
 			tls: &TLSSpec{
-				Enabled: false,
-				CertManager: &CertManagerSpec{
-					Issuer:             CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
-					UnifiedCertificate: true,
-				},
+				Enabled:            false,
+				UnifiedCertificate: true,
 			},
 			expected: false,
 		},

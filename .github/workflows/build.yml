@@ -5,6 +5,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GO_VERSION: '1.26.2'
 
 permissions:
   contents: write
@@ -136,10 +137,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
           version: v3.12.0
+
+      # Regenerate CRDs + DeepCopy and sync them into the Helm chart, then fail
+      # loudly if the working tree is dirty. This guarantees the released chart
+      # always carries the CRD that matches the Go API types — a stale checked-in
+      # CRD cannot reach end-user clusters.
+      - name: Regenerate CRDs and sync to Helm chart
+        run: make generate-all
+
+      - name: Verify generated artifacts are committed
+        run: |
+          if ! git diff --quiet; then
+            echo "::error::Generated CRDs / DeepCopy / Helm chart CRD are out of sync with api/v1/."
+            echo "Run 'make generate-all' locally and commit the result before releasing."
+            git --no-pager diff --stat
+            git --no-pager diff
+            exit 1
+          fi
 
       - name: Update Chart Version
         run: |
