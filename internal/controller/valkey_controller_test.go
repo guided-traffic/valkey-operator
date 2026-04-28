@@ -879,13 +879,17 @@ func newLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
 	return c
 }
 
-// stagedSentinelStatefulSet builds a minimal Sentinel StatefulSet that mounts
-// the named TLS Secret on volume "tls". Used to control the deletion gate in
-// migration tests.
-func stagedSentinelStatefulSet(name, namespace, tlsSecretName string) *appsv1.StatefulSet {
+// stagedSentinelStatefulSet builds a Sentinel StatefulSet that mounts the named
+// TLS Secret on volume "tls" with a fully-rolled-out status (observedGeneration
+// matches generation, updateRevision set). Used as a base for migration tests;
+// callers add Pods that carry the matching revision label to simulate "rollout
+// complete" or supply an older label to simulate "rollout in progress".
+func stagedSentinelStatefulSet(name, tlsSecretName string) *appsv1.StatefulSet {
+	replicas := int32(3)
 	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "iam", Generation: 1},
 		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Volumes: []corev1.Volume{
@@ -899,7 +903,34 @@ func stagedSentinelStatefulSet(name, namespace, tlsSecretName string) *appsv1.St
 				},
 			},
 		},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			UpdateRevision:     "rev-new",
+			CurrentRevision:    "rev-new",
+		},
 	}
+}
+
+// readySentinelPods returns N ready Sentinel pods all stamped with the
+// "rev-new" controller-revision-hash that stagedSentinelStatefulSet exposes,
+// used to model a rolled-out fleet.
+func readySentinelPods(stsName string, count int32) []client.Object {
+	pods := make([]client.Object, 0, count)
+	for i := int32(0); i < count; i++ {
+		pods = append(pods, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%d", stsName, i),
+				Namespace: "iam",
+				Labels:    map[string]string{appsv1.StatefulSetRevisionLabel: "rev-new"},
+			},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				},
+			},
+		})
+	}
+	return pods
 }
 
 func newTestValkeyUnified() *vkov1.Valkey {
@@ -951,33 +982,116 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenSTSStillMountsLegacySecret(t 
 	legacySecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
 	}
-	// Sentinel STS still pointing at the legacy Secret — migration must not delete yet.
-	sts := stagedSentinelStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), "iam", legacyCertName)
-	r, c := newTestReconciler(v, legacyCert, legacySecret, sts)
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	// STS still points at legacy Secret AND pods still on the old revision.
+	sts := stagedSentinelStatefulSet(stsName, legacyCertName)
+	pods := readySentinelPods(stsName, 3)
+	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
+	r, c := newTestReconciler(objs...)
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 
-	gotCert := &unstructured.Unstructured{}
-	gotCert.SetGroupVersionKind(legacyCert.GroupVersionKind())
-	require.NoError(t, c.Get(context.Background(),
-		types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotCert),
-		"legacy Certificate must remain while STS still references the legacy Secret")
-	gotSecret := &corev1.Secret{}
-	require.NoError(t, c.Get(context.Background(),
-		types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotSecret),
-		"legacy Secret must remain while STS still references it")
+	assertLegacyCertExists(t, c, legacyCert)
+	assertLegacySecretExists(t, c, legacyCertName)
 }
 
-func TestReconcileLegacySentinelCleanup_Deletes_WhenSTSUsesUnifiedSecret(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodOnOldRevision(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
-	unifiedSecretName := builder.ValkeyTLSSecretName(v) // oauth2-valkey-tls
+	unifiedSecretName := builder.ValkeyTLSSecretName(v)
 	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
 	legacySecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
 	}
-	sts := stagedSentinelStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), "iam", unifiedSecretName)
-	r, c := newTestReconciler(v, legacyCert, legacySecret, sts)
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	// Two pods rolled to the new revision, one still on the old one.
+	pods := readySentinelPods(stsName, 2)
+	pods = append(pods, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName + "-2",
+			Namespace: "iam",
+			Labels:    map[string]string{appsv1.StatefulSetRevisionLabel: "rev-old"},
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	})
+	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
+	r, c := newTestReconciler(objs...)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	assertLegacyCertExists(t, c, legacyCert)
+	assertLegacySecretExists(t, c, legacyCertName)
+}
+
+func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodNotReady(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v)
+	unifiedSecretName := builder.ValkeyTLSSecretName(v)
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	pods := readySentinelPods(stsName, 2)
+	pods = append(pods, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName + "-2",
+			Namespace: "iam",
+			Labels:    map[string]string{appsv1.StatefulSetRevisionLabel: "rev-new"},
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}},
+		},
+	})
+	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
+	r, c := newTestReconciler(objs...)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	assertLegacyCertExists(t, c, legacyCert)
+	assertLegacySecretExists(t, c, legacyCertName)
+}
+
+func TestReconcileLegacySentinelCleanup_Defers_WhenObservedGenerationStale(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v)
+	unifiedSecretName := builder.ValkeyTLSSecretName(v)
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	// Spec-update has happened (Generation bumped) but STS controller has not yet
+	// observed it — pods may still be on the previous revision.
+	sts.Generation = 2
+	pods := readySentinelPods(stsName, 3)
+	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
+	r, c := newTestReconciler(objs...)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	assertLegacyCertExists(t, c, legacyCert)
+	assertLegacySecretExists(t, c, legacyCertName)
+}
+
+func TestReconcileLegacySentinelCleanup_Deletes_WhenAllPodsOnNewRevision(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v)
+	unifiedSecretName := builder.ValkeyTLSSecretName(v)
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	pods := readySentinelPods(stsName, 3)
+	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
+	r, c := newTestReconciler(objs...)
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 
@@ -1012,17 +1126,33 @@ func TestReconcileLegacySentinelCleanup_Deletes_WhenSentinelSTSAbsent(t *testing
 
 func TestReconcileLegacySentinelCleanup_Idempotent_NotFound(t *testing.T) {
 	v := newTestValkeyUnified()
-	sts := stagedSentinelStatefulSet(
-		common.StatefulSetName(v, common.ComponentSentinel),
-		"iam",
-		builder.ValkeyTLSSecretName(v),
-	)
-	r, _ := newTestReconciler(v, sts)
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	pods := readySentinelPods(stsName, 3)
+	objs := append([]client.Object{v, sts}, pods...)
+	r, _ := newTestReconciler(objs...)
 
 	// No legacy resources present; must not error.
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 	// Calling twice is also fine.
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+}
+
+func assertLegacyCertExists(t *testing.T, c client.Client, legacyCert *unstructured.Unstructured) {
+	t.Helper()
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(legacyCert.GroupVersionKind())
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyCert.GetName(), Namespace: "iam"}, got),
+		"legacy Certificate must remain until rollout completes")
+}
+
+func assertLegacySecretExists(t *testing.T, c client.Client, name string) {
+	t.Helper()
+	got := &corev1.Secret{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: name, Namespace: "iam"}, got),
+		"legacy Secret must remain until rollout completes")
 }
 
 // TestCleanseCertificateSpec_RemovesPrivateKey verifies that cert-manager

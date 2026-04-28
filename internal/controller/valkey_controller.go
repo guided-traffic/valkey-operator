@@ -159,7 +159,7 @@ func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;escalate;bind
@@ -809,8 +809,10 @@ func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov
 
 // reconcileLegacySentinelCertificateCleanup removes the standalone Sentinel
 // Certificate and Secret that pre-date unified-certificate mode. Deletion is
-// gated on the Sentinel StatefulSet already mounting the unified Secret, so
-// restarting pods cannot race against a missing volume during migration.
+// gated on the Sentinel StatefulSet rollout being fully complete on the unified
+// Secret — that is, every Sentinel pod is from the new revision, mounts the
+// unified Secret via its kubelet binding, and is Ready. This prevents pulling
+// the legacy volume out from under any pod that is still bound to it.
 // Idempotent: NotFound is OK.
 func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context.Context, v *vkov1.Valkey) error {
 	if !v.IsCertManagerEnabled() || !v.IsUnifiedCertificateEnabled() {
@@ -823,23 +825,15 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 		return nil
 	}
 
-	if v.IsSentinelEnabled() {
-		sts := &appsv1.StatefulSet{}
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      common.StatefulSetName(v, common.ComponentSentinel),
-			Namespace: v.Namespace,
-		}, sts)
-		switch {
-		case apierrors.IsNotFound(err):
-			// No Sentinel STS yet; safe to clean up.
-		case err != nil:
-			return fmt.Errorf("get sentinel statefulset: %w", err)
-		case !sentinelStatefulSetUsesSecret(sts, builder.ValkeyTLSSecretName(v)):
-			// STS still references the legacy Secret; defer cleanup so a pod
-			// restart between now and the next StatefulSet reconcile does not
-			// land on a missing volume.
-			return nil
-		}
+	ready, err := r.sentinelRolloutComplete(ctx, v)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		// Some Sentinel pod still belongs to the previous revision and is
+		// therefore kubelet-bound to the legacy Secret. Defer cleanup until
+		// checkAndHandleSentinelRollingUpdate has finished rolling all pods.
+		return nil
 	}
 
 	logger := log.FromContext(ctx)
@@ -870,6 +864,66 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 	}
 
 	return nil
+}
+
+// sentinelRolloutComplete reports whether every Sentinel pod has been recreated
+// from the current StatefulSet revision and is Ready. It also verifies that the
+// StatefulSet's template references the unified Secret as a sanity check.
+//
+// When Sentinel is disabled, or the StatefulSet does not exist yet, the rollout
+// is trivially complete (no pods bound to the legacy Secret).
+func (r *ValkeyReconciler) sentinelRolloutComplete(ctx context.Context, v *vkov1.Valkey) (bool, error) {
+	if !v.IsSentinelEnabled() {
+		return true, nil
+	}
+
+	sts := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      common.StatefulSetName(v, common.ComponentSentinel),
+		Namespace: v.Namespace,
+	}, sts)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get sentinel statefulset: %w", err)
+	}
+
+	// Wait until the StatefulSet controller has observed our latest spec
+	// change and computed an updated revision.
+	if sts.Status.ObservedGeneration < sts.Generation {
+		return false, nil
+	}
+	if sts.Status.UpdateRevision == "" {
+		return false, nil
+	}
+	if !sentinelStatefulSetUsesSecret(sts, builder.ValkeyTLSSecretName(v)) {
+		return false, nil
+	}
+
+	desiredReplicas := int32(0)
+	if sts.Spec.Replicas != nil {
+		desiredReplicas = *sts.Spec.Replicas
+	}
+
+	for i := int32(0); i < desiredReplicas; i++ {
+		podName := fmt.Sprintf("%s-%d", sts.Name, i)
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("get sentinel pod %s: %w", podName, err)
+		}
+		if pod.Labels[appsv1.StatefulSetRevisionLabel] != sts.Status.UpdateRevision {
+			return false, nil
+		}
+		if !isPodReady(pod) {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 // sentinelStatefulSetUsesSecret reports whether the given Sentinel StatefulSet

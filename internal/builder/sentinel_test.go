@@ -550,6 +550,32 @@ func TestBuildSentinelStatefulSet_InjectsPodSpecHashAnnotation(t *testing.T) {
 	assert.NotEmpty(t, hash, "sentinel pod spec hash must not be empty")
 }
 
+func TestComputeSentinelPodSpecHash_ChangesWithUnifiedCertificate(t *testing.T) {
+	// Toggling spec.tls.unifiedCertificate must change the Sentinel pod-spec
+	// hash so the operator's rolling-update detector triggers a controlled
+	// pod replacement under OnDelete strategy. Without this guarantee,
+	// Sentinel pods would never load the new TLS certificate.
+	mk := func(unified bool) *vkov1.Valkey {
+		return newTestValkey("test", func(v *vkov1.Valkey) {
+			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+			v.Spec.TLS = &vkov1.TLSSpec{
+				Enabled:            true,
+				UnifiedCertificate: unified,
+				CertManager: &vkov1.CertManagerSpec{
+					Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				},
+			}
+		})
+	}
+
+	hashSplit := ComputeSentinelPodSpecHash(mk(false))
+	hashUnified := ComputeSentinelPodSpecHash(mk(true))
+
+	assert.NotEqual(t, hashSplit, hashUnified,
+		"sentinel pod-spec hash must differ between split-cert and unified-cert mode "+
+			"so checkAndHandleSentinelRollingUpdate replaces existing pods")
+}
+
 func TestBuildSentinelStatefulSet_OnDeleteUpdateStrategy(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
