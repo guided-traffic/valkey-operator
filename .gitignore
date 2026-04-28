@@ -37,3 +37,4 @@ node_modules/
 main
 tmp/
 .claude/
+graphify-out/

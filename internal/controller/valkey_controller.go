@@ -778,22 +778,113 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 }
 
 // reconcileTLSCertificates reconciles cert-manager Certificate resources for TLS.
+//
+// In default (split-cert) mode the Valkey and Sentinel StatefulSets each own a
+// dedicated Certificate. In unified mode (spec.tls.certManager.unifiedCertificate=true)
+// a single Valkey Certificate carries both Valkey and Sentinel SANs, and the
+// Sentinel StatefulSet mounts the same Secret. The legacy <name>-sentinel-tls
+// Certificate (and the Secret it produced) is garbage-collected by
+// reconcileLegacySentinelCertificateCleanup once the Sentinel StatefulSet has
+// switched to the shared Secret.
 func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov1.Valkey) error {
-	// Reconcile Valkey Certificate.
 	desired := builder.BuildValkeyCertificate(v)
 	if err := r.reconcileCertificate(ctx, v, desired); err != nil {
 		return fmt.Errorf("valkey certificate: %w", err)
 	}
 
-	// Reconcile Sentinel Certificate if Sentinel is enabled.
-	if v.IsSentinelEnabled() {
+	if v.IsSentinelEnabled() && !v.IsUnifiedCertificateEnabled() {
 		desiredSentinel := builder.BuildSentinelCertificate(v)
 		if err := r.reconcileCertificate(ctx, v, desiredSentinel); err != nil {
 			return fmt.Errorf("sentinel certificate: %w", err)
 		}
 	}
 
+	// Garbage-collect the legacy per-Sentinel Certificate when migrating to
+	// unified mode. The deletion is gated on the Sentinel StatefulSet already
+	// referencing the unified Secret, so on the first pass (before the STS
+	// reconcile updates the volume) this is a no-op and cleanup happens on a
+	// subsequent reconcile.
+	return r.reconcileLegacySentinelCertificateCleanup(ctx, v)
+}
+
+// reconcileLegacySentinelCertificateCleanup removes the standalone Sentinel
+// Certificate and Secret that pre-date unified-certificate mode. Deletion is
+// gated on the Sentinel StatefulSet already mounting the unified Secret, so
+// restarting pods cannot race against a missing volume during migration.
+// Idempotent: NotFound is OK.
+func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.IsCertManagerEnabled() || !v.IsUnifiedCertificateEnabled() {
+		return nil
+	}
+
+	legacyName := builder.SentinelCertificateName(v)
+	if legacyName == builder.ValkeyTLSSecretName(v) {
+		// Defensive: never delete the active Secret.
+		return nil
+	}
+
+	if v.IsSentinelEnabled() {
+		sts := &appsv1.StatefulSet{}
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      common.StatefulSetName(v, common.ComponentSentinel),
+			Namespace: v.Namespace,
+		}, sts)
+		switch {
+		case apierrors.IsNotFound(err):
+			// No Sentinel STS yet; safe to clean up.
+		case err != nil:
+			return fmt.Errorf("get sentinel statefulset: %w", err)
+		case !sentinelStatefulSetUsesSecret(sts, builder.ValkeyTLSSecretName(v)):
+			// STS still references the legacy Secret; defer cleanup so a pod
+			// restart between now and the next StatefulSet reconcile does not
+			// land on a missing volume.
+			return nil
+		}
+	}
+
+	logger := log.FromContext(ctx)
+
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cert-manager.io",
+		Version: "v1",
+		Kind:    "Certificate",
+	})
+	cert.SetName(legacyName)
+	cert.SetNamespace(v.Namespace)
+	if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete certificate %s: %w", legacyName, err)
+	} else if err == nil {
+		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
+	}
+
+	// cert-manager does not garbage-collect the Secret; drop it explicitly so
+	// no stale TLS material lingers and the name is free for future use.
+	secret := &corev1.Secret{}
+	secret.SetName(legacyName)
+	secret.SetNamespace(v.Namespace)
+	if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete secret %s: %w", legacyName, err)
+	} else if err == nil {
+		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
+	}
+
 	return nil
+}
+
+// sentinelStatefulSetUsesSecret reports whether the given Sentinel StatefulSet
+// already mounts the named TLS Secret in its "tls" volume.
+func sentinelStatefulSetUsesSecret(sts *appsv1.StatefulSet, secretName string) bool {
+	for _, vol := range sts.Spec.Template.Spec.Volumes {
+		if vol.Name != builder.TLSVolumeName {
+			continue
+		}
+		if vol.Secret != nil && vol.Secret.SecretName == secretName {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // reconcileCertificate ensures a cert-manager Certificate resource matches the desired state.

@@ -73,6 +73,22 @@ func TestSentinelTLSSecretName_UserProvided(t *testing.T) {
 	assert.Equal(t, "my-custom-tls-secret", SentinelTLSSecretName(v))
 }
 
+func TestSentinelTLSSecretName_UnifiedCertificate(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				UnifiedCertificate: true,
+			},
+		}
+	})
+	// In unified mode, Sentinel reuses the Valkey TLS Secret.
+	assert.Equal(t, ValkeyTLSSecretName(v), SentinelTLSSecretName(v))
+	assert.Equal(t, "test-tls", SentinelTLSSecretName(v))
+}
+
 // --- BuildValkeyCertificate ---
 
 func TestBuildValkeyCertificate_Basic(t *testing.T) {
@@ -305,6 +321,110 @@ func TestBuildSentinelCertificate_ExtraDNSNames(t *testing.T) {
 	}
 
 	assert.Contains(t, dnsNamesList, "sentinel.example.com")
+}
+
+// --- BuildValkeyCertificate (unified mode) ---
+
+func TestBuildValkeyCertificate_Unified_IncludesSentinelDNSNames(t *testing.T) {
+	v := newTestValkey("oauth2-valkey", func(v *vkov1.Valkey) {
+		v.Namespace = "iam"
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				UnifiedCertificate: true,
+			},
+		}
+	})
+
+	cert := BuildValkeyCertificate(v)
+	spec := cert.Object["spec"].(map[string]interface{})
+	dnsNamesList := stringsFromIface(spec["dnsNames"].([]interface{}))
+
+	// Valkey-side hostnames must still be present.
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-0.oauth2-valkey-headless.iam.svc.cluster.local")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-headless")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-rw")
+
+	// Sentinel-side hostnames must be merged into the Valkey cert.
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-sentinel-0.oauth2-valkey-sentinel-headless.iam.svc.cluster.local")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-sentinel-1.oauth2-valkey-sentinel-headless.iam.svc.cluster.local")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-sentinel-2.oauth2-valkey-sentinel-headless.iam.svc.cluster.local")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-sentinel-headless")
+	assert.Contains(t, dnsNamesList, "oauth2-valkey-sentinel-headless.iam.svc.cluster.local")
+
+	// localhost present exactly once (dedupe must collapse the duplicate from
+	// the merged Sentinel-only list).
+	count := 0
+	for _, n := range dnsNamesList {
+		if n == "localhost" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "localhost should appear exactly once after merge+dedupe")
+
+	// Secret name remains the Valkey TLS secret.
+	assert.Equal(t, "oauth2-valkey-tls", spec["secretName"])
+}
+
+func TestBuildValkeyCertificate_Unified_NoSentinel_BehavesLikeDefault(t *testing.T) {
+	// With Sentinel disabled, unified mode should not change the Valkey cert
+	// (no Sentinel hostnames available to merge).
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				UnifiedCertificate: true,
+			},
+		}
+	})
+
+	cert := BuildValkeyCertificate(v)
+	spec := cert.Object["spec"].(map[string]interface{})
+	dnsNamesList := stringsFromIface(spec["dnsNames"].([]interface{}))
+
+	for _, n := range dnsNamesList {
+		assert.NotContains(t, n, "sentinel", "no sentinel names expected when Sentinel is disabled")
+	}
+}
+
+func TestBuildValkeyCertificate_Unified_MergesExtraDNSNamesOnce(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				UnifiedCertificate: true,
+				ExtraDNSNames:      []string{"valkey.example.com"},
+			},
+		}
+	})
+
+	cert := BuildValkeyCertificate(v)
+	spec := cert.Object["spec"].(map[string]interface{})
+	dnsNamesList := stringsFromIface(spec["dnsNames"].([]interface{}))
+
+	count := 0
+	for _, n := range dnsNamesList {
+		if n == "valkey.example.com" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "extra DNS names must not be duplicated by the merge")
+}
+
+func stringsFromIface(in []interface{}) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = v.(string)
+	}
+	return out
 }
 
 // --- toInterfaceMap ---
