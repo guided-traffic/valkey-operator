@@ -838,29 +838,37 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 
 	logger := log.FromContext(ctx)
 
+	// Delete the legacy Certificate only if it actually exists. We GET first
+	// so a missing resource costs zero delete-permission attempts: the
+	// apiserver evaluates authz before existence, so a Delete against a
+	// non-existent resource on a cluster without `delete` RBAC returns 403
+	// (Forbidden) rather than 404 (NotFound) and would loop the reconciler.
 	cert := &unstructured.Unstructured{}
 	cert.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "cert-manager.io",
 		Version: "v1",
 		Kind:    "Certificate",
 	})
-	cert.SetName(legacyName)
-	cert.SetNamespace(v.Namespace)
-	if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete certificate %s: %w", legacyName, err)
-	} else if err == nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert); err == nil {
+		if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete certificate %s: %w", legacyName, err)
+		}
 		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get legacy certificate %s: %w", legacyName, err)
 	}
 
-	// cert-manager does not garbage-collect the Secret; drop it explicitly so
-	// no stale TLS material lingers and the name is free for future use.
+	// cert-manager does not garbage-collect the Secret it produced; drop it
+	// explicitly so no stale TLS material lingers and the name is free for
+	// future use. Same GET-first guard as above.
 	secret := &corev1.Secret{}
-	secret.SetName(legacyName)
-	secret.SetNamespace(v.Namespace)
-	if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete secret %s: %w", legacyName, err)
-	} else if err == nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, secret); err == nil {
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete secret %s: %w", legacyName, err)
+		}
 		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get legacy secret %s: %w", legacyName, err)
 	}
 
 	return nil

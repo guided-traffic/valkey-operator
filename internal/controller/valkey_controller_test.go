@@ -24,6 +24,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -1136,6 +1137,42 @@ func TestReconcileLegacySentinelCleanup_Idempotent_NotFound(t *testing.T) {
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 	// Calling twice is also fine.
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+}
+
+// TestReconcileLegacySentinelCleanup_FreshInstall_NoDeleteRBAC simulates a
+// brand-new cluster with unifiedCertificate=true: no legacy Cert/Secret has
+// ever existed. The kube-apiserver evaluates authz BEFORE existence, so a
+// Delete on a missing resource against a role lacking the delete verb returns
+// 403 Forbidden — not 404 NotFound. The cleanup must therefore GET the
+// resource first and skip the Delete entirely when it does not exist, so the
+// reconciler does not loop on a phantom RBAC error.
+func TestReconcileLegacySentinelCleanup_FreshInstall_NoDeleteRBAC(t *testing.T) {
+	v := newTestValkeyUnified()
+
+	// Fake client whose Delete reproduces the apiserver's authz-before-existence
+	// behaviour: any Delete attempt is rejected with Forbidden, regardless of
+	// whether the target exists. If the cleanup ever reaches Delete, the test
+	// fails — proving the GET-first guard skips it for missing resources.
+	s := testScheme()
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(v).
+		WithStatusSubresource(&vkov1.Valkey{}, &appsv1.StatefulSet{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				gvk := obj.GetObjectKind().GroupVersionKind()
+				return apierrors.NewForbidden(
+					schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind},
+					obj.GetName(),
+					fmt.Errorf("simulated missing delete RBAC"),
+				)
+			},
+		}).
+		Build()
+	r := &ValkeyReconciler{Client: c, Scheme: s, InstanceChecker: &mockInstanceChecker{}}
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v),
+		"cleanup must succeed when no legacy resources exist, even when delete RBAC is missing")
 }
 
 func assertLegacyCertExists(t *testing.T, c client.Client, legacyCert *unstructured.Unstructured) {
