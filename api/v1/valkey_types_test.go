@@ -214,6 +214,69 @@ func TestIsCertManagerEnabled(t *testing.T) {
 	}
 }
 
+func TestIsUnifiedCertificateEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		tls      *TLSSpec
+		expected bool
+	}{
+		{
+			name:     "nil TLS spec",
+			tls:      nil,
+			expected: false,
+		},
+		{
+			name: "cert-manager without unified flag",
+			tls: &TLSSpec{
+				Enabled: true,
+				CertManager: &CertManagerSpec{
+					Issuer: CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "cert-manager with unified flag",
+			tls: &TLSSpec{
+				Enabled: true,
+				CertManager: &CertManagerSpec{
+					Issuer:             CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+					UnifiedCertificate: true,
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "unified flag without cert-manager (user secret) is ignored",
+			tls: &TLSSpec{
+				Enabled:    true,
+				SecretName: "my-secret",
+			},
+			expected: false,
+		},
+		{
+			name: "TLS disabled but unified flag set",
+			tls: &TLSSpec{
+				Enabled: false,
+				CertManager: &CertManagerSpec{
+					Issuer:             CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+					UnifiedCertificate: true,
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.TLS = tt.tls
+			})
+			assert.Equal(t, tt.expected, v.IsUnifiedCertificateEnabled())
+		})
+	}
+}
+
 func TestIsTLSSecretProvided(t *testing.T) {
 	tests := []struct {
 		name     string

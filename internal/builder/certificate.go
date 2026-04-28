@@ -53,58 +53,68 @@ func ValkeyTLSSecretName(v *vkov1.Valkey) string {
 }
 
 // SentinelTLSSecretName returns the name of the Secret that holds TLS certs for Sentinel.
-// When cert-manager is used, a separate Certificate is created for Sentinel.
+// When cert-manager is used in unified mode, the Valkey Secret is shared.
+// When cert-manager is used in default mode, a separate Certificate is created for Sentinel.
 // When a user-provided secret is used, the same secret is shared.
 func SentinelTLSSecretName(v *vkov1.Valkey) string {
 	if v.IsTLSSecretProvided() {
 		return v.Spec.TLS.SecretName
+	}
+	if v.IsUnifiedCertificateEnabled() {
+		return ValkeyTLSSecretName(v)
 	}
 	return fmt.Sprintf("%s-sentinel-tls", v.Name)
 }
 
 // valkeyDNSNames generates the DNS names for the Valkey Certificate.
 // This includes individual pod DNS names, the headless service, and all client services.
+// When unified-certificate mode is enabled and Sentinel is enabled, Sentinel hostnames
+// are appended so a single Certificate covers both StatefulSets.
 func valkeyDNSNames(v *vkov1.Valkey) []string {
+	dnsNames := valkeyOnlyDNSNames(v)
+
+	if v.IsUnifiedCertificateEnabled() && v.IsSentinelEnabled() {
+		dnsNames = append(dnsNames, sentinelOnlyDNSNames(v)...)
+	}
+
+	dnsNames = append(dnsNames, "localhost")
+
+	if v.Spec.TLS.CertManager != nil && len(v.Spec.TLS.CertManager.ExtraDNSNames) > 0 {
+		dnsNames = append(dnsNames, v.Spec.TLS.CertManager.ExtraDNSNames...)
+	}
+
+	return dedupe(dnsNames)
+}
+
+// valkeyOnlyDNSNames returns the Valkey-component DNS names without trailing
+// shared entries (localhost / extras), so it can be combined with Sentinel
+// names in unified mode.
+func valkeyOnlyDNSNames(v *vkov1.Valkey) []string {
 	headless := common.HeadlessServiceName(v, common.ComponentValkey)
 	rwSvc := RWServiceName(v)
 	allSvc := AllServiceName(v)
 
 	var dnsNames []string
 
-	// Individual pod DNS names.
 	for i := int32(0); i < v.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", common.StatefulSetName(v, common.ComponentValkey), i)
-		// Pod FQDN via headless service.
 		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.%s.svc.cluster.local", podName, headless, v.Namespace))
-		// Short pod DNS.
 		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s", podName, headless))
 	}
 
-	// Headless service DNS.
 	dnsNames = append(dnsNames, headless)
 	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", headless, v.Namespace))
 
-	// Read-write service DNS.
 	dnsNames = append(dnsNames, rwSvc)
 	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", rwSvc, v.Namespace))
 
-	// All-pods service DNS.
 	dnsNames = append(dnsNames, allSvc)
 	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", allSvc, v.Namespace))
 
-	// Read-only replica service DNS (multi-replica only).
 	if v.Spec.Replicas > 1 {
 		rSvc := ReadOnlyServiceName(v)
 		dnsNames = append(dnsNames, rSvc)
 		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", rSvc, v.Namespace))
-	}
-
-	// Localhost for local connections.
-	dnsNames = append(dnsNames, "localhost")
-
-	// Extra DNS names from CRD spec.
-	if v.Spec.TLS.CertManager != nil && len(v.Spec.TLS.CertManager.ExtraDNSNames) > 0 {
-		dnsNames = append(dnsNames, v.Spec.TLS.CertManager.ExtraDNSNames...)
 	}
 
 	return dnsNames
@@ -112,6 +122,20 @@ func valkeyDNSNames(v *vkov1.Valkey) []string {
 
 // sentinelDNSNames generates the DNS names for the Sentinel Certificate.
 func sentinelDNSNames(v *vkov1.Valkey) []string {
+	dnsNames := sentinelOnlyDNSNames(v)
+
+	dnsNames = append(dnsNames, "localhost")
+
+	if v.Spec.TLS.CertManager != nil && len(v.Spec.TLS.CertManager.ExtraDNSNames) > 0 {
+		dnsNames = append(dnsNames, v.Spec.TLS.CertManager.ExtraDNSNames...)
+	}
+
+	return dedupe(dnsNames)
+}
+
+// sentinelOnlyDNSNames returns the Sentinel-component DNS names without trailing
+// shared entries (localhost / extras).
+func sentinelOnlyDNSNames(v *vkov1.Valkey) []string {
 	headless := common.HeadlessServiceName(v, common.ComponentSentinel)
 
 	var dnsNames []string
@@ -121,28 +145,30 @@ func sentinelDNSNames(v *vkov1.Valkey) []string {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
 
-	// Individual pod DNS names.
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", common.StatefulSetName(v, common.ComponentSentinel), i)
-		// Pod FQDN via headless service.
 		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.%s.svc.cluster.local", podName, headless, v.Namespace))
-		// Short pod DNS.
 		dnsNames = append(dnsNames, fmt.Sprintf("%s.%s", podName, headless))
 	}
 
-	// Headless service DNS.
 	dnsNames = append(dnsNames, headless)
 	dnsNames = append(dnsNames, fmt.Sprintf("%s.%s.svc.cluster.local", headless, v.Namespace))
 
-	// Localhost for local connections.
-	dnsNames = append(dnsNames, "localhost")
-
-	// Extra DNS names from CRD spec.
-	if v.Spec.TLS.CertManager != nil && len(v.Spec.TLS.CertManager.ExtraDNSNames) > 0 {
-		dnsNames = append(dnsNames, v.Spec.TLS.CertManager.ExtraDNSNames...)
-	}
-
 	return dnsNames
+}
+
+// dedupe removes duplicate strings while preserving first-seen order.
+func dedupe(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // BuildValkeyCertificate builds the cert-manager Certificate resource for Valkey pods.

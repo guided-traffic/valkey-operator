@@ -16,7 +16,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -25,6 +27,7 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/common"
 	"github.com/guided-traffic/valkey-operator/internal/health"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
@@ -857,6 +860,169 @@ func TestStatusUnchanged_DetectsChanges(t *testing.T) {
 	diffMaster := base.DeepCopy()
 	diffMaster.MasterPod = "test-1"
 	assert.False(t, statusUnchanged(base, diffMaster), "different masterPod should be detected")
+}
+
+// --- Unified Certificate migration ---
+
+// newLegacySentinelCert builds an unstructured cert-manager Certificate matching
+// what the operator created in split-cert mode, so migration tests can stage one.
+func newLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
+	c := &unstructured.Unstructured{}
+	c.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cert-manager.io",
+		Version: "v1",
+		Kind:    "Certificate",
+	})
+	c.SetName(name)
+	c.SetNamespace(namespace)
+	c.Object["spec"] = map[string]interface{}{"secretName": name}
+	return c
+}
+
+// stagedSentinelStatefulSet builds a minimal Sentinel StatefulSet that mounts
+// the named TLS Secret on volume "tls". Used to control the deletion gate in
+// migration tests.
+func stagedSentinelStatefulSet(name, namespace, tlsSecretName string) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: builder.TLSVolumeName,
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{SecretName: tlsSecretName},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func newTestValkeyUnified() *vkov1.Valkey {
+	return newTestValkey("oauth2-valkey", "iam", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer:             vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				UnifiedCertificate: true,
+			},
+		}
+	})
+}
+
+func TestReconcileLegacySentinelCleanup_Noop_WhenNotUnified(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+			},
+		}
+	})
+	legacyCert := newLegacySentinelCert(builder.SentinelCertificateName(v), "default")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: builder.SentinelCertificateName(v), Namespace: "default"},
+	}
+	r, c := newTestReconciler(v, legacyCert, legacySecret)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	// Legacy resources must remain untouched in split-cert mode.
+	gotCert := &unstructured.Unstructured{}
+	gotCert.SetGroupVersionKind(legacyCert.GroupVersionKind())
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyCert.GetName(), Namespace: "default"}, gotCert))
+	gotSecret := &corev1.Secret{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacySecret.Name, Namespace: "default"}, gotSecret))
+}
+
+func TestReconcileLegacySentinelCleanup_Defers_WhenSTSStillMountsLegacySecret(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v) // oauth2-valkey-sentinel-tls
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	// Sentinel STS still pointing at the legacy Secret — migration must not delete yet.
+	sts := stagedSentinelStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), "iam", legacyCertName)
+	r, c := newTestReconciler(v, legacyCert, legacySecret, sts)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	gotCert := &unstructured.Unstructured{}
+	gotCert.SetGroupVersionKind(legacyCert.GroupVersionKind())
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotCert),
+		"legacy Certificate must remain while STS still references the legacy Secret")
+	gotSecret := &corev1.Secret{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotSecret),
+		"legacy Secret must remain while STS still references it")
+}
+
+func TestReconcileLegacySentinelCleanup_Deletes_WhenSTSUsesUnifiedSecret(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v)
+	unifiedSecretName := builder.ValkeyTLSSecretName(v) // oauth2-valkey-tls
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	sts := stagedSentinelStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), "iam", unifiedSecretName)
+	r, c := newTestReconciler(v, legacyCert, legacySecret, sts)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	gotCert := &unstructured.Unstructured{}
+	gotCert.SetGroupVersionKind(legacyCert.GroupVersionKind())
+	err := c.Get(context.Background(), types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotCert)
+	assert.True(t, apierrors.IsNotFound(err), "legacy Certificate should be deleted: %v", err)
+
+	gotSecret := &corev1.Secret{}
+	err = c.Get(context.Background(), types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotSecret)
+	assert.True(t, apierrors.IsNotFound(err), "legacy Secret should be deleted: %v", err)
+}
+
+func TestReconcileLegacySentinelCleanup_Deletes_WhenSentinelSTSAbsent(t *testing.T) {
+	// Fresh cluster with unified mode and no Sentinel STS yet (or transient gap)
+	// — cleanup is safe because there are no pods to mount the legacy Secret.
+	v := newTestValkeyUnified()
+	legacyCertName := builder.SentinelCertificateName(v)
+	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
+	legacySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
+	}
+	r, c := newTestReconciler(v, legacyCert, legacySecret)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	gotCert := &unstructured.Unstructured{}
+	gotCert.SetGroupVersionKind(legacyCert.GroupVersionKind())
+	err := c.Get(context.Background(), types.NamespacedName{Name: legacyCertName, Namespace: "iam"}, gotCert)
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestReconcileLegacySentinelCleanup_Idempotent_NotFound(t *testing.T) {
+	v := newTestValkeyUnified()
+	sts := stagedSentinelStatefulSet(
+		common.StatefulSetName(v, common.ComponentSentinel),
+		"iam",
+		builder.ValkeyTLSSecretName(v),
+	)
+	r, _ := newTestReconciler(v, sts)
+
+	// No legacy resources present; must not error.
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+	// Calling twice is also fine.
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 }
 
 // TestCleanseCertificateSpec_RemovesPrivateKey verifies that cert-manager

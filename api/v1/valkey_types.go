@@ -126,6 +126,17 @@ type CertManagerSpec struct {
 	// beyond the automatically generated ones (pod DNS names, service names).
 	// +optional
 	ExtraDNSNames []string `json:"extraDnsNames,omitempty"`
+
+	// UnifiedCertificate, when true, issues a single Certificate that covers
+	// both the Valkey and the Sentinel hostnames, and mounts the same Secret
+	// in both StatefulSets. This avoids TLS verification errors in clients
+	// (e.g., go-redis Sentinel mode) that share one tls.Config across the
+	// Sentinel discovery and the Valkey master connection.
+	// When enabled, the operator deletes the legacy <name>-sentinel-tls
+	// Certificate and Secret to migrate existing clusters.
+	// +kubebuilder:default=false
+	// +optional
+	UnifiedCertificate bool `json:"unifiedCertificate,omitempty"`
 }
 
 // TLSSpec defines TLS configuration for Valkey.
@@ -469,6 +480,14 @@ func (v *Valkey) IsTLSEnabled() bool {
 // IsCertManagerEnabled returns true if TLS is enabled and cert-manager is configured.
 func (v *Valkey) IsCertManagerEnabled() bool {
 	return v.IsTLSEnabled() && v.Spec.TLS.CertManager != nil
+}
+
+// IsUnifiedCertificateEnabled returns true if a single Certificate covering both
+// Valkey and Sentinel hostnames should be issued. Only effective when cert-manager
+// is enabled. When Sentinel is disabled, the unified flag has no observable effect
+// (the Valkey Certificate is the only one anyway).
+func (v *Valkey) IsUnifiedCertificateEnabled() bool {
+	return v.IsCertManagerEnabled() && v.Spec.TLS.CertManager.UnifiedCertificate
 }
 
 // IsTLSSecretProvided returns true if TLS is enabled with a user-provided Secret.
