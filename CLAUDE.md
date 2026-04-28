@@ -38,15 +38,16 @@ spec:
     enabled: true
   tls:
     enabled: true
-    allowUnencrypted: false   # set to true to keep port 6379 open alongside TLS port 16379
+    allowUnencrypted: false      # set to true to keep port 6379 open alongside TLS port 16379
+    unifiedCertificate: false    # set to true so Valkey and Sentinel share one TLS Secret covering
+                                 # both sets of hostnames (avoids TLS verify errors with go-redis
+                                 # Sentinel mode); under cert-manager, the legacy
+                                 # <name>-sentinel-tls Cert/Secret is migrated automatically
     certManager:
       issuer:
         # group: cert-manager.io
         kind: ClusterIssuer
         name: cluster-ca
-      unifiedCertificate: false  # set to true to issue a single Certificate covering Valkey + Sentinel
-                                 # hostnames (avoids TLS verify errors with go-redis Sentinel mode);
-                                 # the legacy <name>-sentinel-tls Cert/Secret is migrated automatically
   networkPolicy:
     enabled: true
     namePrefix: "my-prefix"

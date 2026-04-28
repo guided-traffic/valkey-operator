@@ -479,17 +479,6 @@ spec:
                         - kind
                         - name
                         type: object
-                      unifiedCertificate:
-                        default: false
-                        description: |-
-                          UnifiedCertificate, when true, issues a single Certificate that covers
-                          both the Valkey and the Sentinel hostnames, and mounts the same Secret
-                          in both StatefulSets. This avoids TLS verification errors in clients
-                          (e.g., go-redis Sentinel mode) that share one tls.Config across the
-                          Sentinel discovery and the Valkey master connection.
-                          When enabled, the operator deletes the legacy <name>-sentinel-tls
-                          Certificate and Secret to migrate existing clusters.
-                        type: boolean
                     required:
                     - issuer
                     type: object
@@ -503,6 +492,20 @@ spec:
                       The Secret must contain keys: tls.crt, tls.key, and ca.crt.
                       Mutually exclusive with CertManager.
                     type: string
+                  unifiedCertificate:
+                    default: false
+                    description: |-
+                      UnifiedCertificate, when true, makes Valkey and Sentinel share a single
+                      TLS certificate / Secret that covers both sets of hostnames. With
+                      cert-manager, the operator issues one Certificate (instead of one per
+                      component) and migrates existing clusters by deleting the legacy
+                      <name>-sentinel-tls Certificate and Secret once the Sentinel StatefulSet
+                      has switched to the unified Secret. With a user-provided Secret, both
+                      StatefulSets already mount that Secret, so the flag is informational.
+                      This avoids TLS verification errors in clients (e.g., go-redis Sentinel
+                      mode) that share one tls.Config across the Sentinel discovery and the
+                      Valkey master connection.
+                    type: boolean
                 type: object
             required:
             - image
