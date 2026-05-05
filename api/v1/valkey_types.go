@@ -620,7 +620,3 @@ func (v *Valkey) GetObserverUnreadyWhen() ObserverUnreadyWhenSpec {
 	}
 	return *v.Spec.Observer.UnreadyWhen
 }
-
-func init() {
-	SchemeBuilder.Register(&Valkey{}, &ValkeyList{})
-}
