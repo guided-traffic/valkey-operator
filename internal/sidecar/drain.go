@@ -178,7 +178,7 @@ func (d *DrainHandler) findSyncedReplica(log drainLog) (string, error) {
 
 // isSyncedReplica returns true if the replication info indicates a fully synced replica.
 func isSyncedReplica(info *valkeyclient.ReplicationInfo) bool {
-	return info.Role == "slave" && info.MasterLinkStatus == "up" && !info.MasterSyncInProgress
+	return info.Role == valkeyRoleSlave && info.MasterLinkStatus == "up" && !info.MasterSyncInProgress
 }
 
 // reconfigureReplicas sends REPLICAOF to all remaining replicas so they follow

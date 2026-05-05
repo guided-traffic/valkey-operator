@@ -177,8 +177,8 @@ func BuildValkeyCertificate(v *vkov1.Valkey) *unstructured.Unstructured {
 	cm := v.Spec.TLS.CertManager
 
 	issuerRef := map[string]interface{}{
-		"name": cm.Issuer.Name,
-		"kind": cm.Issuer.Kind,
+		IssuerRefNameKey: cm.Issuer.Name,
+		IssuerRefKindKey: cm.Issuer.Kind,
 	}
 	if cm.Issuer.Group != "" {
 		issuerRef["group"] = cm.Issuer.Group
@@ -221,8 +221,8 @@ func BuildSentinelCertificate(v *vkov1.Valkey) *unstructured.Unstructured {
 	cm := v.Spec.TLS.CertManager
 
 	issuerRef := map[string]interface{}{
-		"name": cm.Issuer.Name,
-		"kind": cm.Issuer.Kind,
+		IssuerRefNameKey: cm.Issuer.Name,
+		IssuerRefKindKey: cm.Issuer.Kind,
 	}
 	if cm.Issuer.Group != "" {
 		issuerRef["group"] = cm.Issuer.Group

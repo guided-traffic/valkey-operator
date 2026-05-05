@@ -49,6 +49,36 @@ const (
 
 	// AuthSecretEnvName is the environment variable name used to inject the Valkey password.
 	AuthSecretEnvName = "VALKEY_PASSWORD"
+
+	// ValkeyPlainContainerName is the name of the secondary plaintext Valkey container.
+	ValkeyPlainContainerName = "valkey-plain"
+
+	// ValkeyCLIBinary is the path/name of the valkey-cli command.
+	ValkeyCLIBinary = "valkey-cli"
+
+	// ValkeyTLSFlag enables TLS for valkey-cli.
+	ValkeyTLSFlag = "--tls"
+
+	// ValkeyCACertFlag selects the CA certificate for valkey-cli.
+	ValkeyCACertFlag = "--cacert"
+
+	// ValkeyPingCommand is the ping command name used in probes.
+	ValkeyPingCommand = "ping"
+
+	// ManagerBinary is the path of the operator manager binary inside the container image.
+	ManagerBinary = "./manager"
+
+	// PodNamespaceEnvName is the env var name used to inject the pod namespace.
+	PodNamespaceEnvName = "POD_NAMESPACE"
+
+	// DefaultServiceAccountName is the Kubernetes "default" service account name.
+	DefaultServiceAccountName = "default"
+
+	// IssuerRefNameKey is the unstructured map key for an issuer reference name.
+	IssuerRefNameKey = "name"
+
+	// IssuerRefKindKey is the unstructured map key for an issuer reference kind.
+	IssuerRefKindKey = "kind"
 )
 
 // BuildStatefulSet builds the StatefulSet for Valkey instances.
@@ -564,14 +594,14 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	}
 	valkeyContainerPorts := []corev1.ContainerPort{
 		{
-			Name:          "valkey",
+			Name:          ValkeyContainerName,
 			ContainerPort: containerPort,
 			Protocol:      corev1.ProtocolTCP,
 		},
 	}
 	if v.IsValkeyUnencryptedAllowed() {
 		valkeyContainerPorts = append(valkeyContainerPorts, corev1.ContainerPort{
-			Name:          "valkey-plain",
+			Name:          ValkeyPlainContainerName,
 			ContainerPort: ValkeyPort,
 			Protocol:      corev1.ProtocolTCP,
 		})
@@ -655,7 +685,7 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 			},
 		},
 		{
-			Name: "POD_NAMESPACE",
+			Name: PodNamespaceEnvName,
 			ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{
 					FieldPath: "metadata.namespace",
@@ -730,7 +760,7 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 	return corev1.Container{
 		Name:    SidecarContainerName,
 		Image:   sidecarImage,
-		Command: []string{"./manager"},
+		Command: []string{ManagerBinary},
 		Args:    args,
 		Env:     env,
 		Ports: []corev1.ContainerPort{
@@ -1147,24 +1177,24 @@ func ProbeCommand(v *vkov1.Valkey) []string {
 
 	if v.IsTLSEnabled() {
 		return []string{
-			"valkey-cli",
-			"--tls",
+			ValkeyCLIBinary,
+			ValkeyTLSFlag,
 			"--cert", "/tls/tls.crt",
 			"--key", "/tls/tls.key",
-			"--cacert", "/tls/ca.crt",
+			ValkeyCACertFlag, "/tls/ca.crt",
 			"-p", fmt.Sprintf("%d", TLSPort),
-			"ping",
+			ValkeyPingCommand,
 		}
 	}
-	return []string{"valkey-cli", "ping"}
+	return []string{ValkeyCLIBinary, ValkeyPingCommand}
 }
 
 // DesiredServicePort returns the port spec for Services, accounting for TLS.
 func DesiredServicePort(v *vkov1.Valkey) corev1.ServicePort {
 	return corev1.ServicePort{
-		Name:       "valkey",
+		Name:       ValkeyContainerName,
 		Port:       ServicePort(v),
-		TargetPort: intstr.FromString("valkey"),
+		TargetPort: intstr.FromString(ValkeyContainerName),
 		Protocol:   corev1.ProtocolTCP,
 	}
 }

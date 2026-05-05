@@ -574,7 +574,7 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 	if err != nil {
 		if stalled {
 			logger.Info("Finalization stalled, cannot verify replication, resetting sentinel and proceeding",
-				"master", masterPS.name, "error", err)
+				common.RoleMaster, masterPS.name, "error", err)
 			// Use the identified master's address instead of empty string to avoid
 			// the pod-0 fallback in resetSentinelState when pod-0 is not the master.
 			headlessNameOnErr := common.HeadlessServiceName(v, common.ComponentValkey)
@@ -584,18 +584,18 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 		}
 		r.ensureFinalizationTimestamp(ctx, v)
 		logger.Info("Cannot verify replication before sentinel sync, waiting",
-			"master", masterPS.name, "error", err)
+			common.RoleMaster, masterPS.name, "error", err)
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
 	if info.ConnectedSlaves < expectedReplicas {
 		if stalled {
 			logger.Info("Finalization stalled, replicas not all connected, proceeding with partial sync",
-				"master", masterPS.name, "connectedSlaves", info.ConnectedSlaves, "expected", expectedReplicas)
+				common.RoleMaster, masterPS.name, "connectedSlaves", info.ConnectedSlaves, "expected", expectedReplicas)
 		} else {
 			r.ensureFinalizationTimestamp(ctx, v)
 			logger.Info("Waiting for all replicas to connect before sentinel sync",
-				"master", masterPS.name, "connectedSlaves", info.ConnectedSlaves,
+				common.RoleMaster, masterPS.name, "connectedSlaves", info.ConnectedSlaves,
 				"expected", expectedReplicas)
 			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
@@ -604,7 +604,7 @@ func (r *ValkeyReconciler) syncSentinelWithMaster(ctx context.Context, v *vkov1.
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPS.name, headlessName, v.Namespace)
 	logger.Info("Syncing sentinel with current master before finalization",
-		"master", masterPS.name, "masterAddr", masterAddr,
+		common.RoleMaster, masterPS.name, "masterAddr", masterAddr,
 		"connectedSlaves", info.ConnectedSlaves)
 	// Persist the confirmed master address as a CR annotation so that the sentinel
 	// ConfigMap is regenerated with the correct master address on the next reconcile.
@@ -1354,7 +1354,7 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 
 	acked, err := c.Wait(numReplicas, waitWriteSyncTimeout)
 	if err != nil {
-		logger.Info("WAIT command failed, will retry", "master", masterPod.name, "error", err)
+		logger.Info("WAIT command failed, will retry", common.RoleMaster, masterPod.name, "error", err)
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
@@ -1364,12 +1364,12 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 		// master. Since waitForReplicasReady already confirmed every replica is
 		// synced, accept the partial acknowledgement and proceed with failover.
 		logger.Info("Partial WAIT acknowledgement accepted (possible cascaded replication)",
-			"master", masterPod.name, "expected", numReplicas, "acked", acked)
+			common.RoleMaster, masterPod.name, "expected", numReplicas, "acked", acked)
 		return nil
 	}
 
 	logger.Info("All replicas acknowledged pending writes",
-		"master", masterPod.name, "acked", acked)
+		common.RoleMaster, masterPod.name, "acked", acked)
 	return nil
 }
 
@@ -1559,9 +1559,9 @@ func (r *ValkeyReconciler) forceReplicaConnections(ctx context.Context, v *vkov1
 		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, int(builder.ServicePort(v)))
 		c := r.newValkeyClient(addr, password, tlsConfig)
 		if replicaErr := c.ReplicaOf(masterHost, portStr); replicaErr != nil {
-			logger.Info("REPLICAOF command failed (best-effort)", "pod", ps.name, "master", masterHost, "error", replicaErr)
+			logger.Info("REPLICAOF command failed (best-effort)", "pod", ps.name, common.RoleMaster, masterHost, "error", replicaErr)
 		} else {
-			logger.Info("Sent REPLICAOF to pod", "pod", ps.name, "master", masterHost)
+			logger.Info("Sent REPLICAOF to pod", "pod", ps.name, common.RoleMaster, masterHost)
 		}
 	}
 }
@@ -2406,7 +2406,7 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 		logger.Info("REPLICAOF command failed on new pod-0", "pod", masterPodName, "target", promotedHost, "error", err)
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
-	logger.Info("Configured pod-0 as replica of promoted pod", "pod", masterPodName, "master", promotedHost)
+	logger.Info("Configured pod-0 as replica of promoted pod", "pod", masterPodName, common.RoleMaster, promotedHost)
 
 	// Move to topology restoration state.
 	if err := r.setRollingUpdateState(ctx, v, stateRestoringTopology); err != nil {
@@ -2428,7 +2428,7 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 //     masters. Complete when clean or after finalizationStallTimeout.
 //
 // Splitting into two phases prevents an infinite wait loop: once pod-0 is promoted back
-// to master its role is "master", so the Phase 1 sync-check must not run again.
+// to master its role is common.RoleMaster, so the Phase 1 sync-check must not run again.
 func (r *ValkeyReconciler) handleTopologyRestoration(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -2512,9 +2512,9 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 		rc := r.newValkeyClient(addr, password, tlsConfig)
 		if err := rc.ReplicaOf(masterHost, portStr); err != nil {
 			logger.Info("REPLICAOF redirect failed (will verify in Phase 2)",
-				"pod", podName, "master", masterHost, "error", err)
+				"pod", podName, common.RoleMaster, masterHost, "error", err)
 		} else {
-			logger.Info("Redirected replica to pod-0", "pod", podName, "master", masterHost)
+			logger.Info("Redirected replica to pod-0", "pod", podName, common.RoleMaster, masterHost)
 		}
 	}
 

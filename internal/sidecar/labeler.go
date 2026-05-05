@@ -20,6 +20,11 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
+const (
+	// valkeyRoleSlave is the replication role string returned by Valkey for replica nodes.
+	valkeyRoleSlave = "slave"
+)
+
 // RoleDetector detects the current Valkey replication role.
 // This interface allows mocking in tests.
 type RoleDetector interface {
@@ -212,9 +217,9 @@ func (d *valkeyRoleDetector) DetectRole() (string, error) {
 	}
 
 	switch info.Role {
-	case "master":
+	case common.RoleMaster:
 		return common.RoleMaster, nil
-	case "slave":
+	case valkeyRoleSlave:
 		return common.RoleReplica, nil
 	default:
 		return info.Role, nil
