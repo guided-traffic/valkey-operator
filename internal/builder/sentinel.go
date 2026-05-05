@@ -354,7 +354,7 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 	}
 
 	return corev1.PodSpec{
-		ServiceAccountName: "default",
+		ServiceAccountName: DefaultServiceAccountName,
 		// Init container copies the sentinel config to a writable volume.
 		// Sentinel needs to rewrite its config file at runtime.
 		InitContainers: []corev1.Container{
@@ -405,15 +405,15 @@ func SentinelProbeCommand(v *vkov1.Valkey) []string {
 
 	if v.IsTLSEnabled() {
 		return []string{
-			"valkey-cli",
-			"--tls",
-			"--cacert", TLSMountPath + "/ca.crt",
+			ValkeyCLIBinary,
+			ValkeyTLSFlag,
+			ValkeyCACertFlag, TLSMountPath + "/ca.crt",
 			"-p", port,
-			"ping",
+			ValkeyPingCommand,
 		}
 	}
 
-	return []string{"valkey-cli", "-p", port, "ping"}
+	return []string{ValkeyCLIBinary, "-p", port, ValkeyPingCommand}
 }
 
 // buildSentinelContainer builds the Sentinel container spec.
@@ -470,7 +470,7 @@ func buildSentinelContainer(v *vkov1.Valkey) corev1.Container {
 	}
 	sentinelContainerPorts := []corev1.ContainerPort{
 		{
-			Name:          "sentinel",
+			Name:          SentinelContainerName,
 			ContainerPort: sentinelContainerPort,
 			Protocol:      corev1.ProtocolTCP,
 		},

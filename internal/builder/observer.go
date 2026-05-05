@@ -32,7 +32,7 @@ func ObserverLabels(v *vkov1.Valkey) map[string]string {
 		common.LabelComponent: ComponentObserver,
 		common.LabelInstance:  v.Name,
 		common.LabelManagedBy: common.ManagedBy,
-		common.LabelName:      "valkey",
+		common.LabelName:      ValkeyContainerName,
 		common.LabelCluster:   v.Name,
 	}
 }
@@ -58,7 +58,7 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 		{
 			Name:      "observer",
 			Image:     operatorImage,
-			Command:   []string{"./manager"},
+			Command:   []string{ManagerBinary},
 			Args:      append([]string{"observer"}, args...),
 			Resources: resources,
 			Ports: []corev1.ContainerPort{
@@ -208,7 +208,7 @@ func buildSentinelAddrs(v *vkov1.Valkey) string {
 func buildObserverEnv(v *vkov1.Valkey) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{
-			Name: "POD_NAMESPACE",
+			Name: PodNamespaceEnvName,
 			ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{
 					FieldPath: "metadata.namespace",

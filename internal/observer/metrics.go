@@ -122,7 +122,7 @@ func (m *observerMetrics) updateGauges(checks map[string]bool, healthy bool) {
 		}
 	}
 
-	setGauge(m.masterReachable, "master_reachable")
+	setGauge(m.masterReachable, checkMasterReachable)
 	setGauge(m.replicaSyncOK, "replica_sync")
 	setGauge(m.writeTestOK, "write_test")
 	setGauge(m.readTestOK, "read_test")

@@ -44,7 +44,7 @@ func (o *Observer) discoverMasterViaProbe() (string, error) {
 		if err != nil {
 			continue
 		}
-		if info.Role == "master" && info.ConnectedSlaves > bestSlaves {
+		if info.Role == roleMaster && info.ConnectedSlaves > bestSlaves {
 			bestAddr = addr
 			bestSlaves = info.ConnectedSlaves
 		}
@@ -109,8 +109,8 @@ func (o *Observer) checkReplicaSync(masterAddr string) error {
 func (o *Observer) writeHealthKey(masterAddr, value string) error {
 	client := o.newClient(masterAddr, o.cfg.Password)
 	return client.ExecMulti(
-		[]string{"SELECT", fmt.Sprintf("%d", o.cfg.ObserverDB)},
-		[]string{"SET", "__vko_observer_health", value, "EX", "10"},
+		[]string{selectCommand, fmt.Sprintf("%d", o.cfg.ObserverDB)},
+		[]string{"SET", observerHealthKey, value, "EX", "10"},
 	)
 }
 
@@ -118,8 +118,8 @@ func (o *Observer) writeHealthKey(masterAddr, value string) error {
 func (o *Observer) readHealthKey(addr, expectedValue string) error {
 	client := o.newClient(addr, o.cfg.Password)
 	val, err := client.ExecGet(
-		[]string{"SELECT", fmt.Sprintf("%d", o.cfg.ObserverDB)},
-		[]string{"GET", "__vko_observer_health"},
+		[]string{selectCommand, fmt.Sprintf("%d", o.cfg.ObserverDB)},
+		[]string{"GET", observerHealthKey},
 	)
 	if err != nil {
 		return fmt.Errorf("GET health key: %w", err)

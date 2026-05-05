@@ -39,6 +39,15 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
+const (
+	// certManagerGroup is the API group of cert-manager resources.
+	certManagerGroup = "cert-manager.io"
+	// certManagerKindCertificate is the Kind of cert-manager Certificate resources.
+	certManagerKindCertificate = "Certificate"
+	// conditionTypeReady is the standard "Ready" condition type.
+	conditionTypeReady = "Ready"
+)
+
 // InstanceChecker verifies connectivity and health of Valkey instances.
 // Implementations must provide PingPod for basic connectivity checks,
 // CheckCluster for full HA cluster health verification, and GetReplicationInfo
@@ -845,9 +854,9 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 	// (Forbidden) rather than 404 (NotFound) and would loop the reconciler.
 	cert := &unstructured.Unstructured{}
 	cert.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "cert-manager.io",
+		Group:   certManagerGroup,
 		Version: "v1",
-		Kind:    "Certificate",
+		Kind:    certManagerKindCertificate,
 	})
 	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert); err == nil {
 		if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
@@ -966,9 +975,9 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "cert-manager.io",
+		Group:   certManagerGroup,
 		Version: "v1",
-		Kind:    "Certificate",
+		Kind:    certManagerKindCertificate,
 	})
 
 	name := desired.GetName()
@@ -1204,7 +1213,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Message = fmt.Sprintf("Instance unreachable: %v", err)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               conditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ConnectivityCheckFailed",
@@ -1218,7 +1227,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               conditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "AllReplicasReady",
@@ -1230,7 +1239,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = fmt.Sprintf("Waiting for replicas: %d/%d ready", readyReplicas, v.Spec.Replicas)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
+			Type:               conditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "ReplicasNotReady",
@@ -1241,7 +1250,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = "Waiting for replicas to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
+			Type:               conditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "NoReplicasReady",
@@ -1295,7 +1304,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			v.Status.Message = fmt.Sprintf("Cluster health check failed: %v", clusterState.Error)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               conditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ClusterHealthCheckFailed",
@@ -1308,7 +1317,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				clusterState.ReadyReplicas, clusterState.TotalReplicas)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               conditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ReplicationSyncing",
@@ -1321,7 +1330,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               conditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "HAClusterReady",
@@ -1334,7 +1343,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
+			Type:               conditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterProvisioning",
@@ -1346,7 +1355,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		v.Status.Message = "Waiting for HA cluster pods to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
+			Type:               conditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterNotReady",
@@ -1474,7 +1483,7 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 			unreachable++
 			continue
 		}
-		if info.Role == "master" {
+		if info.Role == common.RoleMaster {
 			hasMaster = true
 			break
 		}
@@ -1522,7 +1531,7 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 			logger.Info("Failed to redirect replica to pod-0 (will retry on next reconcile)",
 				"pod", podName, "error", err)
 		} else {
-			logger.Info("Redirected replica to pod-0", "pod", podName, "master", masterHost)
+			logger.Info("Redirected replica to pod-0", "pod", podName, common.RoleMaster, masterHost)
 		}
 	}
 

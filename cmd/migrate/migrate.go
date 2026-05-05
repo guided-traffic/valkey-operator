@@ -19,6 +19,13 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
 
+const (
+	// defaultPasswordKey is the default key used in the auth Secret for the Valkey password.
+	defaultPasswordKey = "password"
+	// certManagerGroup is the API group of cert-manager resources.
+	certManagerGroup = "cert-manager.io"
+)
+
 var (
 	migrateScheme = runtime.NewScheme()
 	migrateLog    = ctrl.Log.WithName("migrate")
@@ -98,14 +105,14 @@ func applyDefaults(vk *vkov1.Valkey) bool {
 
 	// spec.auth.secretPasswordKey defaults to "password"
 	if vk.Spec.Auth != nil && vk.Spec.Auth.SecretPasswordKey == "" {
-		vk.Spec.Auth.SecretPasswordKey = "password"
+		vk.Spec.Auth.SecretPasswordKey = defaultPasswordKey
 		changed = true
 	}
 
 	// spec.tls.certManager.issuer.group defaults to "cert-manager.io"
 	if vk.Spec.TLS != nil && vk.Spec.TLS.CertManager != nil {
 		if vk.Spec.TLS.CertManager.Issuer.Group == "" {
-			vk.Spec.TLS.CertManager.Issuer.Group = "cert-manager.io"
+			vk.Spec.TLS.CertManager.Issuer.Group = certManagerGroup
 			changed = true
 		}
 	}

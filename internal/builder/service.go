@@ -40,17 +40,17 @@ func valkeyClientPorts(v *vkov1.Valkey) []corev1.ServicePort {
 	}
 	ports := []corev1.ServicePort{
 		{
-			Name:       "valkey",
+			Name:       ValkeyContainerName,
 			Port:       primaryPort,
-			TargetPort: intstr.FromString("valkey"),
+			TargetPort: intstr.FromString(ValkeyContainerName),
 			Protocol:   corev1.ProtocolTCP,
 		},
 	}
 	if v.IsValkeyUnencryptedAllowed() {
 		ports = append(ports, corev1.ServicePort{
-			Name:       "valkey-plain",
+			Name:       ValkeyPlainContainerName,
 			Port:       ValkeyPort,
-			TargetPort: intstr.FromString("valkey-plain"),
+			TargetPort: intstr.FromString(ValkeyPlainContainerName),
 			Protocol:   corev1.ProtocolTCP,
 		})
 	}
@@ -68,9 +68,9 @@ func sentinelHeadlessPorts(v *vkov1.Valkey) []corev1.ServicePort {
 	}
 	ports := []corev1.ServicePort{
 		{
-			Name:       "sentinel",
+			Name:       SentinelContainerName,
 			Port:       primaryPort,
-			TargetPort: intstr.FromString("sentinel"),
+			TargetPort: intstr.FromString(SentinelContainerName),
 			Protocol:   corev1.ProtocolTCP,
 		},
 	}
@@ -102,9 +102,9 @@ func BuildHeadlessService(v *vkov1.Valkey) *corev1.Service {
 			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "valkey",
+					Name:       ValkeyContainerName,
 					Port:       ValkeyPort,
-					TargetPort: intstr.FromString("valkey"),
+					TargetPort: intstr.FromString(ValkeyContainerName),
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},

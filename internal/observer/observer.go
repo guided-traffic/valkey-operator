@@ -18,6 +18,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
+const (
+	// checkMasterReachable is the check identifier for master reachability.
+	checkMasterReachable = "master_reachable"
+	// roleMaster is the Valkey replication role for the master instance.
+	roleMaster = "master"
+	// observerHealthKey is the key used by the observer to write its health probe value.
+	observerHealthKey = "__vko_observer_health"
+	// selectCommand is the SELECT command name used by the Valkey RESP protocol.
+	selectCommand = "SELECT"
+)
+
 // Config holds the observer configuration parsed from flags/env vars.
 type Config struct {
 	Namespace         string
@@ -221,7 +232,7 @@ func (o *Observer) runChecks(ctx context.Context) {
 	masterAddr, err := o.discoverMaster(ctx)
 	if err != nil {
 		logger.Error(err, "check failed", "check", "masterUnreachable")
-		o.setResult(false, map[string]bool{"master_reachable": false},
+		o.setResult(false, map[string]bool{checkMasterReachable: false},
 			fmt.Sprintf("[masterUnreachable] master discovery failed: %v", err), start)
 		o.metrics.recordCycle(time.Since(start), false)
 		return
@@ -253,7 +264,7 @@ func (o *Observer) runCoreChecks(_ context.Context, logger logr.Logger, masterAd
 	uw := o.cfg.UnreadyWhen
 
 	// PING master.
-	firstFailMsg = runCheck(logger, checks, "master_reachable", "masterUnreachable",
+	firstFailMsg = runCheck(logger, checks, checkMasterReachable, "masterUnreachable",
 		firstFailMsg, uw.MasterUnreachable, func() error {
 			return o.pingHost(masterAddr)
 		})
