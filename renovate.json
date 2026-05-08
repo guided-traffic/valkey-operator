@@ -162,6 +162,32 @@
       ]
     },
     {
+      "description": "Makefile-pinned Go tools (custom regex manager): automerge minor and patch updates",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Makefile-pinned Go tools (custom regex manager): require manual review for major updates",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "major-update"
+      ]
+    },
+    {
       "description": "Group Kubernetes-related Go dependencies",
       "matchManagers": [
         "gomod"
