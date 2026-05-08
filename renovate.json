@@ -68,12 +68,23 @@
       ]
     },
     {
+      "description": "Go modules: enable updates for indirect dependencies so transitive security patches (e.g. golang.org/x/net via govulncheck) land without waiting for a direct require to bump",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "indirect"
+      ],
+      "enabled": true
+    },
+    {
       "description": "Go modules: automerge minor and patch updates after CI passes",
       "matchManagers": [
         "gomod"
       ],
       "matchDepTypes": [
-        "require"
+        "require",
+        "indirect"
       ],
       "matchUpdateTypes": [
         "minor",
@@ -88,7 +99,8 @@
         "gomod"
       ],
       "matchDepTypes": [
-        "require"
+        "require",
+        "indirect"
       ],
       "matchUpdateTypes": [
         "major"
