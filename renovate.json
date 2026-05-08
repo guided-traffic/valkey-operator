@@ -30,6 +30,17 @@
       "groupSlug": "go-version"
     },
     {
+      "description": "Bundle golang.org/x/* updates with Go version bumps so govulncheck sees a consistent set (e.g. golang.org/x/net fixes shipped alongside Go releases)",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "/^golang\\.org\\/x\\//"
+      ],
+      "groupName": "Go version",
+      "groupSlug": "go-version"
+    },
+    {
       "description": "Go version: automerge minor and patch updates after CI passes",
       "matchDatasources": [
         "golang-version"
