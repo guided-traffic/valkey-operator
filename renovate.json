@@ -14,7 +14,9 @@
   "automergeType": "pr",
   "automergeStrategy": "squash",
   "ignoreTests": false,
-  "prConcurrentLimit": 5,
+  "prConcurrentLimit": 0,
+  "prHourlyLimit": 0,
+  "branchConcurrentLimit": 0,
   "rebaseWhen": "conflicted",
   "postUpdateOptions": [
     "gomodTidy",
@@ -25,6 +27,17 @@
       "description": "Go version: group all Go version updates together to keep them in sync (Containerfile, go.mod, release-template.hbs)",
       "matchDatasources": [
         "golang-version"
+      ],
+      "groupName": "Go version",
+      "groupSlug": "go-version"
+    },
+    {
+      "description": "Bundle golang.org/x/* updates with Go version bumps so govulncheck sees a consistent set (e.g. golang.org/x/net fixes shipped alongside Go releases)",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "/^golang\\.org\\/x\\//"
       ],
       "groupName": "Go version",
       "groupSlug": "go-version"
