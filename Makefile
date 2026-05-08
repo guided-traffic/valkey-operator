@@ -298,11 +298,11 @@ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
 KUSTOMIZE_VERSION ?= v5.8.1
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
-CONTROLLER_GEN_VERSION ?= v0.20.1
+CONTROLLER_GEN_VERSION ?= v0.21.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.19
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.12.1
+GOLANGCI_LINT_VERSION ?= v2.12.2
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
