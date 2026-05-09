@@ -94,13 +94,12 @@
       "automerge": true
     },
     {
-      "description": "Go modules: require manual review for major updates",
+      "description": "Go modules: require manual review for major updates on direct requires",
       "matchManagers": [
         "gomod"
       ],
       "matchDepTypes": [
-        "require",
-        "indirect"
+        "require"
       ],
       "matchUpdateTypes": [
         "major"
@@ -110,6 +109,19 @@
         "dependencies",
         "major-update"
       ]
+    },
+    {
+      "description": "Go modules: never open major PRs for indirect deps. Module-path bumps (/v2 -> /v3) cannot be auto-applied without a direct importer, so go mod tidy resets the indirect line to the MVS minimum and Renovate keeps re-opening the same downgrade PR (e.g. gomodules.xyz/jsonpatch/v2). Major updates land via the parent direct dependency.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "indirect"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
     },
     {
       "description": "Docker base images (non-Go): automerge minor and patch updates",
