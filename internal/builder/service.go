@@ -29,6 +29,58 @@ func ReadOnlyServiceName(v *vkov1.Valkey) string {
 	return fmt.Sprintf("%s-r", v.Name)
 }
 
+// MetricsServiceName returns the name for the metrics Service (<name>-metrics).
+func MetricsServiceName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-metrics", v.Name)
+}
+
+// MetricsServiceLabel marks the dedicated metrics Service so a ServiceMonitor can
+// select it exclusively (the other Valkey Services share the same base labels).
+const MetricsServiceLabel = "vko.gtrfc.com/metrics"
+
+// stringTrue is the string literal "true" reused for boolean-style labels and flags.
+const stringTrue = "true"
+
+// metricsServiceSelector returns the label selector that uniquely identifies the
+// metrics Service. Shared by BuildMetricsService and BuildServiceMonitor.
+func metricsServiceSelector(v *vkov1.Valkey) map[string]string {
+	sel := common.SelectorLabels(v, common.ComponentValkey)
+	sel[MetricsServiceLabel] = stringTrue
+	return sel
+}
+
+// BuildMetricsService builds the ClusterIP Service that exposes the exporter
+// /metrics port across all Valkey pods. It is the scrape target referenced by
+// the ServiceMonitor. The Service carries the MetricsServiceLabel marker so the
+// ServiceMonitor selects it and not the other Valkey Services.
+func BuildMetricsService(v *vkov1.Valkey) *corev1.Service {
+	labels := common.BaseLabels(v, common.ComponentValkey)
+	if v.Spec.Metrics != nil && v.Spec.Metrics.Service != nil {
+		labels = common.MergeLabels(labels, v.Spec.Metrics.Service.Labels)
+	}
+	labels[MetricsServiceLabel] = stringTrue
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      MetricsServiceName(v),
+			Namespace: v.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: common.SelectorLabels(v, common.ComponentValkey),
+			Ports: []corev1.ServicePort{
+				{
+					Name:       ExporterPortName,
+					Port:       v.MetricsPort(),
+					TargetPort: intstr.FromString(ExporterPortName),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
 // valkeyClientPorts returns the Service ports for a Valkey client Service.
 // When TLS is disabled: single port 6379 → named port "valkey" (pod port 6379).
 // When TLS is enabled:  single port 16379 → named port "valkey" (pod port 16379, TLS).

@@ -166,11 +166,89 @@ type TLSSpec struct {
 	UnifiedCertificate bool `json:"unifiedCertificate,omitempty"`
 }
 
-// MetricsSpec defines metrics/exporter configuration.
+const (
+	// DefaultMetricsExporterImage is the exporter image used when spec.metrics.image is empty.
+	// oliver006/redis_exporter supports Valkey and exposes standard Redis/Valkey metrics.
+	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0"
+
+	// DefaultMetricsExporterPort is the default port the exporter serves /metrics on.
+	DefaultMetricsExporterPort int32 = 9121
+
+	// DefaultMetricsScrapeInterval is the default ServiceMonitor scrape interval.
+	DefaultMetricsScrapeInterval = "30s"
+)
+
+// MetricsSpec defines the metrics exporter (Prometheus) configuration.
 type MetricsSpec struct {
 	// Enabled activates the metrics exporter sidecar.
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
+
+	// Image is the exporter container image. When empty, a sensible default
+	// (a redis_exporter release that also supports Valkey) is used.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the container/Service port the exporter serves /metrics on.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// Resources defines the compute resource requirements for the exporter container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ExtraArgs are additional command-line arguments passed to the exporter.
+	// +optional
+	ExtraArgs []string `json:"extraArgs,omitempty"`
+
+	// Service configures the dedicated metrics Service.
+	// The Service is enabled by default when metrics are enabled.
+	// +optional
+	Service *MetricsServiceSpec `json:"service,omitempty"`
+
+	// ServiceMonitor configures a Prometheus-Operator ServiceMonitor.
+	// Requires the monitoring.coreos.com CRDs to be installed in the cluster;
+	// the operator only creates the ServiceMonitor when this is enabled.
+	// +optional
+	ServiceMonitor *ServiceMonitorSpec `json:"serviceMonitor,omitempty"`
+}
+
+// MetricsServiceSpec configures the dedicated metrics Service that exposes the
+// exporter port for scraping.
+type MetricsServiceSpec struct {
+	// Enabled controls creation of the metrics Service.
+	// Defaults to true when metrics are enabled.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Labels are additional labels applied to the metrics Service.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// ServiceMonitorSpec configures a Prometheus-Operator ServiceMonitor for the exporter.
+type ServiceMonitorSpec struct {
+	// Enabled activates ServiceMonitor creation. Requires the Prometheus-Operator CRDs.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Interval at which Prometheus scrapes the exporter (e.g. "30s").
+	// +kubebuilder:default="30s"
+	// +optional
+	Interval string `json:"interval,omitempty"`
+
+	// ScrapeTimeout is the per-scrape timeout (e.g. "10s").
+	// When empty, Prometheus' own default is used.
+	// +optional
+	ScrapeTimeout string `json:"scrapeTimeout,omitempty"`
+
+	// Labels are additional labels applied to the ServiceMonitor, commonly used to
+	// match a Prometheus instance's serviceMonitorSelector (e.g. release: prometheus).
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // NetworkPolicySpec defines network policy configuration.
@@ -502,6 +580,52 @@ func (v *Valkey) IsTLSSecretProvided() bool {
 // IsMetricsEnabled returns true if metrics exporter is enabled.
 func (v *Valkey) IsMetricsEnabled() bool {
 	return v.Spec.Metrics != nil && v.Spec.Metrics.Enabled
+}
+
+// MetricsImage returns the exporter image, falling back to the default.
+func (v *Valkey) MetricsImage() string {
+	if v.Spec.Metrics != nil && v.Spec.Metrics.Image != "" {
+		return v.Spec.Metrics.Image
+	}
+	return DefaultMetricsExporterImage
+}
+
+// MetricsPort returns the exporter port, falling back to the default.
+func (v *Valkey) MetricsPort() int32 {
+	if v.Spec.Metrics != nil && v.Spec.Metrics.Port != 0 {
+		return v.Spec.Metrics.Port
+	}
+	return DefaultMetricsExporterPort
+}
+
+// IsServiceMonitorEnabled returns true if a Prometheus-Operator ServiceMonitor
+// should be created for the exporter.
+func (v *Valkey) IsServiceMonitorEnabled() bool {
+	return v.IsMetricsEnabled() &&
+		v.Spec.Metrics.ServiceMonitor != nil &&
+		v.Spec.Metrics.ServiceMonitor.Enabled
+}
+
+// IsMetricsServiceEnabled returns true if the dedicated metrics Service should be
+// created. It defaults to true when metrics are enabled. A ServiceMonitor requires
+// the Service to scrape, so an enabled ServiceMonitor forces the Service on.
+func (v *Valkey) IsMetricsServiceEnabled() bool {
+	if !v.IsMetricsEnabled() {
+		return false
+	}
+	if v.Spec.Metrics.Service != nil && v.Spec.Metrics.Service.Enabled != nil {
+		return *v.Spec.Metrics.Service.Enabled || v.IsServiceMonitorEnabled()
+	}
+	return true
+}
+
+// MetricsScrapeInterval returns the ServiceMonitor scrape interval or the default.
+func (v *Valkey) MetricsScrapeInterval() string {
+	if v.Spec.Metrics != nil && v.Spec.Metrics.ServiceMonitor != nil &&
+		v.Spec.Metrics.ServiceMonitor.Interval != "" {
+		return v.Spec.Metrics.ServiceMonitor.Interval
+	}
+	return DefaultMetricsScrapeInterval
 }
 
 // IsNetworkPolicyEnabled returns true if network policies are enabled.

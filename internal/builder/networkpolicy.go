@@ -126,6 +126,22 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networ
 		},
 	})
 
+	// When the metrics exporter is enabled, allow ingress on the exporter port.
+	// The scrape traffic originates from Prometheus pods whose location is not
+	// known to the operator, so — like the health port — no From restriction is
+	// applied. The exporter endpoint is read-only.
+	if v.IsMetricsEnabled() {
+		metricsPort := intstr.FromInt32(v.MetricsPort())
+		ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{
+					Protocol: &tcpProtocol,
+					Port:     &metricsPort,
+				},
+			},
+		})
+	}
+
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      NetworkPolicyName(v),
