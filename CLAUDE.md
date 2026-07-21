@@ -35,7 +35,23 @@ spec:
     secretName: my-valkey-secret
     secretPasswordKey: password
   metrics:
-    enabled: true
+    enabled: true                 # adds a Prometheus exporter sidecar to each Valkey pod
+    image: oliver006/redis_exporter:v1.66.0  # optional; sensible default when omitted
+    port: 9121                    # optional; exporter /metrics port (default 9121)
+    resources:                    # optional; compute resources for the exporter container
+      limits:
+        cpu: "100m"
+        memory: "64Mi"
+    extraArgs: []                 # optional; extra exporter CLI flags, e.g. ["--check-keys=*"]
+    service:
+      enabled: true               # optional; dedicated <name>-metrics Service (default true)
+      labels: {}                  # optional; extra labels on the metrics Service
+    serviceMonitor:
+      enabled: false              # set true to create a Prometheus-Operator ServiceMonitor
+      interval: 30s               # optional; scrape interval (default 30s)
+      scrapeTimeout: ""           # optional; per-scrape timeout
+      labels:                     # optional; match your Prometheus serviceMonitorSelector
+        release: prometheus
   tls:
     enabled: true
     allowUnencrypted: false      # set to true to keep port 6379 open alongside TLS port 16379
@@ -139,6 +155,33 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 4. After 2 replicas are migrated: initiate controlled leader failover
 5. Verify failover succeeded
 6. Replace last pod (former master)
+
+## Metrics / Exporter
+
+`spec.metrics.enabled` adds an exporter sidecar (default `oliver006/redis_exporter`)
+to every Valkey pod, serving `/metrics` on `spec.metrics.port` (default 9121, named
+port `metrics`). Implementation:
+
+- Sidecar container: `buildExporterContainer` in `internal/builder/statefulset.go`,
+  appended via `buildPodContainers`. Connects to `localhost` (TLS port + skip-verify
+  when TLS is on), reads the auth password from the Secret as `REDIS_PASSWORD`. It
+  carries **no readiness probe** so a failing exporter never removes the pod from the
+  `-rw`/`-r` Services.
+- Service: `BuildMetricsService` (`<name>-metrics`) carries the marker label
+  `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it.
+- ServiceMonitor: `BuildServiceMonitor` in `internal/builder/servicemonitor.go` is an
+  `unstructured.Unstructured` (`monitoring.coreos.com/v1`) — no typed dependency,
+  mirroring the cert-manager Certificate handling. Gated behind
+  `spec.metrics.serviceMonitor.enabled`; skipped gracefully when the CRD is absent.
+- Controller: `reconcileMetrics` (create-or-cleanup) in `valkey_controller.go`,
+  wired via `reconcileMonitoringResources`.
+- NetworkPolicy: the exporter port is opened on the Valkey ingress rule when metrics
+  are enabled.
+- **Lossless migration:** enabling metrics on a running cluster changes the pod-spec
+  hash, so the existing failover-aware rolling update migrates pods without data loss
+  — no persistence required. Exception: a single standalone pod (`replicas: 1`, no
+  persistence) has no failover target, so adding the sidecar restarts it and loses
+  in-memory data (physically unavoidable).
 
 # Important Notes
 
