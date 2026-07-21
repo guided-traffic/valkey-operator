@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/go-logr/logr v1.4.4
-	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_golang v1.24.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.28.0
 	k8s.io/api v0.36.2
