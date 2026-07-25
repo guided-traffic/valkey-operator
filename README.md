@@ -16,6 +16,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Observability** — CRD status visible in `kubectl` and Lens, Kubernetes Events
 - **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
+- **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
@@ -304,6 +305,52 @@ Health endpoints:
 | `GET /healthz` | Always 200 (liveness) |
 | `GET /metrics` | Prometheus metrics |
 
+### With Metrics (Prometheus Exporter)
+
+Attach a metrics exporter sidecar to every Valkey pod. The exporter (`oliver006/redis_exporter` by default) connects to the local Valkey instance and serves `/metrics` on port `9121`. TLS and authentication are handled automatically — the exporter reuses the pod's mounted certificates and the auth Secret.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: monitored
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  metrics:
+    enabled: true
+    # image: oliver006/redis_exporter:v1.66.0  # optional; default shown
+    # port: 9121                               # optional; exporter /metrics port
+    resources:
+      requests:
+        cpu: 50m
+        memory: 32Mi
+      limits:
+        memory: 64Mi
+    service:
+      enabled: true          # dedicated <name>-metrics Service (default: true)
+    serviceMonitor:
+      enabled: true          # requires the Prometheus-Operator CRDs
+      interval: 30s
+      labels:
+        release: prometheus  # match your Prometheus serviceMonitorSelector
+```
+
+Enabling metrics creates:
+
+| Resource | Name | Description |
+|----------|------|-------------|
+| Container | `exporter` | Exporter sidecar added to each Valkey pod (no readiness probe, so it never affects pod routing) |
+| Service | `monitored-metrics` | ClusterIP Service exposing the `metrics` port across all Valkey pods, marked with `vko.gtrfc.com/metrics: "true"` |
+| ServiceMonitor | `monitored-metrics` | Prometheus-Operator scrape target selecting the metrics Service (only when `serviceMonitor.enabled: true`) |
+
+The `ServiceMonitor` is managed as an unstructured object, so the operator has **no build-time dependency** on the Prometheus-Operator. If the `monitoring.coreos.com` CRDs are not installed, the operator logs a message and skips the `ServiceMonitor` rather than failing.
+
+> **Lossless migration:** turning `metrics.enabled` on (or off) changes the pod template, which the operator rolls out through its normal failover-aware rolling update — replicas are replaced one by one and the leader is failed over, so **no data is lost even without persistence**. The only exception is a single standalone pod (`replicas: 1`) without persistence: it has no failover target, so adding the sidecar restarts it and its in-memory data is lost.
+
 ### HA — With Authentication
 
 Protect your cluster with a password stored in a Kubernetes Secret.
@@ -403,6 +450,36 @@ spec:
 | `issuer.name` | `string` | Name of the issuer resource |
 | `issuer.group` | `string` | API group (default: `cert-manager.io`) |
 | `extraDnsNames` | `[]string` | Additional DNS names for the certificate |
+
+### `spec.metrics`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Add a Prometheus exporter sidecar to each Valkey pod |
+| `image` | `string` | `oliver006/redis_exporter:v1.66.0` | Exporter container image |
+| `port` | `int32` | `9121` | Container/Service port serving `/metrics` (named `metrics`) |
+| `resources` | `ResourceRequirements` | — | CPU/memory requests and limits for the exporter container |
+| `extraArgs` | `[]string` | — | Additional command-line arguments passed to the exporter (e.g. `["--check-keys=*"]`) |
+| `service` | `MetricsServiceSpec` | — | Dedicated metrics Service configuration |
+| `serviceMonitor` | `ServiceMonitorSpec` | — | Prometheus-Operator ServiceMonitor configuration |
+
+### `spec.metrics.service`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Create the dedicated `<name>-metrics` Service. An enabled `serviceMonitor` forces this on regardless. |
+| `labels` | `map[string]string` | — | Additional labels applied to the metrics Service |
+
+### `spec.metrics.serviceMonitor`
+
+Requires the Prometheus-Operator CRDs (`monitoring.coreos.com`) to be installed. When they are absent, the operator skips the ServiceMonitor instead of failing.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Create a ServiceMonitor selecting the metrics Service |
+| `interval` | `string` | `30s` | Scrape interval |
+| `scrapeTimeout` | `string` | — | Per-scrape timeout (empty = Prometheus default) |
+| `labels` | `map[string]string` | — | Additional labels, commonly used to match a Prometheus instance's `serviceMonitorSelector` (e.g. `release: prometheus`) |
 
 ### `spec.observer`
 
@@ -540,6 +617,9 @@ When TLS is enabled (`spec.tls.enabled: true`):
 |-----------|--------|----------|--------------------------|
 | Valkey | `6379` | `16379` | `16379` + `6379` |
 | Sentinel | `26379` | `36379` | `36379` + `26379` |
+| Metrics exporter | `9121` | `9121` | `9121` |
+
+The metrics exporter always serves plaintext HTTP on `9121` (configurable via `spec.metrics.port`); it connects to the local Valkey over the TLS port internally when TLS is enabled.
 
 ### Dual-Port Mode (`allowUnencrypted`)
 

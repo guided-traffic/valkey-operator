@@ -171,6 +171,7 @@ func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;escalate;bind
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
@@ -329,11 +330,139 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		}
 	}
 
-	// Reconcile Observer Deployment (create or cleanup).
-	if err := r.reconcileObserver(ctx, valkey); err != nil {
+	// Reconcile monitoring resources (Observer Deployment + metrics exporter
+	// Service/ServiceMonitor), each created or cleaned up based on its toggle.
+	if err := r.reconcileMonitoringResources(ctx, valkey); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// reconcileMonitoringResources reconciles the Observer deployment and the metrics
+// exporter Service + ServiceMonitor.
+func (r *ValkeyReconciler) reconcileMonitoringResources(ctx context.Context, valkey *vkov1.Valkey) error {
+	if err := r.reconcileObserver(ctx, valkey); err != nil {
+		return err
+	}
+	if err := r.reconcileMetrics(ctx, valkey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reconcileMetrics reconciles the metrics exporter Service and ServiceMonitor,
+// creating them when enabled and cleaning them up when disabled. The exporter
+// sidecar container itself is part of the StatefulSet pod template (see
+// builder.BuildStatefulSet); enabling/disabling it changes the pod-spec hash and
+// is therefore rolled out through the normal failover-aware rolling update.
+func (r *ValkeyReconciler) reconcileMetrics(ctx context.Context, valkey *vkov1.Valkey) error {
+	// Metrics Service.
+	if valkey.IsMetricsServiceEnabled() {
+		if err := r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey)); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile metrics Service: %v", err))
+			return err
+		}
+	} else if err := r.cleanupMetricsService(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup metrics Service: %v", err))
+		return err
+	}
+
+	// Prometheus-Operator ServiceMonitor.
+	if valkey.IsServiceMonitorEnabled() {
+		if err := r.reconcileServiceMonitor(ctx, valkey); err != nil {
+			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ServiceMonitor: %v", err))
+			return err
+		}
+	} else if err := r.cleanupServiceMonitor(ctx, valkey); err != nil {
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup ServiceMonitor: %v", err))
+		return err
+	}
+
+	return nil
+}
+
+// cleanupMetricsService deletes the metrics Service if it exists.
+func (r *ValkeyReconciler) cleanupMetricsService(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	svc := &corev1.Service{}
+	name := types.NamespacedName{Name: builder.MetricsServiceName(v), Namespace: v.Namespace}
+	if err := r.Get(ctx, name, svc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	logger.Info("Deleting metrics Service", "name", svc.Name)
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting metrics service: %w", err)
+	}
+	return nil
+}
+
+// reconcileServiceMonitor ensures a Prometheus-Operator ServiceMonitor matches the
+// desired state. The ServiceMonitor is handled as an unstructured object so the
+// operator needs no typed dependency on prometheus-operator. When the
+// monitoring.coreos.com CRDs are not installed, the reconcile is skipped
+// gracefully rather than failing.
+func (r *ValkeyReconciler) reconcileServiceMonitor(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildServiceMonitor(v)
+
+	ownerRef := builder.ServiceMonitorOwnerRef(v)
+	blockOwnerDeletion := true
+	isController := true
+	ownerRef.BlockOwnerDeletion = &blockOwnerDeletion
+	ownerRef.Controller = &isController
+	desired.SetOwnerReferences([]metav1.OwnerReference{ownerRef})
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(builder.ServiceMonitorGVK())
+
+	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, current)
+	if meta.IsNoMatchError(err) {
+		logger.Info("ServiceMonitor CRD not installed; skipping ServiceMonitor reconcile", "name", desired.GetName())
+		return nil
+	}
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating ServiceMonitor", "name", desired.GetName())
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if !equality.Semantic.DeepEqual(desired.Object["spec"], current.Object["spec"]) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		logger.Info("Updating ServiceMonitor", "name", desired.GetName())
+		current.Object["spec"] = desired.Object["spec"]
+		current.SetLabels(desired.GetLabels())
+		current.SetOwnerReferences(desired.GetOwnerReferences())
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
+		return r.Update(ctx, current)
+	}
+
+	return nil
+}
+
+// cleanupServiceMonitor deletes the ServiceMonitor if it exists. It tolerates the
+// monitoring.coreos.com CRDs being absent.
+func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(builder.ServiceMonitorGVK())
+	name := types.NamespacedName{Name: builder.ServiceMonitorName(v), Namespace: v.Namespace}
+	if err := r.Get(ctx, name, sm); err != nil {
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	logger.Info("Deleting ServiceMonitor", "name", sm.GetName())
+	if err := r.Delete(ctx, sm); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting servicemonitor: %w", err)
+	}
 	return nil
 }
 

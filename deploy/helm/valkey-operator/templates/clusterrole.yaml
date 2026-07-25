@@ -112,6 +112,19 @@ rules:
       - patch
       - update
       - watch
+  # Prometheus-Operator ServiceMonitors (optional; only used when spec.metrics.serviceMonitor.enabled)
+  - apiGroups:
+      - monitoring.coreos.com
+    resources:
+      - servicemonitors
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
   # RBAC resources for per-instance sidecar Role and RoleBinding
   - apiGroups:
       - rbac.authorization.k8s.io

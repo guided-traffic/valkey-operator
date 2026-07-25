@@ -3,6 +3,7 @@ on:
   # Täglich um 2 Uhr morgens UTC ausführen
   schedule:
     - cron: '0 2 * * *'
+      timezone: "Europe/Berlin"
   # Nach jedem Push auf main
   push:
     branches:
@@ -33,7 +34,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Self-hosted Renovate
-        uses: renovatebot/github-action@v46.1.19
+        uses: renovatebot/github-action@v46.1.20
         with:
           token: ${{ secrets.BOT_PAT }}
           configurationFile: renovate.json

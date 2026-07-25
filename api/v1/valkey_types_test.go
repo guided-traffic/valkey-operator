@@ -346,6 +346,112 @@ func TestIsMetricsEnabled(t *testing.T) {
 	}
 }
 
+func TestMetricsImage(t *testing.T) {
+	tests := []struct {
+		name     string
+		metrics  *MetricsSpec
+		expected string
+	}{
+		{name: "nil metrics uses default", metrics: nil, expected: DefaultMetricsExporterImage},
+		{name: "empty image uses default", metrics: &MetricsSpec{Enabled: true}, expected: DefaultMetricsExporterImage},
+		{name: "custom image", metrics: &MetricsSpec{Enabled: true, Image: "my/exporter:1.0"}, expected: "my/exporter:1.0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.Metrics = tt.metrics })
+			assert.Equal(t, tt.expected, v.MetricsImage())
+		})
+	}
+}
+
+func TestMetricsPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		metrics  *MetricsSpec
+		expected int32
+	}{
+		{name: "nil metrics uses default", metrics: nil, expected: DefaultMetricsExporterPort},
+		{name: "zero port uses default", metrics: &MetricsSpec{Enabled: true}, expected: DefaultMetricsExporterPort},
+		{name: "custom port", metrics: &MetricsSpec{Enabled: true, Port: 19121}, expected: 19121},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.Metrics = tt.metrics })
+			assert.Equal(t, tt.expected, v.MetricsPort())
+		})
+	}
+}
+
+func TestIsServiceMonitorEnabled(t *testing.T) {
+	trueVal := true
+	tests := []struct {
+		name     string
+		metrics  *MetricsSpec
+		expected bool
+	}{
+		{name: "nil metrics", metrics: nil, expected: false},
+		{name: "metrics enabled, no serviceMonitor", metrics: &MetricsSpec{Enabled: true}, expected: false},
+		{name: "metrics disabled, serviceMonitor enabled", metrics: &MetricsSpec{Enabled: false, ServiceMonitor: &ServiceMonitorSpec{Enabled: true}}, expected: false},
+		{name: "metrics enabled, serviceMonitor enabled", metrics: &MetricsSpec{Enabled: true, ServiceMonitor: &ServiceMonitorSpec{Enabled: true}}, expected: true},
+		{name: "metrics enabled, serviceMonitor disabled", metrics: &MetricsSpec{Enabled: true, ServiceMonitor: &ServiceMonitorSpec{Enabled: false}}, expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.Metrics = tt.metrics })
+			assert.Equal(t, tt.expected, v.IsServiceMonitorEnabled())
+		})
+	}
+	// Sanity: forced-on service via serviceMonitor while service explicitly disabled.
+	v := newValkey("test", func(v *Valkey) {
+		v.Spec.Metrics = &MetricsSpec{
+			Enabled:        true,
+			Service:        &MetricsServiceSpec{Enabled: new(bool)}, // *false
+			ServiceMonitor: &ServiceMonitorSpec{Enabled: trueVal},
+		}
+	})
+	assert.True(t, v.IsMetricsServiceEnabled(), "ServiceMonitor must force the metrics Service on")
+}
+
+func TestIsMetricsServiceEnabled(t *testing.T) {
+	trueVal, falseVal := true, false
+	tests := []struct {
+		name     string
+		metrics  *MetricsSpec
+		expected bool
+	}{
+		{name: "nil metrics", metrics: nil, expected: false},
+		{name: "metrics disabled", metrics: &MetricsSpec{Enabled: false}, expected: false},
+		{name: "metrics enabled, default", metrics: &MetricsSpec{Enabled: true}, expected: true},
+		{name: "metrics enabled, service explicit true", metrics: &MetricsSpec{Enabled: true, Service: &MetricsServiceSpec{Enabled: &trueVal}}, expected: true},
+		{name: "metrics enabled, service explicit false", metrics: &MetricsSpec{Enabled: true, Service: &MetricsServiceSpec{Enabled: &falseVal}}, expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.Metrics = tt.metrics })
+			assert.Equal(t, tt.expected, v.IsMetricsServiceEnabled())
+		})
+	}
+}
+
+func TestMetricsScrapeInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		metrics  *MetricsSpec
+		expected string
+	}{
+		{name: "nil metrics uses default", metrics: nil, expected: DefaultMetricsScrapeInterval},
+		{name: "no serviceMonitor uses default", metrics: &MetricsSpec{Enabled: true}, expected: DefaultMetricsScrapeInterval},
+		{name: "empty interval uses default", metrics: &MetricsSpec{Enabled: true, ServiceMonitor: &ServiceMonitorSpec{Enabled: true}}, expected: DefaultMetricsScrapeInterval},
+		{name: "custom interval", metrics: &MetricsSpec{Enabled: true, ServiceMonitor: &ServiceMonitorSpec{Enabled: true, Interval: "15s"}}, expected: "15s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.Metrics = tt.metrics })
+			assert.Equal(t, tt.expected, v.MetricsScrapeInterval())
+		})
+	}
+}
+
 func TestIsNetworkPolicyEnabled(t *testing.T) {
 	tests := []struct {
 		name     string

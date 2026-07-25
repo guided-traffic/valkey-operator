@@ -26,6 +26,12 @@ const (
 	// SidecarHealthPort is the port on which the sidecar readiness endpoint listens.
 	SidecarHealthPort = 8082
 
+	// ExporterContainerName is the name of the Prometheus metrics exporter sidecar container.
+	ExporterContainerName = "exporter"
+
+	// ExporterPortName is the named container/Service port that serves /metrics.
+	ExporterPortName = "metrics"
+
 	// ConfigVolumeName is the name of the volume for the master Valkey configuration (readonly).
 	ConfigVolumeName = "config"
 
@@ -504,11 +510,8 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 
 	spec := corev1.PodSpec{
 		ServiceAccountName: SidecarServiceAccountName(v),
-		Containers: []corev1.Container{
-			buildValkeyContainer(v),
-			buildSidecarContainer(v, operatorImage),
-		},
-		Volumes: volumes,
+		Containers:         buildPodContainers(v, operatorImage),
+		Volumes:            volumes,
 	}
 
 	// Set terminationGracePeriodSeconds to allow time for graceful failover.
@@ -800,6 +803,101 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 			FailureThreshold:    5,
 		},
 	}
+}
+
+// buildPodContainers assembles the runtime container list for a Valkey pod: the
+// main Valkey container, the operator sidecar, and — when metrics are enabled —
+// the exporter sidecar. Adding/removing the exporter changes the pod-spec hash, so
+// the operator migrates existing clusters through the normal failover-aware
+// rolling update.
+func buildPodContainers(v *vkov1.Valkey, operatorImage string) []corev1.Container {
+	containers := []corev1.Container{
+		buildValkeyContainer(v),
+		buildSidecarContainer(v, operatorImage),
+	}
+	if v.IsMetricsEnabled() {
+		containers = append(containers, buildExporterContainer(v))
+	}
+	return containers
+}
+
+// buildExporterContainer builds the Prometheus metrics exporter sidecar container.
+// It connects to the local Valkey over localhost and serves /metrics on the
+// configured port. The exporter deliberately carries NO readiness probe: a failing
+// exporter must never remove the Valkey pod from the -rw/-r Services or stall a
+// rolling update, so its health is decoupled from pod readiness.
+func buildExporterContainer(v *vkov1.Valkey) corev1.Container {
+	port := v.MetricsPort()
+
+	scheme := "redis"
+	valkeyPort := ValkeyPort
+	if v.IsTLSEnabled() {
+		scheme = "rediss"
+		valkeyPort = TLSPort
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "REDIS_ADDR", Value: fmt.Sprintf("%s://localhost:%d", scheme, valkeyPort)},
+		{Name: "REDIS_EXPORTER_WEB_LISTEN_ADDRESS", Value: fmt.Sprintf(":%d", port)},
+	}
+
+	// Inject the auth password so the exporter can authenticate against Valkey.
+	if v.IsAuthEnabled() {
+		env = append(env, corev1.EnvVar{
+			Name: "REDIS_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: v.Spec.Auth.SecretName,
+					},
+					Key: v.Spec.Auth.SecretPasswordKey,
+				},
+			},
+		})
+	}
+
+	var volumeMounts []corev1.VolumeMount
+
+	// Under TLS the exporter connects over the TLS port. It talks to localhost,
+	// whose name is not on the server certificate, so server-name verification is
+	// skipped; the CA and client certificate are still provided (tls-auth-clients
+	// is optional on the server side).
+	if v.IsTLSEnabled() {
+		env = append(env,
+			corev1.EnvVar{Name: "REDIS_EXPORTER_SKIP_TLS_VERIFICATION", Value: stringTrue},
+			corev1.EnvVar{Name: "REDIS_EXPORTER_TLS_CA_CERT_FILE", Value: TLSMountPath + "/ca.crt"},
+			corev1.EnvVar{Name: "REDIS_EXPORTER_TLS_CLIENT_CERT_FILE", Value: TLSMountPath + "/tls.crt"},
+			corev1.EnvVar{Name: "REDIS_EXPORTER_TLS_CLIENT_KEY_FILE", Value: TLSMountPath + "/tls.key"},
+		)
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			MountPath: TLSMountPath,
+			ReadOnly:  true,
+		})
+	}
+
+	container := corev1.Container{
+		Name:  ExporterContainerName,
+		Image: v.MetricsImage(),
+		Env:   env,
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          ExporterPortName,
+				ContainerPort: port,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		VolumeMounts: volumeMounts,
+	}
+
+	if v.Spec.Metrics != nil && v.Spec.Metrics.Resources != nil {
+		container.Resources = *v.Spec.Metrics.Resources
+	}
+	if v.Spec.Metrics != nil && len(v.Spec.Metrics.ExtraArgs) > 0 {
+		container.Args = append(container.Args, v.Spec.Metrics.ExtraArgs...)
+	}
+
+	return container
 }
 
 // buildInitContainerVolumeMounts returns the volume mounts for the HA init

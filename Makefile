@@ -205,7 +205,7 @@ coverage-json: ## Generate coverage badge JSON for shields.io.
 gosec: ## Run gosec security scan.
 	@echo "Running gosec security scan..."
 	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION))
-	GOFLAGS="-buildvcs=false" gosec ./...
+	GOFLAGS="-buildvcs=false -p=$(GOSEC_CONCURRENCY)" GOMEMLIMIT=$(GOSEC_MEMLIMIT) gosec -concurrency=$(GOSEC_CONCURRENCY) ./...
 
 .PHONY: vuln
 vuln: ## Check for vulnerabilities.
@@ -306,7 +306,15 @@ GOLANGCI_LINT_VERSION ?= v2.12.2
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.27.1
+GOSEC_VERSION ?= v2.28.0
+
+# gosec defaults its concurrency to the CPU count and lets the Go toolchain fan
+# out one compiler per core while loading the (large) k8s dependency graph. On
+# the self-hosted runners, where all CI jobs share one machine, that peaks at
+# ~10 GB and gets the runner OOM-killed. Bounding both knobs keeps the peak at
+# ~2.5 GB without changing the findings or the runtime.
+GOSEC_CONCURRENCY ?= 4
+GOSEC_MEMLIMIT ?= 1GiB
 
 # Cyclomatic complexity threshold (recommended: 10-15)
 CYCLO_THRESHOLD ?= 15
