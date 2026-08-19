@@ -1,0 +1,129 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/builder"
+)
+
+// reconcilePodDisruptionBudgets reconciles the data and Sentinel PodDisruptionBudgets.
+//
+// Why the operator manages them at all: a node drain evicts every pod on the node
+// at once. Without a budget that can be all data pods (the 2026-08-19 infra-d
+// incident) or the Sentinel majority, which removes automatic failover exactly
+// when it is needed. The Eviction API is the only thing that serializes voluntary
+// disruptions, and it needs a PDB to do so.
+//
+// Both budgets are opt-in (spec.podDisruptionBudget.enabled) because a PDB the
+// operator creates alongside a user-managed one would make eviction fail outright:
+// the Eviction API refuses a pod covered by more than one budget.
+func (r *ValkeyReconciler) reconcilePodDisruptionBudgets(ctx context.Context, valkey *vkov1.Valkey) error {
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "data PodDisruptionBudget", run: r.reconcileDataPodDisruptionBudget},
+		{name: "Sentinel PodDisruptionBudget", run: r.reconcileSentinelPodDisruptionBudget},
+	})
+}
+
+// reconcileDataPodDisruptionBudget creates the data PDB when it applies and removes
+// it otherwise (disabled, or the StatefulSet scaled below the minimum replica count).
+func (r *ValkeyReconciler) reconcileDataPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.NeedsDataPodDisruptionBudget() {
+		if v.IsPodDisruptionBudgetEnabled() && v.Spec.Replicas < vkov1.MinPDBReplicas {
+			logPodDisruptionBudgetSkip(ctx, builder.PodDisruptionBudgetName(v), v.Spec.Replicas)
+		}
+		return r.cleanupPodDisruptionBudget(ctx, v, builder.PodDisruptionBudgetName(v))
+	}
+
+	changed, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v))
+	if err == nil && changed && v.PodDisruptionBudgetMaxUnavailable() >= v.Spec.Replicas {
+		log.FromContext(ctx).Info("PodDisruptionBudget allows every data pod to be evicted at once; "+
+			"spec.podDisruptionBudget.maxUnavailable is not smaller than spec.replicas",
+			"name", builder.PodDisruptionBudgetName(v),
+			"maxUnavailable", v.PodDisruptionBudgetMaxUnavailable(), "replicas", v.Spec.Replicas)
+	}
+	return err
+}
+
+// reconcileSentinelPodDisruptionBudget creates the quorum-preserving Sentinel PDB
+// when it applies and removes it otherwise (PDBs or Sentinel disabled, or fewer
+// than two Sentinel replicas).
+func (r *ValkeyReconciler) reconcileSentinelPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.NeedsSentinelPodDisruptionBudget() {
+		if v.IsPodDisruptionBudgetEnabled() && v.IsSentinelEnabled() &&
+			v.Spec.Sentinel.Replicas < vkov1.MinPDBReplicas {
+			logPodDisruptionBudgetSkip(ctx, builder.SentinelPodDisruptionBudgetName(v), v.Spec.Sentinel.Replicas)
+		}
+		return r.cleanupPodDisruptionBudget(ctx, v, builder.SentinelPodDisruptionBudgetName(v))
+	}
+
+	_, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
+	return err
+}
+
+// logPodDisruptionBudgetSkip records why an enabled PDB was not created. A
+// StatefulSet with a single pod is deliberately left uncovered: maxUnavailable=1
+// would permit evicting the only pod and minAvailable=1 would block node drains
+// forever, neither of which makes a non-HA instance safer.
+func logPodDisruptionBudgetSkip(ctx context.Context, name string, replicas int32) {
+	log.FromContext(ctx).V(1).Info("Skipping PodDisruptionBudget: fewer replicas than the minimum",
+		"name", name, "replicas", replicas, "minimum", vkov1.MinPDBReplicas)
+}
+
+// reconcilePodDisruptionBudget ensures a single PDB matches the desired state.
+// It reports whether the object was created or updated.
+func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *vkov1.Valkey,
+	desired *policyv1.PodDisruptionBudget) (bool, error) {
+	logger := log.FromContext(ctx)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return false, fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
+	}
+
+	current := &policyv1.PodDisruptionBudget{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating PodDisruptionBudget", "name", desired.Name)
+		return true, r.Create(ctx, desired)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if builder.PodDisruptionBudgetHasChanged(desired, current) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		logger.Info("Updating PodDisruptionBudget", "name", desired.Name)
+		builder.ApplyPodDisruptionBudgetSpec(desired, current)
+		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
+		return true, r.Update(ctx, current)
+	}
+
+	return false, nil
+}
+
+// cleanupPodDisruptionBudget deletes the named PDB if it exists.
+func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey, name string) error {
+	logger := log.FromContext(ctx)
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: v.Namespace}, pdb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	logger.Info("Deleting PodDisruptionBudget", "name", name)
+	if err := r.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting poddisruptionbudget: %w", err)
+	}
+	return nil
+}

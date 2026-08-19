@@ -274,6 +274,45 @@ type ServiceMonitorSpec struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
+const (
+	// DefaultPDBMaxUnavailable is the maxUnavailable used for the data
+	// PodDisruptionBudget when spec.podDisruptionBudget.maxUnavailable is unset.
+	DefaultPDBMaxUnavailable int32 = 1
+
+	// MinPDBReplicas is the smallest replica count that gets a PodDisruptionBudget.
+	// A StatefulSet with a single pod is never covered: maxUnavailable=1 would
+	// permit evicting the only pod (a useless object) and minAvailable=1 would
+	// block node drains forever (fake safety — a singleton is not HA either way).
+	MinPDBReplicas int32 = 2
+)
+
+// PodDisruptionBudgetSpec configures PodDisruptionBudgets for the Valkey data
+// and Sentinel StatefulSets. Omit the whole block to keep the operator out of
+// PDBs entirely — users who manage their own PDB for these pods would otherwise
+// end up with two budgets matching the same pods, which makes the Eviction API
+// refuse every eviction.
+type PodDisruptionBudgetSpec struct {
+	// Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
+	// and, when Sentinel is enabled, a quorum-preserving PDB
+	// (minAvailable = floor(replicas/2)+1) for the Sentinel StatefulSet.
+	// StatefulSets with fewer than 2 replicas never get a PDB: it would either be
+	// useless (maxUnavailable 1) or block node drains (minAvailable 1).
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MaxUnavailable is the maximum number of data pods that may be disrupted
+	// voluntarily at the same time. It applies to the data StatefulSet only — the
+	// Sentinel budget is always derived from the quorum and is not configurable,
+	// because a settable value could silently break the quorum guarantee.
+	// A value greater than or equal to spec.replicas disables the protection
+	// (every pod may be evicted at once); the operator logs a warning but honours
+	// it rather than rejecting a later scale-down.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
+}
+
 // NetworkPolicySpec defines network policy configuration.
 type NetworkPolicySpec struct {
 	// Enabled activates NetworkPolicy creation.
@@ -497,6 +536,11 @@ type ValkeySpec struct {
 	// RollingUpdate configures rolling update behaviour.
 	// +optional
 	RollingUpdate *RollingUpdateSpec `json:"rollingUpdate,omitempty"`
+
+	// PodDisruptionBudget configures PodDisruptionBudgets for the data and
+	// Sentinel StatefulSets. Omitted means no PDBs are managed by the operator.
+	// +optional
+	PodDisruptionBudget *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -654,6 +698,34 @@ func (v *Valkey) MetricsScrapeInterval() string {
 // IsNetworkPolicyEnabled returns true if network policies are enabled.
 func (v *Valkey) IsNetworkPolicyEnabled() bool {
 	return v.Spec.NetworkPolicy != nil && v.Spec.NetworkPolicy.Enabled
+}
+
+// IsPodDisruptionBudgetEnabled returns true if the operator should manage
+// PodDisruptionBudgets for this instance.
+func (v *Valkey) IsPodDisruptionBudgetEnabled() bool {
+	return v.Spec.PodDisruptionBudget != nil && v.Spec.PodDisruptionBudget.Enabled
+}
+
+// PodDisruptionBudgetMaxUnavailable returns the maxUnavailable for the data PDB,
+// falling back to the default.
+func (v *Valkey) PodDisruptionBudgetMaxUnavailable() int32 {
+	if v.Spec.PodDisruptionBudget != nil && v.Spec.PodDisruptionBudget.MaxUnavailable != nil {
+		return *v.Spec.PodDisruptionBudget.MaxUnavailable
+	}
+	return DefaultPDBMaxUnavailable
+}
+
+// NeedsDataPodDisruptionBudget reports whether a PDB applies to the data
+// StatefulSet: PDBs enabled and at least MinPDBReplicas pods.
+func (v *Valkey) NeedsDataPodDisruptionBudget() bool {
+	return v.IsPodDisruptionBudgetEnabled() && v.Spec.Replicas >= MinPDBReplicas
+}
+
+// NeedsSentinelPodDisruptionBudget reports whether a PDB applies to the Sentinel
+// StatefulSet: PDBs enabled, Sentinel enabled and at least MinPDBReplicas pods.
+func (v *Valkey) NeedsSentinelPodDisruptionBudget() bool {
+	return v.IsPodDisruptionBudgetEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.Replicas >= MinPDBReplicas
 }
 
 // IsPersistenceEnabled returns true if persistence is configured and enabled.

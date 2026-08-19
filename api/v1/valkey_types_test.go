@@ -1108,3 +1108,95 @@ func TestGetObserverUnreadyWhen_PartialOverride(t *testing.T) {
 	assert.True(t, UnreadyWhenDefault(uw.MasterUnreachable), "unset field defaults to true")
 	assert.False(t, UnreadyWhenDefault(uw.ReplicaSyncFailure), "explicitly false field is false")
 }
+
+// --- PodDisruptionBudget helpers ---
+
+func TestIsPodDisruptionBudgetEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		pdb      *PodDisruptionBudgetSpec
+		expected bool
+	}{
+		{name: "nil spec", pdb: nil, expected: false},
+		{name: "disabled", pdb: &PodDisruptionBudgetSpec{Enabled: false}, expected: false},
+		{name: "enabled", pdb: &PodDisruptionBudgetSpec{Enabled: true}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.PodDisruptionBudget = tt.pdb })
+			assert.Equal(t, tt.expected, v.IsPodDisruptionBudgetEnabled())
+		})
+	}
+}
+
+func TestPodDisruptionBudgetMaxUnavailable(t *testing.T) {
+	v := newValkey("test")
+	assert.Equal(t, DefaultPDBMaxUnavailable, v.PodDisruptionBudgetMaxUnavailable(), "no spec falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+	})
+	assert.Equal(t, DefaultPDBMaxUnavailable, v.PodDisruptionBudgetMaxUnavailable(), "unset field falls back to the default")
+
+	custom := int32(2)
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true, MaxUnavailable: &custom}
+	})
+	assert.Equal(t, int32(2), v.PodDisruptionBudgetMaxUnavailable())
+}
+
+// TestNeedsDataPodDisruptionBudget guards the single-replica skip rule: a PDB is
+// only created for a StatefulSet that has a peer to fall back on.
+func TestNeedsDataPodDisruptionBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		replicas int32
+		expected bool
+	}{
+		{name: "disabled with three replicas", enabled: false, replicas: 3, expected: false},
+		{name: "enabled with one replica", enabled: true, replicas: 1, expected: false},
+		{name: "enabled with two replicas", enabled: true, replicas: 2, expected: true},
+		{name: "enabled with three replicas", enabled: true, replicas: 3, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				if tt.enabled {
+					v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+				}
+			})
+			assert.Equal(t, tt.expected, v.NeedsDataPodDisruptionBudget())
+		})
+	}
+}
+
+func TestNeedsSentinelPodDisruptionBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{name: "pdb disabled", enabled: false, sentinel: &SentinelSpec{Enabled: true, Replicas: 3}, expected: false},
+		{name: "sentinel disabled", enabled: true, sentinel: nil, expected: false},
+		{name: "sentinel spec present but off", enabled: true, sentinel: &SentinelSpec{Enabled: false, Replicas: 3}, expected: false},
+		{name: "single sentinel", enabled: true, sentinel: &SentinelSpec{Enabled: true, Replicas: 1}, expected: false},
+		{name: "three sentinels", enabled: true, sentinel: &SentinelSpec{Enabled: true, Replicas: 3}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Sentinel = tt.sentinel
+				if tt.enabled {
+					v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+				}
+			})
+			assert.Equal(t, tt.expected, v.NeedsSentinelPodDisruptionBudget())
+		})
+	}
+}

@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -175,6 +176,7 @@ func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;escalate;bind
@@ -361,6 +363,7 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		{name: "sidecar RBAC", run: r.reconcileSidecarRBAC},
 		{name: "StatefulSet", run: r.reconcileStatefulSet},
 		{name: "Sentinel resources", when: (*vkov1.Valkey).IsSentinelEnabled, run: r.reconcileSentinelResources},
+		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
 		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
 		{name: "monitoring", run: r.reconcileMonitoringResources},
 	})
@@ -1689,6 +1692,7 @@ func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findValkeyForSecret),

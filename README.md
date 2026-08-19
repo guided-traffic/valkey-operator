@@ -17,6 +17,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
+- **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
@@ -417,6 +418,7 @@ spec:
 | `networkPolicy` | `NetworkPolicySpec` | — | NetworkPolicy configuration |
 | `persistence` | `PersistenceSpec` | — | Data persistence configuration |
 | `observer` | `ObserverSpec` | — | Cluster observer configuration |
+| `podDisruptionBudget` | `PodDisruptionBudgetSpec` | — | PodDisruptionBudgets for the data and Sentinel StatefulSets |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -538,6 +540,60 @@ When `spec.tls.enabled: true`, the observer always verifies the server's certifi
 | `sentinel` | `bool` | `false` | Send client certificate to Sentinel pods (mTLS). When `false`, the observer uses server-only TLS. |
 
 > **Note:** The TLS secret is only mounted into the observer pod when at least one of `mtls.valkey` or `mtls.sentinel` is `true`. If both are `false` (the default), the observer connects using TLS without a client certificate and no volume mount is created.
+
+### `spec.podDisruptionBudget`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Create a PDB for the data StatefulSet and, with Sentinel enabled, a quorum-preserving PDB for the Sentinel StatefulSet |
+| `maxUnavailable` | `int32` | `1` | Data pods that may be disrupted voluntarily at the same time. Applies to the data StatefulSet only |
+
+The budgets are named after the StatefulSets they cover — `<name>` for the data
+pods and `<name>-sentinel` for Sentinel — live in the CR's namespace and are owned
+by the CR, so deleting the CR removes them.
+
+Both budgets are **opt-in**. The operator creates none unless the block is present
+and `enabled: true` — a budget created next to a user-managed one would cover the
+same pods twice, and the Eviction API refuses every eviction in that case.
+
+What the budgets do and do not cover:
+
+- The **data PDB** uses `maxUnavailable` (default `1`), so a node drain takes one
+  data pod at a time instead of the whole StatefulSet. Setting `maxUnavailable`
+  to `spec.replicas` or higher removes the protection; the operator honours it and
+  logs a warning rather than rejecting a later scale-down.
+- The **Sentinel PDB** uses `minAvailable = floor(spec.sentinel.replicas / 2) + 1`
+  — the failover quorum. It is **computed, never configurable**: a settable value
+  could silently break the guarantee that a drain cannot take the Sentinel majority.
+  With exactly 2 Sentinels the quorum equals the replica count, so no voluntary
+  disruption is permitted at all — an even Sentinel count is not HA in the first place.
+- **StatefulSets with fewer than 2 replicas get no PDB**, even with `enabled: true`
+  (data at `spec.replicas: 1`, Sentinel at `spec.sentinel.replicas: 1`). With one pod
+  `maxUnavailable: 1` would permit evicting the only pod and `minAvailable: 1` would
+  block `kubectl drain` forever — fake safety for an instance that is not HA either
+  way. Scaling below 2 deletes an existing PDB; scaling back up recreates it.
+- Budgets gate **voluntary** disruptions only (drain, cluster autoscaler, eviction
+  API). Node failures, `kubectl delete pod` and the operator's own failover-aware
+  rolling update are unaffected — the operator deletes pods directly.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: ha-valkey
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  podDisruptionBudget:
+    enabled: true          # default: false
+    maxUnavailable: 1      # default: 1 (data StatefulSet only)
+```
+
+The operator needs `policy/poddisruptionbudgets` RBAC for this; the Helm chart
+ships it unconditionally, so no permission change is needed to turn the feature on.
 
 ### `spec.persistence`
 

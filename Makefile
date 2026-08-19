@@ -103,10 +103,11 @@ test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind clust
 	MANAGER_BINARY=./bin/manager $(GOTEST) -v -tags=e2e,e2e_helm -count=1 -timeout=10m -run TestE2E_Migrate ./test/e2e/...
 
 .PHONY: kind-create
-kind-create: ## Create a Kind cluster for local testing.
+kind-create: ## Create a Kind cluster for local testing (control-plane + 3 workers).
 	@echo "Creating Kind cluster..."
-	@echo 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: valkey-operator-test\nnodes:\n- role: control-plane' | sed 's/\\n/\n/g' > /tmp/kind-config.yaml
-	kind create cluster --config /tmp/kind-config.yaml --wait 120s
+	@mkdir -p tmp
+	@printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: valkey-operator-test\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n- role: worker\n' > tmp/kind-config.yaml
+	kind create cluster --config tmp/kind-config.yaml --wait 300s
 
 .PHONY: kind-delete
 kind-delete: ## Delete the Kind test cluster.

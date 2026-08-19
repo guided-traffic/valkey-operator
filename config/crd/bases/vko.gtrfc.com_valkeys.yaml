@@ -432,6 +432,34 @@ spec:
                 description: PodAnnotations are additional annotations applied to
                   Valkey pods.
                 type: object
+              podDisruptionBudget:
+                description: |-
+                  PodDisruptionBudget configures PodDisruptionBudgets for the data and
+                  Sentinel StatefulSets. Omitted means no PDBs are managed by the operator.
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
+                      and, when Sentinel is enabled, a quorum-preserving PDB
+                      (minAvailable = floor(replicas/2)+1) for the Sentinel StatefulSet.
+                      StatefulSets with fewer than 2 replicas never get a PDB: it would either be
+                      useless (maxUnavailable 1) or block node drains (minAvailable 1).
+                    type: boolean
+                  maxUnavailable:
+                    default: 1
+                    description: |-
+                      MaxUnavailable is the maximum number of data pods that may be disrupted
+                      voluntarily at the same time. It applies to the data StatefulSet only — the
+                      Sentinel budget is always derived from the quorum and is not configurable,
+                      because a settable value could silently break the quorum guarantee.
+                      A value greater than or equal to spec.replicas disables the protection
+                      (every pod may be evicted at once); the operator logs a warning but honours
+                      it rather than rejecting a later scale-down.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
               podLabels:
                 additionalProperties:
                   type: string

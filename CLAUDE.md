@@ -64,6 +64,12 @@ spec:
         # group: cert-manager.io
         kind: ClusterIssuer
         name: cluster-ca
+  podDisruptionBudget:
+    enabled: true            # opt-in; no PDBs are created when the block is absent
+    maxUnavailable: 1        # optional, default 1; data StatefulSet only
+                             # Sentinel PDB is quorum-derived (minAvailable =
+                             # floor(replicas/2)+1) and not configurable;
+                             # StatefulSets with < 2 replicas get no PDB
   networkPolicy:
     enabled: true
     namePrefix: "my-prefix"

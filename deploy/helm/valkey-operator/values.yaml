@@ -58,3 +58,6 @@ preUpgradeHook:
     limits:
       cpu: 200m
       memory: 128Mi
+
+# Valkey CRs support spec.podDisruptionBudget (opt-in). PDBs are only
+# created for StatefulSets with >= 2 replicas; singletons are skipped.
