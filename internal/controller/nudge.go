@@ -23,6 +23,19 @@ import (
 // 10 s, so the grace period costs at most one requeue cycle.
 const nudgeGracePeriod = 10 * time.Second
 
+// nudgeRequeueInterval is how soon Reconcile is re-entered while a StatefulSet is
+// short of pods.
+//
+// The nudge needs a clock of its own. The phase-based requeue at the end of
+// reconcileWorkload only fires for Error and Syncing, but a StatefulSet whose pod
+// creates are rejected leaves the CR in Provisioning. In that state nothing else
+// wakes the operator: the CR watch uses GenerationChangedPredicate so status
+// writes do not re-trigger, the StatefulSet is not written (no spec drift), and
+// with zero pods there are no pod events — the exact dormancy the nudge exists to
+// break. It is shorter than the grace period so the first bump lands one requeue
+// after the short state is first observed.
+const nudgeRequeueInterval = 5 * time.Second
+
 // nudgeTracker records when a StatefulSet was first observed short of pods.
 // It only implements the grace period; the rate limit between bumps lives in the
 // nudge annotation itself. Losing the map on operator restart is harmless — the
@@ -68,33 +81,44 @@ func (t *nudgeTracker) forget(key types.NamespacedName) {
 //
 // The nudge is suppressed while a rolling update is in progress, where the
 // operator deletes pods on purpose and the short-of-pods state is expected.
-func (r *ValkeyReconciler) nudgeShortStatefulSets(ctx context.Context, v *vkov1.Valkey) {
+//
+// It reports whether any managed StatefulSet is currently short of pods, so the
+// caller can keep requeueing. Without that the grace period would be
+// unreachable: the pass that first observes the short state only records it, and
+// in the blocked case no event ever produces a second pass (see
+// nudgeRequeueInterval).
+func (r *ValkeyReconciler) nudgeShortStatefulSets(ctx context.Context, v *vkov1.Valkey) bool {
 	dataKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentValkey), Namespace: v.Namespace}
 	sentinelKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentSentinel), Namespace: v.Namespace}
 
 	if r.getRollingUpdateState(v) != "" {
 		r.nudges.forget(dataKey)
 		r.nudges.forget(sentinelKey)
-		return
+		return false
 	}
 
-	r.nudgeStatefulSet(ctx, v, dataKey)
-	if v.IsSentinelEnabled() {
-		r.nudgeStatefulSet(ctx, v, sentinelKey)
+	short := r.nudgeStatefulSet(ctx, v, dataKey)
+	if v.IsSentinelEnabled() && r.nudgeStatefulSet(ctx, v, sentinelKey) {
+		short = true
 	}
+	return short
 }
 
 // nudgeStatefulSet bumps the nudge annotation on a single StatefulSet when it has
 // been short of pods for longer than nudgeGracePeriod and the last bump is older
 // than builder.NudgeInterval. Failures are logged and swallowed: a nudge is a
 // recovery accelerator, never a reason to fail the reconcile.
-func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey, key types.NamespacedName) {
+//
+// It reports whether the StatefulSet is short of pods — which is true on every
+// path that did not bump as well, because waiting out the grace period or the
+// rate limit still requires the caller to come back.
+func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey, key types.NamespacedName) bool {
 	logger := log.FromContext(ctx)
 
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, key, sts); err != nil {
 		r.nudges.forget(key)
-		return
+		return false
 	}
 
 	desired := int32(1)
@@ -106,20 +130,20 @@ func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey
 	// is not ready is the kubelet's business and no nudge would help there.
 	if sts.Status.Replicas >= desired {
 		r.nudges.forget(key)
-		return
+		return false
 	}
 
 	now := time.Now()
 	if now.Sub(r.nudges.observe(key, now)) < nudgeGracePeriod {
-		return
+		return true
 	}
 	if !builder.NudgeDue(sts, now) {
-		return
+		return true
 	}
 
 	if err := r.Patch(ctx, sts, client.RawPatch(types.MergePatchType, builder.NudgePatch(now))); err != nil {
 		logger.Error(err, "Failed to nudge StatefulSet", "statefulset", key.Name)
-		return
+		return true
 	}
 
 	logger.Info("Nudged StatefulSet short of pods to force an immediate resync",
@@ -127,4 +151,5 @@ func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey
 	r.recordEvent(v, corev1.EventTypeNormal, "StatefulSetNudged",
 		"StatefulSet %s has %d/%d pods; bumped the nudge annotation to force an immediate resync",
 		key.Name, sts.Status.Replicas, desired)
+	return true
 }

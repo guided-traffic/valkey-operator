@@ -676,6 +676,29 @@ func TestRollingUpdateResult_Defaults(t *testing.T) {
 // --- Integration Tests with Fake Client ---
 
 // createPodForSts creates a pod that looks like it belongs to the given StatefulSet.
+// readyStatefulSetFor returns a data StatefulSet that already reports `replicas`
+// created and ready pods.
+//
+// The fake client runs no statefulset-controller, so a StatefulSet the reconcile
+// creates itself stays at status.replicas = 0 no matter how many pods the test
+// seeded. That state means "short of pods" to the reconciler and makes it requeue
+// for the nudge, which drowns out assertions about rolling-update requeues. Seeding
+// the status to match the pods a test creates keeps the fixture honest.
+func readyStatefulSetFor(v *vkov1.Valkey, replicas int32) *appsv1.StatefulSet {
+	desired := replicas
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.StatefulSetName(v, common.ComponentValkey),
+			Namespace: v.Namespace,
+		},
+		Spec: appsv1.StatefulSetSpec{Replicas: &desired},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:      replicas,
+			ReadyReplicas: replicas,
+		},
+	}
+}
+
 func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *corev1.Pod {
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	podName := fmt.Sprintf("%s-%d", stsName, ordinal)
@@ -984,7 +1007,7 @@ func TestReconcile_RollingUpdate_StandaloneNoRequeueWhenNoChange(t *testing.T) {
 	v := newTestValkey("test", "default")
 	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
 
-	r, _ := newTestReconciler(v, pod0)
+	r, _ := newTestReconciler(v, pod0, readyStatefulSetFor(v, 1))
 	result := reconcileOnce(t, r, "test", "default")
 
 	// No requeue needed — no image change.

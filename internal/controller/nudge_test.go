@@ -208,6 +208,94 @@ func TestNudgeShortStatefulSets_MissingStatefulSetIsNoOp(t *testing.T) {
 	assert.False(t, tracked, "a missing StatefulSet must be dropped from the tracker")
 }
 
+func TestNudgeShortStatefulSets_ReportsShortOfPods(t *testing.T) {
+	v := newSentinelValkey()
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+	data := newNudgeStatefulSet(dataName, 0)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	r, _ := newTestReconciler(v, data, sentinel)
+
+	// Deliberately no pastGrace: the very first observation must already report the
+	// short state, otherwise the caller stops requeueing and the grace period can
+	// never elapse.
+	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"a StatefulSet short of pods must be reported even while inside the grace period")
+}
+
+func TestNudgeShortStatefulSets_ReportsHealthy(t *testing.T) {
+	v := newSentinelValkey()
+	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	r, _ := newTestReconciler(v, data, sentinel)
+
+	assert.False(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"a cluster with every pod created must not keep the reconciler awake")
+}
+
+func TestNudgeShortStatefulSets_ReportsShortSentinelOnly(t *testing.T) {
+	v := newSentinelValkey()
+	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 1)
+	r, _ := newTestReconciler(v, data, sentinel)
+
+	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"a short Sentinel StatefulSet must keep the reconciler awake even when the data pods are complete")
+}
+
+func TestNudgeShortStatefulSets_NoRequeueSignalDuringRollingUpdate(t *testing.T) {
+	v := newSentinelValkey()
+	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
+	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	r, _ := newTestReconciler(v, data)
+
+	assert.False(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"the rolling update drives its own requeue; the nudge must not add a second clock")
+}
+
+// TestReconcileWorkload_RequeuesWhileShortOfPods is the regression guard for the
+// defect that made T1 fail: a StatefulSet whose pod creates are rejected leaves the
+// CR in Provisioning, and Provisioning is not covered by the health-based requeue.
+// Without a requeue of its own the operator goes dormant — no pods means no pod
+// events, an unwritten StatefulSet means no informer event, and
+// GenerationChangedPredicate swallows the status writes — so the nudge never fires.
+func TestReconcileWorkload_RequeuesWhileShortOfPods(t *testing.T) {
+	v := newTestValkey("test", nudgeTestNamespace)
+	desired := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: v.Name, Namespace: nudgeTestNamespace},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
+		Status:     appsv1.StatefulSetStatus{Replicas: 0},
+	}
+	r, _ := newTestReconciler(v, sts)
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+	require.NoError(t, err)
+
+	require.Equal(t, vkov1.ValkeyPhaseProvisioning, v.Status.Phase,
+		"precondition: zero created pods must leave the CR in Provisioning")
+	assert.Positive(t, result.RequeueAfter,
+		"a StatefulSet short of pods must be requeued, otherwise the nudge never gets a second pass")
+}
+
+func TestReconcileWorkload_NoRequeueWhenAllPodsCreated(t *testing.T) {
+	v := newTestValkey("test", nudgeTestNamespace)
+	desired := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: v.Name, Namespace: nudgeTestNamespace},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
+		Status:     appsv1.StatefulSetStatus{Replicas: 1, ReadyReplicas: 1},
+	}
+	r, _ := newTestReconciler(v, sts)
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+	require.NoError(t, err)
+
+	if v.Status.Phase == vkov1.ValkeyPhaseOK {
+		assert.Zero(t, result.RequeueAfter,
+			"a healthy cluster must not be polled; its events are enough")
+	}
+}
+
 func TestNudgeTracker_ObserveKeepsFirstObservation(t *testing.T) {
 	tracker := &nudgeTracker{}
 	key := nudgeKey("test")

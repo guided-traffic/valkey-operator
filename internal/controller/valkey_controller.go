@@ -261,7 +261,7 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 
 	// Nudge StatefulSets that are short of pods so the statefulset-controller
 	// resyncs immediately instead of waiting out its exponential backoff.
-	r.nudgeShortStatefulSets(ctx, valkey)
+	shortOfPods := r.nudgeShortStatefulSets(ctx, valkey)
 
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
@@ -275,6 +275,15 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	if valkey.Status.Phase == vkov1.ValkeyPhaseError || valkey.Status.Phase == vkov1.ValkeyphaseSyncing {
 		logger.Info("Instance not healthy, requeuing", "phase", valkey.Status.Phase)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// A StatefulSet short of pods needs its own requeue. Rejected pod creates leave
+	// the CR in Provisioning, which the branch above does not cover — and with no
+	// pods, no spec drift and GenerationChangedPredicate on the CR watch, nothing
+	// else re-enters Reconcile. The nudge would then never get the second pass its
+	// grace period requires, which is exactly the stall it exists to break.
+	if shortOfPods {
+		return ctrl.Result{RequeueAfter: nudgeRequeueInterval}, nil
 	}
 
 	return ctrl.Result{}, nil
