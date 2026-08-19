@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -211,11 +212,35 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Reconcile all managed resources. The outcome is mirrored into the
 	// ReconcileBlocked condition so an admission rejection is distinguishable
 	// from any other write failure without reading operator logs.
-	if err := r.reconcileResources(ctx, valkey); err != nil {
-		r.setReconcileBlockedCondition(ctx, valkey, err)
-		return ctrl.Result{}, err
+	//
+	// A failure no longer aborts the pass: the data plane (rolling update,
+	// nudge, status) is handled either way, so a rejected write on one
+	// sub-resource cannot leave the CR status stale about everything else.
+	resourceErr := r.reconcileResources(ctx, valkey)
+	r.setReconcileBlockedCondition(ctx, valkey, resourceErr)
+
+	result, err := r.reconcileWorkload(ctx, valkey)
+	if err != nil {
+		return result, err
 	}
-	r.setReconcileBlockedCondition(ctx, valkey, nil)
+
+	if resourceErr != nil {
+		// Written after the workload pass so it is not overwritten by
+		// updateStatus, and returned so the controller-runtime rate limiter
+		// backs the retry off instead of spinning on the 10 s requeue.
+		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError,
+			fmt.Sprintf("Failed to reconcile resources: %s", compactErrorMessage(resourceErr)))
+		return ctrl.Result{}, resourceErr
+	}
+
+	return result, nil
+}
+
+// reconcileWorkload handles everything that depends on the running data plane
+// rather than on the managed objects themselves: rolling updates, the
+// StatefulSet nudge and the status update.
+func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.Valkey) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	// Check for rolling update (image change on running pods).
 	rollingResult := r.checkAndHandleRollingUpdate(ctx, valkey)
@@ -285,82 +310,69 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 	return ctrl.Result{}, false
 }
 
+// reconcileStep is one unit of work inside a reconcile pass: a display name, an
+// optional applicability predicate and the function that performs the write.
+type reconcileStep struct {
+	name string
+	// when reports whether the step applies to this CR. A nil predicate means
+	// the step always runs.
+	when func(*vkov1.Valkey) bool
+	run  func(context.Context, *vkov1.Valkey) error
+}
+
+// runReconcileSteps executes every applicable step and returns the joined error
+// of all failures.
+//
+// A failing step does not stop the pass. Steps only reference the objects of
+// earlier steps by name (a StatefulSet names its ConfigMap, a Service its
+// selector labels), so a rejected write never invalidates the later ones — while
+// aborting the pass would leave NetworkPolicies, monitoring and the status
+// unreconciled for as long as a single write keeps failing. That is the
+// 2026-08-19 infra-d failure mode: one webhook rejection on the Sentinel
+// StatefulSet silenced the rest of the reconcile.
+func (r *ValkeyReconciler) runReconcileSteps(ctx context.Context, v *vkov1.Valkey, steps []reconcileStep) error {
+	var errs []error
+	for _, step := range steps {
+		if step.when != nil && !step.when(v) {
+			continue
+		}
+		if err := step.run(ctx, v); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", step.name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// needsReplicaConfigMap reports whether the replica ConfigMap applies: it is used
+// by every multi-replica topology, with or without Sentinel.
+func needsReplicaConfigMap(v *vkov1.Valkey) bool {
+	return v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel()
+}
+
 // reconcileResources reconciles all Kubernetes resources managed by the operator.
+// The returned error joins every step that failed; the caller mirrors it into the
+// ReconcileBlocked condition and the CR phase.
 func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1.Valkey) error {
-	// Reconcile ConfigMap.
-	if err := r.reconcileConfigMap(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ConfigMap: %v", err))
-		return err
-	}
-
-	// Reconcile replica ConfigMap in multi-replica mode (Sentinel or non-Sentinel replication).
-	if valkey.IsSentinelEnabled() || valkey.IsMultiReplicaWithoutSentinel() {
-		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile TLS Certificates (cert-manager) if enabled.
-	if valkey.IsCertManagerEnabled() {
-		if err := r.reconcileTLSCertificates(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile TLS Certificates: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile all Services (headless, -rw, -all, -r, legacy cleanup).
-	if err := r.reconcileServices(ctx, valkey); err != nil {
-		return err
-	}
-
-	// Reconcile sidecar RBAC (ServiceAccount, Role, RoleBinding).
-	if err := r.reconcileSidecarRBAC(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile sidecar RBAC: %v", err))
-		return err
-	}
-
-	// Reconcile StatefulSet.
-	if err := r.reconcileStatefulSet(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile StatefulSet: %v", err))
-		return err
-	}
-
-	// Reconcile Sentinel resources if enabled.
-	if valkey.IsSentinelEnabled() {
-		if err := r.reconcileSentinelResources(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Sentinel resources: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile NetworkPolicies if enabled.
-	if valkey.IsNetworkPolicyEnabled() {
-		if err := r.reconcileNetworkPolicies(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile NetworkPolicies: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile monitoring resources (Observer Deployment + metrics exporter
-	// Service/ServiceMonitor), each created or cleaned up based on its toggle.
-	if err := r.reconcileMonitoringResources(ctx, valkey); err != nil {
-		return err
-	}
-
-	return nil
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "ConfigMap", run: r.reconcileConfigMap},
+		{name: "replica ConfigMap", when: needsReplicaConfigMap, run: r.reconcileReplicaConfigMap},
+		{name: "TLS Certificates", when: (*vkov1.Valkey).IsCertManagerEnabled, run: r.reconcileTLSCertificates},
+		{name: "Services", run: r.reconcileServices},
+		{name: "sidecar RBAC", run: r.reconcileSidecarRBAC},
+		{name: "StatefulSet", run: r.reconcileStatefulSet},
+		{name: "Sentinel resources", when: (*vkov1.Valkey).IsSentinelEnabled, run: r.reconcileSentinelResources},
+		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
+		{name: "monitoring", run: r.reconcileMonitoringResources},
+	})
 }
 
 // reconcileMonitoringResources reconciles the Observer deployment and the metrics
 // exporter Service + ServiceMonitor.
 func (r *ValkeyReconciler) reconcileMonitoringResources(ctx context.Context, valkey *vkov1.Valkey) error {
-	if err := r.reconcileObserver(ctx, valkey); err != nil {
-		return err
-	}
-	if err := r.reconcileMetrics(ctx, valkey); err != nil {
-		return err
-	}
-	return nil
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "Observer", run: r.reconcileObserver},
+		{name: "metrics", run: r.reconcileMetrics},
+	})
 }
 
 // reconcileMetrics reconciles the metrics exporter Service and ServiceMonitor,
@@ -369,29 +381,28 @@ func (r *ValkeyReconciler) reconcileMonitoringResources(ctx context.Context, val
 // builder.BuildStatefulSet); enabling/disabling it changes the pod-spec hash and
 // is therefore rolled out through the normal failover-aware rolling update.
 func (r *ValkeyReconciler) reconcileMetrics(ctx context.Context, valkey *vkov1.Valkey) error {
-	// Metrics Service.
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "metrics Service", run: r.reconcileMetricsService},
+		{name: "ServiceMonitor", run: r.reconcileMetricsServiceMonitor},
+	})
+}
+
+// reconcileMetricsService creates the metrics Service when metrics are enabled
+// and removes it otherwise.
+func (r *ValkeyReconciler) reconcileMetricsService(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsMetricsServiceEnabled() {
-		if err := r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey)); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile metrics Service: %v", err))
-			return err
-		}
-	} else if err := r.cleanupMetricsService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup metrics Service: %v", err))
-		return err
+		return r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey))
 	}
+	return r.cleanupMetricsService(ctx, valkey)
+}
 
-	// Prometheus-Operator ServiceMonitor.
+// reconcileMetricsServiceMonitor creates the Prometheus-Operator ServiceMonitor
+// when enabled and removes it otherwise.
+func (r *ValkeyReconciler) reconcileMetricsServiceMonitor(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsServiceMonitorEnabled() {
-		if err := r.reconcileServiceMonitor(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ServiceMonitor: %v", err))
-			return err
-		}
-	} else if err := r.cleanupServiceMonitor(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup ServiceMonitor: %v", err))
-		return err
+		return r.reconcileServiceMonitor(ctx, valkey)
 	}
-
-	return nil
+	return r.cleanupServiceMonitor(ctx, valkey)
 }
 
 // cleanupMetricsService deletes the metrics Service if it exists.
@@ -481,49 +492,23 @@ func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.V
 // reconcileObserver creates the observer deployment when enabled, or cleans it up when disabled.
 func (r *ValkeyReconciler) reconcileObserver(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsObserverEnabled() {
-		if err := r.reconcileObserverDeployment(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Observer: %v", err))
-			return err
-		}
-	} else {
-		if err := r.cleanupObserverDeployment(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup Observer: %v", err))
-			return err
-		}
+		return r.reconcileObserverDeployment(ctx, valkey)
 	}
-	return nil
+	return r.cleanupObserverDeployment(ctx, valkey)
 }
 
 // reconcileServices reconciles all Service resources: headless, -rw, and (for multi-replica)
 // -all and -r. It also removes legacy services that no longer exist in the new naming scheme.
+// A failing Service does not stop the others — see runReconcileSteps.
 func (r *ValkeyReconciler) reconcileServices(ctx context.Context, valkey *vkov1.Valkey) error {
-	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
-		return err
-	}
-
-	if err := r.reconcileRWService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -rw Service: %v", err))
-		return err
-	}
-
-	if valkey.Spec.Replicas > 1 {
-		if err := r.reconcileAllService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -all Service: %v", err))
-			return err
-		}
-		if err := r.reconcileReadOnlyService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -r Service: %v", err))
-			return err
-		}
-	}
-
-	if err := r.deleteLegacyServices(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to delete legacy Services: %v", err))
-		return err
-	}
-
-	return nil
+	isMultiReplica := func(v *vkov1.Valkey) bool { return v.Spec.Replicas > 1 }
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "headless Service", run: r.reconcileHeadlessService},
+		{name: "-rw Service", run: r.reconcileRWService},
+		{name: "-all Service", when: isMultiReplica, run: r.reconcileAllService},
+		{name: "-r Service", when: isMultiReplica, run: r.reconcileReadOnlyService},
+		{name: "legacy Service cleanup", run: r.deleteLegacyServices},
+	})
 }
 
 // reconcileConfigMap ensures the Valkey ConfigMap matches the desired state.

@@ -245,6 +245,43 @@ rejects my writes" from "the write itself failed".
   namespace-scoped `failurePolicy: Fail` webhook and asserts the condition names it,
   then flips to `False` after removal.
 
+## Aggregate Reconcile (no abort on the first failing sub-resource)
+
+A rejected write on one managed object must not silence the rest of the pass. In the
+2026-08-19 incident a single webhook rejection on the Sentinel StatefulSet skipped
+NetworkPolicies, monitoring, `updateStatus` and the health/rolling-update handling
+for as long as the rejection lasted.
+
+- `reconcileResources` is a **step list** (`reconcileStep{name, when, run}`) executed by
+  `runReconcileSteps` (`valkey_controller.go`): every applicable step runs, failures are
+  collected and returned as one `errors.Join`, each wrapped with its step name
+  (`"StatefulSet: ..."`). Same helper inside `reconcileServices`, `reconcileMonitoringResources`
+  and `reconcileMetrics`, so a failing Service does not skip its siblings either.
+  Steps only reference earlier objects by name, so continuing is safe.
+- Step order is unchanged (ConfigMap → replica ConfigMap → TLS → Services → sidecar RBAC →
+  StatefulSet → Sentinel → NetworkPolicies → monitoring); `when` replaces the old `if` chains,
+  which also kept cyclomatic complexity down.
+- `Reconcile` no longer returns on a resource error. The data-plane part moved to
+  `reconcileWorkload` (rolling update, post-rolling checks, nudge, `updateStatus`, requeue)
+  and runs either way. The joined error is returned afterwards so the controller-runtime
+  rate limiter backs off instead of spinning on the 10 s requeue.
+- **Phase is written once, last.** The per-step `updatePhase` calls are gone; a blocked pass
+  ends with `Error` + `"Failed to reconcile resources: <joined>"`, written *after*
+  `updateStatus` so it is not overwritten. `compactErrorMessage`
+  (`internal/controller/reconcile_blocked.go`) folds `errors.Join`'s newlines into `"; "` —
+  both the phase message and the `ReconcileBlocked` message must stay single-line for
+  `kubectl`/Lens.
+- Tradeoff accepted: while blocked, `updateStatus` and the final phase write disagree, so a
+  blocked pass costs two status writes instead of one. Healthy passes are unaffected.
+- Unit guards: `internal/controller/reconcile_steps_test.go` (all steps run despite a
+  failure, joined error carries every rejection, data plane still reconciled while blocked).
+- E2E guard: `TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite`
+  (`test/e2e/admission_recovery_test.go`) blocks `UPDATE apps/v1 statefulsets`, scales the CR
+  and enables NetworkPolicies in one patch, then asserts the NetworkPolicies appear anyway,
+  the condition names the `StatefulSet` step, and `status.readyReplicas` still reports the
+  running pod. `blockCoreResourceCreation` is now a wrapper around the generalized
+  `blockResourceOperations(t, ns, name, group, version, operations, resources...)`.
+
 # Important Notes
 
 - Remember Cyclomatic Complexity: Keep it under 15 for all functions. Refactor if it exceeds this threshold.

@@ -22,6 +22,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,16 @@ func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) fu
 // Returns a function that removes the webhook (idempotent).
 func (tc *testClients) blockCoreResourceCreation(t *testing.T, namespace, name string, resources ...string) func() {
 	t.Helper()
+	return tc.blockResourceOperations(t, namespace, name, "", "v1",
+		[]admissionregistrationv1.OperationType{admissionregistrationv1.Create}, resources...)
+}
+
+// blockResourceOperations is the general form of blockCoreResourceCreation: it
+// blocks the given operations on the given apiGroup/apiVersion resources in one
+// namespace. T2 uses it for UPDATE on apps/v1 statefulsets.
+func (tc *testClients) blockResourceOperations(t *testing.T, namespace, name, apiGroup, apiVersion string,
+	operations []admissionregistrationv1.OperationType, resources ...string) func() {
+	t.Helper()
 	ctx := context.Background()
 
 	// A Service without endpoints: the API server resolves it, finds no backend
@@ -106,10 +117,10 @@ func (tc *testClients) blockCoreResourceCreation(t *testing.T, namespace, name s
 				},
 			},
 			Rules: []admissionregistrationv1.RuleWithOperations{{
-				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Operations: operations,
 				Rule: admissionregistrationv1.Rule{
-					APIGroups:   []string{""},
-					APIVersions: []string{"v1"},
+					APIGroups:   []string{apiGroup},
+					APIVersions: []string{apiVersion},
 					Resources:   resources,
 					Scope:       &scope,
 				},
@@ -129,7 +140,7 @@ func (tc *testClients) blockCoreResourceCreation(t *testing.T, namespace, name s
 	_, err := tc.kube.AdmissionregistrationV1().MutatingWebhookConfigurations().
 		Create(ctx, webhook, metav1.CreateOptions{})
 	require.NoError(t, err, "Failed to install blocking webhook %s", name)
-	t.Logf("Installed fail-closed webhook %s blocking CREATE %v in namespace %s", name, resources, namespace)
+	t.Logf("Installed fail-closed webhook %s blocking %v %v in namespace %s", name, operations, resources, namespace)
 
 	removed := false
 	return func() {
@@ -339,5 +350,128 @@ func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
 		cond := tc.waitForReconcileBlocked(t, ns, name, "False", 120*time.Second)
 		assert.Equal(t, "ReconcileSucceeded", cond["reason"])
 		tc.waitForValkeyPhase(t, ns, name, "OK")
+	})
+}
+
+// patchValkeySpec applies fields to the CR spec, retrying on conflict.
+func (tc *testClients) patchValkeySpec(t *testing.T, namespace, name string, fields map[string]interface{}) {
+	t.Helper()
+	ctx := context.Background()
+
+	err := wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			cr, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			for path, value := range fields {
+				if err := unstructured.SetNestedField(cr.Object, value,
+					append([]string{"spec"}, strings.Split(path, ".")...)...); err != nil {
+					return false, err
+				}
+			}
+			if _, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).
+				Update(ctx, cr, metav1.UpdateOptions{}); err != nil {
+				if apierrors.IsConflict(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		})
+	require.NoError(t, err, "Failed to patch Valkey CR %s/%s", namespace, name)
+	t.Logf("Patched Valkey %s/%s: %v", namespace, name, fields)
+}
+
+// waitForNetworkPolicies waits until at least one NetworkPolicy exists in the namespace.
+func (tc *testClients) waitForNetworkPolicies(t *testing.T, namespace string, timeout time.Duration) int {
+	t.Helper()
+
+	count := 0
+	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, timeout, true,
+		func(ctx context.Context) (bool, error) {
+			list, err := tc.kube.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+			count = len(list.Items)
+			return count > 0, nil
+		})
+	require.NoError(t, err, "no NetworkPolicy was created in namespace %s within %v", namespace, timeout)
+	return count
+}
+
+// TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite is scenario T2
+// of the admission-gap ticket, guarding WP3: while a fail-closed webhook rejects
+// UPDATE on statefulsets, the steps behind the StatefulSet write must still run
+// and the CR status must keep telling the truth about the data plane.
+//
+// On 1.10.46 reconcileResources returned on the first failing sub-resource, so a
+// single rejected StatefulSet write silenced NetworkPolicies, monitoring and the
+// status update for as long as the rejection lasted.
+func TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+
+	ns := "e2e-admission-continue"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "continue-test"
+	t.Log("Creating a healthy single-replica Valkey CR")
+	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(1),
+		"image":    "valkey/valkey:8.0",
+	}))
+	defer tc.deleteValkey(t, ns, name)
+
+	tc.waitForStatefulSetReady(t, ns, name, 1)
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	// UPDATE only: the StatefulSet already exists, so this rejects exactly the
+	// operator's write of the scaled spec while leaving every CREATE — Services,
+	// ConfigMaps, NetworkPolicies — admissible.
+	removeWebhook := tc.blockResourceOperations(t, ns, "e2e-continue-blackhole", "apps", "v1",
+		[]admissionregistrationv1.OperationType{admissionregistrationv1.Update}, "statefulsets")
+	defer removeWebhook()
+
+	// Scale up (needs a StatefulSet UPDATE → rejected) and enable NetworkPolicies
+	// (a step behind the StatefulSet → must still run).
+	tc.patchValkeySpec(t, ns, name, map[string]interface{}{
+		"replicas":              int64(2),
+		"networkPolicy.enabled": true,
+	})
+
+	t.Run("steps behind the rejected write still run", func(t *testing.T) {
+		created := tc.waitForNetworkPolicies(t, ns, 90*time.Second)
+		t.Logf("%d NetworkPolicy/-ies created while the StatefulSet update was rejected", created)
+	})
+
+	t.Run("CR names the rejected StatefulSet write", func(t *testing.T) {
+		cond := tc.waitForReconcileBlocked(t, ns, name, "True", 90*time.Second)
+		assert.Equal(t, "AdmissionWebhookDenied", cond["reason"])
+		message, _ := cond["message"].(string)
+		assert.Contains(t, message, blackholeWebhookName)
+		assert.Contains(t, message, "StatefulSet",
+			"the condition must name the failing step, not just the webhook")
+	})
+
+	t.Run("status keeps reflecting the data plane", func(t *testing.T) {
+		// The StatefulSet never grew, so the running pod is still the truth.
+		sts := tc.getStatefulSet(t, ns, name)
+		assert.Equal(t, int32(1), *sts.Spec.Replicas,
+			"the rejected update must not have reached the StatefulSet")
+
+		status := tc.getValkeyStatus(t, ns, name)
+		ready, _ := status["readyReplicas"].(int64)
+		assert.Equal(t, int64(1), ready,
+			"status must report the pod that is actually running")
+	})
+
+	t.Run("cluster converges once the block is gone", func(t *testing.T) {
+		removeWebhook()
+		tc.waitForReconcileBlocked(t, ns, name, "False", 120*time.Second)
+		tc.waitForStatefulSetReady(t, ns, name, 2)
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 }

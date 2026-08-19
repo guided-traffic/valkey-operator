@@ -56,6 +56,16 @@ func reconcileBlockedReason(err error) string {
 	return vkov1.ReasonWriteFailed
 }
 
+// compactErrorMessage renders an error as a single line. A reconcile pass joins
+// the errors of all failing steps with errors.Join, which separates them by
+// newlines — unusable in a condition message or in `kubectl get`'s status column.
+func compactErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.ReplaceAll(err.Error(), "\n", "; ")
+}
+
 // truncateConditionMessage shortens a message to conditionMessageLimit runes.
 func truncateConditionMessage(msg string) string {
 	runes := []rune(msg)
@@ -89,7 +99,7 @@ func (r *ValkeyReconciler) setReconcileBlockedCondition(ctx context.Context, v *
 	}
 
 	reason := reconcileBlockedReason(err)
-	message := truncateConditionMessage(err.Error())
+	message := truncateConditionMessage(compactErrorMessage(err))
 	if existing != nil &&
 		existing.Status == metav1.ConditionTrue &&
 		existing.Reason == reason &&
