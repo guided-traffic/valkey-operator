@@ -221,21 +221,29 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	resourceErr := r.reconcileResources(ctx, valkey)
 	r.setReconcileBlockedCondition(ctx, valkey, resourceErr)
 
-	result, err := r.reconcileWorkload(ctx, valkey)
-	if err != nil {
-		return result, err
+	if resourceErr != nil {
+		// Silence every intermediate phase write for the rest of this pass; the
+		// single write below is the phase authority while blocked.
+		ctx = withBlockedPass(ctx)
 	}
+
+	result, workloadErr := r.reconcileWorkload(ctx, valkey)
 
 	if resourceErr != nil {
-		// Written after the workload pass so it is not overwritten by
-		// updateStatus, and returned so the controller-runtime rate limiter
-		// backs the retry off instead of spinning on the 10 s requeue.
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError,
+		// The one phase write of a blocked pass. It runs even when the workload
+		// pass failed, so an early return in there can never leave the phase on
+		// whatever the previous pass wrote. writePhase bypasses the suppression
+		// that withBlockedPass installed.
+		//
+		// The error is returned so the controller-runtime rate limiter backs the
+		// retry off instead of spinning on the 10 s requeue; a workload failure
+		// is joined in rather than dropped.
+		_ = r.writePhase(ctx, valkey, vkov1.ValkeyPhaseError,
 			fmt.Sprintf("Failed to reconcile resources: %s", compactErrorMessage(resourceErr)))
-		return ctrl.Result{}, resourceErr
+		return ctrl.Result{}, errors.Join(resourceErr, workloadErr)
 	}
 
-	return result, nil
+	return result, workloadErr
 }
 
 // reconcileWorkload handles everything that depends on the running data plane
@@ -1396,14 +1404,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		})
 	}
 
-	// Only update if status actually changed to prevent infinite reconcile loops.
-	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
-	v.Status.OperatorVersion = r.OperatorVersion
-	if statusUnchanged(prevStatus, &v.Status) {
-		return nil
-	}
-
-	return r.Status().Update(ctx, v)
+	return r.persistStatus(ctx, v, prevStatus)
 }
 
 // updateHAStatus updates the status for HA (Sentinel) mode.
@@ -1501,7 +1502,22 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		})
 	}
 
-	// Only update if status actually changed to prevent infinite reconcile loops.
+	return r.persistStatus(ctx, v, prevStatus)
+}
+
+// persistStatus writes the status computed by updateStandaloneStatus/updateHAStatus,
+// skipping the write when nothing changed to prevent infinite reconcile loops.
+//
+// While the pass is blocked the computed phase and message are dropped and the
+// previous ones kept, so the pass keeps its single Error phase write. Everything
+// else — readyReplicas, masterPod, observerReady, conditions — keeps updating:
+// a rejected managed write says nothing about the running data plane.
+func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, prevStatus *vkov1.ValkeyStatus) error {
+	if passIsBlocked(ctx) {
+		v.Status.Phase = prevStatus.Phase
+		v.Status.Message = prevStatus.Message
+	}
+
 	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
 	v.Status.OperatorVersion = r.OperatorVersion
 	if statusUnchanged(prevStatus, &v.Status) {
@@ -1540,7 +1556,20 @@ func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 }
 
 // updatePhase is a convenience function to update only the phase and message.
+//
+// While the pass is blocked the write is dropped: reconcileResources failed, and
+// Reconcile ends the pass with a single Error phase write. Without this the health
+// phase and the Error phase alternate on every pass and watchers see the CR flap.
 func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, phase vkov1.ValkeyPhase, message string) error {
+	if passIsBlocked(ctx) {
+		return nil
+	}
+	return r.writePhase(ctx, v, phase, message)
+}
+
+// writePhase updates phase and message unconditionally. Only the final write of a
+// blocked pass may use it directly; everything else goes through updatePhase.
+func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phase vkov1.ValkeyPhase, message string) error {
 	// Refresh the object first to avoid update conflicts.
 	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
 		return err

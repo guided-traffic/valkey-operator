@@ -112,3 +112,28 @@ func (r *ValkeyReconciler) setReconcileBlockedCondition(ctx context.Context, v *
 		reason,
 		message)
 }
+
+// blockedPassKey marks a reconcile pass whose reconcileResources call failed.
+type blockedPassKey struct{}
+
+// withBlockedPass marks ctx as belonging to a pass whose managed-resource writes
+// were (partly) rejected.
+//
+// A blocked pass ends with one authoritative phase write: Error plus the joined
+// step errors. Every phase write before it in the same pass is dropped, because
+// the phase computed from the running data plane (OK while the cluster is
+// healthy, RollingUpdate n/m while a rolling update runs) and the blocked phase
+// would otherwise alternate on every pass — visible as flapping in Lens,
+// `kubectl get -w` and any monitoring keyed on status.phase.
+//
+// The flag rides on the context rather than on the reconciler so it stays
+// per-pass and per-CR with MaxConcurrentReconciles > 1.
+func withBlockedPass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, blockedPassKey{}, true)
+}
+
+// passIsBlocked reports whether ctx belongs to a pass marked by withBlockedPass.
+func passIsBlocked(ctx context.Context) bool {
+	blocked, _ := ctx.Value(blockedPassKey{}).(bool)
+	return blocked
+}
