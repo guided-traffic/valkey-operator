@@ -183,6 +183,37 @@ port `metrics`). Implementation:
   persistence) has no failover target, so adding the sidecar restarts it and loses
   in-memory data (physically unavoidable).
 
+## StatefulSet Nudge (short-of-pods recovery)
+
+Pod creation for both StatefulSets is entirely the statefulset-controller's job
+(`updateStrategy: OnDelete`, `podManagementPolicy: Parallel`). When its creates are
+rejected — e.g. by a fail-closed admission webhook whose backend is temporarily gone —
+it retries on an exponential workqueue backoff that reached **5 min 29 s** in the
+2026-08-19 infra-d incident, long after the rejection cause was resolved. Nothing else
+wakes it: the StatefulSet object is not written (no spec drift) and with zero pods there
+are no pod events either.
+
+The operator therefore bumps an annotation to force an immediate resync:
+
+- Annotation `vko.gtrfc.com/nudge: <RFC3339>` (`builder.AnnotationNudge`), written as a
+  **merge patch** on the StatefulSet *metadata* — not on the pod template. It is
+  therefore invisible to `StatefulSetHasChanged` / `SentinelStatefulSetHasChanged` /
+  `OperatorVersionChanged` and never triggers a rolling update.
+- The stored timestamp doubles as rate-limit state: re-bumped only when older than
+  `builder.NudgeInterval` (20 s). No CRD field, no in-cluster state.
+- Grace period `nudgeGracePeriod` (10 s, in-memory `nudgeTracker`) before the first bump
+  so normal pod churn is not nudged. Losing the map on restart is harmless.
+- Suppressed while `vko.gtrfc.com/rolling-update-state` is set — there the operator
+  deletes pods on purpose.
+- Applies to the data and the Sentinel StatefulSet; keyed on
+  `status.replicas < spec.replicas` (created pods, not ready ones).
+- Code: `internal/controller/nudge.go` (`nudgeShortStatefulSets`), called from
+  `Reconcile` after the rolling-update checks; helpers in `internal/builder/annotations.go`.
+- E2E guard: `TestE2E_AdmissionRejection_StatefulSetNudgeRecovery`
+  (`test/e2e/admission_recovery_test.go`) blocks CREATE pods with a namespace-scoped
+  `failurePolicy: Fail` webhook, deletes all data pods, then asserts recovery within 60 s
+  of removing the webhook.
+
 # Important Notes
 
 - Remember Cyclomatic Complexity: Keep it under 15 for all functions. Refactor if it exceeds this threshold.

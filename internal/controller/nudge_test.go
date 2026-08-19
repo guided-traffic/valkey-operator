@@ -1,0 +1,223 @@
+package controller
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/common"
+)
+
+// nudgeTestNamespace is the namespace all nudge unit tests operate in.
+const nudgeTestNamespace = "default"
+
+// nudgeTestReplicas is the desired replica count of every StatefulSet built here.
+const nudgeTestReplicas int32 = 3
+
+// newNudgeStatefulSet builds a StatefulSet that wants nudgeTestReplicas pods and
+// reports `created` of them in status.replicas, as the statefulset-controller would.
+func newNudgeStatefulSet(name string, created int32) *appsv1.StatefulSet {
+	desired := nudgeTestReplicas
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: nudgeTestNamespace},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
+		Status:     appsv1.StatefulSetStatus{Replicas: created},
+	}
+}
+
+// newSentinelValkey returns a 3-replica HA Valkey CR.
+func newSentinelValkey() *vkov1.Valkey {
+	return newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+}
+
+// pastGrace makes the reconciler believe the StatefulSet has been short of pods
+// for longer than nudgeGracePeriod.
+func pastGrace(r *ValkeyReconciler, keys ...types.NamespacedName) {
+	for _, key := range keys {
+		r.nudges.observe(key, time.Now().Add(-nudgeGracePeriod-time.Second))
+	}
+}
+
+func nudgeAnnotation(t *testing.T, c client.Client, name string) string {
+	t.Helper()
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: name, Namespace: nudgeTestNamespace}, sts))
+	return sts.Annotations[builder.AnnotationNudge]
+}
+
+// nudgeKey returns the tracker/client key for a StatefulSet name.
+func nudgeKey(name string) types.NamespacedName {
+	return types.NamespacedName{Name: name, Namespace: nudgeTestNamespace}
+}
+
+func TestNudgeShortStatefulSets_NoNudgeWhenHealthy(t *testing.T) {
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
+	r, c := newTestReconciler(v, sts)
+
+	key := nudgeKey(sts.Name)
+	pastGrace(r, key)
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, sts.Name),
+		"a StatefulSet with all pods created must not be nudged")
+	r.nudges.mu.Lock()
+	_, tracked := r.nudges.first[key]
+	r.nudges.mu.Unlock()
+	assert.False(t, tracked, "a healthy StatefulSet must be dropped from the tracker")
+}
+
+func TestNudgeShortStatefulSets_NoNudgeWithinGracePeriod(t *testing.T) {
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	r, c := newTestReconciler(v, sts)
+
+	// No tracker seeding: this is the first observation of the short state.
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, sts.Name),
+		"normal pod churn must not be nudged before the grace period elapses")
+}
+
+func TestNudgeShortStatefulSets_NudgesAfterGracePeriod(t *testing.T) {
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	r, c := newTestReconciler(v, sts)
+
+	pastGrace(r, nudgeKey(sts.Name))
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	stamp := nudgeAnnotation(t, c, sts.Name)
+	require.NotEmpty(t, stamp, "a StatefulSet short of pods must be nudged")
+	_, err := time.Parse(time.RFC3339, stamp)
+	assert.NoError(t, err, "nudge annotation must carry an RFC3339 timestamp")
+}
+
+func TestNudgeShortStatefulSets_RateLimitHonored(t *testing.T) {
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	recent := time.Now().Add(-builder.NudgeInterval / 2).UTC().Format(time.RFC3339)
+	sts.Annotations = map[string]string{builder.AnnotationNudge: recent}
+	r, c := newTestReconciler(v, sts)
+
+	pastGrace(r, nudgeKey(sts.Name))
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Equal(t, recent, nudgeAnnotation(t, c, sts.Name),
+		"a nudge younger than NudgeInterval must not be re-bumped")
+}
+
+func TestNudgeShortStatefulSets_RebumpsStaleNudge(t *testing.T) {
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	stale := time.Now().Add(-builder.NudgeInterval - time.Minute).UTC().Format(time.RFC3339)
+	sts.Annotations = map[string]string{builder.AnnotationNudge: stale}
+	r, c := newTestReconciler(v, sts)
+
+	pastGrace(r, nudgeKey(sts.Name))
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.NotEqual(t, stale, nudgeAnnotation(t, c, sts.Name),
+		"a nudge older than NudgeInterval must be re-bumped so the resync repeats")
+}
+
+func TestNudgeShortStatefulSets_NoNudgeDuringRollingUpdate(t *testing.T) {
+	v := newSentinelValkey()
+	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
+	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 2)
+	r, c := newTestReconciler(v, sts)
+
+	key := nudgeKey(sts.Name)
+	pastGrace(r, key)
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, sts.Name),
+		"pods are deleted on purpose during a rolling update; nudging must be suppressed")
+	r.nudges.mu.Lock()
+	_, tracked := r.nudges.first[key]
+	r.nudges.mu.Unlock()
+	assert.False(t, tracked, "the rolling update must reset the grace period tracker")
+}
+
+func TestNudgeShortStatefulSets_NudgesSentinelStatefulSet(t *testing.T) {
+	v := newSentinelValkey()
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+	sentinelName := common.StatefulSetName(v, common.ComponentSentinel)
+	data := newNudgeStatefulSet(dataName, 3)
+	sentinel := newNudgeStatefulSet(sentinelName, 1)
+	r, c := newTestReconciler(v, data, sentinel)
+
+	pastGrace(r,
+		nudgeKey(dataName),
+		nudgeKey(sentinelName),
+	)
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, dataName), "healthy data StatefulSet must be untouched")
+	assert.NotEmpty(t, nudgeAnnotation(t, c, sentinelName),
+		"the Sentinel StatefulSet has the same failure mode and must be nudged too")
+}
+
+func TestNudgeShortStatefulSets_SkipsSentinelWhenDisabled(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	sentinelName := common.StatefulSetName(v, common.ComponentSentinel)
+	// A leftover Sentinel StatefulSet from a previous HA configuration.
+	sentinel := newNudgeStatefulSet(sentinelName, 0)
+	r, c := newTestReconciler(v, sentinel)
+
+	pastGrace(r, nudgeKey(sentinelName))
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, sentinelName),
+		"Sentinel is disabled; its StatefulSet must not be nudged")
+}
+
+func TestNudgeShortStatefulSets_MissingStatefulSetIsNoOp(t *testing.T) {
+	v := newSentinelValkey()
+	r, _ := newTestReconciler(v)
+
+	key := nudgeKey(common.StatefulSetName(v, common.ComponentValkey))
+	pastGrace(r, key)
+
+	// Must not panic or fail when the StatefulSet does not exist yet.
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	r.nudges.mu.Lock()
+	_, tracked := r.nudges.first[key]
+	r.nudges.mu.Unlock()
+	assert.False(t, tracked, "a missing StatefulSet must be dropped from the tracker")
+}
+
+func TestNudgeTracker_ObserveKeepsFirstObservation(t *testing.T) {
+	tracker := &nudgeTracker{}
+	key := nudgeKey("test")
+	first := time.Now().Add(-time.Minute)
+
+	assert.Equal(t, first, tracker.observe(key, first))
+	assert.Equal(t, first, tracker.observe(key, time.Now()),
+		"a later observation must not reset the grace period")
+
+	tracker.forget(key)
+	now := time.Now()
+	assert.Equal(t, now, tracker.observe(key, now), "forget must restart the grace period")
+}

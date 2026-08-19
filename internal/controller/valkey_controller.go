@@ -70,6 +70,10 @@ type ValkeyReconciler struct {
 	// NewValkeyClientFn overrides the default Valkey client factory.
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
+
+	// nudges tracks how long each StatefulSet has been short of pods.
+	// See nudgeShortStatefulSets.
+	nudges nudgeTracker
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -223,6 +227,10 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if result, done := r.handlePostRollingUpdateChecks(ctx, valkey); done {
 		return result, nil
 	}
+
+	// Nudge StatefulSets that are short of pods so the statefulset-controller
+	// resyncs immediately instead of waiting out its exponential backoff.
+	r.nudgeShortStatefulSets(ctx, valkey)
 
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {
