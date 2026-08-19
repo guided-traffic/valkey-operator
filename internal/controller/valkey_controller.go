@@ -1692,6 +1692,7 @@ func (r *ValkeyReconciler) verifyValkeyConnectivity(ctx context.Context, v *vkov
 // SetupWithManager sets up the controller with the Manager.
 func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(reconcileControllerOptions()).
 		For(&vkov1.Valkey{}, ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
