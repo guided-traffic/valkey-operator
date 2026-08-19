@@ -275,8 +275,8 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
-	if result, done := r.handlePostRollingUpdateChecks(ctx, valkey); done {
-		return result, nil
+	if result, done, err := r.handlePostRollingUpdateChecks(ctx, valkey); done {
+		return result, err
 	}
 
 	// Update status based on StatefulSet readiness.
@@ -306,19 +306,24 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 }
 
 // handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery
-// after the main Valkey rolling update is done. Returns (result, true) if the caller
-// should return immediately, or (_, false) if processing should continue.
-func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool) {
+// after the main Valkey rolling update is done. Returns (result, true, err) if the
+// caller should return immediately, or (_, false, nil) if processing should continue.
+func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool, error) {
 	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
 	// while verifying sentinel quorum before each deletion.
 	if v.IsSentinelEnabled() {
 		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, v)
 		if sentinelResult.Error != nil {
 			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
-			return ctrl.Result{}, true
+			// The error is returned, not swallowed: without it the pass ends with
+			// no requeue and no error, and because status writes do not re-trigger
+			// (GenerationChangedPredicate) reconciliation stalls until an unrelated
+			// owned-object event arrives. Returning it hands the retry to the
+			// rate limiter, mirroring the data rolling-update error path.
+			return ctrl.Result{}, true, sentinelResult.Error
 		}
 		if sentinelResult.NeedsRequeue {
-			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true
+			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
 		}
 	}
 
@@ -327,14 +332,16 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 	// (e.g. after staggered restarts where the master pod was the last to restart).
 	if v.IsMultiReplicaWithoutSentinel() {
 		if recovered, err := r.checkAndRecoverNoMaster(ctx, v); err != nil {
+			// Kept as an explicit requeue rather than a returned error: this path
+			// already carries its own retry clock.
 			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("No-master recovery failed: %v", err))
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 		} else if recovered {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 		}
 	}
 
-	return ctrl.Result{}, false
+	return ctrl.Result{}, false, nil
 }
 
 // reconcileStep is one unit of work inside a reconcile pass: a display name, an

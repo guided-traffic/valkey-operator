@@ -10,9 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -2375,6 +2378,38 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
 		Name: fmt.Sprintf("%s-2", stsName), Namespace: "default",
 	}, pod2))
+}
+
+// --- NA5: a Sentinel rolling-update error must lead to a retry ---
+
+// TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError pins the NA5 fix.
+// The Sentinel rolling-update error path used to return (ctrl.Result{}, true) with
+// no error and no RequeueAfter, so the pass ended without any retry — and since a
+// status write does not re-trigger the CR watch (GenerationChangedPredicate),
+// reconciliation stalled until some unrelated owned-object event arrived.
+func TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError(t *testing.T) {
+	v, objs := sentinelQuorumWaitFixture(3)
+	failingPod := fmt.Sprintf("%s-0", common.StatefulSetName(v, common.ComponentSentinel))
+	failSentinelPodGet := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok && key.Name == failingPod {
+				return apierrors.NewInternalError(fmt.Errorf("etcd unavailable"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	r, _ := newInterceptedReconciler(failSentinelPodGet, objs...)
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+
+	require.Error(t, err,
+		"a Sentinel rolling-update error must reach the caller so the rate limiter retries the pass")
+	assert.Contains(t, err.Error(), failingPod)
+	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase,
+		"the error must also be visible on the CR, not only in the retry")
+	assert.Zero(t, result.RequeueAfter,
+		"the retry comes from the returned error; an extra RequeueAfter would bypass the rate limiter")
 }
 
 // --- persistKnownMaster ---
