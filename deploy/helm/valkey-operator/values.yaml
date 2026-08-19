@@ -61,3 +61,7 @@ preUpgradeHook:
 
 # Valkey CRs support spec.podDisruptionBudget (opt-in). PDBs are only
 # created for StatefulSets with >= 2 replicas; singletons are skipped.
+
+# Valkey CRs get soft pod anti-affinity on kubernetes.io/hostname by default for
+# every StatefulSet with >= 2 replicas; set spec.antiAffinity.mode: hard for a
+# guaranteed spread (surplus pods stay Pending).

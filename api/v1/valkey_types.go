@@ -313,6 +313,61 @@ type PodDisruptionBudgetSpec struct {
 	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
 }
 
+const (
+	// AntiAffinityModeSoft renders preferredDuringSchedulingIgnoredDuringExecution:
+	// the scheduler tries to spread pods but never leaves one Pending.
+	AntiAffinityModeSoft = "soft"
+
+	// AntiAffinityModeHard renders requiredDuringSchedulingIgnoredDuringExecution:
+	// the spread is guaranteed, surplus pods stay Pending.
+	AntiAffinityModeHard = "hard"
+
+	// DefaultAntiAffinityTopologyKey is the spread domain used when
+	// spec.antiAffinity.topologyKey is unset: one pod per node.
+	DefaultAntiAffinityTopologyKey = "kubernetes.io/hostname"
+
+	// MinAntiAffinityReplicas is the smallest replica count that gets an
+	// anti-affinity term. A singleton has no peer to repel, so injecting one
+	// would only change the pod-spec hash and restart the pod for nothing.
+	MinAntiAffinityReplicas int32 = 2
+
+	// AntiAffinityWeight is the weight of the preferred (soft) anti-affinity term.
+	// 100 is the maximum, making the spread the strongest preference the
+	// scheduler weighs against its other priorities.
+	AntiAffinityWeight int32 = 100
+)
+
+// AntiAffinitySpec configures pod anti-affinity for the data and Sentinel
+// StatefulSets. Each StatefulSet repels only its own kind, so data and Sentinel
+// pods may still share a node. Applied whenever the StatefulSet has at least
+// MinAntiAffinityReplicas replicas; singletons are skipped. Omitting the whole
+// block applies the defaults below (soft, hostname) — there is deliberately no
+// off switch, because soft is already the weakest possible setting.
+type AntiAffinitySpec struct {
+	// Mode selects soft (preferredDuringSchedulingIgnoredDuringExecution) or
+	// hard (requiredDuringSchedulingIgnoredDuringExecution).
+	//
+	// Soft is a scheduler preference: under node pressure pods may still be
+	// co-located, so the spread is not guaranteed.
+	//
+	// Hard guarantees the spread and has two consequences worth knowing before
+	// enabling it: with fewer schedulable nodes than replicas the surplus pods
+	// stay Pending (which also wedges the next rolling update), and during a node
+	// drain an evicted pod stays Pending until a node without a pod of the same
+	// StatefulSet becomes schedulable.
+	// +kubebuilder:validation:Enum=soft;hard
+	// +kubebuilder:default=soft
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// TopologyKey is the node label whose values define the spread domains.
+	// Defaults to kubernetes.io/hostname (one pod per node); set e.g.
+	// topology.kubernetes.io/zone to spread across availability zones instead.
+	// +kubebuilder:default="kubernetes.io/hostname"
+	// +optional
+	TopologyKey string `json:"topologyKey,omitempty"`
+}
+
 // NetworkPolicySpec defines network policy configuration.
 type NetworkPolicySpec struct {
 	// Enabled activates NetworkPolicy creation.
@@ -541,6 +596,12 @@ type ValkeySpec struct {
 	// Sentinel StatefulSets. Omitted means no PDBs are managed by the operator.
 	// +optional
 	PodDisruptionBudget *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
+
+	// AntiAffinity configures pod anti-affinity for the data and Sentinel
+	// StatefulSets. Omitted means soft anti-affinity on kubernetes.io/hostname
+	// for every StatefulSet with at least two replicas.
+	// +optional
+	AntiAffinity *AntiAffinitySpec `json:"antiAffinity,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -726,6 +787,37 @@ func (v *Valkey) NeedsDataPodDisruptionBudget() bool {
 func (v *Valkey) NeedsSentinelPodDisruptionBudget() bool {
 	return v.IsPodDisruptionBudgetEnabled() && v.IsSentinelEnabled() &&
 		v.Spec.Sentinel.Replicas >= MinPDBReplicas
+}
+
+// AntiAffinityMode returns the configured anti-affinity mode, falling back to
+// the default (soft). An unknown value is treated as soft: the weakest setting
+// is the safe fallback if validation is ever bypassed.
+func (v *Valkey) AntiAffinityMode() string {
+	if v.Spec.AntiAffinity != nil && v.Spec.AntiAffinity.Mode == AntiAffinityModeHard {
+		return AntiAffinityModeHard
+	}
+	return AntiAffinityModeSoft
+}
+
+// AntiAffinityTopologyKey returns the configured topology key, falling back to
+// the default (kubernetes.io/hostname).
+func (v *Valkey) AntiAffinityTopologyKey() string {
+	if v.Spec.AntiAffinity != nil && v.Spec.AntiAffinity.TopologyKey != "" {
+		return v.Spec.AntiAffinity.TopologyKey
+	}
+	return DefaultAntiAffinityTopologyKey
+}
+
+// NeedsDataAntiAffinity reports whether an anti-affinity term applies to the data
+// StatefulSet: at least MinAntiAffinityReplicas pods.
+func (v *Valkey) NeedsDataAntiAffinity() bool {
+	return v.Spec.Replicas >= MinAntiAffinityReplicas
+}
+
+// NeedsSentinelAntiAffinity reports whether an anti-affinity term applies to the
+// Sentinel StatefulSet: Sentinel enabled and at least MinAntiAffinityReplicas pods.
+func (v *Valkey) NeedsSentinelAntiAffinity() bool {
+	return v.IsSentinelEnabled() && v.Spec.Sentinel.Replicas >= MinAntiAffinityReplicas
 }
 
 // IsPersistenceEnabled returns true if persistence is configured and enabled.

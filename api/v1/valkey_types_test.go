@@ -1200,3 +1200,80 @@ func TestNeedsSentinelPodDisruptionBudget(t *testing.T) {
 		})
 	}
 }
+
+// --- anti-affinity ---
+
+func TestAntiAffinityMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		spec     *AntiAffinitySpec
+		expected string
+	}{
+		{name: "nil spec defaults to soft", spec: nil, expected: AntiAffinityModeSoft},
+		{name: "empty mode defaults to soft", spec: &AntiAffinitySpec{}, expected: AntiAffinityModeSoft},
+		{name: "explicit soft", spec: &AntiAffinitySpec{Mode: AntiAffinityModeSoft}, expected: AntiAffinityModeSoft},
+		{name: "explicit hard", spec: &AntiAffinitySpec{Mode: AntiAffinityModeHard}, expected: AntiAffinityModeHard},
+		{name: "unknown value falls back to soft", spec: &AntiAffinitySpec{Mode: "bogus"}, expected: AntiAffinityModeSoft},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.AntiAffinity = tt.spec })
+			assert.Equal(t, tt.expected, v.AntiAffinityMode())
+		})
+	}
+}
+
+func TestAntiAffinityTopologyKey(t *testing.T) {
+	v := newValkey("test")
+	assert.Equal(t, DefaultAntiAffinityTopologyKey, v.AntiAffinityTopologyKey(), "no spec falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) { v.Spec.AntiAffinity = &AntiAffinitySpec{} })
+	assert.Equal(t, DefaultAntiAffinityTopologyKey, v.AntiAffinityTopologyKey(), "empty key falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.AntiAffinity = &AntiAffinitySpec{TopologyKey: "topology.kubernetes.io/zone"}
+	})
+	assert.Equal(t, "topology.kubernetes.io/zone", v.AntiAffinityTopologyKey())
+}
+
+// TestNeedsAntiAffinity guards the single-replica skip rule: a singleton has no
+// peer to repel, so it must not get a term (and therefore no pod-spec hash churn).
+func TestNeedsAntiAffinity(t *testing.T) {
+	tests := []struct {
+		name             string
+		replicas         int32
+		sentinel         *SentinelSpec
+		expectedData     bool
+		expectedSentinel bool
+	}{
+		{name: "standalone", replicas: 1, expectedData: false, expectedSentinel: false},
+		{name: "two data replicas, no sentinel", replicas: 2, expectedData: true, expectedSentinel: false},
+		{
+			name: "sentinel disabled", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: false, Replicas: 3},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "single sentinel", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 1},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "ha", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			expectedData: true, expectedSentinel: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				v.Spec.Sentinel = tt.sentinel
+			})
+			assert.Equal(t, tt.expectedData, v.NeedsDataAntiAffinity())
+			assert.Equal(t, tt.expectedSentinel, v.NeedsSentinelAntiAffinity())
+		})
+	}
+}

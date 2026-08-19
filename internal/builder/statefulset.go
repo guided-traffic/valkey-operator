@@ -512,6 +512,7 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 		ServiceAccountName: SidecarServiceAccountName(v),
 		Containers:         buildPodContainers(v, operatorImage),
 		Volumes:            volumes,
+		Affinity:           BuildPodAntiAffinity(v, common.ComponentValkey),
 	}
 
 	// Set terminationGracePeriodSeconds to allow time for graceful failover.

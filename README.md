@@ -18,6 +18,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
 - **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
+- **Pod anti-affinity** — data and Sentinel pods spread across nodes by default (soft preference), or `mode: hard` for a guaranteed spread
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
@@ -419,6 +420,7 @@ spec:
 | `persistence` | `PersistenceSpec` | — | Data persistence configuration |
 | `observer` | `ObserverSpec` | — | Cluster observer configuration |
 | `podDisruptionBudget` | `PodDisruptionBudgetSpec` | — | PodDisruptionBudgets for the data and Sentinel StatefulSets |
+| `antiAffinity` | `AntiAffinitySpec` | *(soft on hostname)* | Pod anti-affinity for the data and Sentinel StatefulSets |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -594,6 +596,65 @@ spec:
 
 The operator needs `policy/poddisruptionbudgets` RBAC for this; the Helm chart
 ships it unconditionally, so no permission change is needed to turn the feature on.
+
+### `spec.antiAffinity`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `string` | `soft` | `soft` (scheduler preference) or `hard` (guaranteed spread) |
+| `topologyKey` | `string` | `kubernetes.io/hostname` | Node label whose values define the spread domains |
+
+Unlike `podDisruptionBudget`, this block is **opt-out by degree, not by presence**:
+omitting it applies the defaults below. There is no `enabled` flag because `soft` is
+already the weakest possible setting — a scheduler preference that never blocks
+scheduling.
+
+- **`soft`** (default) renders `preferredDuringSchedulingIgnoredDuringExecution`
+  with weight `100`, the strongest preference the scheduler weighs against its other
+  priorities. Under node pressure pods may still be co-located, so the spread is a
+  best effort, not a guarantee.
+- **`hard`** renders `requiredDuringSchedulingIgnoredDuringExecution`. The spread is
+  guaranteed, with two consequences worth knowing before enabling it: with fewer
+  schedulable spread domains than replicas the surplus pods stay `Pending` (which
+  also wedges the next rolling update), and during a node drain an evicted pod stays
+  `Pending` until a domain without a pod of the same StatefulSet becomes schedulable.
+  That is degraded but correct — the alternative is silently re-co-locating the pods.
+- Each StatefulSet **repels only its own kind**, selected by
+  `app.kubernetes.io/instance` + `app.kubernetes.io/managed-by` +
+  `app.kubernetes.io/component`. Data and Sentinel pods may therefore share a node,
+  and a second Valkey CR in the same namespace is unaffected.
+- **StatefulSets with fewer than 2 replicas get no term** (data at
+  `spec.replicas: 1`, Sentinel at `spec.sentinel.replicas: 1`): a singleton has no
+  peer to repel, and injecting an empty term would change the pod-spec hash and
+  restart the pod for nothing.
+- Changing `mode` or `topologyKey` changes the pod-spec hash and therefore triggers
+  the operator's failover-aware rolling update — lossless for a multi-replica
+  cluster. The same applies when upgrading an operator that did not yet render
+  anti-affinity.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: ha-valkey
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  antiAffinity:
+    mode: soft                            # default: soft
+    topologyKey: kubernetes.io/hostname   # default: kubernetes.io/hostname
+```
+
+Spreading across availability zones instead of nodes is a `topologyKey` change:
+
+```yaml
+  antiAffinity:
+    mode: hard
+    topologyKey: topology.kubernetes.io/zone
+```
 
 ### `spec.persistence`
 

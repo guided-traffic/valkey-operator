@@ -366,6 +366,7 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 
 	return corev1.PodSpec{
 		ServiceAccountName: DefaultServiceAccountName,
+		Affinity:           BuildPodAntiAffinity(v, common.ComponentSentinel),
 		// Init container copies the sentinel config to a writable volume.
 		// Sentinel needs to rewrite its config file at runtime.
 		InitContainers: []corev1.Container{

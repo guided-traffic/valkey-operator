@@ -71,6 +71,38 @@ spec:
           spec:
             description: ValkeySpec defines the desired state of Valkey.
             properties:
+              antiAffinity:
+                description: |-
+                  AntiAffinity configures pod anti-affinity for the data and Sentinel
+                  StatefulSets. Omitted means soft anti-affinity on kubernetes.io/hostname
+                  for every StatefulSet with at least two replicas.
+                properties:
+                  mode:
+                    default: soft
+                    description: |-
+                      Mode selects soft (preferredDuringSchedulingIgnoredDuringExecution) or
+                      hard (requiredDuringSchedulingIgnoredDuringExecution).
+
+                      Soft is a scheduler preference: under node pressure pods may still be
+                      co-located, so the spread is not guaranteed.
+
+                      Hard guarantees the spread and has two consequences worth knowing before
+                      enabling it: with fewer schedulable nodes than replicas the surplus pods
+                      stay Pending (which also wedges the next rolling update), and during a node
+                      drain an evicted pod stays Pending until a node without a pod of the same
+                      StatefulSet becomes schedulable.
+                    enum:
+                    - soft
+                    - hard
+                    type: string
+                  topologyKey:
+                    default: kubernetes.io/hostname
+                    description: |-
+                      TopologyKey is the node label whose values define the spread domains.
+                      Defaults to kubernetes.io/hostname (one pod per node); set e.g.
+                      topology.kubernetes.io/zone to spread across availability zones instead.
+                    type: string
+                type: object
               auth:
                 description: Auth configures authentication.
                 properties:
