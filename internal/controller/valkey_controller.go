@@ -252,6 +252,18 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.Valkey) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Nudge StatefulSets that are short of pods so the statefulset-controller
+	// resyncs immediately instead of waiting out its exponential backoff.
+	//
+	// This runs before the rolling-update checks, not after. Both of them return
+	// early while they wait, and the Sentinel quorum guard waits for a deleted
+	// Sentinel pod that is being recreated — so when that recreation is blocked,
+	// reaching the nudge only afterwards made it unreachable in exactly the
+	// situation it exists for, for both StatefulSets. Which StatefulSet may be
+	// nudged is decided in nudgeShortStatefulSets, per StatefulSet, instead of by
+	// the position of this call.
+	shortOfPods := r.nudgeShortStatefulSets(ctx, valkey)
+
 	// Check for rolling update (image change on running pods).
 	rollingResult := r.checkAndHandleRollingUpdate(ctx, valkey)
 	if rollingResult.Error != nil {
@@ -266,10 +278,6 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	if result, done := r.handlePostRollingUpdateChecks(ctx, valkey); done {
 		return result, nil
 	}
-
-	// Nudge StatefulSets that are short of pods so the statefulset-controller
-	// resyncs immediately instead of waiting out its exponential backoff.
-	shortOfPods := r.nudgeShortStatefulSets(ctx, valkey)
 
 	// Update status based on StatefulSet readiness.
 	if err := r.updateStatus(ctx, valkey); err != nil {

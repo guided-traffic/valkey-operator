@@ -79,8 +79,20 @@ func (t *nudgeTracker) forget(key types.NamespacedName) {
 // with zero pods there are no pod events either. Bumping an annotation is the
 // operator's only lever, so it uses it.
 //
-// The nudge is suppressed while a rolling update is in progress, where the
-// operator deletes pods on purpose and the short-of-pods state is expected.
+// Suppression is per StatefulSet and covers exactly one case: the data rolling
+// update, which deletes data pods on purpose and drives its own requeue. It
+// deliberately does not extend further:
+//
+//   - The Sentinel StatefulSet is nudged during a data rolling update, because
+//     that update never deletes a Sentinel pod — a short Sentinel StatefulSet
+//     there is a genuine stall, and losing quorum is what blocks the update.
+//   - There is no Sentinel-rolling-update suppression at all. That path deletes
+//     one pod and then waits for its replacement, so a blocked recreation is
+//     precisely when the nudge is needed. Bumping the annotation of a StatefulSet
+//     whose pod the operator just deleted is harmless under OnDelete: the resync
+//     recreates the pod from the current template, which is the next step of the
+//     rolling update anyway. The annotation lives on the StatefulSet metadata,
+//     not the pod template, so it never feeds back into update detection.
 //
 // It reports whether any managed StatefulSet is currently short of pods, so the
 // caller can keep requeueing. Without that the grace period would be
@@ -91,13 +103,13 @@ func (r *ValkeyReconciler) nudgeShortStatefulSets(ctx context.Context, v *vkov1.
 	dataKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentValkey), Namespace: v.Namespace}
 	sentinelKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentSentinel), Namespace: v.Namespace}
 
-	if r.getRollingUpdateState(v) != "" {
+	short := false
+	if r.getRollingUpdateState(v) == "" {
+		short = r.nudgeStatefulSet(ctx, v, dataKey)
+	} else {
 		r.nudges.forget(dataKey)
-		r.nudges.forget(sentinelKey)
-		return false
 	}
 
-	short := r.nudgeStatefulSet(ctx, v, dataKey)
 	if v.IsSentinelEnabled() && r.nudgeStatefulSet(ctx, v, sentinelKey) {
 		short = true
 	}
