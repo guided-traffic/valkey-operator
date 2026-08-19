@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -38,6 +39,10 @@ import (
 // nudgeAnnotationKey is the annotation the operator bumps to force a
 // statefulset-controller resync (internal/builder.AnnotationNudge).
 const nudgeAnnotationKey = "vko.gtrfc.com/nudge"
+
+// blackholeWebhookName is the webhook name the API server quotes in its
+// rejection message; T4 asserts the CR condition carries exactly this string.
+const blackholeWebhookName = "blackhole.e2e.vko.gtrfc.com"
 
 // admissionBlockHold is how long pod creation stays blocked. It must be long
 // enough for the statefulset-controller's exponential backoff (5 ms · 2^n) to
@@ -51,15 +56,22 @@ const admissionBlockHold = 90 * time.Second
 // headroom on a loaded Kind cluster. In the incident the same step took 5 min 29 s.
 const admissionRecoveryDeadline = 60 * time.Second
 
-// blockPodCreation installs a fail-closed MutatingWebhookConfiguration that
-// matches CREATE pods in the given namespace only and points at a Service with
-// no endpoints, reproducing the incident's
+// blockPodCreation installs a fail-closed webhook that rejects CREATE pods in
+// the given namespace, as the incident's Kyverno webhook did.
+func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) func() {
+	t.Helper()
+	return tc.blockCoreResourceCreation(t, namespace, name, "pods")
+}
+
+// blockCoreResourceCreation installs a fail-closed MutatingWebhookConfiguration
+// that matches CREATE of the given core/v1 resources in the given namespace only
+// and points at a Service with no endpoints, reproducing the incident's
 // "no endpoints available for service" rejection. The namespaceSelector is
 // mandatory: an unscoped fail-closed webhook would also block Kind system pods
 // and every parallel e2e test.
 //
 // Returns a function that removes the webhook (idempotent).
-func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) func() {
+func (tc *testClients) blockCoreResourceCreation(t *testing.T, namespace, name string, resources ...string) func() {
 	t.Helper()
 	ctx := context.Background()
 
@@ -84,7 +96,7 @@ func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) fu
 	webhook := &admissionregistrationv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Webhooks: []admissionregistrationv1.MutatingWebhook{{
-			Name: "blackhole.e2e.vko.gtrfc.com",
+			Name: blackholeWebhookName,
 			ClientConfig: admissionregistrationv1.WebhookClientConfig{
 				Service: &admissionregistrationv1.ServiceReference{
 					Name:      svc.Name,
@@ -98,7 +110,7 @@ func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) fu
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"pods"},
+					Resources:   resources,
 					Scope:       &scope,
 				},
 			}},
@@ -117,7 +129,7 @@ func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) fu
 	_, err := tc.kube.AdmissionregistrationV1().MutatingWebhookConfigurations().
 		Create(ctx, webhook, metav1.CreateOptions{})
 	require.NoError(t, err, "Failed to install blocking webhook %s", name)
-	t.Logf("Installed fail-closed webhook %s blocking CREATE pods in namespace %s", name, namespace)
+	t.Logf("Installed fail-closed webhook %s blocking CREATE %v in namespace %s", name, resources, namespace)
 
 	removed := false
 	return func() {
@@ -234,5 +246,98 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	t.Run("cluster returns to OK", func(t *testing.T) {
 		tc.waitForStatefulSetReady(t, ns, name, 3)
 		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+	})
+}
+
+// reconcileBlockedCondition returns the ReconcileBlocked condition of a Valkey
+// CR, or nil while the CR has no status or no such condition yet.
+func (tc *testClients) reconcileBlockedCondition(t *testing.T, namespace, name string) map[string]interface{} {
+	t.Helper()
+	ctx := context.Background()
+
+	cr, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil
+	}
+	conditions, found, err := unstructured.NestedSlice(cr.Object, "status", "conditions")
+	if err != nil || !found {
+		return nil
+	}
+	for _, raw := range conditions {
+		cond, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if cond["type"] == "ReconcileBlocked" {
+			return cond
+		}
+	}
+	return nil
+}
+
+// waitForReconcileBlocked polls until the ReconcileBlocked condition reaches the
+// expected status, and returns it.
+func (tc *testClients) waitForReconcileBlocked(t *testing.T, namespace, name, status string,
+	timeout time.Duration) map[string]interface{} {
+	t.Helper()
+
+	var last map[string]interface{}
+	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, timeout, true,
+		func(_ context.Context) (bool, error) {
+			last = tc.reconcileBlockedCondition(t, namespace, name)
+			return last != nil && last["status"] == status, nil
+		})
+	require.NoError(t, err,
+		"Valkey %s/%s did not report ReconcileBlocked=%s within %v (last: %v)",
+		namespace, name, status, timeout, last)
+	return last
+}
+
+// TestE2E_AdmissionRejection_ReconcileBlockedCondition is scenario T4 of the
+// admission-gap ticket: while a fail-closed webhook rejects a write the operator
+// owns, the CR must name the webhook instead of leaving the user with a bare
+// "Error" phase and operator logs to read.
+//
+// The webhook here blocks CREATE configmaps, not pods: the operator writes the
+// ConfigMap itself, whereas pod creation is the statefulset-controller's job and
+// never reaches the operator's error path (that failure mode is T1 above).
+func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+
+	ns := "e2e-admission-condition"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	// The root-CA publisher creates kube-root-ca.crt in every new namespace.
+	// Wait for it, otherwise the webhook below blocks it and pods cannot mount
+	// their service-account CA once the block is lifted.
+	tc.waitForConfigMap(t, ns, "kube-root-ca.crt")
+
+	removeWebhook := tc.blockCoreResourceCreation(t, ns, "e2e-condition-blackhole", "configmaps")
+	defer removeWebhook()
+
+	name := "condition-test"
+	t.Log("Creating Valkey CR while ConfigMap creation is rejected")
+	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(1),
+		"image":    "valkey/valkey:8.0",
+	}))
+	defer tc.deleteValkey(t, ns, name)
+
+	t.Run("CR names the rejecting webhook", func(t *testing.T) {
+		cond := tc.waitForReconcileBlocked(t, ns, name, "True", 90*time.Second)
+		assert.Equal(t, "AdmissionWebhookDenied", cond["reason"],
+			"an admission rejection must be distinguishable from an ordinary write failure")
+		message, _ := cond["message"].(string)
+		assert.Contains(t, message, blackholeWebhookName,
+			"the condition message must carry the webhook name")
+	})
+
+	t.Run("condition clears once the block is gone", func(t *testing.T) {
+		removeWebhook()
+		cond := tc.waitForReconcileBlocked(t, ns, name, "False", 120*time.Second)
+		assert.Equal(t, "ReconcileSucceeded", cond["reason"])
+		tc.waitForValkeyPhase(t, ns, name, "OK")
 	})
 }

@@ -208,10 +208,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// Reconcile all managed resources.
+	// Reconcile all managed resources. The outcome is mirrored into the
+	// ReconcileBlocked condition so an admission rejection is distinguishable
+	// from any other write failure without reading operator logs.
 	if err := r.reconcileResources(ctx, valkey); err != nil {
+		r.setReconcileBlockedCondition(ctx, valkey, err)
 		return ctrl.Result{}, err
 	}
+	r.setReconcileBlockedCondition(ctx, valkey, nil)
 
 	// Check for rolling update (image change on running pods).
 	rollingResult := r.checkAndHandleRollingUpdate(ctx, valkey)

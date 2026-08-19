@@ -214,6 +214,37 @@ The operator therefore bumps an annotation to force an immediate resync:
   `failurePolicy: Fail` webhook, deletes all data pods, then asserts recovery within 60 s
   of removing the webhook.
 
+## ReconcileBlocked Condition
+
+`status.conditions[type=ReconcileBlocked]` tells a user *why* a CR is stuck without
+reading operator logs — specifically it separates "a cluster-side admission gate
+rejects my writes" from "the write itself failed".
+
+- Set from the outcome of every `reconcileResources` pass in `Reconcile`
+  (`valkey_controller.go`), via `setReconcileBlockedCondition`
+  (`internal/controller/reconcile_blocked.go`).
+- Reasons: `AdmissionWebhookDenied` when `isAdmissionRejection` matches the error
+  (message contains `failed calling webhook`, or `admission webhook ... denied the
+  request`, or an internal error mentioning the admission chain), `WriteFailed`
+  otherwise, `ReconcileSucceeded` when cleared. Matching is on the message, not only
+  the typed reason: callers wrap errors (`fmt.Errorf("sentinel statefulset: %w", err)`)
+  and explicit denials arrive as `Forbidden`, not as an internal error.
+- Message carries the underlying error (truncated at `conditionMessageLimit`, 1024
+  runes) including the webhook name.
+- **No status write when nothing changes** — neither on a healthy pass that was never
+  blocked, nor on repeated identical failures. A blocked cluster reconciles every few
+  seconds; rewriting the condition each time would be pure API churn.
+- No CRD schema change: `status.conditions` already exists, so `make manifests`
+  produces no diff.
+- Note on scope: only writes the *operator* performs reach this condition. Pod
+  creation is the statefulset-controller's job, so the 2026-08-19 incident's
+  `CREATE pods` rejection never surfaced here — that failure mode is covered by the
+  StatefulSet nudge above.
+- E2E guard: `TestE2E_AdmissionRejection_ReconcileBlockedCondition`
+  (`test/e2e/admission_recovery_test.go`) blocks `CREATE configmaps` with a
+  namespace-scoped `failurePolicy: Fail` webhook and asserts the condition names it,
+  then flips to `False` after removal.
+
 # Important Notes
 
 - Remember Cyclomatic Complexity: Keep it under 15 for all functions. Refactor if it exceeds this threshold.

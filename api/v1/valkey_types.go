@@ -35,6 +35,29 @@ const (
 	// because a replaced pod failed to sync within the configured timeout.
 	// The operator will not resume until the user applies a new spec change.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
+
+	// ConditionTypeReconcileBlocked is set when the operator could not write one
+	// of the managed resources. Its reason distinguishes an admission-webhook
+	// rejection (a cluster-side gate, e.g. a fail-closed policy webhook whose
+	// backend is down) from any other write failure, so users do not have to read
+	// operator logs to tell the two apart.
+	ConditionTypeReconcileBlocked ConditionType = "ReconcileBlocked"
+)
+
+const (
+	// ReasonAdmissionWebhookDenied is the ReconcileBlocked reason for a write
+	// rejected by the admission chain — either an explicit webhook denial or a
+	// fail-closed webhook that could not be called. The condition message carries
+	// the API server error including the webhook name.
+	ReasonAdmissionWebhookDenied = "AdmissionWebhookDenied"
+
+	// ReasonWriteFailed is the ReconcileBlocked reason for any other failure to
+	// write a managed resource (RBAC, quota, conflict, API server unreachable).
+	ReasonWriteFailed = "WriteFailed"
+
+	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
+	// reconcile pass over all managed resources.
+	ReasonReconcileSucceeded = "ReconcileSucceeded"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
