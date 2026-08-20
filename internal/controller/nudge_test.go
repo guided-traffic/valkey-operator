@@ -192,23 +192,26 @@ func TestNudgeShortStatefulSets_RebumpsStaleNudge(t *testing.T) {
 		"a nudge older than NudgeInterval must be re-bumped so the resync repeats")
 }
 
-func TestNudgeShortStatefulSets_NoNudgeDuringRollingUpdate(t *testing.T) {
+// TestNudgeShortStatefulSets_NudgesDataStatefulSetDuringRollingUpdate is the unit
+// half of NA15. The rolling-update state is a phase marker, not a liveness marker:
+// it stays set for as long as the phase runs, including while a pod recreation is
+// stuck, so it cannot tell "deleted on purpose, back in two seconds" from "deleted
+// on purpose, never coming back". Duration can, and nudgeGracePeriod measures it —
+// which is why the data StatefulSet is nudged here too.
+func TestNudgeShortStatefulSets_NudgesDataStatefulSetDuringRollingUpdate(t *testing.T) {
 	v := newSentinelValkey()
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
 	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 2)
 	r, c := newTestReconciler(v, sts)
 
-	key := nudgeKey(sts.Name)
-	pastGrace(r, key)
+	pastGrace(r, nudgeKey(sts.Name))
 
 	r.nudgeShortStatefulSets(context.Background(), v)
 
-	assert.Empty(t, nudgeAnnotation(t, c, sts.Name),
-		"pods are deleted on purpose during a rolling update; nudging must be suppressed")
-	r.nudges.mu.Lock()
-	_, tracked := r.nudges.first[key]
-	r.nudges.mu.Unlock()
-	assert.False(t, tracked, "the rolling update must reset the grace period tracker")
+	assert.NotEmpty(t, nudgeAnnotation(t, c, sts.Name),
+		"a data pod whose recreation is blocked must be nudged, rolling update or not")
+	assert.True(t, nudgeTracked(r, sts.Name),
+		"the grace period must keep accumulating across rolling-update passes")
 }
 
 func TestNudgeShortStatefulSets_NudgesSentinelStatefulSet(t *testing.T) {
@@ -296,22 +299,22 @@ func TestNudgeShortStatefulSets_ReportsShortSentinelOnly(t *testing.T) {
 		"a short Sentinel StatefulSet must keep the reconciler awake even when the data pods are complete")
 }
 
-func TestNudgeShortStatefulSets_NoRequeueSignalDuringRollingUpdate(t *testing.T) {
+func TestNudgeShortStatefulSets_ReportsShortDuringRollingUpdate(t *testing.T) {
 	v := newSentinelValkey()
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
 	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
 	r, _ := newTestReconciler(v, data)
 
-	assert.False(t, r.nudgeShortStatefulSets(context.Background(), v),
-		"the data rolling update drives its own requeue; the data nudge must not add a second clock")
+	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"a data StatefulSet short of pods is reported as short during a rolling update too")
 }
 
-// TestNudgeShortStatefulSets_NudgesSentinelDuringDataRollingUpdate pins the scope of
-// the rolling-update suppression: it belongs to the StatefulSet whose pods that
-// update deletes, and to no other. A data rolling update never touches a Sentinel
-// pod, so a short Sentinel StatefulSet during one is a genuine stall — and the
-// quorum it costs is what the data rolling update itself waits on.
-func TestNudgeShortStatefulSets_NudgesSentinelDuringDataRollingUpdate(t *testing.T) {
+// TestNudgeShortStatefulSets_NudgesBothDuringDataRollingUpdate pins that a data
+// rolling update exempts neither StatefulSet. The Sentinel half matters because
+// that update never deletes a Sentinel pod, so a short Sentinel StatefulSet during
+// one is a genuine stall — and the quorum it costs is what the data rolling update
+// itself waits on.
+func TestNudgeShortStatefulSets_NudgesBothDuringDataRollingUpdate(t *testing.T) {
 	v := newSentinelValkey()
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
@@ -324,8 +327,8 @@ func TestNudgeShortStatefulSets_NudgesSentinelDuringDataRollingUpdate(t *testing
 
 	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
 		"a short Sentinel StatefulSet must keep the reconciler awake during a data rolling update")
-	assert.Empty(t, nudgeAnnotation(t, c, dataName),
-		"data pods are deleted on purpose during a data rolling update; that nudge stays suppressed")
+	assert.NotEmpty(t, nudgeAnnotation(t, c, dataName),
+		"a data pod whose recreation is blocked must be nudged, rolling update or not")
 	assert.NotEmpty(t, nudgeAnnotation(t, c, sentinelName),
 		"a data rolling update never deletes a Sentinel pod, so its short StatefulSet must still be nudged")
 }
@@ -455,4 +458,78 @@ func TestReconcileWorkload_NudgesSentinelStatefulSetWhileRecreationBlocked(t *te
 
 	assert.NotEmpty(t, nudgeAnnotation(t, c, sentinelName),
 		"a Sentinel pod whose recreation is blocked must be nudged, not waited out")
+}
+
+// dataRecreationBlockedFixture builds the NA15 constellation: a data rolling
+// update in progress (state annotation set, image bumped), pod-2 deleted by that
+// update and never recreated because pod creation is rejected. pod-0 and pod-1
+// still run the outdated image, so the rolling update is not finished and its
+// candidate list is headed by the missing pod — the pass therefore ends in the
+// "waiting for pod to be recreated" requeue.
+//
+// The Sentinel StatefulSet is seeded complete on purpose, so the data StatefulSet
+// is the only possible source of the short signal.
+func dataRecreationBlockedFixture() (*vkov1.Valkey, []client.Object) {
+	const outdatedImage = "valkey/valkey:8.0"
+
+	v := newSentinelValkey()
+	v.Spec.Image = "valkey/valkey:9.0"
+	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
+
+	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 2)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), nudgeTestReplicas)
+
+	pod0 := createPodForSts(v, 0, outdatedImage, true)
+	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
+	pod1 := createPodForSts(v, 1, outdatedImage, true)
+	pod1.Labels[common.LabelInstanceRole] = common.RoleReplica
+
+	return v, []client.Object{v, data, sentinel, pod0, pod1}
+}
+
+// TestReconcileWorkload_NudgesDataStatefulSetWhenRecreationBlocked is the
+// regression guard for NA15. NA4 removed the Sentinel-rolling-update suppression
+// on the argument that the update deletes one pod and then waits for that exact
+// pod to come back; the data rolling update does the same thing, so suppressing
+// its nudge suppressed it precisely where it was the only lever. The rolling
+// update's own 10 s requeue keeps the operator awake but never wakes the
+// statefulset-controller, whose backoff reached 5 min 29 s in the incident.
+func TestReconcileWorkload_NudgesDataStatefulSetWhenRecreationBlocked(t *testing.T) {
+	v, objs := dataRecreationBlockedFixture()
+	r, c := newTestReconciler(objs...)
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+
+	pastGrace(r, nudgeKey(dataName))
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+	require.NoError(t, err)
+	require.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter,
+		"precondition: the pass must end in the rolling-update wait for the missing pod")
+
+	assert.NotEmpty(t, nudgeAnnotation(t, c, dataName),
+		"a data pod whose recreation is blocked must be nudged, not waited out")
+}
+
+// TestReconcileWorkload_RollingUpdateKeepsRequeueAuthority is the other half of
+// NA15: the data nudge is now live during a rolling update, and that is only
+// harmless because reconcileWorkload returns the rolling-update result before it
+// reads shortOfPods. Without this guard a later refactor that hoists the
+// shortOfPods check would silently replace the rolling update's 10 s clock with
+// the nudge's 5 s one and preempt its steps.
+func TestReconcileWorkload_RollingUpdateKeepsRequeueAuthority(t *testing.T) {
+	v, objs := dataRecreationBlockedFixture()
+	r, c := newTestReconciler(objs...)
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+
+	pastGrace(r, nudgeKey(dataName))
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, nudgeAnnotation(t, c, dataName),
+		"precondition: the data StatefulSet is nudged in this pass")
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter,
+		"the rolling update keeps requeue authority; the nudge must not add a second clock")
+	assert.NotEqual(t, nudgeRequeueInterval, result.RequeueAfter,
+		"the nudge requeue must not preempt the rolling-update wait")
 }

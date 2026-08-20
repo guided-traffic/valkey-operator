@@ -259,12 +259,15 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	// resyncs immediately instead of waiting out its exponential backoff.
 	//
 	// This runs before the rolling-update checks, not after. Both of them return
-	// early while they wait, and the Sentinel quorum guard waits for a deleted
-	// Sentinel pod that is being recreated — so when that recreation is blocked,
-	// reaching the nudge only afterwards made it unreachable in exactly the
-	// situation it exists for, for both StatefulSets. Which StatefulSet may be
-	// nudged is decided in nudgeShortStatefulSets, per StatefulSet, instead of by
-	// the position of this call.
+	// early while they wait, and both wait for a deleted pod that is being
+	// recreated — so when that recreation is blocked, reaching the nudge only
+	// afterwards made it unreachable in exactly the situation it exists for.
+	// Both StatefulSets are nudged unconditionally; this call's position only
+	// guarantees the nudge is reached, it does not decide who gets one.
+	//
+	// The rolling update keeps requeue authority: shortOfPods is read at the very
+	// end of this function, after every rolling-update return, so the 5 s nudge
+	// clock never preempts a rolling-update wait.
 	shortOfPods := r.nudgeShortStatefulSets(ctx, valkey)
 
 	// Check for rolling update (image change on running pods).

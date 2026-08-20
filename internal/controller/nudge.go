@@ -98,20 +98,37 @@ func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
 // with zero pods there are no pod events either. Bumping an annotation is the
 // operator's only lever, so it uses it.
 //
-// Suppression is per StatefulSet and covers exactly one case: the data rolling
-// update, which deletes data pods on purpose and drives its own requeue. It
-// deliberately does not extend further:
+// There is no rolling-update suppression, for either StatefulSet. Both rolling
+// updates delete a pod and then block on exactly that pod coming back
+// (replaceNextReplica, replaceRemainingPods, handleManualFailover — every delete
+// site requeues into a "waiting for pod to be recreated" branch), so a blocked
+// recreation is precisely when the nudge is needed, not a case to stand back
+// from. Bumping the annotation of a StatefulSet whose pod the operator itself
+// deleted is at worst a no-op:
 //
-//   - The Sentinel StatefulSet is nudged during a data rolling update, because
-//     that update never deletes a Sentinel pod — a short Sentinel StatefulSet
-//     there is a genuine stall, and losing quorum is what blocks the update.
-//   - There is no Sentinel-rolling-update suppression at all. That path deletes
-//     one pod and then waits for its replacement, so a blocked recreation is
-//     precisely when the nudge is needed. Bumping the annotation of a StatefulSet
-//     whose pod the operator just deleted is harmless under OnDelete: the resync
-//     recreates the pod from the current template, which is the next step of the
-//     rolling update anyway. The annotation lives on the StatefulSet metadata,
-//     not the pod template, so it never feeds back into update detection.
+//   - Under OnDelete with Parallel pod management, creating a missing ordinal is
+//     unconditional. A nudge can only make a recreation the statefulset-controller
+//     already owes happen sooner; it cannot cause one it does not owe, and the
+//     ordinal name makes a duplicate impossible.
+//   - The desired pod template is written before every delete in the same pass —
+//     reconcileResources runs its StatefulSet step before reconcileWorkload, and
+//     outdated pods are the rolling update's trigger *because* the template is
+//     already new. So the recreated pod comes back with the spec the update wants.
+//   - The annotation lives on StatefulSet object metadata, never on
+//     spec.template, so it enters neither StatefulSetHasChanged/podTemplateChanged
+//     nor ComputePodSpecHash: no drift verdict, no hash change, no feedback loop.
+//   - What separates an intentional deletion from a stalled one is duration, not
+//     the rolling-update state. nudgeGracePeriod requires 10 s of observed
+//     shortness, which a healthy recreation never reaches — status.replicas counts
+//     created pods, so it recovers at pod creation, long before readiness. The
+//     rolling-update state annotation is a phase marker that persists for the whole
+//     phase, including while a recreation is stuck, so keying suppression on it
+//     suppressed the nudge for the entire duration of exactly the stall it exists
+//     to break.
+//
+// The rolling update keeps requeue authority regardless: reconcileWorkload
+// returns the rolling-update result before it reads this function's return value,
+// so a nudge never shortens a rolling-update wait.
 //
 // It reports whether any managed StatefulSet is currently short of pods, so the
 // caller can keep requeueing. Without that the grace period would be
@@ -122,12 +139,7 @@ func (r *ValkeyReconciler) nudgeShortStatefulSets(ctx context.Context, v *vkov1.
 	dataKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentValkey), Namespace: v.Namespace}
 	sentinelKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentSentinel), Namespace: v.Namespace}
 
-	short := false
-	if r.getRollingUpdateState(v) == "" {
-		short = r.nudgeStatefulSet(ctx, v, dataKey)
-	} else {
-		r.nudges.forget(dataKey)
-	}
+	short := r.nudgeStatefulSet(ctx, v, dataKey)
 
 	if v.IsSentinelEnabled() && r.nudgeStatefulSet(ctx, v, sentinelKey) {
 		short = true
