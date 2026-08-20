@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -154,14 +155,26 @@ func (r *ValkeyReconciler) nudgeShortStatefulSets(ctx context.Context, v *vkov1.
 //
 // It reports whether the StatefulSet is short of pods — which is true on every
 // path that did not bump as well, because waiting out the grace period or the
-// rate limit still requires the caller to come back.
+// rate limit still requires the caller to come back. A read that failed for any
+// reason other than NotFound reports short too: unknown is not the same as
+// recovered, and only the caller coming back can resolve it.
 func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey, key types.NamespacedName) bool {
 	logger := log.FromContext(ctx)
 
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, key, sts); err != nil {
-		r.nudges.forget(key)
-		return false
+		if apierrors.IsNotFound(err) {
+			r.nudges.forget(key)
+			return false
+		}
+		// Any other error says nothing about the StatefulSet, so it must not be
+		// read as "no longer short". Forgetting here would restart the grace
+		// period, and returning false would end the requeue chain — which in
+		// Provisioning is the only wakeup source (see nudgeRequeueInterval), so
+		// one transient read error would park the very stall this exists to
+		// break until an unrelated event arrives. Keep the observation, come back.
+		logger.Error(err, "Failed to read StatefulSet for the nudge check", "statefulset", key.Name)
+		return true
 	}
 
 	desired := int32(1)

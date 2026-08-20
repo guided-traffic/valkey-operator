@@ -2,15 +2,18 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -532,4 +535,53 @@ func TestReconcileWorkload_RollingUpdateKeepsRequeueAuthority(t *testing.T) {
 		"the rolling update keeps requeue authority; the nudge must not add a second clock")
 	assert.NotEqual(t, nudgeRequeueInterval, result.RequeueAfter,
 		"the nudge requeue must not preempt the rolling-update wait")
+}
+
+// failStatefulSetGet makes every StatefulSet read for name fail with a
+// non-NotFound error, standing in for a transient API/cache failure.
+func failStatefulSetGet(name string) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.StatefulSet); ok && key.Name == name {
+				return apierrors.NewInternalError(fmt.Errorf("etcd unavailable"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue is the NA16 guard.
+// In Provisioning the nudge requeue is the only wakeup source, so treating an
+// unreadable StatefulSet as "not short" would end the requeue chain on the exact
+// path the nudge exists for. Unknown must mean come back, not give up.
+func TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue(t *testing.T) {
+	v := newSentinelValkey()
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+	data := newNudgeStatefulSet(dataName, 0)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	r, _ := newInterceptedReconciler(failStatefulSetGet(dataName), v, data, sentinel)
+
+	pastGrace(r, nudgeKey(dataName))
+
+	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
+		"a StatefulSet that could not be read must keep the reconciler awake")
+}
+
+// TestNudgeShortStatefulSets_TransientGetErrorKeepsObservation is the other half
+// of NA16: forgetting on a transient error restarts the 10 s grace period, so a
+// repeating error would postpone the first bump indefinitely.
+func TestNudgeShortStatefulSets_TransientGetErrorKeepsObservation(t *testing.T) {
+	v := newSentinelValkey()
+	dataName := common.StatefulSetName(v, common.ComponentValkey)
+	data := newNudgeStatefulSet(dataName, 0)
+	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	r, _ := newInterceptedReconciler(failStatefulSetGet(dataName), v, data, sentinel)
+
+	pastGrace(r, nudgeKey(dataName))
+
+	r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.True(t, nudgeTracked(r, dataName),
+		"a transient read error must not restart the grace period")
 }
