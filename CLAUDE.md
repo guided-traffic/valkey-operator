@@ -191,6 +191,35 @@ clusters, so spreading three replicas needs three schedulable workers.
 5. Verify failover succeeded
 6. Replace last pod (former master)
 
+### Known master (`vko.gtrfc.com/known-master`)
+
+The annotation carries the address of the pod the operator currently considers
+master. It feeds the `replicaof` directive of the replica ConfigMap
+(`GenerateValkeyConf`), never the config hash (`GenerateValkeyConfForHash`
+ignores it), so publishing it during a failover cannot trigger a rolling restart.
+
+Both init containers consult it, and the operator maintains it on both paths:
+
+- Sentinel path: `syncSentinelWithMaster` persists the confirmed master at
+  finalization; the init container uses it when no Sentinel answers.
+- Non-Sentinel path: `handleManualFailover` publishes the promoted pod **and
+  republishes the replica ConfigMap before deleting the old master**;
+  `promotePod0AndRedirect` points it back at pod-0 after the topology is
+  restored. The init container consults it only after peer discovery fails, only
+  when the address is not the pod itself, and only when that peer answers
+  `role:master`.
+
+Why it is needed without Sentinel: with 2 replicas the promoted pod has no
+replicas attached, so the init container's `role:master && connected_slaves > 0`
+test rejects it and a returning pod-0 would elect itself master (NA20).
+
+Related: while the manual failover is in flight, `detectAndResolveSplitBrain`
+must be told that the promoted pod is the real master (`handleMultiReplicaRollingUpdate`
+passes `annotationPromotedPod` for the `manualFailover`/`replacingMaster` states).
+Otherwise its "most connected slaves" fallback ties at zero, picks the lowest
+ordinal — the old master that was just deleted — and demotes the promoted pod,
+losing the data (NA21).
+
 ## Metrics / Exporter
 
 `spec.metrics.enabled` adds an exporter sidecar (default `oliver006/redis_exporter`)

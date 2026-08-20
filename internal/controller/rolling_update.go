@@ -749,11 +749,13 @@ func countMasters(pods []podState) int {
 // updating.
 //
 // The real master is determined by:
-//  1. Using the sentinelMaster name (authoritative Sentinel view, may be empty).
+//  1. Using knownMaster, the name of the pod an authority already designated as
+//     master — Sentinel in the Sentinel path, the promoted pod while a manual
+//     failover is in flight. May be empty.
 //  2. Falling back to the master with the most connected slaves (preserves data).
 //
 // Returns the updated pod states and the corrected master index.
-func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int, sentinelMaster string) ([]podState, int) {
+func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int, knownMaster string) ([]podState, int) {
 	logger := log.FromContext(ctx)
 
 	// Count pods reporting as master.
@@ -773,13 +775,13 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 	r.recordEvent(v, corev1.EventTypeWarning, "SplitBrainDetected",
 		"Split-brain detected: %d pods report master role", len(masterIndices))
 
-	// Determine the real master by asking Sentinel (authoritative source).
+	// Determine the real master from the authoritative name, if one was given.
 	realMasterIdx := -1
 	var rogueIndices []int
 
-	if sentinelMaster != "" {
+	if knownMaster != "" {
 		for _, idx := range masterIndices {
-			if pods[idx].name == sentinelMaster {
+			if pods[idx].name == knownMaster {
 				realMasterIdx = idx
 			} else {
 				rogueIndices = append(rogueIndices, idx)
@@ -787,7 +789,7 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 		}
 	}
 
-	// Fallback: if Sentinel doesn't know any of them, prefer the one with the
+	// Fallback: if no authority names one of them, prefer the one with the
 	// most connected slaves (the one actively serving replicas has the real data).
 	if realMasterIdx < 0 {
 		checker := r.getInstanceChecker()
@@ -2174,7 +2176,18 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 	// Detect and resolve split-brain before proceeding. This mirrors the sentinel
 	// path and ensures a rogue master left over from a prior failed topology
 	// restoration is demoted before the rolling update makes further decisions.
-	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, "")
+	//
+	// While the manual failover is in flight the promoted pod and the old master
+	// both report master by design, and the promoted pod is the authority. Without
+	// naming it, the resolver falls back to "most connected slaves": with two
+	// replicas neither master has one, the tie goes to the lowest index — the old
+	// master that was just deleted — and the promoted pod is demoted to replicate
+	// from a pod that is about to disappear, taking the data with it.
+	preferredMaster := ""
+	if state := r.getRollingUpdateState(v); state == stateManualFailover || state == stateReplacingMaster {
+		preferredMaster = v.Annotations[annotationPromotedPod]
+	}
+	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, preferredMaster)
 
 	updatedCount := countUpdatedPods(pods)
 	if updatedCount == totalPods {
@@ -2286,14 +2299,32 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	// Record the promoted pod and set state.
+	// Record the promoted pod and set state. The promoted pod is also recorded as
+	// the known master so that the replica ConfigMap points at it while the old
+	// master is away: the init container of the returning pod reads that address
+	// and joins as a replica instead of electing itself master (its peer-based
+	// discovery rejects the promoted pod, which has no replicas attached yet).
 	if v.Annotations == nil {
 		v.Annotations = make(map[string]string)
 	}
+	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
+	promotedHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", promotedPod.name, headlessName, v.Namespace)
 	v.Annotations[annotationPromotedPod] = promotedPod.name
 	v.Annotations[annotationRollingUpdateState] = stateManualFailover
+	v.Annotations[builder.AnnotationKnownMaster] = promotedHost
 	if err := r.Update(ctx, v); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("setting manual failover state: %w", err)}
+	}
+
+	// Republish the replica ConfigMap before the delete, so the recreated pod
+	// mounts the new master address rather than the stale pod-0 default.
+	// Best-effort: a failure here reopens the split-brain window, but blocking
+	// the delete would stall the rolling update indefinitely.
+	if err := r.reconcileReplicaConfigMap(ctx, v); err != nil {
+		logger.Info("Could not publish known master to replica ConfigMap before master delete",
+			common.RoleMaster, promotedHost, "error", err)
+		r.recordEvent(v, corev1.EventTypeWarning, "KnownMasterPublishFailed",
+			"Could not publish known master %s to the replica ConfigMap: %v", promotedHost, err)
 	}
 
 	// Delete the old master pod.
@@ -2533,6 +2564,16 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 	logger.Info("Promoted pod-0 back to master", "pod", masterPodName)
+
+	// Pod-0 is the master again — point the known-master annotation (and with it
+	// the replica ConfigMap) back at pod-0. Leaving it on the promoted pod would
+	// make any later replica restart replicate from a pod that is about to be
+	// demoted.
+	r.persistKnownMaster(ctx, v, masterHost)
+	if err := r.reconcileReplicaConfigMap(ctx, v); err != nil {
+		logger.Info("Could not reset known master in replica ConfigMap",
+			common.RoleMaster, masterHost, "error", err)
+	}
 
 	// Redirect all other pods to replicate from pod-0.
 	totalPods := int(*currentSts.Spec.Replicas)

@@ -431,7 +431,28 @@ while [ "$WAITED" -lt "$MAX_WAIT" ] && [ -z "$MASTER_ADDR" ]; do
   [ "$SLEEP" -gt 4 ] && SLEEP=4
 done
 
-# Phase 2: Apply discovery result or fall back to ordinal-based config.
+# Phase 2: No master with connected replicas was found. Consult the known-master
+# address that the operator writes into the replica config before it deletes the
+# old master during a manual failover. At that moment the promoted pod is the only
+# master and has no replicas attached yet, so Phase 1 rejects it — without this
+# step the returning pod-0 would take the ordinal fallback and boot as a second,
+# independent master. The address is only trusted when that peer is reachable and
+# actually reports role:master, so a stale entry degrades to the ordinal fallback.
+if [ -z "$MASTER_ADDR" ]; then
+  KNOWN_MASTER=$(grep '^replicaof ' %[4]s/%[3]s 2>/dev/null | awk '{print $2}')
+  if [ -n "$KNOWN_MASTER" ] && [ "$KNOWN_MASTER" != "$MY_HOST" ]; then
+    KNOWN_INFO=$(timeout 2 valkey-cli %[10]s %[11]s -h "$KNOWN_MASTER" -p $PORT INFO replication 2>/dev/null)
+    KNOWN_ROLE=$(echo "$KNOWN_INFO" | grep "^role:" | tr -d '\r' | cut -d: -f2)
+    if [ "$KNOWN_ROLE" = "master" ]; then
+      MASTER_ADDR="$KNOWN_MASTER"
+      echo "Using known master from replica config: $MASTER_ADDR"
+    else
+      echo "Known master $KNOWN_MASTER reports role=${KNOWN_ROLE:-unreachable}, ignoring"
+    fi
+  fi
+fi
+
+# Phase 3: Apply discovery result or fall back to ordinal-based config.
 if [ -n "$MASTER_ADDR" ]; then
   echo "This pod is a replica, discovered master=$MASTER_ADDR"
   cp %[1]s/%[3]s %[2]s/%[3]s
