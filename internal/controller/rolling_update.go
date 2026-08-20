@@ -142,10 +142,13 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		return RollingUpdateResult{Error: fmt.Errorf("getting StatefulSet: %w", err)}
 	}
 
-	// Check if any pods are running a different image or config than desired.
-	desiredImage := v.Spec.Image
+	// Check if any pods are running a different image or config than the
+	// persisted StatefulSet template. All four inputs come from the live
+	// StatefulSet -- see valkeyImageFromSts for why the CR must not be the
+	// source here.
+	desiredImage := valkeyImageFromSts(currentSts)
 	sidecarImg := sidecarImageFromSts(currentSts)
-	desiredConfigHash := builder.ComputeConfigHash(v)
+	desiredConfigHash := configHashFromSts(currentSts)
 	desiredPodSpecHash := podSpecHashFromSts(currentSts)
 	needsRollingUpdate := false
 
@@ -318,6 +321,33 @@ func sidecarImageFromSts(sts *appsv1.StatefulSet) string {
 // annotations, or empty string when the annotation is not present.
 func podSpecHashFromSts(sts *appsv1.StatefulSet) string {
 	return sts.Spec.Template.Annotations[builder.AnnotationPodSpecHash]
+}
+
+// valkeyImageFromSts returns the Valkey container image from a StatefulSet's
+// pod template, or empty string when no Valkey container is present.
+//
+// The rolling update reads every "desired" input from the live StatefulSet
+// rather than from the CR, because the pods it deletes are recreated by the
+// statefulset-controller from that template and from nothing else. Reading the
+// CR instead would make the operator delete pods to converge on a template that
+// was never persisted -- e.g. while an admission webhook rejects the
+// StatefulSet update -- and the recreated pod would come back on the old
+// template, once per requeue, for as long as the write stays blocked.
+func valkeyImageFromSts(sts *appsv1.StatefulSet) string {
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name == builder.ValkeyContainerName {
+			return c.Image
+		}
+	}
+	return ""
+}
+
+// configHashFromSts returns the config hash from a StatefulSet's pod template
+// annotations, or empty string when the annotation is not present. Same
+// rationale as valkeyImageFromSts: the persisted template is the only thing a
+// recreated pod can converge on.
+func configHashFromSts(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.AnnotationConfigHash]
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -910,7 +940,7 @@ type podState struct {
 
 // collectPodStates gathers the current state of all pods in the StatefulSet.
 func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) ([]podState, int, error) {
-	desiredImage := v.Spec.Image
+	desiredImage := valkeyImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	totalPods := int(*currentSts.Spec.Replicas)
 	checker := r.getInstanceChecker()
@@ -933,7 +963,7 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers)
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers)
 			ps.ready = isPodReady(pod)
 
 			// Determine if this pod is the master via GetReplicationInfo.
@@ -2031,7 +2061,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 // via a rolling update because the remaining replicas provide redundancy.
 func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
-	desiredImage := v.Spec.Image
+	desiredImage := valkeyImageFromSts(currentSts)
 	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	sidecarPending := false
@@ -2050,7 +2080,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, builder.ComputeConfigHash(v), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
 			// For sidecar-only changes in true standalone mode (single replica),
 			// defer the update to the next natural pod restart rather than
 			// auto-deleting the only instance.
@@ -2156,7 +2186,7 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 		currentState := r.getRollingUpdateState(v)
 		switch currentState {
 		case stateManualFailover, stateReplacingMaster:
-			return r.handlePostManualFailover(ctx, v)
+			return r.handlePostManualFailover(ctx, v, currentSts)
 		case stateRestoringTopology:
 			return r.handleTopologyRestoration(ctx, v, currentSts)
 		case stateVerifyingTopology:
@@ -2185,7 +2215,7 @@ func (r *ValkeyReconciler) dispatchMultiReplicaState(ctx context.Context, v *vko
 	logger := log.FromContext(ctx)
 
 	if currentState == stateManualFailover || currentState == stateReplacingMaster {
-		return r.handlePostManualFailover(ctx, v)
+		return r.handlePostManualFailover(ctx, v, currentSts)
 	}
 	if currentState == stateRestoringTopology {
 		return r.handleTopologyRestoration(ctx, v, currentSts)
@@ -2338,7 +2368,7 @@ func (r *ValkeyReconciler) promoteAndRedirect(ctx context.Context, v *vkov1.Valk
 
 // handlePostManualFailover waits for the old master pod (pod-0) to come back
 // after deletion, then configures it to sync from the promoted replica.
-func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
+func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
 	promotedPodName := v.Annotations[annotationPromotedPod]
@@ -2372,9 +2402,9 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 	// template) and not the old pod that a concurrent reconcile still sees. Without
 	// this check, REPLICAOF is sent to the old pod that is about to be deleted,
 	// and the new pod starts as a standalone master with no data.
-	desiredImage := v.Spec.Image
+	desiredImage := valkeyImageFromSts(currentSts)
 	for _, c := range masterPod.Spec.Containers {
-		if c.Name == builder.ValkeyContainerName && c.Image != desiredImage {
+		if c.Name == builder.ValkeyContainerName && desiredImage != "" && c.Image != desiredImage {
 			logger.Info("Master pod still running old image, waiting for replacement",
 				"pod", masterPodName, "currentImage", c.Image, "desiredImage", desiredImage)
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
