@@ -571,8 +571,15 @@ What the budgets do and do not cover:
 - The **Sentinel PDB** uses `minAvailable = floor(spec.sentinel.replicas / 2) + 1`
   — the failover quorum. It is **computed, never configurable**: a settable value
   could silently break the guarantee that a drain cannot take the Sentinel majority.
-  With exactly 2 Sentinels the quorum equals the replica count, so no voluntary
-  disruption is permitted at all — an even Sentinel count is not HA in the first place.
+  With `spec.sentinel.replicas: 2` the quorum equals the replica count, so **no
+  voluntary disruption is permitted at all** — `kubectl drain` on a node hosting a
+  Sentinel pod never finishes until the CR is scaled or the PDB removed. The formula
+  stays (a smaller `minAvailable` would let a drain take automatic failover), and the
+  operator makes the consequence visible: a log line plus a
+  `SentinelPodDisruptionBudgetBlocksDrains` Event on the CR, emitted on every reconcile
+  while the condition holds — including after scaling `spec.sentinel.replicas` `3` ->
+  `2`, where the quorum stays `2` and the PDB object itself never changes. Use an odd
+  Sentinel count of 3 or more; an even count is not HA in the first place.
 - **StatefulSets with fewer than 2 replicas get no PDB**, even with `enabled: true`
   (data at `spec.replicas: 1`, Sentinel at `spec.sentinel.replicas: 1`). With one pod
   `maxUnavailable: 1` would permit evicting the only pod and `minAvailable: 1` would

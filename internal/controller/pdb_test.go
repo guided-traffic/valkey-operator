@@ -349,3 +349,96 @@ func TestReconcileDataPodDisruptionBudget_NoWarningBelowReplicas(t *testing.T) {
 
 	assert.Empty(t, rec.events, "the default maxUnavailable 1 with 3 replicas is not a warning")
 }
+
+// TestReconcileSentinelPodDisruptionBudget_WarnsWhenQuorumEqualsReplicas is NA7:
+// with 2 Sentinels the quorum equals the replica count, so the budget refuses every
+// eviction and a node drain hosting a Sentinel pod stalls. Only a builder comment
+// said so before; nothing warned at runtime.
+func TestReconcileSentinelPodDisruptionBudget_WarnsWhenQuorumEqualsReplicas(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		haWithPDB(v)
+		v.Spec.Sentinel.Replicas = 2
+	})
+	r, _ := newTestReconciler(v)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+
+	pdb, err := getPDB(ctx, r, "test-sentinel")
+	require.NoError(t, err, "the budget is still created: the quorum is what protects failover")
+	require.NotNil(t, pdb.Spec.MinAvailable)
+	assert.Equal(t, intstr.FromInt32(2), *pdb.Spec.MinAvailable, "the formula is unchanged")
+
+	warnings := rec.withReason(reasonSentinelPodDisruptionBudgetBlocksDrains)
+	require.Len(t, warnings, 1)
+	assert.Equal(t, corev1.EventTypeWarning, warnings[0].eventType)
+	assert.Contains(t, warnings[0].note, "minAvailable 2 equals spec.sentinel.replicas 2")
+	assert.Contains(t, warnings[0].note, builder.SentinelPodDisruptionBudgetName(v))
+}
+
+// TestReconcileSentinelPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite is the
+// Sentinel counterpart of the NA6 scale-down path: 3 -> 2 Sentinels keeps the
+// quorum at 2, so the PDB object never changes while the budget turns into a drain
+// blocker. A write-gated warning would be silent for exactly that transition.
+func TestReconcileSentinelPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite(t *testing.T) {
+	v := newTestValkey("test", "default", haWithPDB)
+	writes := &pdbWriteCounter{}
+	r, _ := newInterceptedReconciler(writes.intercept(), v)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+	require.Equal(t, 1, writes.writes, "precondition: the first pass creates the PDB")
+	require.Empty(t, rec.withReason(reasonSentinelPodDisruptionBudgetBlocksDrains),
+		"a quorum of 2 out of 3 Sentinels still permits one eviction")
+
+	v.Spec.Sentinel.Replicas = 2
+	writes.reset()
+	rec.reset()
+	require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+
+	assert.Zero(t, writes.writes, "the quorum stays 2, so the scale-down does not touch the PDB object")
+	assert.Len(t, rec.withReason(reasonSentinelPodDisruptionBudgetBlocksDrains), 1,
+		"the pass that turned the budget into a drain blocker must warn")
+}
+
+// TestReconcileSentinelPodDisruptionBudget_WarnsOnEveryApplicablePass guards that
+// the warning keeps being emitted while the condition holds, not once per write.
+func TestReconcileSentinelPodDisruptionBudget_WarnsOnEveryApplicablePass(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		haWithPDB(v)
+		v.Spec.Sentinel.Replicas = 2
+	})
+	r, _ := newTestReconciler(v)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+	require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+
+	assert.Len(t, rec.withReason(reasonSentinelPodDisruptionBudgetBlocksDrains), 2,
+		"the create pass and the following no-op pass must both warn")
+}
+
+// TestReconcileSentinelPodDisruptionBudget_NoWarningAtOddCount pins the other
+// direction: an odd Sentinel count leaves room for one voluntary disruption.
+func TestReconcileSentinelPodDisruptionBudget_NoWarningAtOddCount(t *testing.T) {
+	for _, replicas := range []int32{3, 5} {
+		v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+			haWithPDB(v)
+			v.Spec.Sentinel.Replicas = replicas
+		})
+		r, _ := newTestReconciler(v)
+		rec := &fakeEventRecorder{}
+		r.Recorder = rec
+		ctx := context.Background()
+
+		require.NoError(t, r.reconcileSentinelPodDisruptionBudget(ctx, v))
+
+		assert.Empty(t, rec.events, "%d Sentinels keep a quorum below the replica count", replicas)
+	}
+}

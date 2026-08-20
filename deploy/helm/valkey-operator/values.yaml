@@ -61,6 +61,11 @@ preUpgradeHook:
 
 # Valkey CRs support spec.podDisruptionBudget (opt-in). PDBs are only
 # created for StatefulSets with >= 2 replicas; singletons are skipped.
+# The Sentinel budget is the failover quorum (floor(replicas/2)+1), so with
+# spec.sentinel.replicas: 2 it equals the replica count and blocks every
+# voluntary disruption - node drains hosting a Sentinel pod then stall. Use an
+# odd Sentinel count of 3 or more; the operator warns and records a
+# SentinelPodDisruptionBudgetBlocksDrains Event while the condition holds.
 
 # Valkey CRs get soft pod anti-affinity on kubernetes.io/hostname by default for
 # every StatefulSet with >= 2 replicas; set spec.antiAffinity.mode: hard for a

@@ -91,7 +91,48 @@ func (r *ValkeyReconciler) reconcileSentinelPodDisruptionBudget(ctx context.Cont
 		return r.cleanupPodDisruptionBudget(ctx, v, builder.SentinelPodDisruptionBudgetName(v))
 	}
 
-	return r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
+	if err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v)); err != nil {
+		return err
+	}
+	r.warnIfSentinelBudgetBlocksEveryDrain(ctx, v)
+	return nil
+}
+
+// reasonSentinelPodDisruptionBudgetBlocksDrains is the Event reason for a Sentinel
+// budget whose quorum equals the replica count, so no voluntary disruption is
+// permitted at all.
+const reasonSentinelPodDisruptionBudgetBlocksDrains = "SentinelPodDisruptionBudgetBlocksDrains"
+
+// warnIfSentinelBudgetBlocksEveryDrain warns while the Sentinel quorum equals
+// spec.sentinel.replicas — with an even Sentinel count of 2 that is the case, and
+// the Eviction API then refuses every eviction indefinitely: a node drain hosting
+// a Sentinel pod never completes without manual intervention.
+//
+// The formula stays: minAvailable below the quorum would let a drain take the
+// Sentinel majority and thereby automatic failover. The gap NA7 closes is that the
+// consequence was documented in a builder comment only and invisible at runtime.
+//
+// Like the data-side warning, it runs on every pass in which the budget applies
+// rather than on writes. Scaling spec.sentinel.replicas 3 -> 2 leaves the quorum
+// at 2, so the PDB object is byte-identical and a write-gated warning would stay
+// silent for exactly the change that turned the budget into a drain blocker.
+func (r *ValkeyReconciler) warnIfSentinelBudgetBlocksEveryDrain(ctx context.Context, v *vkov1.Valkey) {
+	replicas := v.Spec.Sentinel.Replicas
+	minAvailable := builder.SentinelQuorumFor(replicas)
+	if minAvailable < replicas {
+		return
+	}
+
+	name := builder.SentinelPodDisruptionBudgetName(v)
+	log.FromContext(ctx).Info("Sentinel PodDisruptionBudget blocks every voluntary disruption; "+
+		"the quorum equals spec.sentinel.replicas, so node drains hosting a Sentinel pod stall. "+
+		"Use an odd Sentinel count of 3 or more",
+		"name", name, "minAvailable", minAvailable, "replicas", replicas)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonSentinelPodDisruptionBudgetBlocksDrains,
+		"PodDisruptionBudget %s blocks every voluntary disruption "+
+			"(minAvailable %d equals spec.sentinel.replicas %d); node drains hosting a Sentinel pod "+
+			"will not complete. Use an odd Sentinel count of 3 or more",
+		name, minAvailable, replicas)
 }
 
 // logPodDisruptionBudgetSkip records why an enabled PDB was not created. A

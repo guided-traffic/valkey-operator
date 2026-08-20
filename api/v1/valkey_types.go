@@ -84,7 +84,13 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Replicas is the number of Sentinel instances to run.
+	// Replicas is the number of Sentinel instances to run. Use an odd count of 3
+	// or more: a failover needs floor(replicas/2)+1 Sentinels to agree, so 2
+	// Sentinels tolerate no outage at all. With spec.podDisruptionBudget.enabled
+	// that even count also blocks node drains, because the quorum then equals the
+	// replica count and the Eviction API refuses every eviction; the operator
+	// warns and records a SentinelPodDisruptionBudgetBlocksDrains Event on every
+	// reconcile while that holds.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas,omitempty"`
@@ -297,6 +303,11 @@ type PodDisruptionBudgetSpec struct {
 	// (minAvailable = floor(replicas/2)+1) for the Sentinel StatefulSet.
 	// StatefulSets with fewer than 2 replicas never get a PDB: it would either be
 	// useless (maxUnavailable 1) or block node drains (minAvailable 1).
+	// With exactly 2 Sentinels the quorum equals the replica count, so the Sentinel
+	// budget permits no voluntary disruption at all and a node drain hosting a
+	// Sentinel pod stalls until it is resolved manually; the operator keeps the
+	// quorum formula (a smaller minAvailable would let a drain take automatic
+	// failover) and warns about it on every reconcile.
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
