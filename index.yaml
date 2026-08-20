@@ -2,8 +2,30 @@ apiVersion: v1
 entries:
   valkey-operator:
   - apiVersion: v2
+    appVersion: 1.10.47
+    created: "2026-08-20T02:04:56.565358624Z"
+    description: A Kubernetes operator for managing Valkey and Sentinel instances
+    digest: e8b4acfb46e232aee7929ba2108ab3f8af1dd1d6316c18299d2cb98c10bf87d6
+    home: https://github.com/guided-traffic/valkey-operator
+    keywords:
+    - valkey
+    - redis
+    - sentinel
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Guided Traffic
+      url: https://github.com/guided-traffic
+    name: valkey-operator
+    sources:
+    - https://github.com/guided-traffic/valkey-operator
+    type: application
+    urls:
+    - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.10.47.tgz
+    version: 1.10.47
+  - apiVersion: v2
     appVersion: 1.10.46
-    created: "2026-08-19T01:34:17.457023517Z"
+    created: "2026-08-20T02:04:56.564855376Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8c2866c4e3f2ba000c50189cdaa012a6b829381bb14c373a5bb8f88003c872d9
     home: https://github.com/guided-traffic/valkey-operator
@@ -25,7 +47,7 @@ entries:
     version: 1.10.46
   - apiVersion: v2
     appVersion: 1.10.45
-    created: "2026-08-19T01:34:17.456504247Z"
+    created: "2026-08-20T02:04:56.564146369Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 4728ee903ba7ddafb928370733c03b1ca1a08e7caa4d0a6420cdc094c2d4a318
     home: https://github.com/guided-traffic/valkey-operator
@@ -47,7 +69,7 @@ entries:
     version: 1.10.45
   - apiVersion: v2
     appVersion: 1.10.44
-    created: "2026-08-19T01:34:17.455850303Z"
+    created: "2026-08-20T02:04:56.562506057Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: e1bec0165e08ae41b119b19650e8e0a4b4c51455609c6a5f9d5fcc55662181f6
     home: https://github.com/guided-traffic/valkey-operator
@@ -69,7 +91,7 @@ entries:
     version: 1.10.44
   - apiVersion: v2
     appVersion: 1.10.43
-    created: "2026-08-19T01:34:17.455337565Z"
+    created: "2026-08-20T02:04:56.56200365Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: a70a892928ccf43003e9b11514e259c1a7380f0e70638e4e37a4a316545e3e09
     home: https://github.com/guided-traffic/valkey-operator
@@ -91,7 +113,7 @@ entries:
     version: 1.10.43
   - apiVersion: v2
     appVersion: 1.10.42
-    created: "2026-08-19T01:34:17.454708158Z"
+    created: "2026-08-20T02:04:56.561487749Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 0d92a703643fd0fc583dcd3be7ec07c290310d1b4ff9f23924afee8b2c94b9e2
     home: https://github.com/guided-traffic/valkey-operator
@@ -113,7 +135,7 @@ entries:
     version: 1.10.42
   - apiVersion: v2
     appVersion: 1.10.41
-    created: "2026-08-19T01:34:17.454093368Z"
+    created: "2026-08-20T02:04:56.560979831Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 133d244952d0a7ef681352893afed62fd02a10d2bed963dd15c9537d9a475489
     home: https://github.com/guided-traffic/valkey-operator
@@ -135,7 +157,7 @@ entries:
     version: 1.10.41
   - apiVersion: v2
     appVersion: 1.10.40
-    created: "2026-08-19T01:34:17.453515398Z"
+    created: "2026-08-20T02:04:56.560372677Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: c2ab50f9395b6c61d43142d11c74f79570dfd7868f85fedd93c53d8609a2e1fb
     home: https://github.com/guided-traffic/valkey-operator
@@ -157,7 +179,7 @@ entries:
     version: 1.10.40
   - apiVersion: v2
     appVersion: 1.10.39
-    created: "2026-08-19T01:34:17.45247249Z"
+    created: "2026-08-20T02:04:56.55932387Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: df006e6c6dbce4fd2e802f967028557b918558d61fd042daa0a5bb4c76f659d6
     home: https://github.com/guided-traffic/valkey-operator
@@ -179,7 +201,7 @@ entries:
     version: 1.10.39
   - apiVersion: v2
     appVersion: 1.10.38
-    created: "2026-08-19T01:34:17.451834146Z"
+    created: "2026-08-20T02:04:56.558805072Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 0a1c758cab5639a549a1c9e3281cc6c57969591caa77f2191bc800c5d427702c
     home: https://github.com/guided-traffic/valkey-operator
@@ -201,7 +223,7 @@ entries:
     version: 1.10.38
   - apiVersion: v2
     appVersion: 1.10.37
-    created: "2026-08-19T01:34:17.450995453Z"
+    created: "2026-08-20T02:04:56.558234035Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: b4dcf70d6a3dd3ae0cf831fbcbc1c9c6d3361d0ad69cc327eec7b28489e4a344
     home: https://github.com/guided-traffic/valkey-operator
@@ -223,7 +245,7 @@ entries:
     version: 1.10.37
   - apiVersion: v2
     appVersion: 1.10.36
-    created: "2026-08-19T01:34:17.449942477Z"
+    created: "2026-08-20T02:04:56.557686674Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 55cc8a614d9fb3eec4cd734b2c3c668097da9e9569907bf87bdf2a7c25d3652f
     home: https://github.com/guided-traffic/valkey-operator
@@ -245,7 +267,7 @@ entries:
     version: 1.10.36
   - apiVersion: v2
     appVersion: 1.10.35
-    created: "2026-08-19T01:34:17.448436495Z"
+    created: "2026-08-20T02:04:56.557149311Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 0e9b410bea6fccd5d480a948d504743d8fcbf2fb7d96bf742935ccc216375b69
     home: https://github.com/guided-traffic/valkey-operator
@@ -267,7 +289,7 @@ entries:
     version: 1.10.35
   - apiVersion: v2
     appVersion: 1.10.34
-    created: "2026-08-19T01:34:17.447854888Z"
+    created: "2026-08-20T02:04:56.556591028Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8a419ef5d84f8bcebedc481f29d33c6ab3f4abbd16ec8d856e15c275772f9432
     home: https://github.com/guided-traffic/valkey-operator
@@ -289,7 +311,7 @@ entries:
     version: 1.10.34
   - apiVersion: v2
     appVersion: 1.10.33
-    created: "2026-08-19T01:34:17.447281676Z"
+    created: "2026-08-20T02:04:56.556028558Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 828ab7396818287086ecdff2a176df5eb8ebd03f63f8e9036446727dae09335a
     home: https://github.com/guided-traffic/valkey-operator
@@ -311,7 +333,7 @@ entries:
     version: 1.10.33
   - apiVersion: v2
     appVersion: 1.10.32
-    created: "2026-08-19T01:34:17.44659992Z"
+    created: "2026-08-20T02:04:56.554501059Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8a562184ee2dd4decc83f16696c6760a53f20d4189575a50ca0a1ad7b250539f
     home: https://github.com/guided-traffic/valkey-operator
@@ -333,7 +355,7 @@ entries:
     version: 1.10.32
   - apiVersion: v2
     appVersion: 1.10.31
-    created: "2026-08-19T01:34:17.446153878Z"
+    created: "2026-08-20T02:04:56.55389157Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 2def6025748ae1d7a4f064a68d606168ecc8b269478b4d190123722ceda8c5de
     home: https://github.com/guided-traffic/valkey-operator
@@ -355,7 +377,7 @@ entries:
     version: 1.10.31
   - apiVersion: v2
     appVersion: 1.10.30
-    created: "2026-08-19T01:34:17.445630892Z"
+    created: "2026-08-20T02:04:56.55323327Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: b4ceebb00758dd0b1e872cb8f97364584f85cb446da622ba3c8eb619160e4930
     home: https://github.com/guided-traffic/valkey-operator
@@ -377,7 +399,7 @@ entries:
     version: 1.10.30
   - apiVersion: v2
     appVersion: 1.10.29
-    created: "2026-08-19T01:34:17.444480912Z"
+    created: "2026-08-20T02:04:56.552146041Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: f31b937dd54f99449acae13348b2578799bee90a43656d3579901da0c8ff9dff
     home: https://github.com/guided-traffic/valkey-operator
@@ -399,7 +421,7 @@ entries:
     version: 1.10.29
   - apiVersion: v2
     appVersion: 1.10.28
-    created: "2026-08-19T01:34:17.443738441Z"
+    created: "2026-08-20T02:04:56.551642101Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 23ec163c0cc316e168e7dfc140cc40486d84e0fe35376f4aff2704b4489da12e
     home: https://github.com/guided-traffic/valkey-operator
@@ -421,7 +443,7 @@ entries:
     version: 1.10.28
   - apiVersion: v2
     appVersion: 1.10.27
-    created: "2026-08-19T01:34:17.443127247Z"
+    created: "2026-08-20T02:04:56.551143611Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 44464ad137e5f2221d314d6ab810fa8a2444259b1978e892ce32b38523d29476
     home: https://github.com/guided-traffic/valkey-operator
@@ -443,7 +465,7 @@ entries:
     version: 1.10.27
   - apiVersion: v2
     appVersion: 1.10.26
-    created: "2026-08-19T01:34:17.442606545Z"
+    created: "2026-08-20T02:04:56.550582443Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: a45fd9bc2baf9f74aaf5eeb956b564ff7c27ec42174b5ba7c088abc3d6a20ae0
     home: https://github.com/guided-traffic/valkey-operator
@@ -465,7 +487,7 @@ entries:
     version: 1.10.26
   - apiVersion: v2
     appVersion: 1.10.25
-    created: "2026-08-19T01:34:17.442121179Z"
+    created: "2026-08-20T02:04:56.550116435Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 5f4a2060c23e086c73e4bcc73e617be6fd9f1fd1aa48a1135f4ec1f5fdbaf4ff
     home: https://github.com/guided-traffic/valkey-operator
@@ -487,7 +509,7 @@ entries:
     version: 1.10.25
   - apiVersion: v2
     appVersion: 1.10.24
-    created: "2026-08-19T01:34:17.441578526Z"
+    created: "2026-08-20T02:04:56.549581617Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 41f1b6bc4c3d16168f226628a865ebe51f549823cbe795e8ddad3f21d870d935
     home: https://github.com/guided-traffic/valkey-operator
@@ -509,7 +531,7 @@ entries:
     version: 1.10.24
   - apiVersion: v2
     appVersion: 1.10.23
-    created: "2026-08-19T01:34:17.440772836Z"
+    created: "2026-08-20T02:04:56.549119936Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: dc7274ab69d5e077481108faa3c32d6cd95e7def0a91a380c86a73325d00120c
     home: https://github.com/guided-traffic/valkey-operator
@@ -531,7 +553,7 @@ entries:
     version: 1.10.23
   - apiVersion: v2
     appVersion: 1.10.22
-    created: "2026-08-19T01:34:17.437956501Z"
+    created: "2026-08-20T02:04:56.548613222Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 7068ebd03e259293402a165b0284109c7bdd2a95db36baa08327762699ae20d3
     home: https://github.com/guided-traffic/valkey-operator
@@ -553,7 +575,7 @@ entries:
     version: 1.10.22
   - apiVersion: v2
     appVersion: 1.10.21
-    created: "2026-08-19T01:34:17.437322075Z"
+    created: "2026-08-20T02:04:56.548109723Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 33ec6560a1909f42883850314ca03b7e34c49657499d26b2a9b40b33c773f408
     home: https://github.com/guided-traffic/valkey-operator
@@ -575,7 +597,7 @@ entries:
     version: 1.10.21
   - apiVersion: v2
     appVersion: 1.10.20
-    created: "2026-08-19T01:34:17.436744094Z"
+    created: "2026-08-20T02:04:56.547526633Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: df53b1aca43181bd2251b396d779a337f127a4c161175bf2d3b485b0c567687b
     home: https://github.com/guided-traffic/valkey-operator
@@ -597,7 +619,7 @@ entries:
     version: 1.10.20
   - apiVersion: v2
     appVersion: 1.10.19
-    created: "2026-08-19T01:34:17.436223602Z"
+    created: "2026-08-20T02:04:56.546990343Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 7e579d5eeef722230782d0f1ad9d29fca075570773d201d173f86e6c6e528161
     home: https://github.com/guided-traffic/valkey-operator
@@ -619,7 +641,7 @@ entries:
     version: 1.10.19
   - apiVersion: v2
     appVersion: 1.10.18
-    created: "2026-08-19T01:34:17.435661101Z"
+    created: "2026-08-20T02:04:56.546374271Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 388d6818cbb91d727dcc05161bc802e3641099fe369a105bf4f09eac39a1141e
     home: https://github.com/guided-traffic/valkey-operator
@@ -641,7 +663,7 @@ entries:
     version: 1.10.18
   - apiVersion: v2
     appVersion: 1.10.17
-    created: "2026-08-19T01:34:17.435006566Z"
+    created: "2026-08-20T02:04:56.544994521Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 0e07b6630341bbaff2d5d64ef412ed5cfb57d7d1975fd61dc0baa9a715c68969
     home: https://github.com/guided-traffic/valkey-operator
@@ -663,7 +685,7 @@ entries:
     version: 1.10.17
   - apiVersion: v2
     appVersion: 1.10.16
-    created: "2026-08-19T01:34:17.434347272Z"
+    created: "2026-08-20T02:04:56.543915196Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 82206219cf160836cb11f6668ec08a21bea1804c2b6ea3326d37c5d1dfab0c8d
     home: https://github.com/guided-traffic/valkey-operator
@@ -685,7 +707,7 @@ entries:
     version: 1.10.16
   - apiVersion: v2
     appVersion: 1.10.15
-    created: "2026-08-19T01:34:17.433747761Z"
+    created: "2026-08-20T02:04:56.543399694Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: bada908a0a86ee7295a26a09c9b768c8e84af9fafd402ea27a3407c72692a06c
     home: https://github.com/guided-traffic/valkey-operator
@@ -707,7 +729,7 @@ entries:
     version: 1.10.15
   - apiVersion: v2
     appVersion: 1.10.14
-    created: "2026-08-19T01:34:17.433179138Z"
+    created: "2026-08-20T02:04:56.542888781Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: fa8327bf67036b6797dd0dcc0c5a891bbf24bff5e6c9db733aaa969410b70cf0
     home: https://github.com/guided-traffic/valkey-operator
@@ -729,7 +751,7 @@ entries:
     version: 1.10.14
   - apiVersion: v2
     appVersion: 1.10.13
-    created: "2026-08-19T01:34:17.432681018Z"
+    created: "2026-08-20T02:04:56.54242114Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 3a1f49638a86da290291fda711231f2442c9e099227a3a9cdeefd431194aa9e2
     home: https://github.com/guided-traffic/valkey-operator
@@ -751,7 +773,7 @@ entries:
     version: 1.10.13
   - apiVersion: v2
     appVersion: 1.10.12
-    created: "2026-08-19T01:34:17.432101245Z"
+    created: "2026-08-20T02:04:56.541949882Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 29b3cb2cdbb396a76f3df9786bb564af9036d53a0fb40d5bb6b38d26d3870dc2
     home: https://github.com/guided-traffic/valkey-operator
@@ -773,7 +795,7 @@ entries:
     version: 1.10.12
   - apiVersion: v2
     appVersion: 1.10.6
-    created: "2026-08-19T01:34:17.45768768Z"
+    created: "2026-08-20T02:04:56.565845481Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: e01d56cc23788e0679fe1882ff5f677f326bb30c89550445af3fbc32b535c7d4
     home: https://github.com/guided-traffic/valkey-operator
@@ -795,7 +817,7 @@ entries:
     version: 1.10.6
   - apiVersion: v2
     appVersion: 1.10.4
-    created: "2026-08-19T01:34:17.452940172Z"
+    created: "2026-08-20T02:04:56.559890688Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 0d4764e33c3cc6963169978ca7a63c6085b148be1a8c7850c160c2620ff23984
     home: https://github.com/guided-traffic/valkey-operator
@@ -817,7 +839,7 @@ entries:
     version: 1.10.4
   - apiVersion: v2
     appVersion: 1.10.3
-    created: "2026-08-19T01:34:17.445113756Z"
+    created: "2026-08-20T02:04:56.552674056Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 3054a6d2d76eeaf990339b1b63d3c6c51242e658119e9214614d9715c871e18c
     home: https://github.com/guided-traffic/valkey-operator
@@ -839,7 +861,7 @@ entries:
     version: 1.10.3
   - apiVersion: v2
     appVersion: 1.10.0
-    created: "2026-08-19T01:34:17.431463221Z"
+    created: "2026-08-20T02:04:56.541422377Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 4dd8c5fd6f29aace9fd6bac202db1b82a7e6ff70852d53ec2e3743e64ca69b34
     home: https://github.com/guided-traffic/valkey-operator
@@ -861,7 +883,7 @@ entries:
     version: 1.10.0
   - apiVersion: v2
     appVersion: 1.9.7
-    created: "2026-08-19T01:34:17.482288815Z"
+    created: "2026-08-20T02:04:56.583002982Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 5a6b71b024c3dd1b7318daa5a7cb9b9d293b341ed0b0533b22cf0774de37a8c2
     home: https://github.com/guided-traffic/valkey-operator
@@ -883,7 +905,7 @@ entries:
     version: 1.9.7
   - apiVersion: v2
     appVersion: 1.9.6
-    created: "2026-08-19T01:34:17.481618982Z"
+    created: "2026-08-20T02:04:56.582418399Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: ead77c5b68eaf67c8a24382fe0dc50dba4ef0dc9f011d3bd8489a44672ff5683
     home: https://github.com/guided-traffic/valkey-operator
@@ -905,7 +927,7 @@ entries:
     version: 1.9.6
   - apiVersion: v2
     appVersion: 1.9.5
-    created: "2026-08-19T01:34:17.480971721Z"
+    created: "2026-08-20T02:04:56.581951009Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 9f4baae23c44947b7d093b936ab70d56f7d2302266946e70f0c53d69c36c063c
     home: https://github.com/guided-traffic/valkey-operator
@@ -927,7 +949,7 @@ entries:
     version: 1.9.5
   - apiVersion: v2
     appVersion: 1.9.4
-    created: "2026-08-19T01:34:17.48034596Z"
+    created: "2026-08-20T02:04:56.581438814Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 87d5647344d0d4ce81dc277be213bf3bb8f77ab0de305d37e0f363f1d100e5bb
     home: https://github.com/guided-traffic/valkey-operator
@@ -949,7 +971,7 @@ entries:
     version: 1.9.4
   - apiVersion: v2
     appVersion: 1.9.3
-    created: "2026-08-19T01:34:17.47974204Z"
+    created: "2026-08-20T02:04:56.580940825Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: ec368427e352d5da188f8c6bc38e7de981c5507c4dec126990f4a6687177803e
     home: https://github.com/guided-traffic/valkey-operator
@@ -971,7 +993,7 @@ entries:
     version: 1.9.3
   - apiVersion: v2
     appVersion: 1.9.2
-    created: "2026-08-19T01:34:17.479230966Z"
+    created: "2026-08-20T02:04:56.580399975Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: eea71075159bfd27120225500fdf181a7734b1930b15c7bb98604384496d0ee1
     home: https://github.com/guided-traffic/valkey-operator
@@ -993,7 +1015,7 @@ entries:
     version: 1.9.2
   - apiVersion: v2
     appVersion: 1.9.1
-    created: "2026-08-19T01:34:17.478618701Z"
+    created: "2026-08-20T02:04:56.579286967Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 2e26bd01afc405f3be3f91c4a443874a743e2f8bc9840bffecdec9f309189f1d
     home: https://github.com/guided-traffic/valkey-operator
@@ -1015,7 +1037,7 @@ entries:
     version: 1.9.1
   - apiVersion: v2
     appVersion: 1.9.0
-    created: "2026-08-19T01:34:17.477943607Z"
+    created: "2026-08-20T02:04:56.578397731Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 94bf685de1d0b4bf226e8344b8075918b367c54047ca378c0a9cdd2f4966b759
     home: https://github.com/guided-traffic/valkey-operator
@@ -1037,7 +1059,7 @@ entries:
     version: 1.9.0
   - apiVersion: v2
     appVersion: 1.8.1
-    created: "2026-08-19T01:34:17.477388389Z"
+    created: "2026-08-20T02:04:56.577999311Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: ec537d4efefa11843264f2abde8d3943dd2c2c7cede72a72e5829e093d517c11
     home: https://github.com/guided-traffic/valkey-operator
@@ -1059,7 +1081,7 @@ entries:
     version: 1.8.1
   - apiVersion: v2
     appVersion: 1.8.0
-    created: "2026-08-19T01:34:17.476772307Z"
+    created: "2026-08-20T02:04:56.577529074Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 3e0edc92800cb2cf84282c9afdcd436eb3d9c732b4d91a1d7e9b39d743afd8f1
     home: https://github.com/guided-traffic/valkey-operator
@@ -1081,7 +1103,7 @@ entries:
     version: 1.8.0
   - apiVersion: v2
     appVersion: 1.7.1
-    created: "2026-08-19T01:34:17.476236977Z"
+    created: "2026-08-20T02:04:56.577083264Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 5780d948f7a38e014f43a9b566f93f2b35e0ecf84ad34ec8ae1d57f341e4d366
     home: https://github.com/guided-traffic/valkey-operator
@@ -1103,7 +1125,7 @@ entries:
     version: 1.7.1
   - apiVersion: v2
     appVersion: 1.7.0
-    created: "2026-08-19T01:34:17.475423071Z"
+    created: "2026-08-20T02:04:56.576614039Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 84268fc851d109c734a964dda37f99df00862e21baac836b3ceb78704fca077d
     home: https://github.com/guided-traffic/valkey-operator
@@ -1125,7 +1147,7 @@ entries:
     version: 1.7.0
   - apiVersion: v2
     appVersion: 1.6.2
-    created: "2026-08-19T01:34:17.47344551Z"
+    created: "2026-08-20T02:04:56.576088128Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: ae84684b7c46f774339d514607b62306e9849c3109d34b9dbd5bae123b21a68c
     home: https://github.com/guided-traffic/valkey-operator
@@ -1147,7 +1169,7 @@ entries:
     version: 1.6.2
   - apiVersion: v2
     appVersion: 1.6.1
-    created: "2026-08-19T01:34:17.472731884Z"
+    created: "2026-08-20T02:04:56.575520849Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8d46e87cb5cb77252c3ee551075f984675636e343c1bd169f12256cbb053ec07
     home: https://github.com/guided-traffic/valkey-operator
@@ -1169,7 +1191,7 @@ entries:
     version: 1.6.1
   - apiVersion: v2
     appVersion: 1.6.0
-    created: "2026-08-19T01:34:17.471968354Z"
+    created: "2026-08-20T02:04:56.575040373Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 2be8c9076b8923afce54b9c921bd4a9a7009938f8333b4dec325a3ef69ad50af
     home: https://github.com/guided-traffic/valkey-operator
@@ -1191,7 +1213,7 @@ entries:
     version: 1.6.0
   - apiVersion: v2
     appVersion: 1.5.1
-    created: "2026-08-19T01:34:17.47048278Z"
+    created: "2026-08-20T02:04:56.57457176Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: d8c9f74f90d929f4529c28cdc058635718f79c5dc2b1bcfedc6266d7b7588210
     home: https://github.com/guided-traffic/valkey-operator
@@ -1213,7 +1235,7 @@ entries:
     version: 1.5.1
   - apiVersion: v2
     appVersion: 1.5.0
-    created: "2026-08-19T01:34:17.469917694Z"
+    created: "2026-08-20T02:04:56.574097416Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: e036b7b7d67846b8cf5ef52f3a40af79853efd74ec5497e6074fef0dc25ab8e9
     home: https://github.com/guided-traffic/valkey-operator
@@ -1235,7 +1257,7 @@ entries:
     version: 1.5.0
   - apiVersion: v2
     appVersion: 1.4.5
-    created: "2026-08-19T01:34:17.469344373Z"
+    created: "2026-08-20T02:04:56.573575913Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 6b0efabb83898745e4af089e9c689d49f5da036ac77786029a95cba393dd9faf
     home: https://github.com/guided-traffic/valkey-operator
@@ -1257,7 +1279,7 @@ entries:
     version: 1.4.5
   - apiVersion: v2
     appVersion: 1.4.4
-    created: "2026-08-19T01:34:17.468705667Z"
+    created: "2026-08-20T02:04:56.573066613Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 4320ca148a054d27b812123fe119ce6506a20e96088321360c8afddd7e912964
     home: https://github.com/guided-traffic/valkey-operator
@@ -1279,7 +1301,7 @@ entries:
     version: 1.4.4
   - apiVersion: v2
     appVersion: 1.4.3
-    created: "2026-08-19T01:34:17.46579693Z"
+    created: "2026-08-20T02:04:56.572628036Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8a962709d1ae75888f9fde36a783321d698f5afb148ad9c333e5cd5c12a1703b
     home: https://github.com/guided-traffic/valkey-operator
@@ -1301,7 +1323,7 @@ entries:
     version: 1.4.3
   - apiVersion: v2
     appVersion: 1.4.2
-    created: "2026-08-19T01:34:17.465379993Z"
+    created: "2026-08-20T02:04:56.572113026Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 059f84a162f72d7a8a5b2b63a7dde71c6f361904b8510b80391bc36ad2900704
     home: https://github.com/guided-traffic/valkey-operator
@@ -1323,7 +1345,7 @@ entries:
     version: 1.4.2
   - apiVersion: v2
     appVersion: 1.4.1
-    created: "2026-08-19T01:34:17.464940704Z"
+    created: "2026-08-20T02:04:56.570678191Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: f5299b8f630e6e92f639fcc53baa875041a186490a3d312febb71642d0e131cc
     home: https://github.com/guided-traffic/valkey-operator
@@ -1345,7 +1367,7 @@ entries:
     version: 1.4.1
   - apiVersion: v2
     appVersion: 1.4.0
-    created: "2026-08-19T01:34:17.464460007Z"
+    created: "2026-08-20T02:04:56.570150466Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: a22fb1d1d9aa6e91e6e54dc71ca16628deb66c2b45309ee951b208bc8d6e3361
     home: https://github.com/guided-traffic/valkey-operator
@@ -1367,7 +1389,7 @@ entries:
     version: 1.4.0
   - apiVersion: v2
     appVersion: 1.3.4
-    created: "2026-08-19T01:34:17.463917814Z"
+    created: "2026-08-20T02:04:56.569692684Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: d5aa83ecf78bfabbfb1544de2538970ccf15adf39926c58ee3d5bcae8293ccce
     home: https://github.com/guided-traffic/valkey-operator
@@ -1389,7 +1411,7 @@ entries:
     version: 1.3.4
   - apiVersion: v2
     appVersion: 1.3.3
-    created: "2026-08-19T01:34:17.463261015Z"
+    created: "2026-08-20T02:04:56.569301186Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: fd4db848a2e2d7564378889b5947b17d2be07df4cce2c6b521e2173930741a01
     home: https://github.com/guided-traffic/valkey-operator
@@ -1411,7 +1433,7 @@ entries:
     version: 1.3.3
   - apiVersion: v2
     appVersion: 1.3.2
-    created: "2026-08-19T01:34:17.462694837Z"
+    created: "2026-08-20T02:04:56.568901212Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 5a7fa4f9d87fc3a6ee0d2dbd25ebb511a777155614ffc6a416823a9b89954aa5
     home: https://github.com/guided-traffic/valkey-operator
@@ -1433,7 +1455,7 @@ entries:
     version: 1.3.2
   - apiVersion: v2
     appVersion: 1.3.1
-    created: "2026-08-19T01:34:17.462207037Z"
+    created: "2026-08-20T02:04:56.568475099Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 950738ddc356e0ebeb8d4d685bd2b7551e67660d2d7dce05bb1249183ce666e2
     home: https://github.com/guided-traffic/valkey-operator
@@ -1455,7 +1477,7 @@ entries:
     version: 1.3.1
   - apiVersion: v2
     appVersion: 1.3.0
-    created: "2026-08-19T01:34:17.461679491Z"
+    created: "2026-08-20T02:04:56.568080414Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: cc7e705615b039f04b981487858fa4b26824985aa507542696f0cae0845e109d
     home: https://github.com/guided-traffic/valkey-operator
@@ -1477,7 +1499,7 @@ entries:
     version: 1.3.0
   - apiVersion: v2
     appVersion: 1.2.3
-    created: "2026-08-19T01:34:17.461209154Z"
+    created: "2026-08-20T02:04:56.567622993Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 529d095f98c4e3ef2a35133a5394f60b14af2b1b26bd97c6bd7eb53f8b25984f
     home: https://github.com/guided-traffic/valkey-operator
@@ -1499,7 +1521,7 @@ entries:
     version: 1.2.3
   - apiVersion: v2
     appVersion: 1.2.2
-    created: "2026-08-19T01:34:17.460688772Z"
+    created: "2026-08-20T02:04:56.567158877Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 8286b83ac433bb9aeafc6d5a565d7c5d095880258be34c1f4f1b95a318cec935
     home: https://github.com/guided-traffic/valkey-operator
@@ -1521,7 +1543,7 @@ entries:
     version: 1.2.2
   - apiVersion: v2
     appVersion: 1.2.1
-    created: "2026-08-19T01:34:17.460131119Z"
+    created: "2026-08-20T02:04:56.566631483Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 96d254869fd1bb0e53e690376e505471085644f8e47d69790fa41d7a26a9166d
     home: https://github.com/guided-traffic/valkey-operator
@@ -1543,7 +1565,7 @@ entries:
     version: 1.2.1
   - apiVersion: v2
     appVersion: 1.2.0
-    created: "2026-08-19T01:34:17.45860508Z"
+    created: "2026-08-20T02:04:56.56624239Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: f07a9282704c0b4267f11a6b354de00587e81f2b3d31f7ca7d3f0eef749a47be
     home: https://github.com/guided-traffic/valkey-operator
@@ -1565,7 +1587,7 @@ entries:
     version: 1.2.0
   - apiVersion: v2
     appVersion: 1.1.7
-    created: "2026-08-19T01:34:17.430768771Z"
+    created: "2026-08-20T02:04:56.540900905Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: f00b2a64054b046671f52c555bf7ed2e270ffb52c49b879e0e9a2eb21c04d57c
     home: https://github.com/guided-traffic/valkey-operator
@@ -1587,7 +1609,7 @@ entries:
     version: 1.1.7
   - apiVersion: v2
     appVersion: 1.1.6
-    created: "2026-08-19T01:34:17.430174129Z"
+    created: "2026-08-20T02:04:56.540469552Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: e1e126faaa1c6ada058805c71a49d0a7a41b9d45f1d2534ec487e0d4c04bec24
     home: https://github.com/guided-traffic/valkey-operator
@@ -1609,7 +1631,7 @@ entries:
     version: 1.1.6
   - apiVersion: v2
     appVersion: 1.1.5
-    created: "2026-08-19T01:34:17.42953939Z"
+    created: "2026-08-20T02:04:56.54007064Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 386c0c9768b936598994f490d82131f67de3e5288502bc3e25289bd8bfe12498
     home: https://github.com/guided-traffic/valkey-operator
@@ -1631,7 +1653,7 @@ entries:
     version: 1.1.5
   - apiVersion: v2
     appVersion: 1.1.4
-    created: "2026-08-19T01:34:17.427606755Z"
+    created: "2026-08-20T02:04:56.53961959Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: a27dbf036890c7f28198789cab11e00dbd6426bf382c27a0ae9cd121f71273d6
     home: https://github.com/guided-traffic/valkey-operator
@@ -1653,7 +1675,7 @@ entries:
     version: 1.1.4
   - apiVersion: v2
     appVersion: 1.1.2
-    created: "2026-08-19T01:34:17.427207291Z"
+    created: "2026-08-20T02:04:56.53922736Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 7e856908b70c891b151118ea28be1d2fd9be1773cf6f9e987e8274eb2212a3b0
     home: https://github.com/guided-traffic/valkey-operator
@@ -1675,7 +1697,7 @@ entries:
     version: 1.1.2
   - apiVersion: v2
     appVersion: 1.1.1
-    created: "2026-08-19T01:34:17.42672452Z"
+    created: "2026-08-20T02:04:56.538882581Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 867fc0cab378eaf47446c074254fb7ebd2a20b719f196307cc32943d4cde9dcb
     home: https://github.com/guided-traffic/valkey-operator
@@ -1697,7 +1719,7 @@ entries:
     version: 1.1.1
   - apiVersion: v2
     appVersion: 1.1.0
-    created: "2026-08-19T01:34:17.426118536Z"
+    created: "2026-08-20T02:04:56.538480853Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 79e436e15cde0ae0f94590bf52c8abd4090440cdeed3e0eccb89e98a5557fc8f
     home: https://github.com/guided-traffic/valkey-operator
@@ -1719,7 +1741,7 @@ entries:
     version: 1.1.0
   - apiVersion: v2
     appVersion: 1.0.1
-    created: "2026-08-19T01:34:17.425587655Z"
+    created: "2026-08-20T02:04:56.538066573Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: b7e7f773dd188ff3036be95f77fbd8be5f66bbc229c37f4b95a85aeca9dbaf79
     home: https://github.com/guided-traffic/valkey-operator
@@ -1741,7 +1763,7 @@ entries:
     version: 1.0.1
   - apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-08-19T01:34:17.425038289Z"
+    created: "2026-08-20T02:04:56.537603529Z"
     description: A Kubernetes operator for managing Valkey and Sentinel instances
     digest: 21945c698c83ffe2dea02424a63a0d94ca2a39e8f957d61f4823e49dc6bd9f63
     home: https://github.com/guided-traffic/valkey-operator
@@ -1761,4 +1783,4 @@ entries:
     urls:
     - https://guided-traffic.github.io/valkey-operator/valkey-operator-1.0.0.tgz
     version: 1.0.0
-generated: "2026-08-19T01:34:17.424309524Z"
+generated: "2026-08-20T02:04:56.536895936Z"
