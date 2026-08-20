@@ -29,9 +29,9 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     strategy:
-      # Both legs build their Kind cluster on the same DinD host, so they run one
-      # after the other instead of competing for CPU, memory and inotify watches.
-      max-parallel: 1
+      # The legs run in parallel: each lands on its own ephemeral ARC runner pod,
+      # and the distinct cluster names keep them collision-free even if two pods
+      # are ever scheduled onto the same node.
       fail-fast: false
       matrix:
         include:
@@ -423,6 +423,22 @@ jobs:
       - name: Cleanup Kind cluster
         if: always()
         run: kind delete cluster --name "${KIND_CLUSTER}" || true
+
+  # Branch protection requires the status context "E2E Tests". The matrix legs
+  # report as "E2E Tests (single-node)" / "E2E Tests (multi-node)", so this gate
+  # job carries the stable context and fails unless every leg succeeded. Keeps
+  # the required check independent of future matrix reshaping.
+  e2e-gate:
+    name: E2E Tests
+    runs-on: self-hosted
+    needs: [e2e-tests]
+    if: always()
+    steps:
+      - name: Require all matrix legs to succeed
+        run: |
+          result="${{ needs.e2e-tests.result }}"
+          echo "E2E matrix result: ${result}"
+          [ "${result}" = "success" ]
 
   linter:
     name: Code Linting
