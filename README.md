@@ -563,7 +563,11 @@ What the budgets do and do not cover:
 - The **data PDB** uses `maxUnavailable` (default `1`), so a node drain takes one
   data pod at a time instead of the whole StatefulSet. Setting `maxUnavailable`
   to `spec.replicas` or higher removes the protection; the operator honours it and
-  logs a warning rather than rejecting a later scale-down.
+  warns rather than rejecting a later scale-down. The warning is a log line plus a
+  `PodDisruptionBudgetTooPermissive` Event on the CR, emitted on every reconcile
+  while the condition holds — so scaling `spec.replicas` down into it (`5` -> `2`
+  with `maxUnavailable: 2`) is reported too, even though the PDB object itself
+  never changes.
 - The **Sentinel PDB** uses `minAvailable = floor(spec.sentinel.replicas / 2) + 1`
   — the failover quorum. It is **computed, never configurable**: a settable value
   could silently break the guarantee that a drain cannot take the Sentinel majority.

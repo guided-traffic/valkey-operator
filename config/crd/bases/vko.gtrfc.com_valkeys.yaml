@@ -486,8 +486,10 @@ spec:
                       Sentinel budget is always derived from the quorum and is not configurable,
                       because a settable value could silently break the quorum guarantee.
                       A value greater than or equal to spec.replicas disables the protection
-                      (every pod may be evicted at once); the operator logs a warning but honours
-                      it rather than rejecting a later scale-down.
+                      (every pod may be evicted at once); the operator logs a warning and records a
+                      PodDisruptionBudgetTooPermissive Event on every reconcile but honours it
+                      rather than rejecting a later scale-down. Scaling spec.replicas down into
+                      that condition is warned about as well, not only a change of this field.
                     format: int32
                     minimum: 1
                     type: integer

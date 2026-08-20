@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -42,14 +43,40 @@ func (r *ValkeyReconciler) reconcileDataPodDisruptionBudget(ctx context.Context,
 		return r.cleanupPodDisruptionBudget(ctx, v, builder.PodDisruptionBudgetName(v))
 	}
 
-	changed, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v))
-	if err == nil && changed && v.PodDisruptionBudgetMaxUnavailable() >= v.Spec.Replicas {
-		log.FromContext(ctx).Info("PodDisruptionBudget allows every data pod to be evicted at once; "+
-			"spec.podDisruptionBudget.maxUnavailable is not smaller than spec.replicas",
-			"name", builder.PodDisruptionBudgetName(v),
-			"maxUnavailable", v.PodDisruptionBudgetMaxUnavailable(), "replicas", v.Spec.Replicas)
+	if err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v)); err != nil {
+		return err
 	}
-	return err
+	r.warnIfDataBudgetProtectsNothing(ctx, v)
+	return nil
+}
+
+// reasonPodDisruptionBudgetTooPermissive is the Event reason for a data budget
+// that permits evicting every data pod at once.
+const reasonPodDisruptionBudgetTooPermissive = "PodDisruptionBudgetTooPermissive"
+
+// warnIfDataBudgetProtectsNothing warns while maxUnavailable is not smaller than
+// spec.replicas — the budget then permits a single drain to take every data pod.
+//
+// It runs on every pass in which the budget applies, not only when the PDB was
+// written. Scaling spec.replicas down into the condition (5 -> 2 with
+// maxUnavailable 2) leaves the PDB object byte-identical, so a write-gated warning
+// stayed silent for exactly the change that created the hazard. The repetition
+// that costs is the Event, and the recorder aggregates a repeated Event into one
+// series instead of new objects.
+func (r *ValkeyReconciler) warnIfDataBudgetProtectsNothing(ctx context.Context, v *vkov1.Valkey) {
+	maxUnavailable := v.PodDisruptionBudgetMaxUnavailable()
+	if maxUnavailable < v.Spec.Replicas {
+		return
+	}
+
+	name := builder.PodDisruptionBudgetName(v)
+	log.FromContext(ctx).Info("PodDisruptionBudget allows every data pod to be evicted at once; "+
+		"spec.podDisruptionBudget.maxUnavailable is not smaller than spec.replicas",
+		"name", name, "maxUnavailable", maxUnavailable, "replicas", v.Spec.Replicas)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonPodDisruptionBudgetTooPermissive,
+		"PodDisruptionBudget %s allows every data pod to be evicted at once "+
+			"(maxUnavailable %d is not smaller than replicas %d)",
+		name, maxUnavailable, v.Spec.Replicas)
 }
 
 // reconcileSentinelPodDisruptionBudget creates the quorum-preserving Sentinel PDB
@@ -64,8 +91,7 @@ func (r *ValkeyReconciler) reconcileSentinelPodDisruptionBudget(ctx context.Cont
 		return r.cleanupPodDisruptionBudget(ctx, v, builder.SentinelPodDisruptionBudgetName(v))
 	}
 
-	_, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
-	return err
+	return r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
 }
 
 // logPodDisruptionBudgetSkip records why an enabled PDB was not created. A
@@ -78,24 +104,23 @@ func logPodDisruptionBudgetSkip(ctx context.Context, name string, replicas int32
 }
 
 // reconcilePodDisruptionBudget ensures a single PDB matches the desired state.
-// It reports whether the object was created or updated.
 func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *vkov1.Valkey,
-	desired *policyv1.PodDisruptionBudget) (bool, error) {
+	desired *policyv1.PodDisruptionBudget) error {
 	logger := log.FromContext(ctx)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return false, fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
+		return fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
 	}
 
 	current := &policyv1.PodDisruptionBudget{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating PodDisruptionBudget", "name", desired.Name)
-		return true, r.Create(ctx, desired)
+		return r.Create(ctx, desired)
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if builder.PodDisruptionBudgetHasChanged(desired, current) ||
@@ -104,10 +129,10 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 		builder.ApplyPodDisruptionBudgetSpec(desired, current)
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return true, r.Update(ctx, current)
+		return r.Update(ctx, current)
 	}
 
-	return false, nil
+	return nil
 }
 
 // cleanupPodDisruptionBudget deletes the named PDB if it exists.
