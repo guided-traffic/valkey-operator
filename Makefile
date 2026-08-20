@@ -70,16 +70,20 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 test: fmt vet envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out
 
+# No -short: it used to gate eight tests in internal/controller behind
+# testing.Short(), and since CI runs test-unit-coverage they were skipped
+# everywhere automated - three of them had been failing unnoticed. Without the
+# flag a testing.Short() gate can never silently remove a test from CI again.
 .PHONY: test-unit
 test-unit: envtest ## Run unit tests only.
 	@echo "Running unit tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -short ./...
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v ./...
 
 .PHONY: test-unit-coverage
 test-unit-coverage: envtest ## Run unit tests with coverage.
 	@echo "Running unit tests with coverage..."
 	@mkdir -p $(COVERAGE_DIR)
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -short -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic ./...
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic ./...
 
 .PHONY: test-integration
 test-integration: envtest ## Run integration tests only.

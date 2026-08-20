@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"testing"
 	"time"
@@ -2582,9 +2583,6 @@ func (m *perPodMockChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valke
 // after SENTINEL REMOVE+MONITOR sentinel cannot discover or fix it. Without
 // forceReplicaConnections the cluster is permanently stuck in "Syncing: 1/2".
 func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
 	v := newTestValkey("ha-cascaded", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:9.0"
@@ -2637,9 +2635,6 @@ func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testin
 // syncSentinelWithMaster uses the identified master pod's address (not an empty
 // string that would fall back to pod-0, which may not be the master).
 func TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMasterAddr(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent sentinel pods")
-	}
 	v := newTestValkey("ha-errstall", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:9.0"
@@ -4152,27 +4147,39 @@ func TestCountMasters_SingleMaster(t *testing.T) {
 // when two pods report "master" in a non-sentinel cluster, the split-brain is detected
 // and the rogue master is demoted before the rolling update proceeds. This covers the
 // bug where detectAndResolveSplitBrain was only called in the Sentinel path.
+//
+// Every pod in the fixture is up to date on purpose: detectAndResolveSplitBrain runs at
+// the top of handleMultiReplicaRollingUpdate, ahead of the "all pods updated" branch
+// that finalizes the update. Moving the call behind that branch would leave the rogue
+// master in place, and that regression is what this test pins.
 func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	// Non-sentinel, 3-replica cluster with split-brain:
 	// pod-0 reports master (rogue, 0 slaves), pod-1 reports master (real, 1 slave), pod-2 replica.
-	// All pods have the current image so the rolling update was already complete — but
-	// a rogue master was left behind by a failed topology restoration.
+	// The pods are built from the persisted StatefulSet template, so the rolling update
+	// itself is already complete — the rogue master was left behind by a failed
+	// topology restoration.
 	v := newTestValkey("mr-split", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
 	})
+	sts := stsForValkey(v)
 
-	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0 := podFromStsTemplate(v, sts, 0)
 	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
-	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1 := podFromStsTemplate(v, sts, 1)
 	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster
-	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+	pod2 := podFromStsTemplate(v, sts, 2)
 
-	r, _ := newTestReconciler(v, pod0, pod1, pod2)
+	r, _ := newTestReconciler(v, sts, pod0, pod1, pod2)
+
+	// A server that answers REPLICAOF, so the demotion is exercised for real instead
+	// of dying on a refused connection.
+	addr := fakeValkeyServer(t)
+	var demoted []string
+	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
+		demoted = append(demoted, target)
+		return valkeyclient.New(addr)
+	}
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4188,15 +4195,15 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 		},
 	}
 
-	sts := &appsv1.StatefulSet{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "mr-split", Namespace: "default"}, sts))
-
 	result := r.handleMultiReplicaRollingUpdate(context.Background(), v, sts)
 
-	// Should requeue (split-brain demoted, but REPLICAOF to rogue master will fail
-	// since no real Valkey pods exist — the demote is best-effort).
-	assert.True(t, result.NeedsRequeue, "Should requeue after split-brain detection")
-	assert.Nil(t, result.Error, "Should not return an error")
+	require.Nil(t, result.Error, "Should not return an error")
+	assert.True(t, result.Completed, "every pod is up to date, so the update finalizes")
+
+	// The master without connected slaves is the rogue one and the only pod that may
+	// be demoted — demoting pod-1 would point the data it serves at an empty master.
+	require.Len(t, demoted, 1, "exactly one pod must be demoted")
+	assert.Contains(t, demoted[0], "mr-split-0.", "the rogue master must be the demoted pod")
 }
 
 // --- Two-phase handleTopologyRestoration ---
@@ -4205,10 +4212,6 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 // promotes pod-0, sends REPLICAOF to all other pods, sets the
 // annotationTopologyRestoreStarted annotation, and requeues without completing.
 func TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-p1", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4227,6 +4230,14 @@ func TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues(t *testing.T)
 		annotationPromotedPod:        "topo-p1-1",
 	}
 	require.NoError(t, c.Update(context.Background(), v))
+
+	// Phase 1 only reaches stateVerifyingTopology once REPLICAOF NO ONE on pod-0
+	// succeeded; a refused connection correctly keeps the state at
+	// stateRestoringTopology, so the fixture needs a server that answers.
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
 
 	// pod-0 is fully synced as replica of pod-1 and ready for promotion.
 	r.InstanceChecker = &mockInstanceChecker{
@@ -4312,10 +4323,6 @@ func TestVerifyTopologyRestored_CleanTopologyCompletes(t *testing.T) {
 // (via detectAndResolveSplitBrain) and requeues — until finalizationStallTimeout,
 // after which it clears state and completes to prevent an indefinite stall.
 func TestVerifyTopologyRestored_RogueMasterRetriedThenStall(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-stall", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4373,10 +4380,6 @@ func TestVerifyTopologyRestored_RogueMasterRetriedThenStall(t *testing.T) {
 // stall timeout, verifyTopologyRestored requeues rather than completing when a rogue
 // master is still present after a REPLICAOF attempt.
 func TestVerifyTopologyRestored_RequeuesWhenRogueMasterPresent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-retry", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4479,10 +4482,6 @@ func TestFindPromotionCandidate_Pod0IsOnlyCandidate_ReturnsNegative(t *testing.T
 // stateVerifyingTopology. Without this guard the operator waits forever for
 // master_link_status=up on a self-referencing REPLICAOF.
 func TestHandleTopologyRestoration_SelfLoopRecovery(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("selfloop", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4502,6 +4501,14 @@ func TestHandleTopologyRestoration_SelfLoopRecovery(t *testing.T) {
 		annotationPromotedPod:        "selfloop-0", // self-loop: pod-0 was promoted
 	}
 	require.NoError(t, c.Update(context.Background(), v))
+
+	// Phase 1 only reaches stateVerifyingTopology once REPLICAOF NO ONE on pod-0
+	// succeeded; a refused connection correctly keeps the state at
+	// stateRestoringTopology, so the fixture needs a server that answers.
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
 
 	// GetReplicationInfo returns role=slave, link=down (the stuck self-loop state).
 	r.InstanceChecker = &mockInstanceChecker{

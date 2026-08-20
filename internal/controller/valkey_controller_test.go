@@ -2786,10 +2786,6 @@ func TestCheckAndRecoverNoMaster_NoRecoveryWhenPodUnreachable(t *testing.T) {
 }
 
 func TestCheckAndRecoverNoMaster_RecoverWhenAllReplicas(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 	})

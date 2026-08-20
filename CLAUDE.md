@@ -160,6 +160,17 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Build Docker image            | `make docker-build`            |
 | Build & load into Kind        | `make kind-load`               |
 
+### No `-short`, no `testing.Short()` gates
+
+The unit targets deliberately do **not** pass `-short`, and no test in this
+repo may gate itself behind `testing.Short()`. Both rules exist because the
+combination silently removed eight `internal/controller` tests from CI, three
+of which had been failing unnoticed (NA22). Unit tests reach no real Valkey:
+`newTestReconciler` redirects every client to `127.0.0.1` for an instant
+refusal, and tests that need a command to succeed use `fakeValkeyServer(t)`
+(`internal/controller/manual_failover_known_master_test.go`) via
+`NewValkeyClientFn`. There is no runtime left to save by skipping.
+
 ### E2E cluster topology
 
 CI runs the E2E job twice, as a matrix in `.github/workflows/release.yml`:
