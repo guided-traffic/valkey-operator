@@ -13,9 +13,10 @@ import (
 // and Sentinel pods never repel each other and a second Valkey instance in the
 // same namespace is unaffected.
 //
-// Returns nil when the component has fewer than MinAntiAffinityReplicas replicas:
-// a singleton has no peer to repel, and an empty term would still change the
-// pod-spec hash and restart the pod for nothing.
+// Returns nil when mode is off (the default — scheduling stays untouched unless
+// the user opts in) or when the component has fewer than MinAntiAffinityReplicas
+// replicas: a singleton has no peer to repel, and an empty term would still
+// change the pod-spec hash and restart the pod for nothing.
 func BuildPodAntiAffinity(v *vkov1.Valkey, component string) *corev1.Affinity {
 	if !needsAntiAffinity(v, component) {
 		return nil
@@ -41,8 +42,8 @@ func BuildPodAntiAffinity(v *vkov1.Valkey, component string) *corev1.Affinity {
 	return &corev1.Affinity{PodAntiAffinity: antiAffinity}
 }
 
-// needsAntiAffinity reports whether the given component's StatefulSet has enough
-// replicas for an anti-affinity term to mean anything.
+// needsAntiAffinity reports whether a term is requested (mode soft or hard) and
+// the given component's StatefulSet has enough replicas for it to mean anything.
 func needsAntiAffinity(v *vkov1.Valkey, component string) bool {
 	if component == common.ComponentSentinel {
 		return v.NeedsSentinelAntiAffinity()

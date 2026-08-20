@@ -21,17 +21,30 @@ func withReplicas(replicas int32) func(*vkov1.Valkey) {
 	return func(v *vkov1.Valkey) { v.Spec.Replicas = replicas }
 }
 
-// --- defaults (block omitted) ---
+// --- defaults (block omitted → off) ---
 
-func TestBuildPodAntiAffinity_DefaultsToSoftOnHostname(t *testing.T) {
+func TestBuildPodAntiAffinity_DefaultOffRendersNothing(t *testing.T) {
 	v := newTestValkey("test", withReplicas(3))
+
+	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentValkey),
+		"an omitted antiAffinity block must not change scheduling")
+}
+
+func TestBuildPodAntiAffinity_ExplicitOffRendersNothing(t *testing.T) {
+	v := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeOff, ""))
+
+	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentValkey))
+}
+
+func TestBuildPodAntiAffinity_SoftOnHostname(t *testing.T) {
+	v := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	affinity := BuildPodAntiAffinity(v, common.ComponentValkey)
 
 	require.NotNil(t, affinity)
 	require.NotNil(t, affinity.PodAntiAffinity)
 	assert.Empty(t, affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
-		"default must not block scheduling")
+		"soft must not block scheduling")
 
 	preferred := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 	require.Len(t, preferred, 1)
@@ -42,7 +55,8 @@ func TestBuildPodAntiAffinity_DefaultsToSoftOnHostname(t *testing.T) {
 // --- component scoping ---
 
 func TestBuildPodAntiAffinity_SelectorIsComponentScoped(t *testing.T) {
-	v := newTestValkey("test", withReplicas(3), withSentinel(3))
+	v := newTestValkey("test", withReplicas(3), withSentinel(3),
+		withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	data := BuildPodAntiAffinity(v, common.ComponentValkey)
 	sentinel := BuildPodAntiAffinity(v, common.ComponentSentinel)
@@ -90,14 +104,11 @@ func TestBuildPodAntiAffinity_ExplicitSoftMode(t *testing.T) {
 	assert.Empty(t, affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
 }
 
-func TestBuildPodAntiAffinity_UnknownModeFallsBackToSoft(t *testing.T) {
+func TestBuildPodAntiAffinity_UnknownModeFallsBackToOff(t *testing.T) {
 	v := newTestValkey("test", withReplicas(3), withAntiAffinity("bogus", ""))
 
-	affinity := BuildPodAntiAffinity(v, common.ComponentValkey)
-
-	require.NotNil(t, affinity)
-	assert.Len(t, affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, 1,
-		"an unvalidated value must not silently become a hard constraint")
+	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentValkey),
+		"an unvalidated value must not silently become any constraint")
 }
 
 // --- topologyKey ---
@@ -113,23 +124,24 @@ func TestBuildPodAntiAffinity_CustomTopologyKey(t *testing.T) {
 		affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].TopologyKey)
 }
 
-// --- single-replica skip ---
+// --- single-replica skip (mode soft, so the replica rule is what skips) ---
 
 func TestBuildPodAntiAffinity_SkippedForSingleReplica(t *testing.T) {
-	v := newTestValkey("test", withReplicas(1))
+	v := newTestValkey("test", withReplicas(1), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentValkey))
 }
 
 func TestBuildPodAntiAffinity_SkippedForSingleSentinel(t *testing.T) {
-	v := newTestValkey("test", withReplicas(3), withSentinel(1))
+	v := newTestValkey("test", withReplicas(3), withSentinel(1),
+		withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	assert.NotNil(t, BuildPodAntiAffinity(v, common.ComponentValkey))
 	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentSentinel))
 }
 
 func TestBuildPodAntiAffinity_SkippedWhenSentinelDisabled(t *testing.T) {
-	v := newTestValkey("test", withReplicas(3))
+	v := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	assert.Nil(t, BuildPodAntiAffinity(v, common.ComponentSentinel))
 }
@@ -137,13 +149,22 @@ func TestBuildPodAntiAffinity_SkippedWhenSentinelDisabled(t *testing.T) {
 // --- rendered into the pod templates ---
 
 func TestBuildStatefulSet_CarriesAntiAffinity(t *testing.T) {
-	v := newTestValkey("test", withReplicas(3))
+	v := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	sts := BuildStatefulSet(v, "operator:test")
 
 	require.NotNil(t, sts.Spec.Template.Spec.Affinity)
 	assert.Len(t, sts.Spec.Template.Spec.Affinity.PodAntiAffinity.
 		PreferredDuringSchedulingIgnoredDuringExecution, 1)
+}
+
+func TestBuildStatefulSet_DefaultHasNoAffinity(t *testing.T) {
+	v := newTestValkey("test", withReplicas(3))
+
+	sts := BuildStatefulSet(v, "operator:test")
+
+	assert.Nil(t, sts.Spec.Template.Spec.Affinity,
+		"without an antiAffinity block the pod template must stay as it was before the feature")
 }
 
 func TestBuildSentinelStatefulSet_CarriesAntiAffinity(t *testing.T) {
@@ -160,7 +181,7 @@ func TestBuildSentinelStatefulSet_CarriesAntiAffinity(t *testing.T) {
 }
 
 func TestBuildStatefulSet_SingleReplicaHasNoAffinity(t *testing.T) {
-	v := newTestValkey("test", withReplicas(1))
+	v := newTestValkey("test", withReplicas(1), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 
 	sts := BuildStatefulSet(v, "operator:test")
 
@@ -168,17 +189,24 @@ func TestBuildStatefulSet_SingleReplicaHasNoAffinity(t *testing.T) {
 		"a standalone instance must not get a pointless pod-spec hash change")
 }
 
-// --- pod-spec hash: the anti-affinity change must trigger a rolling update ---
+// --- pod-spec hash: a mode change must trigger a rolling update ---
 
 func TestComputePodSpecHash_ChangesWithAntiAffinityMode(t *testing.T) {
-	soft := newTestValkey("test", withReplicas(3))
+	off := newTestValkey("test", withReplicas(3))
+	soft := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 	hard := newTestValkey("test", withReplicas(3), withAntiAffinity(vkov1.AntiAffinityModeHard, ""))
 
-	assert.NotEqual(t, ComputePodSpecHash(soft, "operator:test"), ComputePodSpecHash(hard, "operator:test"))
+	offHash := ComputePodSpecHash(off, "operator:test")
+	softHash := ComputePodSpecHash(soft, "operator:test")
+	hardHash := ComputePodSpecHash(hard, "operator:test")
+
+	assert.NotEqual(t, offHash, softHash, "opting into soft must roll the pods")
+	assert.NotEqual(t, softHash, hardHash, "switching soft to hard must roll the pods")
 }
 
 func TestComputeSentinelPodSpecHash_ChangesWithTopologyKey(t *testing.T) {
-	host := newTestValkey("test", withReplicas(3), withSentinel(3))
+	host := newTestValkey("test", withReplicas(3), withSentinel(3),
+		withAntiAffinity(vkov1.AntiAffinityModeSoft, ""))
 	zone := newTestValkey("test", withReplicas(3), withSentinel(3),
 		withAntiAffinity(vkov1.AntiAffinityModeSoft, "topology.kubernetes.io/zone"))
 

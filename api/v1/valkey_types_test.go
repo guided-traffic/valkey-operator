@@ -1209,11 +1209,12 @@ func TestAntiAffinityMode(t *testing.T) {
 		spec     *AntiAffinitySpec
 		expected string
 	}{
-		{name: "nil spec defaults to soft", spec: nil, expected: AntiAffinityModeSoft},
-		{name: "empty mode defaults to soft", spec: &AntiAffinitySpec{}, expected: AntiAffinityModeSoft},
+		{name: "nil spec defaults to off", spec: nil, expected: AntiAffinityModeOff},
+		{name: "empty mode defaults to off", spec: &AntiAffinitySpec{}, expected: AntiAffinityModeOff},
+		{name: "explicit off", spec: &AntiAffinitySpec{Mode: AntiAffinityModeOff}, expected: AntiAffinityModeOff},
 		{name: "explicit soft", spec: &AntiAffinitySpec{Mode: AntiAffinityModeSoft}, expected: AntiAffinityModeSoft},
 		{name: "explicit hard", spec: &AntiAffinitySpec{Mode: AntiAffinityModeHard}, expected: AntiAffinityModeHard},
-		{name: "unknown value falls back to soft", spec: &AntiAffinitySpec{Mode: "bogus"}, expected: AntiAffinityModeSoft},
+		{name: "unknown value falls back to off", spec: &AntiAffinitySpec{Mode: "bogus"}, expected: AntiAffinityModeOff},
 	}
 
 	for _, tt := range tests {
@@ -1237,31 +1238,48 @@ func TestAntiAffinityTopologyKey(t *testing.T) {
 	assert.Equal(t, "topology.kubernetes.io/zone", v.AntiAffinityTopologyKey())
 }
 
-// TestNeedsAntiAffinity guards the single-replica skip rule: a singleton has no
-// peer to repel, so it must not get a term (and therefore no pod-spec hash churn).
+// TestNeedsAntiAffinity guards two skip rules: the off default (no block, or
+// mode off, renders nothing regardless of replica count) and the single-replica
+// skip (a singleton has no peer to repel, so it must not get a term and
+// therefore no pod-spec hash churn).
 func TestNeedsAntiAffinity(t *testing.T) {
 	tests := []struct {
 		name             string
 		replicas         int32
 		sentinel         *SentinelSpec
+		antiAffinity     *AntiAffinitySpec
 		expectedData     bool
 		expectedSentinel bool
 	}{
-		{name: "standalone", replicas: 1, expectedData: false, expectedSentinel: false},
-		{name: "two data replicas, no sentinel", replicas: 2, expectedData: true, expectedSentinel: false},
-		{
-			name: "sentinel disabled", replicas: 3,
-			sentinel:     &SentinelSpec{Enabled: false, Replicas: 3},
-			expectedData: true, expectedSentinel: false,
-		},
-		{
-			name: "single sentinel", replicas: 3,
-			sentinel:     &SentinelSpec{Enabled: true, Replicas: 1},
-			expectedData: true, expectedSentinel: false,
-		},
-		{
-			name: "ha", replicas: 3,
+		{name: "default off: no block", replicas: 3,
 			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			expectedData: false, expectedSentinel: false},
+		{name: "explicit off", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeOff},
+			expectedData: false, expectedSentinel: false},
+		{name: "soft, standalone", replicas: 1,
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: false, expectedSentinel: false},
+		{name: "soft, two data replicas, no sentinel", replicas: 2,
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false},
+		{
+			name: "soft, sentinel disabled", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: false, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "soft, single sentinel", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 1},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "hard, ha", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeHard},
 			expectedData: true, expectedSentinel: true,
 		},
 	}
@@ -1271,6 +1289,7 @@ func TestNeedsAntiAffinity(t *testing.T) {
 			v := newValkey("test", func(v *Valkey) {
 				v.Spec.Replicas = tt.replicas
 				v.Spec.Sentinel = tt.sentinel
+				v.Spec.AntiAffinity = tt.antiAffinity
 			})
 			assert.Equal(t, tt.expectedData, v.NeedsDataAntiAffinity())
 			assert.Equal(t, tt.expectedSentinel, v.NeedsSentinelAntiAffinity())

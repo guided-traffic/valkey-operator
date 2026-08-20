@@ -10,14 +10,16 @@ package e2e
 // at once. Anti-affinity prevents that co-location up front; the PodDisruptionBudget
 // (T3) only serializes the evictions that remain.
 //
-// The soft default runs on any cluster shape. The hard-mode spread assertion needs
-// at least three schedulable nodes (Makefile kind-create locally, the multi-node CI
-// leg in .github/workflows/release.yml) and skips otherwise — unless
-// E2E_REQUIRE_MULTI_NODE=true, which the multi-node leg sets so a shrunken cluster
-// fails instead of skipping. The Pending negative case is node-count agnostic:
-// instead of cordoning nodes — which would disturb the tests running in parallel —
-// it collapses the spread domains by pointing topologyKey at a label every node
-// shares.
+// The default is off — an operator upgrade must not change the scheduling of
+// existing clusters — so spreading is an explicit opt-in to soft or hard. The
+// off-default and soft assertions run on any cluster shape. The hard-mode spread
+// assertion needs at least three schedulable nodes (Makefile kind-create locally,
+// the multi-node CI leg in .github/workflows/release.yml) and skips otherwise —
+// unless E2E_REQUIRE_MULTI_NODE=true, which the multi-node leg sets so a shrunken
+// cluster fails instead of skipping. The Pending negative case is node-count
+// agnostic: instead of cordoning nodes — which would disturb the tests running in
+// parallel — it collapses the spread domains by pointing topologyKey at a label
+// every node shares.
 
 import (
 	"context"
@@ -51,11 +53,43 @@ const pendingObservationTimeout = 90 * time.Second
 // exists for, and a skip reads as green.
 const multiNodeRequiredEnv = "E2E_REQUIRE_MULTI_NODE"
 
-// TestE2E_AntiAffinity_SoftByDefault is the default half of T5: a CR that says
-// nothing about anti-affinity still gets a preferred term on the hostname for both
-// StatefulSets, and — because a preference never blocks scheduling — the cluster
-// becomes ready even when the nodes cannot satisfy the spread.
-func TestE2E_AntiAffinity_SoftByDefault(t *testing.T) {
+// TestE2E_AntiAffinity_OffByDefault guards the default half of T5: a CR that says
+// nothing about anti-affinity gets no term on either StatefulSet, so upgrading the
+// operator changes nothing about how existing clusters are scheduled.
+func TestE2E_AntiAffinity_OffByDefault(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+
+	ns := "e2e-antiaffinity-off"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "aa-off"
+	t.Log("Creating an HA Valkey CR without an antiAffinity block")
+	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    "valkey/valkey:8.0",
+		"sentinel": map[string]interface{}{
+			"enabled":  true,
+			"replicas": int64(3),
+		},
+	}))
+	defer tc.deleteValkey(t, ns, name)
+
+	tc.waitForStatefulSetReady(t, ns, name, 3)
+	tc.waitForStatefulSetReady(t, ns, name+"-sentinel", 3)
+
+	for _, sts := range []string{name, name + "-sentinel"} {
+		assert.Nil(t, tc.getStatefulSet(t, ns, sts).Spec.Template.Spec.Affinity,
+			"StatefulSet %s must carry no affinity without an explicit opt-in", sts)
+	}
+}
+
+// TestE2E_AntiAffinity_SoftWhenRequested is the soft half of T5: with mode: soft
+// both StatefulSets get a preferred term on the hostname, and — because a
+// preference never blocks scheduling — the cluster becomes ready even when the
+// nodes cannot satisfy the spread.
+func TestE2E_AntiAffinity_SoftWhenRequested(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)
 
@@ -64,13 +98,16 @@ func TestE2E_AntiAffinity_SoftByDefault(t *testing.T) {
 	defer cleanup()
 
 	name := "aa-soft"
-	t.Log("Creating an HA Valkey CR without an antiAffinity block")
+	t.Log("Creating an HA Valkey CR with antiAffinity.mode: soft")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
 		"image":    "valkey/valkey:8.0",
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
+		},
+		"antiAffinity": map[string]interface{}{
+			"mode": "soft",
 		},
 	}))
 	defer tc.deleteValkey(t, ns, name)
@@ -187,7 +224,7 @@ func requirePreferredAntiAffinity(t *testing.T, sts *appsv1.StatefulSet) corev1.
 	require.NotNil(t, affinity, "StatefulSet %s has no affinity", sts.Name)
 	require.NotNil(t, affinity.PodAntiAffinity, "StatefulSet %s has no pod anti-affinity", sts.Name)
 	assert.Empty(t, affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
-		"the default must never block scheduling")
+		"soft must never block scheduling")
 
 	preferred := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 	require.Len(t, preferred, 1, "expected exactly one preferred anti-affinity term")

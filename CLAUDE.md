@@ -71,8 +71,9 @@ spec:
                              # floor(replicas/2)+1) and not configurable;
                              # StatefulSets with < 2 replicas get no PDB
   antiAffinity:
-    mode: soft               # optional, default soft (scheduler preference, never
-                             # blocks); hard = required spread, surplus pods Pending
+    mode: soft               # optional, default off (no term - upgrades change
+                             # nothing); soft = scheduler preference, never blocks;
+                             # hard = required spread, surplus pods Pending
     topologyKey: kubernetes.io/hostname  # optional, default kubernetes.io/hostname
                              # applies to data and sentinel pods, each repelling only
                              # its own kind; StatefulSets with < 2 replicas get no term

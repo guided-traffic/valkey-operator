@@ -74,14 +74,16 @@ spec:
               antiAffinity:
                 description: |-
                   AntiAffinity configures pod anti-affinity for the data and Sentinel
-                  StatefulSets. Omitted means soft anti-affinity on kubernetes.io/hostname
-                  for every StatefulSet with at least two replicas.
+                  StatefulSets. Omitted means off: no term is rendered and scheduling is
+                  unchanged. Set mode: soft or hard to spread StatefulSets with at least
+                  two replicas across nodes.
                 properties:
                   mode:
-                    default: soft
+                    default: "off"
                     description: |-
-                      Mode selects soft (preferredDuringSchedulingIgnoredDuringExecution) or
-                      hard (requiredDuringSchedulingIgnoredDuringExecution).
+                      Mode selects off (no term, the default), soft
+                      (preferredDuringSchedulingIgnoredDuringExecution) or hard
+                      (requiredDuringSchedulingIgnoredDuringExecution).
 
                       Soft is a scheduler preference: under node pressure pods may still be
                       co-located, so the spread is not guaranteed.
@@ -91,7 +93,11 @@ spec:
                       stay Pending (which also wedges the next rolling update), and during a node
                       drain an evicted pod stays Pending until a node without a pod of the same
                       StatefulSet becomes schedulable.
+
+                      Switching between the modes changes the pod-spec hash and therefore
+                      triggers one failover-aware rolling update.
                     enum:
+                    - "off"
                     - soft
                     - hard
                     type: string

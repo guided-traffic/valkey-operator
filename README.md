@@ -18,7 +18,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
 - **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
-- **Pod anti-affinity** — data and Sentinel pods spread across nodes by default (soft preference), or `mode: hard` for a guaranteed spread
+- **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread); off by default so upgrades change nothing
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
@@ -420,7 +420,7 @@ spec:
 | `persistence` | `PersistenceSpec` | — | Data persistence configuration |
 | `observer` | `ObserverSpec` | — | Cluster observer configuration |
 | `podDisruptionBudget` | `PodDisruptionBudgetSpec` | — | PodDisruptionBudgets for the data and Sentinel StatefulSets |
-| `antiAffinity` | `AntiAffinitySpec` | *(soft on hostname)* | Pod anti-affinity for the data and Sentinel StatefulSets |
+| `antiAffinity` | `AntiAffinitySpec` | *(off)* | Opt-in pod anti-affinity for the data and Sentinel StatefulSets |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -612,15 +612,20 @@ ships it unconditionally, so no permission change is needed to turn the feature 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | `string` | `soft` | `soft` (scheduler preference) or `hard` (guaranteed spread) |
+| `mode` | `string` | `off` | `off` (no term), `soft` (scheduler preference) or `hard` (guaranteed spread) |
 | `topologyKey` | `string` | `kubernetes.io/hostname` | Node label whose values define the spread domains |
 
-Unlike `podDisruptionBudget`, this block is **opt-out by degree, not by presence**:
-omitting it applies the defaults below. There is no `enabled` flag because `soft` is
-already the weakest possible setting — a scheduler preference that never blocks
-scheduling.
+Anti-affinity is **opt-in**: omitting the block (or `mode: off`, the default)
+renders no term at all, so upgrading the operator never changes how existing
+clusters are scheduled. The flip side is that without an opt-in all pods of a
+cluster may land on one node — a single drain then takes the whole data plane
+down at once. **Multi-replica clusters should set `mode: soft` (or `hard`)**;
+enabling it on a running cluster triggers one failover-aware rolling update
+(lossless for multi-replica clusters).
 
-- **`soft`** (default) renders `preferredDuringSchedulingIgnoredDuringExecution`
+- **`off`** (default) renders nothing. Scheduling is exactly what it was before
+  the operator supported anti-affinity.
+- **`soft`** renders `preferredDuringSchedulingIgnoredDuringExecution`
   with weight `100`, the strongest preference the scheduler weighs against its other
   priorities. Under node pressure pods may still be co-located, so the spread is a
   best effort, not a guarantee.
@@ -640,8 +645,7 @@ scheduling.
   restart the pod for nothing.
 - Changing `mode` or `topologyKey` changes the pod-spec hash and therefore triggers
   the operator's failover-aware rolling update — lossless for a multi-replica
-  cluster. The same applies when upgrading an operator that did not yet render
-  anti-affinity.
+  cluster.
 
 ```yaml
 apiVersion: vko.gtrfc.com/v1
@@ -655,7 +659,7 @@ spec:
     enabled: true
     replicas: 3
   antiAffinity:
-    mode: soft                            # default: soft
+    mode: soft                            # default: off (no term; opt in with soft or hard)
     topologyKey: kubernetes.io/hostname   # default: kubernetes.io/hostname
 ```
 

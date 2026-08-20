@@ -67,6 +67,7 @@ preUpgradeHook:
 # odd Sentinel count of 3 or more; the operator warns and records a
 # SentinelPodDisruptionBudgetBlocksDrains Event while the condition holds.
 
-# Valkey CRs get soft pod anti-affinity on kubernetes.io/hostname by default for
-# every StatefulSet with >= 2 replicas; set spec.antiAffinity.mode: hard for a
-# guaranteed spread (surplus pods stay Pending).
+# Valkey CRs support spec.antiAffinity (opt-in, default mode: off - upgrades
+# change nothing). mode: soft spreads StatefulSets with >= 2 replicas across
+# kubernetes.io/hostname as a scheduler preference; mode: hard guarantees the
+# spread (surplus pods stay Pending). Multi-replica clusters should opt in.

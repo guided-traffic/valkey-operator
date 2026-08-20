@@ -327,6 +327,11 @@ type PodDisruptionBudgetSpec struct {
 }
 
 const (
+	// AntiAffinityModeOff renders no anti-affinity term at all. It is the
+	// default: an operator upgrade must not change the scheduling behavior of
+	// existing clusters, so spreading is strictly opt-in.
+	AntiAffinityModeOff = "off"
+
 	// AntiAffinityModeSoft renders preferredDuringSchedulingIgnoredDuringExecution:
 	// the scheduler tries to spread pods but never leaves one Pending.
 	AntiAffinityModeSoft = "soft"
@@ -352,13 +357,17 @@ const (
 
 // AntiAffinitySpec configures pod anti-affinity for the data and Sentinel
 // StatefulSets. Each StatefulSet repels only its own kind, so data and Sentinel
-// pods may still share a node. Applied whenever the StatefulSet has at least
-// MinAntiAffinityReplicas replicas; singletons are skipped. Omitting the whole
-// block applies the defaults below (soft, hostname) — there is deliberately no
-// off switch, because soft is already the weakest possible setting.
+// pods may still share a node. A term is rendered only when mode is soft or
+// hard AND the StatefulSet has at least MinAntiAffinityReplicas replicas;
+// omitting the block (or mode: off, the default) renders nothing, so an
+// operator upgrade never changes the scheduling of existing clusters. Without
+// a term all pods of a cluster may land on one node — the enabling condition
+// of the 2026-08-19 infra-d incident — so multi-replica clusters should opt
+// into soft or hard.
 type AntiAffinitySpec struct {
-	// Mode selects soft (preferredDuringSchedulingIgnoredDuringExecution) or
-	// hard (requiredDuringSchedulingIgnoredDuringExecution).
+	// Mode selects off (no term, the default), soft
+	// (preferredDuringSchedulingIgnoredDuringExecution) or hard
+	// (requiredDuringSchedulingIgnoredDuringExecution).
 	//
 	// Soft is a scheduler preference: under node pressure pods may still be
 	// co-located, so the spread is not guaranteed.
@@ -368,8 +377,11 @@ type AntiAffinitySpec struct {
 	// stay Pending (which also wedges the next rolling update), and during a node
 	// drain an evicted pod stays Pending until a node without a pod of the same
 	// StatefulSet becomes schedulable.
-	// +kubebuilder:validation:Enum=soft;hard
-	// +kubebuilder:default=soft
+	//
+	// Switching between the modes changes the pod-spec hash and therefore
+	// triggers one failover-aware rolling update.
+	// +kubebuilder:validation:Enum=off;soft;hard
+	// +kubebuilder:default=off
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
@@ -611,8 +623,9 @@ type ValkeySpec struct {
 	PodDisruptionBudget *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
 
 	// AntiAffinity configures pod anti-affinity for the data and Sentinel
-	// StatefulSets. Omitted means soft anti-affinity on kubernetes.io/hostname
-	// for every StatefulSet with at least two replicas.
+	// StatefulSets. Omitted means off: no term is rendered and scheduling is
+	// unchanged. Set mode: soft or hard to spread StatefulSets with at least
+	// two replicas across nodes.
 	// +optional
 	AntiAffinity *AntiAffinitySpec `json:"antiAffinity,omitempty"`
 }
@@ -803,13 +816,26 @@ func (v *Valkey) NeedsSentinelPodDisruptionBudget() bool {
 }
 
 // AntiAffinityMode returns the configured anti-affinity mode, falling back to
-// the default (soft). An unknown value is treated as soft: the weakest setting
-// is the safe fallback if validation is ever bypassed.
+// the default (off). An unknown value is treated as off: the weakest setting —
+// no constraint at all — is the safe fallback if validation is ever bypassed.
 func (v *Valkey) AntiAffinityMode() string {
-	if v.Spec.AntiAffinity != nil && v.Spec.AntiAffinity.Mode == AntiAffinityModeHard {
-		return AntiAffinityModeHard
+	if v.Spec.AntiAffinity == nil {
+		return AntiAffinityModeOff
 	}
-	return AntiAffinityModeSoft
+	switch v.Spec.AntiAffinity.Mode {
+	case AntiAffinityModeSoft:
+		return AntiAffinityModeSoft
+	case AntiAffinityModeHard:
+		return AntiAffinityModeHard
+	default:
+		return AntiAffinityModeOff
+	}
+}
+
+// IsAntiAffinityEnabled reports whether an anti-affinity term is requested at
+// all (mode soft or hard).
+func (v *Valkey) IsAntiAffinityEnabled() bool {
+	return v.AntiAffinityMode() != AntiAffinityModeOff
 }
 
 // AntiAffinityTopologyKey returns the configured topology key, falling back to
@@ -822,15 +848,17 @@ func (v *Valkey) AntiAffinityTopologyKey() string {
 }
 
 // NeedsDataAntiAffinity reports whether an anti-affinity term applies to the data
-// StatefulSet: at least MinAntiAffinityReplicas pods.
+// StatefulSet: mode soft or hard, and at least MinAntiAffinityReplicas pods.
 func (v *Valkey) NeedsDataAntiAffinity() bool {
-	return v.Spec.Replicas >= MinAntiAffinityReplicas
+	return v.IsAntiAffinityEnabled() && v.Spec.Replicas >= MinAntiAffinityReplicas
 }
 
 // NeedsSentinelAntiAffinity reports whether an anti-affinity term applies to the
-// Sentinel StatefulSet: Sentinel enabled and at least MinAntiAffinityReplicas pods.
+// Sentinel StatefulSet: mode soft or hard, Sentinel enabled and at least
+// MinAntiAffinityReplicas pods.
 func (v *Valkey) NeedsSentinelAntiAffinity() bool {
-	return v.IsSentinelEnabled() && v.Spec.Sentinel.Replicas >= MinAntiAffinityReplicas
+	return v.IsAntiAffinityEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.Replicas >= MinAntiAffinityReplicas
 }
 
 // IsPersistenceEnabled returns true if persistence is configured and enabled.

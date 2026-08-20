@@ -17,7 +17,9 @@ import (
 
 // TestAntiAffinity_Integration runs against a real API server (envtest), so it also
 // exercises the generated CRD schema — including the mode/topologyKey defaults the
-// fake client in the unit tests never applies.
+// fake client in the unit tests never applies. The default is off: an operator
+// upgrade must not change the scheduling of existing clusters, so a term appears
+// only after an explicit opt-in to soft or hard.
 func TestAntiAffinity_Integration(t *testing.T) {
 	ctx := testCtx
 
@@ -25,6 +27,17 @@ func TestAntiAffinity_Integration(t *testing.T) {
 		sts := &appsv1.StatefulSet{}
 		err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, sts)
 		return sts, err
+	}
+
+	setMode := func(mode string) {
+		require.Eventually(t, func() bool {
+			current := &vkov1.Valkey{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "aa-test", Namespace: "default"}, current); err != nil {
+				return false
+			}
+			current.Spec.AntiAffinity.Mode = mode
+			return k8sClient.Update(ctx, current) == nil
+		}, 10*time.Second, 250*time.Millisecond, "CR should switch to mode %s", mode)
 	}
 
 	v := &vkov1.Valkey{
@@ -47,23 +60,40 @@ func TestAntiAffinity_Integration(t *testing.T) {
 		}, 10*time.Second, 250*time.Millisecond)
 
 		require.NotNil(t, stored.Spec.AntiAffinity)
-		assert.Equal(t, vkov1.AntiAffinityModeSoft, stored.Spec.AntiAffinity.Mode)
+		assert.Equal(t, vkov1.AntiAffinityModeOff, stored.Spec.AntiAffinity.Mode,
+			"the CRD default must be off so an upgrade changes nothing")
 		assert.Equal(t, vkov1.DefaultAntiAffinityTopologyKey, stored.Spec.AntiAffinity.TopologyKey)
 	})
 
-	t.Run("both pod templates carry the soft term", func(t *testing.T) {
+	t.Run("no pod template carries a term by default", func(t *testing.T) {
+		for _, name := range []string{"aa-test", "aa-test-sentinel"} {
+			require.Eventually(t, func() bool {
+				_, err := getSTS(name)
+				return err == nil
+			}, 10*time.Second, 250*time.Millisecond, "StatefulSet %s never appeared", name)
+
+			sts, err := getSTS(name)
+			require.NoError(t, err)
+			assert.Nil(t, sts.Spec.Template.Spec.Affinity,
+				"StatefulSet %s must carry no affinity while the mode is off", name)
+		}
+	})
+
+	t.Run("opting into soft adds the preferred term to both pod templates", func(t *testing.T) {
+		setMode(vkov1.AntiAffinityModeSoft)
+
 		for _, name := range []string{"aa-test", "aa-test-sentinel"} {
 			require.Eventually(t, func() bool {
 				sts, err := getSTS(name)
 				return err == nil && sts.Spec.Template.Spec.Affinity != nil
-			}, 10*time.Second, 250*time.Millisecond, "StatefulSet %s never got an affinity", name)
+			}, 30*time.Second, 250*time.Millisecond, "StatefulSet %s never got an affinity", name)
 
 			sts, err := getSTS(name)
 			require.NoError(t, err)
 			antiAffinity := sts.Spec.Template.Spec.Affinity.PodAntiAffinity
 			require.NotNil(t, antiAffinity)
 			assert.Empty(t, antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
-				"the default must never block scheduling")
+				"soft must never block scheduling")
 			require.Len(t, antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, 1)
 			assert.Equal(t, vkov1.DefaultAntiAffinityTopologyKey,
 				antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].PodAffinityTerm.TopologyKey)
@@ -71,14 +101,7 @@ func TestAntiAffinity_Integration(t *testing.T) {
 	})
 
 	t.Run("switching to hard replaces the term", func(t *testing.T) {
-		require.Eventually(t, func() bool {
-			current := &vkov1.Valkey{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "aa-test", Namespace: "default"}, current); err != nil {
-				return false
-			}
-			current.Spec.AntiAffinity.Mode = vkov1.AntiAffinityModeHard
-			return k8sClient.Update(ctx, current) == nil
-		}, 10*time.Second, 250*time.Millisecond, "CR should switch to hard mode")
+		setMode(vkov1.AntiAffinityModeHard)
 
 		require.Eventually(t, func() bool {
 			sts, err := getSTS("aa-test")
