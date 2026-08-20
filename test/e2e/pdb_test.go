@@ -13,8 +13,11 @@ package e2e
 //
 // The assertions use the Eviction API directly rather than `kubectl drain`, so they
 // hold on a single-node cluster as well: a budget is enforced per pod set, not per
-// node. The multi-node Kind config (Makefile kind-create) is what makes the real
-// drain path reproducible locally.
+// node. A real drain stays out on purpose — it would evict the pods of every other
+// e2e test sharing that node, and these tests run in parallel. The multi-node Kind
+// config (Makefile kind-create locally, the multi-node CI leg in
+// .github/workflows/release.yml) is what makes the real drain path reproducible by
+// hand, and it is where CI re-runs these tests with more than one node under them.
 
 import (
 	"context"

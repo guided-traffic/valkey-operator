@@ -92,10 +92,16 @@ test-integration-coverage: envtest ## Run integration tests with coverage.
 	@mkdir -p $(COVERAGE_DIR)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -tags=integration -count=1 -timeout=60m -coverprofile=$(COVERAGE_DIR)/integration.out -covermode=atomic -coverpkg=./... ./test/integration/...
 
+# E2E_RUN optionally narrows the E2E run to matching test names, e.g.
+#   make test-e2e E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'
+# CI uses it for the multi-node leg, which re-runs only the node-shape-sensitive
+# scenarios on a control-plane + 3 workers cluster.
+E2E_RUN ?=
+
 .PHONY: test-e2e
-test-e2e: ## Run E2E tests against a running Kind cluster.
+test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by test name).
 	@echo "Running E2E tests..."
-	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m ./test/e2e/...
+	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
 
 .PHONY: test-e2e-helm
 test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind cluster with operator).

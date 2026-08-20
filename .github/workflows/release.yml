@@ -25,9 +25,34 @@ env:
 
 jobs:
   e2e-tests:
-    name: E2E Tests
+    name: E2E Tests (${{ matrix.topology }})
     runs-on: self-hosted
     timeout-minutes: 60
+    strategy:
+      # Both legs build their Kind cluster on the same DinD host, so they run one
+      # after the other instead of competing for CPU, memory and inotify watches.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          # Historical leg: the full suite on a single-node cluster.
+          - topology: single-node
+            workers: 0
+            cluster: valkey-operator-test
+            run_filter: ""
+            require_multi_node: "false"
+          # Multi-node leg: re-runs only the scenarios whose outcome depends on the
+          # node count - T3 (eviction serialization) and T5 (anti-affinity spread).
+          # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
+          # multi-node clusters, so spreading three replicas needs three workers.
+          - topology: multi-node
+            workers: 3
+            cluster: valkey-operator-test-multinode
+            run_filter: TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget
+            require_multi_node: "true"
+    env:
+      KIND_CLUSTER: ${{ matrix.cluster }}
+      KIND_WORKERS: ${{ matrix.workers }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,14 +95,24 @@ jobs:
 
       - name: Create Kind config for DinD
         run: |
-          cat << EOF > kind-config.yaml
+          set -euo pipefail
+          {
+            cat << EOF
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
-          name: valkey-operator-test
+          name: ${KIND_CLUSTER}
           networking:
             kubeProxyMode: "iptables"
           nodes:
           - role: control-plane
+          EOF
+            # One worker line per matrix worker; the single-node leg emits none.
+            worker=0
+            while [ "${worker}" -lt "${KIND_WORKERS}" ]; do
+              echo "- role: worker"
+              worker=$((worker + 1))
+            done
+            cat << EOF
           # Use native snapshotter to avoid nested overlay issues in DinD
           containerdConfigPatches:
           - |-
@@ -85,6 +120,9 @@ jobs:
               snapshotter = "native"
               disable_snapshot_annotations = false
           EOF
+          } > kind-config.yaml
+          echo "=== kind-config.yaml ==="
+          cat kind-config.yaml
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v5
@@ -97,7 +135,7 @@ jobs:
         with:
           version: v0.30.0
           node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
-          cluster_name: valkey-operator-test
+          cluster_name: ${{ matrix.cluster }}
           wait: 300s
           ignore_failed_clean: true
           config: kind-config.yaml
@@ -108,14 +146,27 @@ jobs:
           kubectl cluster-info
           kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
+          # The multi-node leg is only worth running with the nodes it asked for:
+          # a cluster that silently came up smaller would turn its assertions into
+          # skips, which is exactly the blind spot this leg exists to close.
+          expected=$(( KIND_WORKERS + 1 ))
+          actual=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+          if [ "$actual" -ne "$expected" ]; then
+            echo "ERROR: the ${{ matrix.topology }} leg expects ${expected} nodes, cluster has ${actual}"
+            exit 1
+          fi
 
-      - name: Fix inotify limits inside Kind node
+      - name: Fix inotify limits inside Kind nodes
         run: |
+          set -euo pipefail
           # Since Linux 5.13, inotify limits are user-namespace-aware.
           # Host sysctl settings are NOT inherited by containers.
           # kube-proxy crashes with "too many open files" without this.
-          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_watches=1048576
-          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_instances=8192
+          # Applied per node: every worker of the multi-node leg runs its own kube-proxy.
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            docker exec "$node" sysctl -w fs.inotify.max_user_watches=1048576
+            docker exec "$node" sysctl -w fs.inotify.max_user_instances=8192
+          done
 
       - name: Wait for kube-system pods
         run: |
@@ -124,7 +175,7 @@ jobs:
           kubectl -n kube-system get pods -o wide
           echo ""
           echo "=== containerd info inside Kind node ==="
-          docker exec valkey-operator-test-control-plane ctr version || true
+          docker exec "${KIND_CLUSTER}-control-plane" ctr version || true
           echo ""
 
           # ---------- helper: resilient daemonset wait ----------
@@ -211,20 +262,32 @@ jobs:
 
       - name: Build and load operator image
         run: |
+          set -euo pipefail
           make docker-build IMG=valkey-operator:test
           # Manual ctr import without --all-platforms/--snapshotter flags
-          # to avoid "no unpack platforms defined" error with native snapshotter in DinD
-          docker save valkey-operator:test | docker exec -i valkey-operator-test-control-plane ctr --namespace=k8s.io images import -
+          # to avoid "no unpack platforms defined" error with native snapshotter in DinD.
+          # Imported into every node: the operator Deployment runs with
+          # pullPolicy: Never (test/e2e/helm-values.yaml) and may land on any worker.
+          mkdir -p tmp
+          docker save valkey-operator:test -o tmp/valkey-operator-test.tar
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            echo "Importing operator image into ${node}..."
+            docker exec -i "$node" ctr --namespace=k8s.io images import - < tmp/valkey-operator-test.tar
+          done
+          rm -f tmp/valkey-operator-test.tar
 
       - name: Verify image in cluster
         run: |
-          echo "=== Verifying image is available in Kind cluster ==="
-          docker exec valkey-operator-test-control-plane crictl images | grep -E 'valkey-operator\s+test|valkey-operator:test' || {
-            echo "ERROR: Image not found in cluster!"
-            echo "Available images:"
-            docker exec valkey-operator-test-control-plane crictl images
-            exit 1
-          }
+          set -euo pipefail
+          echo "=== Verifying image is available on every Kind node ==="
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            docker exec "$node" crictl images | grep -E 'valkey-operator\s+test|valkey-operator:test' || {
+              echo "ERROR: Image not found on ${node}!"
+              echo "Available images:"
+              docker exec "$node" crictl images
+              exit 1
+            }
+          done
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -325,9 +388,27 @@ jobs:
         run: kubectl -n valkey-operator-system wait --for=condition=available --timeout=120s deployment/valkey-operator
 
       - name: Run E2E tests
-        run: make test-e2e
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          make test-e2e E2E_RUN="${E2E_RUN}" 2>&1 | tee "tmp/e2e-${{ matrix.topology }}.log"
+          # A -run filter that stopped matching (renamed test, moved file) would leave
+          # this leg green without executing anything, so the filtered leg proves its
+          # two scenarios ran.
+          if [ -n "${E2E_RUN}" ]; then
+            for guard in TestE2E_AntiAffinity_HardSpreadsAcrossNodes \
+                         TestE2E_PodDisruptionBudget_SerializesEvictions; do
+              grep -q -- "--- PASS: ${guard}" "tmp/e2e-${{ matrix.topology }}.log" || {
+                echo "ERROR: ${guard} did not run - E2E_RUN='${E2E_RUN}' no longer matches it"
+                exit 1
+              }
+            done
+          fi
         env:
           E2E_TESTS: "true"
+          E2E_RUN: ${{ matrix.run_filter }}
+          # Turns "not enough nodes" from a skip into a failure on the multi-node leg.
+          E2E_REQUIRE_MULTI_NODE: ${{ matrix.require_multi_node }}
 
       - name: Collect logs on failure
         if: failure()
@@ -341,7 +422,7 @@ jobs:
 
       - name: Cleanup Kind cluster
         if: always()
-        run: kind delete cluster --name valkey-operator-test || true
+        run: kind delete cluster --name "${KIND_CLUSTER}" || true
 
   linter:
     name: Code Linting

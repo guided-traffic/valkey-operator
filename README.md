@@ -880,7 +880,8 @@ make test-unit               # Unit tests
 make test-unit-coverage      # Unit tests with coverage
 make test-integration        # Integration tests (envtest)
 make test-e2e                # E2E tests (requires running cluster)
-make e2e-local               # Full E2E: create Kind cluster → deploy → test → cleanup
+make test-e2e E2E_RUN='TestE2E_PodDisruptionBudget'  # E2E tests filtered by name
+make e2e-local               # Full E2E: create Kind cluster (control-plane + 3 workers) → deploy → test → cleanup
 make lint                    # Linting (golangci-lint + go vet)
 make gosec                   # Security scan
 make vuln                    # Vulnerability check

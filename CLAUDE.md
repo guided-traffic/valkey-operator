@@ -159,6 +159,28 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Build Docker image            | `make docker-build`            |
 | Build & load into Kind        | `make kind-load`               |
 
+### E2E cluster topology
+
+CI runs the E2E job twice, as a matrix in `.github/workflows/release.yml`:
+
+| Leg          | Cluster                             | Scope                                             |
+|--------------|-------------------------------------|---------------------------------------------------|
+| `single-node`| control-plane only                  | full suite (`make test-e2e`)                      |
+| `multi-node` | control-plane + 3 workers           | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
+
+The multi-node leg exists because two behaviors are meaningless on one node:
+eviction serialization (T3) and hard-mode anti-affinity spread (T5). Three
+workers, not two: Kind keeps the control-plane `NoSchedule` taint on multi-node
+clusters, so spreading three replicas needs three schedulable workers.
+
+- `E2E_RUN` narrows `make test-e2e` to matching test names; empty runs everything.
+- `E2E_REQUIRE_MULTI_NODE=true` turns the "fewer than 3 schedulable nodes" skip in
+  `test/e2e/affinity_test.go` into a failure, so a cluster that came up smaller
+  than requested cannot pass as a green skip. The multi-node leg sets it, and it
+  additionally greps the test output to prove both scenarios actually ran.
+- Locally: `make kind-create` already builds control-plane + 3 workers, so
+  `make e2e-local` covers both.
+
 ## Rolling Update Strategy
 
 1. Replace replica pods one by one

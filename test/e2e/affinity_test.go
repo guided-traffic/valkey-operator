@@ -11,14 +11,17 @@ package e2e
 // (T3) only serializes the evictions that remain.
 //
 // The soft default runs on any cluster shape. The hard-mode spread assertion needs
-// at least three schedulable nodes (the multi-node Kind config from Makefile
-// kind-create) and skips otherwise. The Pending negative case is node-count
-// agnostic: instead of cordoning nodes — which would disturb the tests running in
-// parallel — it collapses the spread domains by pointing topologyKey at a label
-// every node shares.
+// at least three schedulable nodes (Makefile kind-create locally, the multi-node CI
+// leg in .github/workflows/release.yml) and skips otherwise — unless
+// E2E_REQUIRE_MULTI_NODE=true, which the multi-node leg sets so a shrunken cluster
+// fails instead of skipping. The Pending negative case is node-count agnostic:
+// instead of cordoning nodes — which would disturb the tests running in parallel —
+// it collapses the spread domains by pointing topologyKey at a label every node
+// shares.
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -41,6 +44,12 @@ const singleDomainTopologyKey = "kubernetes.io/os"
 // pendingObservationTimeout is how long the surplus pods of the hard-mode negative
 // case are given to reach (and stay in) Pending.
 const pendingObservationTimeout = 90 * time.Second
+
+// multiNodeRequiredEnv turns the "not enough nodes" skip below into a failure. CI
+// sets it on the multi-node leg (.github/workflows/release.yml): a cluster that
+// came up smaller than requested would otherwise skip the one assertion that leg
+// exists for, and a skip reads as green.
+const multiNodeRequiredEnv = "E2E_REQUIRE_MULTI_NODE"
 
 // TestE2E_AntiAffinity_SoftByDefault is the default half of T5: a CR that says
 // nothing about anti-affinity still gets a preferred term on the hostname for both
@@ -90,9 +99,7 @@ func TestE2E_AntiAffinity_HardSpreadsAcrossNodes(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)
 
-	if nodes := tc.schedulableNodeCount(t); nodes < 3 {
-		t.Skipf("hard-mode spread needs at least 3 schedulable nodes, cluster has %d", nodes)
-	}
+	tc.requireThreeSchedulableNodes(t)
 
 	ns := "e2e-antiaffinity-hard"
 	cleanup := tc.createNamespace(t, ns)
@@ -290,6 +297,23 @@ func isUnschedulable(pod corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// requireThreeSchedulableNodes skips the hard-mode spread assertion on a cluster
+// too small to satisfy it - unless multiNodeRequiredEnv says the cluster was built
+// for exactly this test, in which case a small cluster is the defect.
+func (tc *testClients) requireThreeSchedulableNodes(t *testing.T) {
+	t.Helper()
+
+	nodes := tc.schedulableNodeCount(t)
+	if nodes >= 3 {
+		return
+	}
+	if os.Getenv(multiNodeRequiredEnv) == "true" {
+		t.Fatalf("%s=true but the cluster has only %d schedulable nodes: hard-mode spread needs at least 3",
+			multiNodeRequiredEnv, nodes)
+	}
+	t.Skipf("hard-mode spread needs at least 3 schedulable nodes, cluster has %d", nodes)
 }
 
 // schedulableNodeCount counts the nodes a pod without tolerations could actually
