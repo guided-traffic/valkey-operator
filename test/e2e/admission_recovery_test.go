@@ -45,10 +45,11 @@ const nudgeAnnotationKey = "vko.gtrfc.com/nudge"
 // rejection message; T4 asserts the CR condition carries exactly this string.
 const blackholeWebhookName = "blackhole.e2e.vko.gtrfc.com"
 
-// admissionBlockHold is how long pod creation stays blocked. It must be long
-// enough for the statefulset-controller's exponential backoff (5 ms · 2^n) to
-// grow well past the recovery deadline asserted below — otherwise the test would
-// pass on the statefulset-controller's own retry and guard nothing.
+// admissionBlockHold is how long pod creation stays blocked. It is long enough
+// for the statefulset-controller's exponential backoff (5 ms · 2^n) to grow past
+// the recovery deadline asserted below, so a pass is normally the nudge's doing
+// and not the controller's own retry. Measured runs show that is a tendency, not
+// a guarantee — see the test header on why the deterministic guard is a unit test.
 const admissionBlockHold = 90 * time.Second
 
 // admissionRecoveryDeadline is the time budget for all data pods to be recreated
@@ -174,9 +175,17 @@ func (tc *testClients) waitForStatefulSetCreatedPods(ctx context.Context, namesp
 }
 
 // TestE2E_AdmissionRejection_StatefulSetNudgeRecovery is scenario T1 of the
-// admission-gap ticket. Step "pods return quickly after the webhook is removed"
-// is the regression guard: without the nudge the recovery is bounded only by the
-// statefulset-controller's backoff, which is minutes deep by then.
+// admission-gap ticket.
+//
+// Step "all data pods return shortly after the webhook is removed" is a forward
+// assertion, not the regression guard for the nudge: against an operator without
+// the nudge its outcome is a coin flip, because the statefulset-controller may
+// happen to retry inside the deadline on its own (measured on the same unfixed
+// binary: pass at 15 s under load, fail at 60 s isolated). With the nudge in
+// place the step is deterministic — bounded by nudgeGracePeriod + NudgeInterval.
+//
+// The deterministic guard for the nudge is the unit test
+// TestReconcileWorkload_RequeuesWhileShortOfPods (internal/controller/nudge_test.go).
 func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)
@@ -227,8 +236,24 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 		})
 		require.NoError(t, err, "data StatefulSet should report zero created pods while the webhook rejects creates")
 
-		phase, _ := tc.getValkeyStatus(t, ns, name)["phase"].(string)
-		assert.NotEqual(t, "OK", phase, "CR must not report OK with zero data pods")
+		// Poll the phase instead of reading it once: the StatefulSet poll above
+		// exits on the same watch event the operator still has to process, so a
+		// single read races the operator writing the status.
+		lastPhase := "<none>"
+		err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+			cr, err := tc.dynamic.Resource(valkeyGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			phase, found, err := unstructured.NestedString(cr.Object, "status", "phase")
+			if err != nil || !found {
+				return false, nil
+			}
+			lastPhase = phase
+			return phase != "OK", nil
+		})
+		require.NoError(t, err, "CR must leave phase OK with zero data pods (last observed phase: %s)", lastPhase)
+		t.Logf("CR left phase OK, now reporting %s", lastPhase)
 	})
 
 	t.Run("operator nudges the StatefulSet instead of waiting", func(t *testing.T) {
