@@ -144,17 +144,20 @@ func (tc *testClients) blockResourceOperations(t *testing.T, namespace, name, ap
 	t.Logf("Installed fail-closed webhook %s blocking %v %v in namespace %s", name, operations, resources, namespace)
 
 	removed := false
+	// The flag is set only after the delete succeeded, so a transient API error
+	// on the first call leaves the deferred second call able to retry instead of
+	// short-circuiting and leaking the cluster-scoped webhook configuration.
 	return func() {
 		if removed {
 			return
 		}
-		removed = true
 		err := tc.kube.AdmissionregistrationV1().MutatingWebhookConfigurations().
 			Delete(ctx, name, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			t.Logf("Failed to remove blocking webhook %s: %v", name, err)
 			return
 		}
+		removed = true
 		t.Logf("Removed blocking webhook %s", name)
 	}
 }
