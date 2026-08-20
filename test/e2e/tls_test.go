@@ -190,6 +190,19 @@ func (tc *testClients) waitForCertificateReady(t *testing.T, namespace, name str
 // getPodLogs retrieves the logs from a specific pod container.
 func (tc *testClients) getPodLogs(t *testing.T, namespace, podName, containerName string) string {
 	t.Helper()
+	return tc.getPodLogsArgs(t, namespace, podName, containerName)
+}
+
+// getPodLogsSince retrieves a pod's logs restricted to lines emitted at or
+// after the given time.
+func (tc *testClients) getPodLogsSince(t *testing.T, namespace, podName string, since time.Time) string {
+	t.Helper()
+	return tc.getPodLogsArgs(t, namespace, podName, "", "--since-time="+since.UTC().Format(time.RFC3339))
+}
+
+// getPodLogsArgs runs kubectl logs with optional extra flags.
+func (tc *testClients) getPodLogsArgs(t *testing.T, namespace, podName, containerName string, extraArgs ...string) string {
+	t.Helper()
 
 	cliArgs := []string{
 		"logs", podName,
@@ -198,6 +211,7 @@ func (tc *testClients) getPodLogs(t *testing.T, namespace, podName, containerNam
 	if containerName != "" {
 		cliArgs = append(cliArgs, "-c", containerName)
 	}
+	cliArgs = append(cliArgs, extraArgs...)
 
 	cmd := exec.CommandContext(context.Background(), "kubectl", cliArgs...)
 	var stdout, stderr bytes.Buffer

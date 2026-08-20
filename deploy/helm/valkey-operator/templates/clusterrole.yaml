@@ -78,9 +78,12 @@ rules:
       - patch
       - update
       - watch
-  # Events for status reporting
+  # Events for status reporting. The operator records through the
+  # events.k8s.io/v1 API; the legacy core-group rule stays for older API
+  # servers and tooling that still read it.
   - apiGroups:
       - ""
+      - events.k8s.io
     resources:
       - events
     verbs:

@@ -182,6 +182,11 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	tc := newTestClients(t)
 	ctx := context.Background()
 
+	// Start of the window the operator-log assertion below inspects. Restricting
+	// it keeps the assertion honest on long-lived clusters whose operator log
+	// still carries rejections from before the RBAC fix was deployed.
+	testStart := time.Now()
+
 	ns := "e2e-admission-nudge"
 	cleanup := tc.createNamespace(t, ns)
 	defer cleanup()
@@ -237,6 +242,28 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 		require.NoError(t, err, "operator must bump %s while the StatefulSet is short of pods", nudgeAnnotationKey)
 	})
 
+	// NA12 regression guard: the operator records through events.k8s.io/v1, so a
+	// ClusterRole granting only core-group events silently discards every Event
+	// ("Server rejected event" in the operator log, nothing on the CR). The nudge
+	// above must therefore be re-observable as an Event on the Valkey CR. The
+	// recorder broadcasts asynchronously, hence the poll.
+	t.Run("nudge Event is visible on the Valkey CR", func(t *testing.T) {
+		err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+			events, err := tc.kube.EventsV1().Events(ns).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+			for _, ev := range events.Items {
+				if ev.Regarding.Kind == "Valkey" && ev.Regarding.Name == name && ev.Reason == "StatefulSetNudged" {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+		require.NoError(t, err,
+			"a StatefulSetNudged Event must appear on Valkey %s/%s; if it never does, the operator RBAC is missing create/patch on events.k8s.io", ns, name)
+	})
+
 	// Hold the block long enough for the statefulset-controller's own backoff to
 	// exceed the recovery deadline asserted below.
 	t.Logf("Holding the admission block for %v so the statefulset-controller backoff grows", admissionBlockHold)
@@ -257,6 +284,28 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	t.Run("cluster returns to OK", func(t *testing.T) {
 		tc.waitForStatefulSetReady(t, ns, name, 3)
 		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+	})
+
+	// Second half of the NA12 guard: no Event write may be denied by RBAC. The
+	// assertion is scoped to forbidden-rejections because a namespace being torn
+	// down by a parallel test can legitimately reject an Event create without any
+	// RBAC involvement, and to this test's time window so pre-fix history in a
+	// long-lived operator pod's log cannot fail a cluster that is already fixed.
+	t.Run("operator log has no RBAC-rejected events", func(t *testing.T) {
+		pods, err := tc.kube.CoreV1().Pods("valkey-operator-system").List(ctx, metav1.ListOptions{
+			LabelSelector: "app.kubernetes.io/name=valkey-operator",
+		})
+		require.NoError(t, err)
+		require.NotEmpty(t, pods.Items, "no operator pods found in valkey-operator-system")
+
+		for _, pod := range pods.Items {
+			logs := tc.getPodLogsSince(t, "valkey-operator-system", pod.Name, testStart)
+			for _, line := range strings.Split(logs, "\n") {
+				if strings.Contains(line, "Server rejected event") && strings.Contains(line, "forbidden") {
+					t.Errorf("operator pod %s logged an RBAC-rejected event: %s", pod.Name, line)
+				}
+			}
+		}
 	})
 }
 
