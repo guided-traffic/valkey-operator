@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -65,6 +66,24 @@ func (t *nudgeTracker) forget(key types.NamespacedName) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.first, key)
+}
+
+// forgetNudges drops the grace-period observations of both StatefulSets belonging
+// to the named CR.
+//
+// It exists for the two Reconcile exits that never look at a StatefulSet again:
+// the CR is gone, or it is being deleted. nudgeStatefulSet is the only other place
+// that forgets, and it is unreachable from there — so without this the tracker
+// keeps two entries per deleted CR until the operator restarts. The leak is
+// bytes-sized, but it is unbounded in a namespace that churns CRs.
+func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
+	v := &vkov1.Valkey{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+	for _, component := range []string{common.ComponentValkey, common.ComponentSentinel} {
+		r.nudges.forget(types.NamespacedName{
+			Name:      common.StatefulSetName(v, component),
+			Namespace: namespace,
+		})
+	}
 }
 
 // nudgeShortStatefulSets patches a nudge annotation onto the data and Sentinel

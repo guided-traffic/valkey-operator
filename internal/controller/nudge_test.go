@@ -63,6 +63,60 @@ func nudgeKey(name string) types.NamespacedName {
 	return types.NamespacedName{Name: name, Namespace: nudgeTestNamespace}
 }
 
+// nudgeTracked reports whether the tracker still holds a grace-period observation
+// for the named StatefulSet.
+func nudgeTracked(r *ValkeyReconciler, name string) bool {
+	r.nudges.mu.Lock()
+	defer r.nudges.mu.Unlock()
+	_, ok := r.nudges.first[nudgeKey(name)]
+	return ok
+}
+
+// TestReconcile_ForgetsNudgesWhenCRIsDeleted covers the deletion exit: reconcile
+// returns before any StatefulSet is looked at, so nudgeStatefulSet — the only
+// other place that forgets — never runs again for this CR.
+func TestReconcile_ForgetsNudgesWhenCRIsDeleted(t *testing.T) {
+	now := metav1.Now()
+	v := newTestValkey("test", nudgeTestNamespace, func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		v.DeletionTimestamp = &now
+		v.Finalizers = []string{"foregroundDeletion"}
+	})
+	r, _ := newTestReconciler(v)
+	pastGrace(r, nudgeKey("test"), nudgeKey("test-sentinel"))
+
+	reconcileOnce(t, r, "test", nudgeTestNamespace)
+
+	assert.False(t, nudgeTracked(r, "test"), "a deleted CR must not keep a data tracker entry")
+	assert.False(t, nudgeTracked(r, "test-sentinel"), "a deleted CR must not keep a Sentinel tracker entry")
+}
+
+// TestReconcile_ForgetsNudgesWhenCRIsGone covers the same leak one step later,
+// when the CR object is already collected and only the queued request arrives.
+func TestReconcile_ForgetsNudgesWhenCRIsGone(t *testing.T) {
+	r, _ := newTestReconciler()
+	pastGrace(r, nudgeKey("gone"), nudgeKey("gone-sentinel"))
+
+	reconcileOnce(t, r, "gone", nudgeTestNamespace)
+
+	assert.False(t, nudgeTracked(r, "gone"), "a vanished CR must not keep a data tracker entry")
+	assert.False(t, nudgeTracked(r, "gone-sentinel"), "a vanished CR must not keep a Sentinel tracker entry")
+}
+
+// TestReconcile_KeepsNudgesOfOtherCRs guards the obvious over-reach: forgetting
+// must be scoped to the CR that is gone, not to the whole tracker.
+func TestReconcile_KeepsNudgesOfOtherCRs(t *testing.T) {
+	r, _ := newTestReconciler()
+	pastGrace(r, nudgeKey("gone"), nudgeKey("other"), nudgeKey("other-sentinel"))
+
+	reconcileOnce(t, r, "gone", nudgeTestNamespace)
+
+	assert.False(t, nudgeTracked(r, "gone"))
+	assert.True(t, nudgeTracked(r, "other"), "another CR's data entry must survive")
+	assert.True(t, nudgeTracked(r, "other-sentinel"), "another CR's Sentinel entry must survive")
+}
+
 func TestNudgeShortStatefulSets_NoNudgeWhenHealthy(t *testing.T) {
 	v := newSentinelValkey()
 	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)

@@ -148,23 +148,114 @@ func TestE2E_PodDisruptionBudget_SkippedForSingleReplica(t *testing.T) {
 		"no PodDisruptionBudget may be created for a single-replica instance")
 }
 
+// evictionRaceAttempts bounds how often assertSecondEvictionRefused repeats its
+// two-eviction sequence.
+//
+// The refusal window is only as long as the evicted pod stays gone or unready:
+// once its replacement is Ready the disruption controller republishes
+// disruptionsAllowed=1 and a second eviction is legitimately granted. That window
+// was measured at 0.1 s for Sentinel pods locally, and nothing in the test
+// controls it — so a single pass is a race the operator cannot lose but the test
+// can. Retrying makes a lost race cost one more round instead of a red build,
+// while a genuinely unenforced budget still fails: it loses every attempt.
+const evictionRaceAttempts = 3
+
+// evictionPollInterval is how fast the budget is polled while waiting for the
+// first eviction to spend it. It is deliberately far below the 1 s of
+// waitForPodDisruptionBudget: the state being observed can be shorter-lived than
+// a single 1 s tick.
+const evictionPollInterval = 100 * time.Millisecond
+
+// evictionRaceTimeout bounds one attempt's wait for the exhausted budget. It is
+// short on purpose — missing the window is a retryable outcome here, not a
+// failure, so waiting out pdbSettleTimeout would only delay the next attempt.
+const evictionRaceTimeout = 30 * time.Second
+
 // assertSecondEvictionRefused evicts firstPod, waits until the budget is spent and
 // then requires the eviction of secondPod to be refused by the Eviction API.
+//
+// Both halves are retried as a unit (see evictionRaceAttempts): the assertion is
+// "while one pod is down, the next eviction is refused", and both ways of losing
+// the race — the exhausted budget never observed, or the second eviction granted
+// because the replacement was already Ready — mean the precondition was gone, not
+// that the budget failed.
 func (tc *testClients) assertSecondEvictionRefused(t *testing.T, namespace, pdbName, firstPod, secondPod string) {
 	t.Helper()
 
-	t.Logf("Evicting %s/%s (within budget)", namespace, firstPod)
-	require.NoError(t, tc.evictPod(namespace, firstPod), "the first eviction must be allowed")
+	sts, err := tc.kube.AppsV1().StatefulSets(namespace).Get(context.Background(), pdbName, metav1.GetOptions{})
+	require.NoError(t, err, "the StatefulSet covered by PDB %s/%s must exist", namespace, pdbName)
+	require.NotNil(t, sts.Spec.Replicas)
+	replicas := *sts.Spec.Replicas
 
-	tc.waitForPodDisruptionBudget(t, namespace, pdbName, func(pdb *policyv1.PodDisruptionBudget) bool {
-		return pdb.Status.DisruptionsAllowed == 0
-	}, "budget never reported an exhausted disruption allowance after the first eviction")
+	for attempt := 1; attempt <= evictionRaceAttempts; attempt++ {
+		// The disruption controller republishes the budget a moment after the pods
+		// are Ready, not with them. A retry that evicts in that gap gets a 429 on
+		// the *first* eviction and would report the recovery lag as a defect.
+		tc.waitForPodDisruptionBudget(t, namespace, pdbName, func(pdb *policyv1.PodDisruptionBudget) bool {
+			return pdb.Status.DisruptionsAllowed > 0
+		}, "budget never reported an allowed disruption before the first eviction")
 
-	t.Logf("Evicting %s/%s (must be refused)", namespace, secondPod)
-	err := tc.evictPod(namespace, secondPod)
-	require.Error(t, err, "the second concurrent eviction must be refused — this is the drain protection")
-	assert.True(t, apierrors.IsTooManyRequests(err),
-		"expected a 429 from the Eviction API, got: %v", err)
+		t.Logf("Attempt %d/%d: evicting %s/%s (within budget)", attempt, evictionRaceAttempts, namespace, firstPod)
+		require.NoError(t, tc.evictPod(namespace, firstPod), "the first eviction must be allowed")
+
+		observed, evictErr := tc.evictWhenBudgetExhausted(t, namespace, pdbName, secondPod)
+		switch {
+		case !observed:
+			t.Logf("Budget never reported an exhausted allowance within %s — the replacement pod "+
+				"was ready again before the window could be observed; retrying", evictionRaceTimeout)
+		case evictErr == nil:
+			t.Logf("The second eviction of %s/%s was granted — the budget had recovered before the "+
+				"request reached the API server; retrying", namespace, secondPod)
+		default:
+			assert.True(t, apierrors.IsTooManyRequests(evictErr),
+				"expected a 429 from the Eviction API, got: %v", evictErr)
+			return
+		}
+
+		// Both retryable outcomes leave at least one pod missing, and the granted
+		// case leaves two. Start the next attempt from a full, healthy pod set.
+		tc.waitForStatefulSetReady(t, namespace, pdbName, replicas)
+	}
+
+	t.Fatalf("the second concurrent eviction was never refused in %d attempts — this is the drain "+
+		"protection PDB %s/%s exists for", evictionRaceAttempts, namespace, pdbName)
+}
+
+// evictWhenBudgetExhausted polls the PDB and requests the eviction of pod as soon
+// as it reports no allowed disruption, so the request leaves for the API server
+// from the tightest point after the observation.
+//
+// It reports whether the exhausted budget was observed at all, and the eviction
+// error (nil when the eviction was granted). A budget that never reports
+// disruptionsAllowed=0 within evictionRaceTimeout returns observed=false and no
+// eviction is attempted.
+func (tc *testClients) evictWhenBudgetExhausted(t *testing.T, namespace, pdbName, pod string) (bool, error) {
+	t.Helper()
+
+	var evictErr error
+	observed := false
+	waitErr := wait.PollUntilContextTimeout(context.Background(), evictionPollInterval, evictionRaceTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			pdb, err := tc.kube.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, pdbName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			if pdb.Status.DisruptionsAllowed != 0 {
+				return false, nil
+			}
+			observed = true
+			t.Logf("Budget %s/%s is spent; evicting %s/%s (must be refused)", namespace, pdbName, namespace, pod)
+			evictErr = tc.evictPod(namespace, pod)
+			return true, nil
+		})
+	if !observed {
+		require.True(t, waitErr != nil && wait.Interrupted(waitErr),
+			"polling PDB %s/%s failed for a reason other than the timeout: %v", namespace, pdbName, waitErr)
+	}
+	return observed, evictErr
 }
 
 // evictPod requests eviction of a pod through the Eviction API, which is what

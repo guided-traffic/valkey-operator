@@ -191,6 +191,7 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, req.NamespacedName, valkey); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Valkey resource not found, probably deleted")
+			r.forgetNudges(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -201,6 +202,7 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// This prevents a reboot loop on partially provisioned clusters that are being deleted.
 	if !valkey.DeletionTimestamp.IsZero() {
 		logger.Info("Valkey resource is being deleted, skipping reconciliation")
+		r.forgetNudges(valkey.Namespace, valkey.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -1602,8 +1604,20 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 
 // setStatusCondition sets a named status condition on the Valkey CR.
 // It refreshes the object from the API server before writing to avoid conflicts.
+//
+// Both failures are logged and swallowed rather than returned: a condition is a
+// report about the pass, never a reason to fail it, and every caller is a void
+// helper. Losing one write is self-healing — the condition is recomputed from
+// live state on the next pass and rewritten unless it already matches — but it is
+// not silent any more: a persistent conflict or a lost permission shows up in the
+// operator log instead of leaving the condition stale with no trace.
 func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
+	logger := log.FromContext(ctx)
+
 	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to refresh Valkey before writing a status condition", "condition", condType)
+		}
 		return
 	}
 	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
@@ -1613,7 +1627,10 @@ func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valk
 		Message:            message,
 		LastTransitionTime: metav1.Now(),
 	})
-	_ = r.Status().Update(ctx, v)
+	if err := r.Status().Update(ctx, v); err != nil {
+		logger.Error(err, "Failed to write status condition; it will be retried on the next reconcile",
+			"condition", condType, "reason", reason)
+	}
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.

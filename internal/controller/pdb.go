@@ -168,6 +168,13 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating PodDisruptionBudget", "name", desired.Name)
 		builder.ApplyPodDisruptionBudgetSpec(desired, current)
+		// Accepted tradeoff: assignment, not a merge, so labels added to the PDB by
+		// anything other than the operator are dropped on the next update. This is
+		// the repo-wide convention for every managed object (StatefulSet, Service,
+		// ConfigMap, NetworkPolicy — see valkey_controller.go), and the PDB must not
+		// deviate from it in isolation: a PDB whose labels survive while its
+		// StatefulSet's do not is worse than either rule applied consistently.
+		// Changing it is a convention-wide change, deliberately out of scope here.
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
 		return r.Update(ctx, current)
