@@ -364,7 +364,7 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		})
 	}
 
-	return corev1.PodSpec{
+	spec := corev1.PodSpec{
 		ServiceAccountName: DefaultServiceAccountName,
 		Affinity:           BuildPodAntiAffinity(v, common.ComponentSentinel),
 		// Init container copies the sentinel config to a writable volume.
@@ -377,6 +377,15 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		},
 		Volumes: volumes,
 	}
+
+	// Set terminationGracePeriodSeconds explicitly to the Kubernetes default (30s).
+	// A nil value never matches the API-server-defaulted stored object, so drift
+	// detection would rewrite the StatefulSet on every reconcile. Sentinel has no
+	// failover to wait out on shutdown, so the default is sufficient.
+	sentinelTerminationGrace := int64(30)
+	spec.TerminationGracePeriodSeconds = &sentinelTerminationGrace
+
+	return spec
 }
 
 // SentinelProbeCommand returns the exec probe command for a Sentinel container,

@@ -607,6 +607,45 @@ func TestSentinelStatefulSetHasChanged_NoChange(t *testing.T) {
 	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
 }
 
+func TestSentinelStatefulSetHasChanged_NoDriftAfterAPIServerDefaulting(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Simulate API-server defaulting of the stored object: a nil
+	// terminationGracePeriodSeconds is persisted as 30. A desired spec that
+	// leaves the field nil would report drift on every reconcile.
+	if current.Spec.Template.Spec.TerminationGracePeriodSeconds == nil {
+		defaulted := int64(30)
+		current.Spec.Template.Spec.TerminationGracePeriodSeconds = &defaulted
+	}
+
+	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestBuildSentinelPodSpec_ExplicitTerminationGracePeriod(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	spec := buildSentinelPodSpec(v)
+
+	// Pinned to the Kubernetes default so the fix changes no runtime behavior;
+	// only the permanent nil-vs-30 drift disappears.
+	if assert.NotNil(t, spec.TerminationGracePeriodSeconds) {
+		assert.Equal(t, int64(30), *spec.TerminationGracePeriodSeconds)
+	}
+}
+
 func TestSentinelStatefulSetHasChanged_ReplicaChange(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
