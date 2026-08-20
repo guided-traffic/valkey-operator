@@ -66,6 +66,10 @@ preUpgradeHook:
 # voluntary disruption - node drains hosting a Sentinel pod then stall. Use an
 # odd Sentinel count of 3 or more; the operator warns and records a
 # SentinelPodDisruptionBudgetBlocksDrains Event while the condition holds.
+# Budgets the operator does not own (no ownerReference to the CR) are never
+# deleted and never adopted, even under the generated names - a hand-written PDB
+# for these pods survives, and the operator records a PodDisruptionBudgetNotOwned
+# Event instead.
 
 # Valkey CRs support spec.antiAffinity (opt-in, default mode: off - upgrades
 # change nothing). mode: soft spreads StatefulSets with >= 2 replicas across

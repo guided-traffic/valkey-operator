@@ -10,9 +10,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -21,7 +23,10 @@ import (
 )
 
 // haWithPDB is a three-replica Sentinel cluster with PodDisruptionBudgets enabled.
+// The UID is set so the ownerReference the operator writes is distinguishable from
+// the empty one of a foreign object (NA14).
 func haWithPDB(v *vkov1.Valkey) {
+	v.UID = testValkeyUID
 	v.Spec.Replicas = 3
 	v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
 	v.Spec.PodDisruptionBudget = &vkov1.PodDisruptionBudgetSpec{Enabled: true}
@@ -441,4 +446,167 @@ func TestReconcileSentinelPodDisruptionBudget_NoWarningAtOddCount(t *testing.T) 
 
 		assert.Empty(t, rec.events, "%d Sentinels keep a quorum below the replica count", replicas)
 	}
+}
+
+// --- NA14: PDBs the operator does not own are never deleted and never adopted ---
+
+// testValkeyUID is the UID of the Valkey CR in the PDB tests. metav1.IsControlledBy
+// compares UIDs, so an empty one would make every ownerReference-less object look
+// owned and the guard untestable.
+const testValkeyUID = types.UID("11111111-2222-3333-4444-555555555555")
+
+// foreignPDB is a PodDisruptionBudget under one of the operator's budget names that
+// the operator did not create — the hand-written budget the incident remediation
+// told users to add. minAvailable instead of maxUnavailable and a foreign selector
+// make any operator write to it visible.
+func foreignPDB(name string, owners ...metav1.OwnerReference) *policyv1.PodDisruptionBudget {
+	minAvailable := intstr.FromInt32(2)
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       "default",
+			Labels:          map[string]string{"owner": "platform-team"},
+			OwnerReferences: owners,
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "hand-written"},
+			},
+		},
+	}
+}
+
+// assertPDBUntouched verifies the stored PDB is still the hand-written one.
+func assertPDBUntouched(t *testing.T, r *ValkeyReconciler, name string) {
+	t.Helper()
+	pdb, err := getPDB(context.Background(), r, name)
+	require.NoError(t, err, "the foreign PodDisruptionBudget must still exist")
+	require.NotNil(t, pdb.Spec.MinAvailable, "minAvailable must survive")
+	assert.Equal(t, intstr.FromInt32(2), *pdb.Spec.MinAvailable)
+	assert.Nil(t, pdb.Spec.MaxUnavailable, "the operator must not add its maxUnavailable")
+	require.NotNil(t, pdb.Spec.Selector)
+	assert.Equal(t, map[string]string{"app": "hand-written"}, pdb.Spec.Selector.MatchLabels,
+		"the selector must not be repointed at the operator's pods")
+	assert.Equal(t, "platform-team", pdb.Labels["owner"], "foreign labels must not be dropped")
+	assert.Empty(t, pdb.Annotations[builder.AnnotationOperatorVersion],
+		"the operator must not stamp its version on a foreign object")
+}
+
+// TestCleanupPodDisruptionBudget_KeepsForeignBudget is NA14's severe half: the
+// cleanup path runs on every pass of every CR whose PDBs are absent or disabled —
+// which is every pre-existing CR after the operator upgrade — and deleted the
+// same-named PDB by name. A hand-written budget for the data pods is called exactly
+// that (the StatefulSet name), so it disappeared silently and stayed gone.
+func TestCleanupPodDisruptionBudget_KeepsForeignBudget(t *testing.T) {
+	otherOwner := metav1.OwnerReference{
+		APIVersion: "apps/v1",
+		Kind:       "Deployment",
+		Name:       "someone-else",
+		UID:        types.UID("99999999-9999-9999-9999-999999999999"),
+		Controller: ptr.To(true),
+	}
+	cases := []struct {
+		name   string
+		owners []metav1.OwnerReference
+	}{
+		{name: "hand-written, no ownerReference"},
+		{name: "controlled by another object", owners: []metav1.OwnerReference{otherOwner}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// spec.podDisruptionBudget is absent: the cleanup path for both budgets.
+			v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+				v.UID = testValkeyUID
+				v.Spec.Replicas = 3
+				v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+			})
+			data := foreignPDB("test", tc.owners...)
+			sentinel := foreignPDB("test-sentinel", tc.owners...)
+			r, _ := newTestReconciler(v, data, sentinel)
+			rec := &fakeEventRecorder{}
+			r.Recorder = rec
+			ctx := context.Background()
+
+			// Two passes: the deletion was not a one-off but ran on every pass.
+			require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+			require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+
+			assertPDBUntouched(t, r, "test")
+			assertPDBUntouched(t, r, "test-sentinel")
+
+			warnings := rec.withReason(reasonPodDisruptionBudgetNotOwned)
+			require.Len(t, warnings, 4, "both budgets warn on both passes")
+			assert.Equal(t, corev1.EventTypeWarning, warnings[0].eventType)
+			assert.Contains(t, warnings[0].note, "PodDisruptionBudget test exists but is not owned")
+			assert.Contains(t, warnings[0].note, "the operator only deletes budgets it created")
+		})
+	}
+}
+
+// TestCleanupPodDisruptionBudget_DeletesOwnedBudget is the positive control for the
+// guard: with a real UID on the CR, the budget the operator created is still removed
+// when the feature is switched off. Without it a UID-comparing guard could pass the
+// foreign-object tests while breaking cleanup outright.
+func TestCleanupPodDisruptionBudget_DeletesOwnedBudget(t *testing.T) {
+	v := newTestValkey("test", "default", haWithPDB)
+	r, _ := newTestReconciler(v)
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+	data, err := getPDB(ctx, r, "test")
+	require.NoError(t, err)
+	require.True(t, metav1.IsControlledBy(data, v), "precondition: the operator owns the budget")
+
+	v.Spec.PodDisruptionBudget.Enabled = false
+	require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+
+	_, err = getPDB(ctx, r, "test")
+	assert.True(t, apierrors.IsNotFound(err), "an owned budget is still deleted")
+	_, err = getPDB(ctx, r, "test-sentinel")
+	assert.True(t, apierrors.IsNotFound(err), "an owned sentinel budget is still deleted")
+}
+
+// TestReconcilePodDisruptionBudget_DoesNotAdoptForeignBudget is NA14's mirror image:
+// enabling the feature next to a same-named hand-written budget silently adopted it —
+// Get, HasChanged, Update overwrote the budget fields and the selector without ever
+// asking who owns the object.
+func TestReconcilePodDisruptionBudget_DoesNotAdoptForeignBudget(t *testing.T) {
+	v := newTestValkey("test", "default", haWithPDB)
+	data := foreignPDB("test")
+	sentinel := foreignPDB("test-sentinel")
+	r, _ := newTestReconcilerWithVersion("1.2.3", v, data, sentinel)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+
+	assertPDBUntouched(t, r, "test")
+	assertPDBUntouched(t, r, "test-sentinel")
+
+	stored, err := getPDB(ctx, r, "test")
+	require.NoError(t, err)
+	assert.Empty(t, stored.OwnerReferences, "the operator must not claim ownership")
+
+	warnings := rec.withReason(reasonPodDisruptionBudgetNotOwned)
+	require.Len(t, warnings, 2, "both budgets warn")
+	assert.Equal(t, corev1.EventTypeWarning, warnings[0].eventType)
+	assert.Contains(t, warnings[0].note,
+		"spec.podDisruptionBudget cannot take effect until that budget is deleted or renamed")
+}
+
+// TestReconcilePodDisruptionBudget_NoWriteToForeignBudget pins that the refusal costs
+// no API write at all, so a foreign budget cannot be churned by the reconcile loop.
+func TestReconcilePodDisruptionBudget_NoWriteToForeignBudget(t *testing.T) {
+	v := newTestValkey("test", "default", haWithPDB)
+	writes := &pdbWriteCounter{}
+	r, _ := newInterceptedReconciler(writes.intercept(), v, foreignPDB("test"), foreignPDB("test-sentinel"))
+	r.Recorder = &fakeEventRecorder{}
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcilePodDisruptionBudgets(ctx, v))
+
+	assert.Zero(t, writes.writes, "no create and no update against a foreign PodDisruptionBudget")
 }

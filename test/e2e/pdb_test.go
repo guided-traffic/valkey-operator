@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
@@ -112,6 +113,59 @@ func TestE2E_PodDisruptionBudget_SerializesEvictions(t *testing.T) {
 		})
 		tc.waitForNoPodDisruptionBudget(t, ns, name)
 		tc.waitForNoPodDisruptionBudget(t, ns, name+"-sentinel")
+	})
+}
+
+// TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone is NA14: the operator must
+// touch only budgets it owns.
+//
+// Both budget names are the StatefulSet names, which is exactly what a hand-written
+// PDB covering the same pods is called — and hand-writing that PDB was the
+// remediation for the incident this feature exists for. The cleanup path runs on
+// every pass of every CR whose spec.podDisruptionBudget is absent (every CR that
+// predates the feature), and it deleted that object by name; the update path adopted
+// it by name once the feature was switched on.
+//
+// The assertions run against a real API server on purpose: the guard is an
+// ownerReference comparison, and the unit tests observe it through a fake client
+// that neither writes UIDs nor garbage-collects.
+func TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+
+	ns := "e2e-pdb-foreign"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "pdb-foreign"
+	t.Log("Creating a hand-written PodDisruptionBudget under the operator's data-budget name")
+	tc.createForeignPodDisruptionBudget(t, ns, name)
+
+	// No spec.podDisruptionBudget block at all: this is the shape of every CR that
+	// predates the feature, and it puts the cleanup path on every reconcile pass.
+	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(2),
+		"image":    "valkey/valkey:8.0",
+	}))
+	defer tc.deleteValkey(t, ns, name)
+
+	tc.waitForStatefulSetReady(t, ns, name, 2)
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+
+	t.Run("the cleanup path never deletes it", func(t *testing.T) {
+		tc.assertForeignPodDisruptionBudgetIntact(t, ns, name)
+	})
+
+	t.Run("enabling the feature does not adopt it", func(t *testing.T) {
+		tc.patchValkeySpec(t, ns, name, map[string]interface{}{
+			"podDisruptionBudget.enabled": true,
+		})
+
+		// The Warning Event is the operator's own report that the update path ran
+		// and refused; without it the assertion below could pass simply because no
+		// reconcile happened yet.
+		tc.waitForValkeyEvent(t, ns, name, "PodDisruptionBudgetNotOwned")
+		tc.assertForeignPodDisruptionBudgetIntact(t, ns, name)
 	})
 }
 
@@ -302,6 +356,71 @@ func (tc *testClients) waitForNoPodDisruptionBudget(t *testing.T, namespace, nam
 			return false, nil
 		})
 	require.NoError(t, err, "PodDisruptionBudget %s/%s was not removed", namespace, name)
+}
+
+// createForeignPodDisruptionBudget creates a PDB the operator did not create: no
+// ownerReference, minAvailable instead of maxUnavailable and a selector pointing at
+// something else, so any operator write to it is visible.
+func (tc *testClients) createForeignPodDisruptionBudget(t *testing.T, namespace, name string) {
+	t.Helper()
+
+	minAvailable := intstr.FromInt32(2)
+	_, err := tc.kube.PolicyV1().PodDisruptionBudgets(namespace).Create(context.Background(),
+		&policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Labels:    map[string]string{"owner": "platform-team"},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MinAvailable: &minAvailable,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "hand-written"},
+				},
+			},
+		}, metav1.CreateOptions{})
+	require.NoError(t, err, "failed to create the foreign PodDisruptionBudget %s/%s", namespace, name)
+}
+
+// assertForeignPodDisruptionBudgetIntact watches the hand-written budget across
+// several reconcile passes and fails on deletion or on any operator write to it.
+func (tc *testClients) assertForeignPodDisruptionBudgetIntact(t *testing.T, namespace, name string) {
+	t.Helper()
+	ctx := context.Background()
+
+	assert.Never(t, func() bool {
+		pdb, err := tc.kube.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("foreign PodDisruptionBudget %s/%s: %v", namespace, name, err)
+			return true
+		}
+		return pdb.Spec.MinAvailable == nil || pdb.Spec.MaxUnavailable != nil ||
+			len(pdb.OwnerReferences) > 0 || pdb.Labels["owner"] != "platform-team"
+	}, pdbSkipObservationWindow, pollInterval,
+		"the operator must neither delete nor rewrite the hand-written PodDisruptionBudget %s/%s",
+		namespace, name)
+}
+
+// waitForValkeyEvent waits for an Event with the given reason on a Valkey CR. The
+// recorder broadcasts asynchronously, hence the poll; Events travel through
+// events.k8s.io/v1, so a missing one can also mean missing operator RBAC (NA12).
+func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason string) {
+	t.Helper()
+
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, pdbSettleTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			events, err := tc.kube.EventsV1().Events(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+			for _, ev := range events.Items {
+				if ev.Regarding.Kind == "Valkey" && ev.Regarding.Name == name && ev.Reason == reason {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+	require.NoError(t, err, "no %s Event appeared on Valkey %s/%s", reason, namespace, name)
 }
 
 // statusOf renders a PDB status for assertion messages, tolerating a nil PDB.

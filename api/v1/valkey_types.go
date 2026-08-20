@@ -297,6 +297,13 @@ const (
 // PDBs entirely — users who manage their own PDB for these pods would otherwise
 // end up with two budgets matching the same pods, which makes the Eviction API
 // refuse every eviction.
+//
+// The operator only ever touches budgets it created, recognised by the
+// ownerReference on them. A PodDisruptionBudget carrying one of the generated
+// names (the StatefulSet names) that the operator does not own is neither deleted
+// when the feature is off nor overwritten when it is on: it is left untouched and
+// reported as a PodDisruptionBudgetNotOwned Warning Event on the CR, and this spec
+// has no effect for that StatefulSet until the foreign budget is removed.
 type PodDisruptionBudgetSpec struct {
 	// Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
 	// and, when Sentinel is enabled, a quorum-preserving PDB
@@ -308,6 +315,10 @@ type PodDisruptionBudgetSpec struct {
 	// Sentinel pod stalls until it is resolved manually; the operator keeps the
 	// quorum formula (a smaller minAvailable would let a drain take automatic
 	// failover) and warns about it on every reconcile.
+	// A PodDisruptionBudget under one of those names that the operator does not own
+	// is never deleted and never adopted: it stays untouched, this field has no
+	// effect for that StatefulSet, and the operator records a
+	// PodDisruptionBudgetNotOwned Event on every reconcile while that holds.
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 

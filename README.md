@@ -554,6 +554,14 @@ The budgets are named after the StatefulSets they cover — `<name>` for the dat
 pods and `<name>-sentinel` for Sentinel — live in the CR's namespace and are owned
 by the CR, so deleting the CR removes them.
 
+The ownerReference is also what the operator goes by: **a PodDisruptionBudget it
+does not own is never deleted and never adopted**, even under exactly those names.
+A hand-written budget for the same pods therefore survives every reconcile — the
+operator leaves it untouched and records a `PodDisruptionBudgetNotOwned` Warning
+Event on the CR instead. While such a budget exists, `spec.podDisruptionBudget` has
+no effect for that StatefulSet; delete or rename the foreign budget to hand the
+name over to the operator.
+
 Both budgets are **opt-in**. The operator creates none unless the block is present
 and `enabled: true` — a budget created next to a user-managed one would cover the
 same pods twice, and the Eviction API refuses every eviction in that case.

@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -164,6 +165,12 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 		return err
 	}
 
+	if !metav1.IsControlledBy(current, v) {
+		r.warnPodDisruptionBudgetNotOwned(ctx, v, desired.Name,
+			"spec.podDisruptionBudget cannot take effect until that budget is deleted or renamed")
+		return nil
+	}
+
 	if builder.PodDisruptionBudgetHasChanged(desired, current) ||
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating PodDisruptionBudget", "name", desired.Name)
@@ -183,7 +190,8 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 	return nil
 }
 
-// cleanupPodDisruptionBudget deletes the named PDB if it exists.
+// cleanupPodDisruptionBudget deletes the named PDB if it exists and this Valkey
+// owns it.
 func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey, name string) error {
 	logger := log.FromContext(ctx)
 	pdb := &policyv1.PodDisruptionBudget{}
@@ -194,9 +202,41 @@ func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vk
 		return err
 	}
 
+	if !metav1.IsControlledBy(pdb, v) {
+		r.warnPodDisruptionBudgetNotOwned(ctx, v, name,
+			"the operator only deletes budgets it created")
+		return nil
+	}
+
 	logger.Info("Deleting PodDisruptionBudget", "name", name)
 	if err := r.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting poddisruptionbudget: %w", err)
 	}
 	return nil
+}
+
+// reasonPodDisruptionBudgetNotOwned is the Event reason for a PodDisruptionBudget
+// that carries a name the operator manages but is not controlled by this Valkey.
+const reasonPodDisruptionBudgetNotOwned = "PodDisruptionBudgetNotOwned"
+
+// warnPodDisruptionBudgetNotOwned reports a foreign PDB under one of the operator's
+// budget names and states what the operator did not do to it.
+//
+// Why ownership is checked by ownerReference and not by name: both budget names are
+// the StatefulSet names (`<name>`, `<name>-sentinel`), which is exactly what a
+// hand-written PDB covering the same pods is called — and hand-writing that PDB was
+// the documented workaround before the operator managed budgets at all. Deleting or
+// overwriting it by name would remove a protection the user built, silently and on
+// every pass.
+//
+// Like the NA6/NA7 budget warnings this fires on every applicable pass rather than
+// on writes: the condition is a property of the cluster, not of a transition, and
+// the recorder aggregates a repeated Event into one series instead of new objects.
+func (r *ValkeyReconciler) warnPodDisruptionBudgetNotOwned(ctx context.Context, v *vkov1.Valkey,
+	name, consequence string) {
+	log.FromContext(ctx).Info("PodDisruptionBudget exists but is not owned by this Valkey; "+
+		"leaving it untouched", "name", name, "consequence", consequence)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonPodDisruptionBudgetNotOwned,
+		"PodDisruptionBudget %s exists but is not owned by this Valkey; leaving it untouched. %s",
+		name, consequence)
 }

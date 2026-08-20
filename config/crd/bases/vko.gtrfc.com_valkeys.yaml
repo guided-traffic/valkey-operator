@@ -488,6 +488,10 @@ spec:
                       Sentinel pod stalls until it is resolved manually; the operator keeps the
                       quorum formula (a smaller minAvailable would let a drain take automatic
                       failover) and warns about it on every reconcile.
+                      A PodDisruptionBudget under one of those names that the operator does not own
+                      is never deleted and never adopted: it stays untouched, this field has no
+                      effect for that StatefulSet, and the operator records a
+                      PodDisruptionBudgetNotOwned Event on every reconcile while that holds.
                     type: boolean
                   maxUnavailable:
                     default: 1
