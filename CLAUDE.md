@@ -231,6 +231,36 @@ Otherwise its "most connected slaves" fallback ties at zero, picks the lowest
 ordinal — the old master that was just deleted — and demotes the promoted pod,
 losing the data (NA21).
 
+### Topology restoration (non-Sentinel, two phases)
+
+After the master was replaced, `handleTopologyRestoration` (Phase 1,
+`stateRestoringTopology`) waits for pod-0 to sync back from the promoted replica
+and then promotes it again; `verifyTopologyRestored` (Phase 2,
+`stateVerifyingTopology`) confirms every replica reconnected.
+
+Both phases are bounded, and they end differently:
+
+- Phase 1 is bounded by `spec.rollingUpdate.syncTimeout` (default 5m), tracked in
+  `vko.gtrfc.com/topology-restore-started`. On timeout `abandonTopologyRestoration`
+  gives up the canonical topology, not the data: pod-0 is never force-promoted
+  (an unsynced pod-0 would come up empty and discard the promoted replica's
+  writes). It records `TopologyRestoreAbandoned` + `TopologyRestored=False` and
+  hands over to **Phase 2**, not to a cleared state — once the state annotation is
+  gone, `checkAndHandleRollingUpdate` returns early and nothing calls
+  `detectAndResolveSplitBrain` again, so Phase 2 is the last pass that can
+  consolidate the masters (NA23).
+- Phase 2 is bounded by `finalizationStallTimeout` (2m, own annotation) on both
+  its rogue-master branch and its pod-lookup-error branch.
+
+**The known-master annotation is the split-brain authority for both states.**
+`promotePod0AndRedirect` moves it to pod-0 only after the promotion succeeded, so
+on the abandoned path it still names the promoted replica. Without naming it, the
+"most connected slaves" fallback ties at zero in a shrunken cluster and picks the
+returning pod-0 by lowest ordinal — NA21, one state later.
+
+A non-pod-0 master is a supported end state: the `-rw`/`-r` Services select on
+`instanceRole`, not on ordinal.
+
 ## Metrics / Exporter
 
 `spec.metrics.enabled` adds an exporter sidecar (default `oliver006/redis_exporter`)

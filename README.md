@@ -421,6 +421,7 @@ spec:
 | `observer` | `ObserverSpec` | — | Cluster observer configuration |
 | `podDisruptionBudget` | `PodDisruptionBudgetSpec` | — | PodDisruptionBudgets for the data and Sentinel StatefulSets |
 | `antiAffinity` | `AntiAffinitySpec` | *(off)* | Opt-in pod anti-affinity for the data and Sentinel StatefulSets |
+| `rollingUpdate` | `RollingUpdateSpec` | — | Rolling update timing |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -688,6 +689,27 @@ Spreading across availability zones instead of nodes is a `topologyKey` change:
 | `storageClass` | `string` | `""` | StorageClass name (empty = default) |
 | `size` | `Quantity` | `1Gi` | Requested storage size |
 
+### `spec.rollingUpdate`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting |
+
+`syncTimeout` bounds the two points in a rolling update where the operator waits
+for a full dataset transfer, and it does something different at each:
+
+| Wait | On timeout |
+|------|------------|
+| A replaced replica syncing from the master, before the next pod is replaced | The rolling update is **paused** (`RollingUpdatePaused` condition, phase `Error`). It resumes on the next spec change. |
+| The former master (pod-0) syncing back after the failover, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
+
+The second case never force-promotes pod-0. An unsynced pod-0 would come up as an
+empty master and discard every write the promoted replica accepted since the
+failover, so the operator gives up the canonical topology rather than the data.
+The cluster stays fully usable — the `-rw`/`-r` Services select the master by
+label, not by ordinal. Raise `syncTimeout` for large datasets whose initial sync
+does not fit in five minutes.
+
 ### `spec.auth`
 
 | Field | Type | Default | Description |
@@ -705,6 +727,15 @@ Spreading across availability zones instead of nodes is a `topologyKey` change:
 | `phase` | `string` | Current lifecycle phase |
 | `message` | `string` | Human-readable status description |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions |
+
+#### Condition Types
+
+| Type | Meaning when `True` |
+|------|---------------------|
+| `RollingUpdatePaused` | A rolling update stopped because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. It resumes on the next spec change. |
+| `TopologyRestored` | The last multi-replica rolling update handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. |
+| `SidecarUpdatePending` | A standalone pod carries an outdated sidecar image; it updates on the next pod restart. |
+| `ReconcileBlocked` | A managed resource could not be written. The reason distinguishes an admission-webhook rejection from any other write failure. |
 
 #### Phase Values
 

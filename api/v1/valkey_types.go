@@ -36,6 +36,15 @@ const (
 	// The operator will not resume until the user applies a new spec change.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
 
+	// ConditionTypeTopologyRestored reports whether the multi-replica rolling
+	// update managed to hand the master role back to pod-0. It is set to True
+	// once pod-0 has been promoted again, and to False when the operator gave up
+	// waiting for pod-0 to sync and left the promoted replica as master. The
+	// cluster is healthy in both cases -- the Services select the master by label,
+	// not by ordinal -- so the condition is the only durable record that the
+	// topology differs from the canonical one.
+	ConditionTypeTopologyRestored ConditionType = "TopologyRestored"
+
 	// ConditionTypeReconcileBlocked is set when the operator could not write one
 	// of the managed resources. Its reason distinguishes an admission-webhook
 	// rejection (a cluster-side gate, e.g. a fail-closed policy webhook whose
