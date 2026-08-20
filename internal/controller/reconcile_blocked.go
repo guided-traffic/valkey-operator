@@ -82,12 +82,20 @@ func truncateConditionMessage(msg string) string {
 // Writes are skipped when nothing would change — a healthy cluster reconciles
 // every few seconds and must not produce a status write per pass, and a
 // persistently blocked one must not rewrite an identical condition either.
+//
+// "Nothing would change" includes the observed generation. A cluster that stays
+// blocked across a spec edit reports the same reason and message for the new
+// generation, and skipping that write would leave the condition naming the old
+// one — readable as "the new spec was never evaluated" by anything that judges
+// staleness by observedGeneration, which is the opposite of what happened. The
+// extra write costs one status update per generation change, not per pass.
 func (r *ValkeyReconciler) setReconcileBlockedCondition(ctx context.Context, v *vkov1.Valkey, err error) {
 	existing := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
 
 	if err == nil {
-		// Never set before, or already cleared: nothing to do.
-		if existing == nil || existing.Status == metav1.ConditionFalse {
+		// Never set before, or already cleared for this generation: nothing to do.
+		if existing == nil ||
+			(existing.Status == metav1.ConditionFalse && existing.ObservedGeneration == v.Generation) {
 			return
 		}
 		r.setStatusCondition(ctx, v,
@@ -103,7 +111,8 @@ func (r *ValkeyReconciler) setReconcileBlockedCondition(ctx context.Context, v *
 	if existing != nil &&
 		existing.Status == metav1.ConditionTrue &&
 		existing.Reason == reason &&
-		existing.Message == message {
+		existing.Message == message &&
+		existing.ObservedGeneration == v.Generation {
 		return
 	}
 	r.setStatusCondition(ctx, v,

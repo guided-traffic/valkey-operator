@@ -1609,6 +1609,13 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 // setStatusCondition sets a named status condition on the Valkey CR.
 // It refreshes the object from the API server before writing to avoid conflicts.
 //
+// ObservedGeneration is taken from the refreshed object, not from the caller's
+// copy, so it names the spec generation the condition was actually computed
+// against. Every Ready condition already carries it; without it here, tooling
+// that judges staleness by observedGeneration (kstatus and everything modelled
+// on it) reads ReconcileBlocked and SidecarUpdatePending as generation 0 and
+// therefore as permanently stale.
+//
 // Both failures are logged and swallowed rather than returned: a condition is a
 // report about the pass, never a reason to fail it, and every caller is a void
 // helper. Losing one write is self-healing — the condition is recomputed from
@@ -1627,6 +1634,7 @@ func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valk
 	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
+		ObservedGeneration: v.Generation,
 		Reason:             reason,
 		Message:            message,
 		LastTransitionTime: metav1.Now(),
