@@ -261,22 +261,26 @@ func TestManagerOptions_LeaderElectionOff(t *testing.T) {
 	}
 }
 
-// TestManagerOptions_MetricsBindAddressIsNotWired documents a real defect:
-// --metrics-bind-address is declared and parsed into operatorFlags.metricsAddr,
-// but that value never reaches ctrl.Options.Metrics. The manager therefore always
-// falls back to controller-runtime's default (":8080"), so a user who passes
-// --metrics-bind-address=:9090 or --metrics-bind-address=0 is silently ignored.
-// It is dormant today only because deploy/helm/.../deployment.yaml hardcodes the
-// very value the default already produces.
-// When the wiring is fixed, replace this test with one asserting
-// opts.Metrics.BindAddress == f.metricsAddr.
-func TestManagerOptions_MetricsBindAddressIsNotWired(t *testing.T) {
+// TestManagerOptions_MetricsBindAddress pins that --metrics-bind-address reaches
+// ctrl.Options.Metrics. Before this wiring the parsed value went nowhere and
+// controller-runtime silently fell back to its ":8080" default, which happened to
+// equal both the flag default and the chart argument — so a non-default value,
+// including the documented "0" that disables the metrics server, was ignored.
+func TestManagerOptions_MetricsBindAddress(t *testing.T) {
 	f := &operatorFlags{metricsAddr: ":9090", probeAddr: ":8081"}
 	opts := managerOptions(f)
 
-	if opts.Metrics.BindAddress != "" {
-		t.Fatalf("Metrics.BindAddress = %q: the flag now reaches the manager, "+
-			"update this test to assert it equals f.metricsAddr", opts.Metrics.BindAddress)
+	if opts.Metrics.BindAddress != ":9090" {
+		t.Errorf("Metrics.BindAddress = %q, want the flag value :9090", opts.Metrics.BindAddress)
+	}
+}
+
+func TestManagerOptions_MetricsDisabledByZero(t *testing.T) {
+	opts := managerOptions(&operatorFlags{metricsAddr: "0", probeAddr: ":8081"})
+
+	if opts.Metrics.BindAddress != "0" {
+		t.Errorf("Metrics.BindAddress = %q, want the literal 0 that disables the metrics server",
+			opts.Metrics.BindAddress)
 	}
 }
 

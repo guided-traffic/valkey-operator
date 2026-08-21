@@ -11,6 +11,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/cmd/migrate"
@@ -74,6 +75,7 @@ func bindOperatorFlags(fs *flag.FlagSet) *operatorFlags {
 func managerOptions(f *operatorFlags) ctrl.Options {
 	return ctrl.Options{
 		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: f.metricsAddr},
 		HealthProbeBindAddress: f.probeAddr,
 		LeaderElection:         f.enableLeaderElection,
 		LeaderElectionID:       "valkey-operator.vko.gtrfc.com",

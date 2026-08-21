@@ -2,10 +2,12 @@
 
 ## Status
 
-Accepted. Date: 2026-08-21.
+Accepted. Date: 2026-08-21. Amended 2026-08-21: D8 is implemented — the flag is wired
+through — and D9 is rewritten accordingly.
 
 The exporter, the metrics Service and the ServiceMonitor are implemented. The operator's own
-`--metrics-bind-address` handling is **open**: the flag is parsed and never applied.
+`--metrics-bind-address` is applied since the D8 fix; the authentication filter (D10) remains
+a separate, unmade trade.
 
 Everything in this ADR was **verified by reading** the builders, `cmd/main.go`, the chart
 `deployment.yaml` and the controller-runtime version pinned in `go.mod`. Nothing here was
@@ -97,21 +99,24 @@ persistence is required**. Routing every pod-spec change through the same rollin
 new features do not each need their own migration story
 ([ADR 0007](0007-failover-aware-rolling-update.md)).
 
-**D8 — A parsed flag must be applied.** `bindOperatorFlags` declares
-`--metrics-bind-address` (default `:8080`) but `managerOptions` builds `ctrl.Options` with no
-`Metrics` field, so the value reaches nothing. The fix is
-`Metrics: metricsserver.Options{BindAddress: f.metricsAddr}` plus a test that a **non-default**
-value reaches the options struct — the default coincidence is exactly what hides the bug.
+**D8 — A parsed flag must be applied.** `managerOptions` sets
+`Metrics: metricsserver.Options{BindAddress: f.metricsAddr}`
+([`cmd/main.go`](../../cmd/main.go)), so `--metrics-bind-address` reaches the manager.
+`TestManagerOptions_MetricsBindAddress` pins a **non-default** value — the default coincidence
+(flag default, controller-runtime default and chart argument all `:8080`) is exactly what hid
+the original bug — and `TestManagerOptions_MetricsDisabledByZero` pins the literal `0` that
+disables the metrics server ([`cmd/main_test.go`](../../cmd/main_test.go)).
+*(Superseded wording, kept for the record: before 2026-08-21 `managerOptions` built
+`ctrl.Options` with no `Metrics` field, so the parsed value reached nothing.)*
 
-**D9 — Until then, treat the operator's metrics endpoint as public.** It serves `:8080`
-(metrics) and `:8081` (health), both plain HTTP, no authentication filter, no `SecureServing`.
-The unmovable half is the **metrics** address alone: there is **no supported way to move it or
-turn it off**, because `--metrics-bind-address=0`, controller-runtime's documented way to
-disable the metrics server, is silently ignored. The health address is wired —
-`managerOptions` sets `HealthProbeBindAddress: f.probeAddr`
-([`cmd/main.go`](../../cmd/main.go)) — so `--health-probe-bind-address`, `=0` included, does
-what it says. Documenting the metrics endpoint as public prevents a network design built on a
-setting that does nothing.
+**D9 — Treat the operator's metrics endpoint as public unless it is moved or disabled.** The
+default install serves `:8080` (metrics) and `:8081` (health), both plain HTTP, no
+authentication filter, no `SecureServing`. Since D8 both addresses are wired:
+`--metrics-bind-address` and `--health-probe-bind-address` each do what they say, `=0`
+included. What remains is the posture, not a defect — the endpoint is unauthenticated wherever
+it binds, and authenticating it is D10's separate trade.
+*(Superseded wording, kept for the record: until the D8 fix there was no supported way to move
+or disable the metrics endpoint, because the flag was silently ignored.)*
 
 **D10 — Adding `FilterProvider: filters.WithAuthenticationAndAuthorization` is a separate,
 deliberate trade, not free hardening.** It requires a `TokenReview`/`SubjectAccessReview` grant
@@ -171,9 +176,9 @@ Rejected: unnecessary for multi-replica clusters, which migrate losslessly.
 
 ### Leave `--metrics-bind-address` unwired
 
-The status quo, hidden by the default coincidence. Rejected: an operator configured to bind the
-endpoint elsewhere, or to disable it, keeps listening on `:8080` regardless — **an operator
-believed to be closed is open.**
+The former status quo, hidden by the default coincidence. Rejected (and since fixed, see D8):
+an operator configured to bind the endpoint elsewhere, or to disable it, kept listening on
+`:8080` regardless — **an operator believed to be closed is open.**
 
 ### Wire the flag *and* the authentication filter in one change
 
@@ -182,10 +187,9 @@ flag alone is the recommended minimum.
 
 ## Residual risks
 
-* **`managerOptions` still has no `Metrics` field (open).** Verified by reading `cmd/main.go`
-  and the controller-runtime default for the version pinned in `go.mod`
-  (`sigs.k8s.io/controller-runtime v0.24.1`, `DefaultBindAddress = ":8080"`); **not reproduced
-  against a cluster.**
+* **Closed 2026-08-21:** `managerOptions` had no `Metrics` field, so the flag reached nothing.
+  Fixed per D8 and pinned by two unit tests; verified by `make test-unit`, **not reproduced
+  against a cluster** (no scrape of a moved or disabled endpoint was measured).
 * **The operator metrics endpoint is unauthenticated.** Risk named per case rather than as a
   blanket: the payload is standard controller-runtime and workqueue metrics — **no Secret
   material and no CR contents** — so this is exposure of operational metadata, not of

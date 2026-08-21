@@ -493,7 +493,8 @@ spec:
                       A PodDisruptionBudget under one of those names that the operator does not own
                       is never deleted and never adopted: it stays untouched, this field has no
                       effect for that StatefulSet, and the operator records a
-                      PodDisruptionBudgetNotOwned Event on every reconcile while that holds.
+                      PodDisruptionBudgetNotOwned Event on every reconcile while that holds and
+                      spec.podDisruptionBudget.enabled is true.
                     type: boolean
                   maxUnavailable:
                     default: 1

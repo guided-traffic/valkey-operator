@@ -310,9 +310,10 @@ const (
 // The operator only ever touches budgets it created, recognised by the
 // ownerReference on them. A PodDisruptionBudget carrying one of the generated
 // names (the StatefulSet names) that the operator does not own is neither deleted
-// when the feature is off nor overwritten when it is on: it is left untouched and
-// reported as a PodDisruptionBudgetNotOwned Warning Event on the CR, and this spec
-// has no effect for that StatefulSet until the foreign budget is removed.
+// when the feature is off nor overwritten when it is on: it is left untouched and,
+// while spec.podDisruptionBudget.enabled is true, reported as a
+// PodDisruptionBudgetNotOwned Warning Event on the CR, and this spec has no
+// effect for that StatefulSet until the foreign budget is removed.
 type PodDisruptionBudgetSpec struct {
 	// Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
 	// and, when Sentinel is enabled, a quorum-preserving PDB
@@ -327,7 +328,8 @@ type PodDisruptionBudgetSpec struct {
 	// A PodDisruptionBudget under one of those names that the operator does not own
 	// is never deleted and never adopted: it stays untouched, this field has no
 	// effect for that StatefulSet, and the operator records a
-	// PodDisruptionBudgetNotOwned Event on every reconcile while that holds.
+	// PodDisruptionBudgetNotOwned Event on every reconcile while that holds and
+	// spec.podDisruptionBudget.enabled is true.
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 

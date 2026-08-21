@@ -69,7 +69,7 @@ preUpgradeHook:
 # Budgets the operator does not own (no ownerReference to the CR) are never
 # deleted and never adopted, even under the generated names - a hand-written PDB
 # for these pods survives, and the operator records a PodDisruptionBudgetNotOwned
-# Event instead.
+# Event instead while spec.podDisruptionBudget.enabled is true.
 
 # Valkey CRs support spec.antiAffinity (opt-in, default mode: off - upgrades
 # change nothing). mode: soft spreads StatefulSets with >= 2 replicas across

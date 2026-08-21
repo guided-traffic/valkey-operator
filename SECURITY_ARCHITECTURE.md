@@ -413,11 +413,12 @@ analysis.
       `tls-auth-clients optional` means TLS authenticates the server only.
 - [ ] **Do not leave `spec.sentinel.disableAuth` or either `allowUnencrypted` on
       after the migration that needed them.**
-- [ ] **Treat the operator metrics endpoint as public.** It binds `:8080` in
-      plain HTTP with no authentication filter — and `--metrics-bind-address` is
-      parsed but never applied to the manager options, so it cannot be moved or
-      switched off from the chart
-      ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md) D8).
+- [ ] **Treat the operator metrics endpoint as public unless moved or disabled.**
+      By default it binds `:8080` in plain HTTP with no authentication filter.
+      `--metrics-bind-address` is applied since the ADR 0018 D8 fix, so the
+      endpoint can be moved or switched off (`=0`) from the chart; wherever it
+      binds it stays unauthenticated — the filter is a separate trade
+      ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md) D9/D10).
 - [ ] **Restrict who may `create valkeys`.** A CR author chooses the image the
       cluster runs and the name every generated object gets, and generated names
       collide with existing objects by design. [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)
