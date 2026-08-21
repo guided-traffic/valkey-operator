@@ -57,11 +57,16 @@ rules:
       - list
       - patch
       - watch
+  # Secrets: read for auth and TLS material. `delete` garbage-collects the
+  # legacy <name>-sentinel-tls Secret when a cluster migrates to
+  # spec.tls.unifiedCertificate (reconcileLegacySentinelCertificateCleanup);
+  # without it that reconcile fails 403 on every pass.
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
+      - delete
       - get
       - list
       - watch
