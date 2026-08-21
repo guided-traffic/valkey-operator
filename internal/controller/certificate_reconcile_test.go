@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -448,7 +449,7 @@ func TestReconcileLegacySentinelCleanup_Noop_WhenLegacyNameIsTheActiveSecret(t *
 func TestReconcileLegacySentinelCleanup_PropagatesRolloutProbeError(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyName, Namespace: "iam"}}
+	legacySecret := newLegacySentinelSecret(legacyName, "iam")
 
 	funcs := interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -470,7 +471,7 @@ func TestReconcileLegacySentinelCleanup_PropagatesRolloutProbeError(t *testing.T
 func TestReconcileLegacySentinelCleanup_PropagatesCertificateGetError(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyName, Namespace: "iam"}}
+	legacySecret := newLegacySentinelSecret(legacyName, "iam")
 
 	r, c := newReconcilerWithInterceptor("1.0.0", failCertGet("cert-manager CRD flapping"), v, legacySecret)
 
@@ -485,8 +486,8 @@ func TestReconcileLegacySentinelCleanup_PropagatesCertificateGetError(t *testing
 func TestReconcileLegacySentinelCleanup_PropagatesCertificateDeleteError(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacyCert := newLegacySentinelCert(legacyName, "iam")
-	legacySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyName, Namespace: "iam"}}
+	legacyCert := newLegacySentinelCert(v, legacyName)
+	legacySecret := newLegacySentinelSecret(legacyName, "iam")
 
 	funcs := interceptor.Funcs{
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
@@ -509,7 +510,7 @@ func TestReconcileLegacySentinelCleanup_PropagatesCertificateDeleteError(t *test
 func TestReconcileLegacySentinelCleanup_PropagatesSecretGetError(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacyCert := newLegacySentinelCert(legacyName, "iam")
+	legacyCert := newLegacySentinelCert(v, legacyName)
 
 	funcs := interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -530,7 +531,7 @@ func TestReconcileLegacySentinelCleanup_PropagatesSecretGetError(t *testing.T) {
 func TestReconcileLegacySentinelCleanup_PropagatesSecretDeleteError(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyName, Namespace: "iam"}}
+	legacySecret := newLegacySentinelSecret(legacyName, "iam")
 
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
@@ -552,8 +553,8 @@ func TestReconcileLegacySentinelCleanup_PropagatesSecretDeleteError(t *testing.T
 func TestReconcileLegacySentinelCleanup_ToleratesConcurrentDeletion(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
-	legacyCert := newLegacySentinelCert(legacyName, "iam")
-	legacySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyName, Namespace: "iam"}}
+	legacyCert := newLegacySentinelCert(v, legacyName)
+	legacySecret := newLegacySentinelSecret(legacyName, "iam")
 
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
@@ -568,18 +569,13 @@ func TestReconcileLegacySentinelCleanup_ToleratesConcurrentDeletion(t *testing.T
 		"a concurrent deletion must not fail the reconcile")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_DeletesForeignSecretUnderLegacyName
-// documents the OPEN hazard tracked as NA49 in
-// local_valkey_operator_admission_gap.md: the cleanup deletes the Secret purely
-// by name. A Secret that the operator never created — no owner reference to the
-// CR, no cert-manager provenance annotation, unrelated labels and payload — is
-// removed as soon as a Valkey CR whose name derives to <name>-sentinel-tls runs
-// with certManager + unifiedCertificate and a completed Sentinel rollout.
-//
-// This test asserts the CURRENT behaviour so the hazard is visible in the suite.
-// When NA49 is decided (provenance annotation and/or UID precondition), this test
-// must be inverted: the foreign Secret must then survive.
-func TestReconcileLegacySentinelCleanup_NA49_DeletesForeignSecretUnderLegacyName(t *testing.T) {
+// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignSecretUnderLegacyName is
+// the closed form of NA49. <cr>-sentinel-tls is derived from a CR name, and a
+// principal who may create Valkey CRs in a namespace picks that name — so the
+// name is attacker-chosen input, not evidence. A Secret the operator never
+// created (no owning Certificate, no cert-manager provenance annotation,
+// unrelated payload) survives, and the refusal is reported as an Event.
+func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignSecretUnderLegacyName(t *testing.T) {
 	v := newTestValkeyUnified() // name oauth2-valkey, namespace iam
 	legacyName := builder.SentinelCertificateName(v)
 
@@ -599,26 +595,27 @@ func TestReconcileLegacySentinelCleanup_NA49_DeletesForeignSecretUnderLegacyName
 	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
 	objs := append([]client.Object{v, foreign, sts}, readySentinelPods(stsName, 3)...)
 	r, c := newTestReconciler(objs...)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 
-	err := c.Get(context.Background(),
-		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{})
-	assert.True(t, apierrors.IsNotFound(err),
-		"NA49: a foreign Secret under the legacy name is deleted today — "+
-			"invert this assertion once the provenance guard lands")
+	got := &corev1.Secret{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, got),
+		"NA49: a foreign Secret under the legacy name must survive")
+	assert.Equal(t, []byte("s3cr3t"), got.Data["api-token"], "its payload must be untouched")
+	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
+		"the refusal must be reported, not silent")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_NoSentinelMeansNoWaitBeforeDeleting
-// sharpens NA49: the ticket describes the attacker waiting for the Sentinel
-// rollout to finish, but with Sentinel disabled entirely sentinelRolloutComplete
-// short-circuits to "complete" (there are no pods bound to the legacy Secret),
-// so the name-based delete fires on the very first reconcile. certManager plus
-// unifiedCertificate on a Sentinel-less instance is a valid spec.
-//
-// Asserts CURRENT behaviour; invert together with the other NA49 test once the
-// provenance guard lands.
-func TestReconcileLegacySentinelCleanup_NA49_NoSentinelMeansNoWaitBeforeDeleting(t *testing.T) {
+// TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete keeps the
+// sharpest shape of NA49 pinned: with Sentinel disabled sentinelRolloutComplete
+// short-circuits to "complete", so the delete is reached on the very first
+// reconcile with no rollout window to wait for. certManager plus
+// unifiedCertificate on a Sentinel-less instance is a valid spec. The guard, not
+// the timing, is what protects the Secret — so it must hold here too.
+func TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete(t *testing.T) {
 	v := newTestValkey("payments", "prod", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 1
 		// Sentinel deliberately left disabled.
@@ -641,11 +638,217 @@ func TestReconcileLegacySentinelCleanup_NA49_NoSentinelMeansNoWaitBeforeDeleting
 		Data: map[string][]byte{"api-token": []byte("s3cr3t")},
 	}
 	r, c := newTestReconciler(v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "prod"}, &corev1.Secret{}),
+		"NA49: without a rollout window the provenance guard is the only protection")
+	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
+		"the refusal must be reported, not silent")
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificate covers the
+// other half of the same hazard, which predates NA37 entirely: the chart always
+// granted delete on cert-manager Certificates. A foreign Certificate under the
+// legacy name is left alone — deleting it would stop somebody else's issuance and
+// renewal. Ownership is decided by ownerReference because the operator sets that
+// reference itself on every Certificate it creates.
+func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificate(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	foreignCert := newForeignLegacySentinelCert(legacyName, "iam")
+
+	r, c := newTestReconciler(v, foreignCert)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	got := newEmptyCert()
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, got),
+		"a Certificate this Valkey does not control must survive")
+	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
+		"the refusal must be reported, not silent")
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificateAndItsSecret
+// pins the composition of the two guards: a foreign Certificate is not deleted,
+// and because it is foreign it also grants no provenance to the Secret beside it.
+// The Secret carries the annotation of a DIFFERENT Certificate, so neither proof
+// holds and both objects survive.
+func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificateAndItsSecret(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	foreignCert := newForeignLegacySentinelCert(legacyName, "iam")
+	foreignSecret := newLegacySentinelSecret(legacyName, "iam")
+	foreignSecret.Annotations[certManagerCertificateNameAnnotation] = "someone-elses-cert"
+
+	r, c := newTestReconciler(v, foreignCert, foreignSecret)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, newEmptyCert()))
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{}))
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_AnnotationAloneAuthorisesTheDelete is
+// the migration path that matters in practice. The Certificate is already gone —
+// an earlier pass deleted it and the Secret delete then failed 403, which is
+// exactly the state NA37 repaired — so the in-pass ownership proof is unavailable
+// and only the retroactive cert-manager annotation remains. Without this path the
+// guard would strand every Secret it exists to clean up.
+func TestReconcileLegacySentinelCleanup_NA49_AnnotationAloneAuthorisesTheDelete(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	orphaned := newLegacySentinelSecret(legacyName, "iam")
+
+	r, c := newTestReconciler(v, orphaned) // no Certificate under that name
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 
 	err := c.Get(context.Background(),
-		types.NamespacedName{Name: foreign.Name, Namespace: "prod"}, &corev1.Secret{})
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{})
 	assert.True(t, apierrors.IsNotFound(err),
-		"NA49: without Sentinel the delete needs no rollout window at all")
+		"the cert-manager provenance annotation must authorise the delete on its own: %v", err)
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_OwnedCertificateAuthorisesUnstampedSecret
+// covers the reverse asymmetry: a Secret with no provenance annotation is still
+// deleted when this same pass found a Certificate this Valkey controls that issues
+// into that exact name. Guards against a cert-manager release that drops or renames
+// the annotation — the in-pass proof is self-issued and survives that.
+func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificateAuthorisesUnstampedSecret(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	ownedCert := newLegacySentinelCert(v, legacyName)
+	unstamped := newLegacySentinelSecret(legacyName, "iam")
+	delete(unstamped.Annotations, certManagerCertificateNameAnnotation)
+
+	r, c := newTestReconciler(v, ownedCert, unstamped)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	err := c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{})
+	assert.True(t, apierrors.IsNotFound(err), "the owned Certificate must authorise the delete: %v", err)
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_OwnedCertificatePointingElsewhere shows
+// why the secretName comparison is explicit rather than assumed. The Certificate is
+// ours, but it issues into a different Secret, so it says nothing about the object
+// under the legacy name. Today the two names coincide by construction; if that
+// derivation is ever split, this fails instead of authorising the wrong Secret.
+func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificatePointingElsewhere(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	ownedCert := newLegacySentinelCert(v, legacyName)
+	ownedCert.Object["spec"] = map[string]interface{}{"secretName": "somewhere-else"}
+	unstamped := newLegacySentinelSecret(legacyName, "iam")
+	delete(unstamped.Annotations, certManagerCertificateNameAnnotation)
+
+	r, c := newTestReconciler(v, ownedCert, unstamped)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	// The Certificate is ours, so it is still cleaned up.
+	certErr := c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, newEmptyCert())
+	assert.True(t, apierrors.IsNotFound(certErr), "an owned Certificate is deleted regardless: %v", certErr)
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{}),
+		"a Certificate that issues elsewhere proves nothing about this Secret")
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_NonTLSTypeIsNeverDeleted pins the type
+// precondition. It does not establish provenance on its own — an attacker can
+// point the name at a real TLS Secret — but it removes the whole class of
+// accidental collateral, and it outranks the annotation: a Secret that is not
+// kubernetes.io/tls was not issued by cert-manager whatever it claims.
+func TestReconcileLegacySentinelCleanup_NA49_NonTLSTypeIsNeverDeleted(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	ownedCert := newLegacySentinelCert(v, legacyName)
+	opaque := newLegacySentinelSecret(legacyName, "iam")
+	opaque.Type = corev1.SecretTypeOpaque // keeps the annotation, and the owned Certificate
+
+	r, c := newTestReconciler(v, ownedCert, opaque)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{}),
+		"an Opaque Secret is not cert-manager TLS material, whatever else points at it")
+	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
+		"the refusal must be reported, not silent")
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_UIDPreconditionOnBothDeletes pins the
+// NA31 discipline on this path: both ownership decisions are made on cache-backed
+// reads, so both Deletes must name the UID they inspected. A Conflict means the
+// name now holds a different object and is not an error.
+func TestReconcileLegacySentinelCleanup_NA49_UIDPreconditionOnBothDeletes(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	ownedCert := newLegacySentinelCert(v, legacyName)
+	ownedCert.SetUID("cert-uid")
+	secret := newLegacySentinelSecret(legacyName, "iam")
+	secret.UID = "secret-uid"
+
+	var seen []string
+	funcs := interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			var o client.DeleteOptions
+			for _, opt := range opts {
+				opt.ApplyToDelete(&o)
+			}
+			require.NotNil(t, o.Preconditions, "delete of %s must carry a precondition", obj.GetName())
+			require.NotNil(t, o.Preconditions.UID)
+			seen = append(seen, string(*o.Preconditions.UID))
+			// Model the object having been replaced under its name.
+			return apierrors.NewConflict(schema.GroupResource{Resource: "x"}, obj.GetName(), errors.New("uid mismatch"))
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, ownedCert, secret)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v),
+		"a failed precondition is the guard working, not a reconcile error")
+	// The Secret is still reached: it carries the cert-manager annotation, which
+	// authorises it independently of the Certificate. Both deletes name their UID.
+	assert.Equal(t, []string{"cert-uid", "secret-uid"}, seen)
+}
+
+// TestReconcileLegacySentinelCleanup_NA49_CertificateConflictRevokesInPassProof
+// isolates what a failed Certificate precondition actually costs. The object under
+// that name is no longer the one this pass inspected, so it proves nothing about
+// the Secret beside it — and a Secret with no annotation of its own then has no
+// admissible proof left and survives.
+func TestReconcileLegacySentinelCleanup_NA49_CertificateConflictRevokesInPassProof(t *testing.T) {
+	v := newTestValkeyUnified()
+	legacyName := builder.SentinelCertificateName(v)
+	ownedCert := newLegacySentinelCert(v, legacyName)
+	ownedCert.SetUID("cert-uid")
+	unstamped := newLegacySentinelSecret(legacyName, "iam")
+	delete(unstamped.Annotations, certManagerCertificateNameAnnotation)
+
+	funcs := interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == certManagerKindCertificate {
+				return apierrors.NewConflict(
+					schema.GroupResource{Resource: "certificates"}, obj.GetName(), errors.New("uid mismatch"))
+			}
+			return errors.New("the Secret must not be deleted without an admissible proof")
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, ownedCert, unstamped)
+
+	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
 }

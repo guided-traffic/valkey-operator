@@ -217,10 +217,10 @@ consequence for a compromised or misbehaving operator.
 | `vko.gtrfc.com` | `valkeys/status`, `valkeys/finalizers` | get/update/patch, update | Status authority; finalizer updates |
 | `""` | `configmaps`, `serviceaccounts`, `services` | get, list, watch, create, update, patch, delete | Can rewrite or delete **any** ConfigMap, ServiceAccount or Service in the cluster, not only its own. Deleting a foreign ServiceAccount invalidates its tokens |
 | `""` | `pods` | get, list, watch, **delete**, patch | Can delete any pod in the cluster. This is the rolling-update primitive; it is not scoped to owned pods |
-| `""` | `secrets` | get, list, watch, **delete** | **Reads every Secret in the cluster** (the heaviest confidentiality exposure) and can destroy any of them. `delete` exists for one caller: the legacy `<name>-sentinel-tls` cleanup on the `unifiedCertificate` migration — see [NA49](local_valkey_operator_admission_gap.md), where that delete is still name-based |
+| `""` | `secrets` | get, list, watch, **delete** | **Reads every Secret in the cluster** (the heaviest confidentiality exposure) and can destroy any of them. `delete` exists for one caller: the legacy `<name>-sentinel-tls` cleanup on the `unifiedCertificate` migration. That caller no longer deletes on the name alone — it requires either a Certificate this Valkey controls issuing into that name, or cert-manager's `cert-manager.io/certificate-name` annotation, plus `type: kubernetes.io/tls`, plus a UID precondition ([NA49](local_valkey_operator_admission_gap.md)). The *grant* is still cluster-wide, so a compromised operator is unaffected by that guard |
 | `""` + `events.k8s.io` | `events` | create, patch | Can write Events anywhere. Both groups are listed because the operator records through `events.k8s.io/v1` while older tooling still reads the core group (NA12) |
 | `apps` | `deployments`, `statefulsets` | get, list, watch, create, update, patch, delete | Can replace the pod template — hence the image, hence the code — of **any** Deployment or StatefulSet in the cluster |
-| `cert-manager.io` | `certificates` | full CRUD | Can request certificates from any Issuer/ClusterIssuer the namespace can reference, and delete existing ones |
+| `cert-manager.io` | `certificates` | full CRUD | Can request certificates from any Issuer/ClusterIssuer the namespace can reference, and delete existing ones. The legacy-Sentinel cleanup deletes only Certificates this Valkey controls by ownerReference ([NA49](local_valkey_operator_admission_gap.md)); no other path deletes a Certificate |
 | `monitoring.coreos.com` | `servicemonitors` | full CRUD | Scrape configuration; used only when `spec.metrics.serviceMonitor.enabled` |
 | `networking.k8s.io` | `networkpolicies` | full CRUD | **Can delete any NetworkPolicy in the cluster**, including policies that protect unrelated workloads |
 | `policy` | `poddisruptionbudgets` | full CRUD | Availability guarantees of any workload can be removed or tightened |
@@ -376,10 +376,15 @@ analysis.
       That triple is namespaced admin everywhere. Test whether the sidecar Role can
       be created without `escalate` now that it is a strict subset of the
       operator's own pod grant (section 4.1) — and if so, drop the verb.
-- [ ] **Gate the legacy Sentinel TLS Secret delete on provenance
-      ([NA49](local_valkey_operator_admission_gap.md), open, awaiting decision).**
-      It deletes by name, with no ownerReference check and no UID precondition,
-      which is the opposite of the rule NA14/NA31 enforce for PDBs.
+- [x] **Gate the legacy Sentinel TLS Secret delete on provenance
+      ([NA49](local_valkey_operator_admission_gap.md), done 2026-08-21).** It used
+      to delete by name, with no ownerReference check and no UID precondition —
+      the opposite of the rule NA14/NA31 enforce for PDBs. The Secret now needs a
+      Certificate this Valkey controls or cert-manager's provenance annotation,
+      and the Certificate beside it needs the ownerReference; both deletes carry a
+      UID precondition and every refusal records a Warning. This bounds what the
+      *reconcile path* touches; narrowing the cluster-wide `secrets` grant itself
+      is the separate item above.
 - [ ] **Narrow the sidecar Role to `patch` with `resourceNames`
       ([NA54](local_valkey_operator_admission_gap.md)).** Dropping the unused
       `list` verb is the precondition — `resourceNames` and `list` are
@@ -405,7 +410,10 @@ analysis.
       ([NA55](local_valkey_operator_admission_gap.md)).
 - [ ] **Restrict who may `create valkeys`.** A CR author chooses the image the
       cluster runs and the name every generated object gets, and generated names
-      collide with existing objects by design (that is [NA49](local_valkey_operator_admission_gap.md)).
+      collide with existing objects by design. [NA49](local_valkey_operator_admission_gap.md)
+      closed the one path where such a collision was destructive; the general
+      property — an attacker-chosen CR name drives every generated name — remains,
+      so any new delete-by-generated-name needs the same provenance discipline.
 - [ ] **Disable the pre-upgrade hook (`preUpgradeHook.enabled: false`) unless a
       migration needs it**, or accept a cluster-wide CRD write grant during every
       upgrade.

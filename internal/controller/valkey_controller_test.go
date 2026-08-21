@@ -108,6 +108,10 @@ func newTestValkey(name, ns string, opts ...func(*vkov1.Valkey)) *vkov1.Valkey {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
+			// A real CR always has one, and ownership checks compare it. Without a
+			// UID here, metav1.IsControlledBy matches an ownerReference whose UID is
+			// also empty, so an ownership test would pass without testing anything.
+			UID: types.UID(name + "-" + ns + "-uid"),
 		},
 		Spec: vkov1.ValkeySpec{
 			Replicas: 1,
@@ -867,7 +871,26 @@ func TestStatusUnchanged_DetectsChanges(t *testing.T) {
 
 // newLegacySentinelCert builds an unstructured cert-manager Certificate matching
 // what the operator created in split-cert mode, so migration tests can stage one.
-func newLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
+// newLegacySentinelCert builds the legacy Sentinel Certificate as the operator
+// itself would have written it: controller ownerReference on the CR and
+// spec.secretName pointing at its own name. That pair is the in-pass provenance
+// proof the cleanup consumes, so a Certificate built any other way is foreign by
+// construction — see newForeignLegacySentinelCert.
+func newLegacySentinelCert(v *vkov1.Valkey, name string) *unstructured.Unstructured {
+	c := newForeignLegacySentinelCert(name, v.Namespace)
+	ownerRef := builder.CertificateOwnerRef(v)
+	blockOwnerDeletion := true
+	isController := true
+	ownerRef.BlockOwnerDeletion = &blockOwnerDeletion
+	ownerRef.Controller = &isController
+	c.SetOwnerReferences([]metav1.OwnerReference{ownerRef})
+	return c
+}
+
+// newForeignLegacySentinelCert builds a Certificate that merely carries the legacy
+// name — no ownerReference to any Valkey. Models the NA49 collision: a name the
+// operator would clean up, on an object it never created.
+func newForeignLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
 	c := &unstructured.Unstructured{}
 	c.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "cert-manager.io",
@@ -878,6 +901,25 @@ func newLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
 	c.SetNamespace(namespace)
 	c.Object["spec"] = map[string]interface{}{"secretName": name}
 	return c
+}
+
+// newLegacySentinelSecret builds the Secret as cert-manager issues it: type
+// kubernetes.io/tls plus the cert-manager.io/certificate-name annotation naming
+// the Certificate that produced it. Verified against cert-manager v1.21.1 — the
+// annotation carries the CERTIFICATE name, which for the legacy Sentinel material
+// equals the Secret name because SentinelCertificateName and SentinelTLSSecretName
+// derive the same string.
+func newLegacySentinelSecret(name, namespace string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Annotations: map[string]string{certManagerCertificateNameAnnotation: name},
+			Labels:      map[string]string{"controller.cert-manager.io/fao": "true"},
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{"tls.crt": []byte("cert"), "tls.key": []byte("key")},
+	}
 }
 
 // stagedSentinelStatefulSet builds a Sentinel StatefulSet that mounts the named
@@ -958,10 +1000,8 @@ func TestReconcileLegacySentinelCleanup_Noop_WhenNotUnified(t *testing.T) {
 			},
 		}
 	})
-	legacyCert := newLegacySentinelCert(builder.SentinelCertificateName(v), "default")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: builder.SentinelCertificateName(v), Namespace: "default"},
-	}
+	legacyCert := newLegacySentinelCert(v, builder.SentinelCertificateName(v))
+	legacySecret := newLegacySentinelSecret(builder.SentinelCertificateName(v), "default")
 	r, c := newTestReconciler(v, legacyCert, legacySecret)
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))
@@ -979,10 +1019,8 @@ func TestReconcileLegacySentinelCleanup_Noop_WhenNotUnified(t *testing.T) {
 func TestReconcileLegacySentinelCleanup_Defers_WhenSTSStillMountsLegacySecret(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v) // oauth2-valkey-sentinel-tls
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	// STS still points at legacy Secret AND pods still on the old revision.
 	sts := stagedSentinelStatefulSet(stsName, legacyCertName)
@@ -1000,10 +1038,8 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodOnOldRevision(t *testin
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
 	unifiedSecretName := builder.ValkeyTLSSecretName(v)
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
 	// Two pods rolled to the new revision, one still on the old one.
@@ -1031,10 +1067,8 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodNotReady(t *testing.T) 
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
 	unifiedSecretName := builder.ValkeyTLSSecretName(v)
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
 	pods := readySentinelPods(stsName, 2)
@@ -1061,10 +1095,8 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenObservedGenerationStale(t *te
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
 	unifiedSecretName := builder.ValkeyTLSSecretName(v)
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
 	// Spec-update has happened (Generation bumped) but STS controller has not yet
@@ -1084,10 +1116,8 @@ func TestReconcileLegacySentinelCleanup_Deletes_WhenAllPodsOnNewRevision(t *test
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
 	unifiedSecretName := builder.ValkeyTLSSecretName(v)
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
 	pods := readySentinelPods(stsName, 3)
@@ -1111,10 +1141,8 @@ func TestReconcileLegacySentinelCleanup_Deletes_WhenSentinelSTSAbsent(t *testing
 	// — cleanup is safe because there are no pods to mount the legacy Secret.
 	v := newTestValkeyUnified()
 	legacyCertName := builder.SentinelCertificateName(v)
-	legacyCert := newLegacySentinelCert(legacyCertName, "iam")
-	legacySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyCertName, Namespace: "iam"},
-	}
+	legacyCert := newLegacySentinelCert(v, legacyCertName)
+	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	r, c := newTestReconciler(v, legacyCert, legacySecret)
 
 	require.NoError(t, r.reconcileLegacySentinelCertificateCleanup(context.Background(), v))

@@ -740,8 +740,15 @@ func (v *Valkey) IsCertManagerEnabled() bool {
 // IsUnifiedCertificateEnabled returns true if Valkey and Sentinel should share
 // a single TLS certificate / Secret. With cert-manager this changes the issued
 // Certificate to cover both hostname sets; with a user-provided Secret the flag
-// is informational (both StatefulSets already mount the same Secret). When
-// Sentinel is disabled, the flag has no observable effect.
+// is informational (both StatefulSets already mount the same Secret).
+//
+// With Sentinel disabled the flag still has one observable effect: it admits
+// reconcileLegacySentinelCertificateCleanup, which garbage-collects the legacy
+// <name>-sentinel-tls Certificate and Secret left behind by an instance that used
+// to run Sentinel. sentinelRolloutComplete short-circuits to "complete" in that
+// case (no pods are bound to the legacy Secret), so the cleanup runs on the first
+// pass with no rollout to wait for. It only ever removes material it can prove is
+// the operator's own — see deleteLegacySentinelSecret (NA49).
 func (v *Valkey) IsUnifiedCertificateEnabled() bool {
 	return v.IsTLSEnabled() && v.Spec.TLS.UnifiedCertificate
 }

@@ -48,6 +48,15 @@ const (
 	certManagerKindCertificate = "Certificate"
 	// conditionTypeReady is the standard "Ready" condition type.
 	conditionTypeReady = "Ready"
+	// certManagerCertificateNameAnnotation is the annotation cert-manager stamps
+	// on every Secret it issues, naming the Certificate that produced it. Verified
+	// against cert-manager v1.21.1: present on all 119 issued Secrets of the
+	// reference cluster, and the value is the Certificate name — not the Secret
+	// name, which can differ (spec.secretName).
+	certManagerCertificateNameAnnotation = "cert-manager.io/certificate-name"
+	// reasonLegacySentinelTLSNotOwned is the Event reason for legacy Sentinel TLS
+	// material that the operator refused to delete for lack of provenance (NA49).
+	reasonLegacySentinelTLSNotOwned = "LegacySentinelTLSNotOwned"
 )
 
 // InstanceChecker verifies connectivity and health of Valkey instances.
@@ -1018,6 +1027,11 @@ func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov
 // unified Secret via its kubelet binding, and is Ready. This prevents pulling
 // the legacy volume out from under any pod that is still bound to it.
 // Idempotent: NotFound is OK.
+//
+// Neither object is deleted on its name alone. <cr>-sentinel-tls is a name a user
+// object can legitimately carry, and a principal who may create Valkey CRs in a
+// namespace picks the CR name — so the name is attacker-chosen input, not evidence
+// of ownership (NA49). The two helpers below each establish provenance first.
 func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context.Context, v *vkov1.Valkey) error {
 	if !v.IsCertManagerEnabled() || !v.IsUnifiedCertificateEnabled() {
 		return nil
@@ -1040,42 +1054,176 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 		return nil
 	}
 
+	ourCertificate, err := r.deleteLegacySentinelCertificate(ctx, v, legacyName)
+	if err != nil {
+		return err
+	}
+
+	return r.deleteLegacySentinelSecret(ctx, v, legacyName, ourCertificate)
+}
+
+// deleteLegacySentinelCertificate removes the legacy per-Sentinel Certificate and
+// reports whether the object under that name was one this Valkey owned and whose
+// spec.secretName pointed at the legacy Secret name. That verdict is the in-pass
+// provenance proof the Secret deletion below consumes; it is returned rather than
+// re-read so the Secret decision costs no second API call.
+//
+// A Certificate that is NOT controlled by this Valkey is left untouched (NA49).
+// The operator sets the ownerReference itself on every Certificate it creates
+// (see reconcileCertificate), so ownership is a self-issued fact here and needs no
+// external convention. A foreign Certificate under this name belongs to someone
+// else; deleting it stops their issuance and renewal.
+//
+// We GET first so a missing resource costs zero delete-permission attempts: the
+// apiserver evaluates authz before existence, so a Delete against a non-existent
+// resource on a cluster without `delete` RBAC returns 403 (Forbidden) rather than
+// 404 (NotFound) and would loop the reconciler.
+func (r *ValkeyReconciler) deleteLegacySentinelCertificate(
+	ctx context.Context, v *vkov1.Valkey, legacyName string,
+) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	// Delete the legacy Certificate only if it actually exists. We GET first
-	// so a missing resource costs zero delete-permission attempts: the
-	// apiserver evaluates authz before existence, so a Delete against a
-	// non-existent resource on a cluster without `delete` RBAC returns 403
-	// (Forbidden) rather than 404 (NotFound) and would loop the reconciler.
 	cert := &unstructured.Unstructured{}
 	cert.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   certManagerGroup,
 		Version: "v1",
 		Kind:    certManagerKindCertificate,
 	})
-	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert); err == nil {
-		if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete certificate %s: %w", legacyName, err)
-		}
-		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get legacy certificate %s: %w", legacyName, err)
+	err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get legacy certificate %s: %w", legacyName, err)
 	}
 
-	// cert-manager does not garbage-collect the Secret it produced; drop it
-	// explicitly so no stale TLS material lingers and the name is free for
-	// future use. Same GET-first guard as above.
+	if !metav1.IsControlledBy(cert, v) {
+		r.warnLegacySentinelTLSNotOwned(ctx, v, certManagerKindCertificate, legacyName,
+			"it is not controlled by this Valkey")
+		return false, nil
+	}
+
+	// The Secret this Certificate issues into. Under the operator's own naming
+	// these coincide with legacyName (SentinelCertificateName and
+	// SentinelTLSSecretName both derive <cr>-sentinel-tls in split-cert mode),
+	// but the check is explicit so a future split of those two derivations
+	// fails loudly instead of silently authorising the wrong Secret.
+	secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
+
+	// UID precondition, same reasoning as cleanupPodDisruptionBudget (NA31): the
+	// ownership decision above was made on a cache-backed read, so the name can
+	// hold a different object by the time the Delete lands.
+	uid := cert.GetUID()
+	switch err := r.Delete(ctx, cert, client.Preconditions{UID: &uid}); {
+	case err == nil || apierrors.IsNotFound(err):
+		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
+	case apierrors.IsConflict(err):
+		// The name now holds a different object, which by definition is not the
+		// Certificate this pass inspected. Nothing went wrong and nothing is left
+		// to do, but the provenance proof no longer applies to whatever is there.
+		logger.Info("Skipping legacy Sentinel Certificate deletion: the object was replaced under its name",
+			"name", legacyName, "uid", uid)
+		return false, nil
+	default:
+		return false, fmt.Errorf("delete certificate %s: %w", legacyName, err)
+	}
+
+	return secretName == legacyName, nil
+}
+
+// deleteLegacySentinelSecret removes the Secret the legacy Sentinel Certificate
+// produced. cert-manager does not garbage-collect it — the Secrets it issues carry
+// no ownerReference unless the controller runs with --enable-certificate-owner-ref
+// (verified absent on the reference cluster) — so without this delete the stale TLS
+// material lingers and the name stays occupied.
+//
+// The delete is never taken on the name alone (NA49). One of two provenance proofs
+// must hold, and the Secret must additionally be a TLS Secret:
+//
+//   - ourCertificate: this same pass found a Certificate under legacyName that this
+//     Valkey controls and that issues into legacyName. Fully self-issued evidence,
+//     but only available while that Certificate still exists.
+//   - the cert-manager provenance annotation names legacyName. Retroactive: it sits
+//     on Secrets issued long before this guard existed, which is the population the
+//     migration actually has to clean up. Verified against cert-manager v1.21.1 on
+//     the reference cluster: present on 119 of 119 issued Secrets, and its value is
+//     the CERTIFICATE name, not the Secret name.
+//
+// A Secret that satisfies neither is left alone and reported as an Event. Failing
+// this way round leaves stale TLS material, which is recoverable by hand; the other
+// direction destroys a Secret the operator never created.
+func (r *ValkeyReconciler) deleteLegacySentinelSecret(
+	ctx context.Context, v *vkov1.Valkey, legacyName string, ourCertificate bool,
+) error {
+	logger := log.FromContext(ctx)
+
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, secret); err == nil {
-		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete secret %s: %w", legacyName, err)
-		}
-		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
-	} else if !apierrors.IsNotFound(err) {
+	err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, secret)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("get legacy secret %s: %w", legacyName, err)
 	}
 
-	return nil
+	if reason, ok := legacySentinelSecretIsOurs(secret, legacyName, ourCertificate); !ok {
+		r.warnLegacySentinelTLSNotOwned(ctx, v, "Secret", legacyName, reason)
+		return nil
+	}
+
+	uid := secret.GetUID()
+	switch err := r.Delete(ctx, secret, client.Preconditions{UID: &uid}); {
+	case err == nil || apierrors.IsNotFound(err):
+		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
+		return nil
+	case apierrors.IsConflict(err):
+		logger.Info("Skipping legacy Sentinel TLS Secret deletion: the object was replaced under its name",
+			"name", legacyName, "uid", uid)
+		return nil
+	default:
+		return fmt.Errorf("delete secret %s: %w", legacyName, err)
+	}
+}
+
+// legacySentinelSecretIsOurs decides whether the Secret under the legacy name is
+// the one the legacy Sentinel Certificate produced. It returns the reason for a
+// refusal so the Event can state what was missing rather than only that something
+// was. See deleteLegacySentinelSecret for why each proof is admissible.
+func legacySentinelSecretIsOurs(secret *corev1.Secret, legacyName string, ourCertificate bool) (string, bool) {
+	// A cert-manager-issued TLS Secret is always kubernetes.io/tls. This does not
+	// establish provenance on its own — an attacker can point the name at a real
+	// TLS Secret — but it removes the entire class of accidental collateral
+	// (token, config and registry Secrets) before either proof is consulted.
+	if secret.Type != corev1.SecretTypeTLS {
+		return fmt.Sprintf("its type is %q, not %q", secret.Type, corev1.SecretTypeTLS), false
+	}
+
+	if ourCertificate {
+		return "", true
+	}
+
+	if secret.Annotations[certManagerCertificateNameAnnotation] == legacyName {
+		return "", true
+	}
+
+	return fmt.Sprintf("neither a Certificate owned by this Valkey nor the %s annotation identifies it "+
+		"as the legacy Sentinel certificate material", certManagerCertificateNameAnnotation), false
+}
+
+// warnLegacySentinelTLSNotOwned reports legacy TLS material that carries the name
+// the operator would clean up but could not be proven to belong to this Valkey.
+//
+// It fires on every applicable pass rather than on a transition: the condition is a
+// property of the cluster, not of an event, and the recorder aggregates a repeated
+// Event into one series. Same shape and rationale as warnPodDisruptionBudgetNotOwned.
+func (r *ValkeyReconciler) warnLegacySentinelTLSNotOwned(
+	ctx context.Context, v *vkov1.Valkey, kind, name, reason string,
+) {
+	log.FromContext(ctx).Info("Legacy Sentinel TLS object exists but was not proven to belong to this Valkey; "+
+		"leaving it untouched", "kind", kind, "name", name, "reason", reason)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonLegacySentinelTLSNotOwned,
+		"%s %s carries the legacy Sentinel TLS name but %s; leaving it untouched. "+
+			"Remove it by hand once you have confirmed it is unused.", kind, name, reason)
 }
 
 // sentinelRolloutComplete reports whether every Sentinel pod has been recreated
