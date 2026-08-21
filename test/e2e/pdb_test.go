@@ -3,7 +3,7 @@
 package e2e
 
 // Tests in this file cover the PodDisruptionBudgets the operator manages for the
-// data and Sentinel StatefulSets (scenario T3 of the admission-gap ticket).
+// data and Sentinel StatefulSets (docs/adr/0004-opt-in-poddisruptionbudgets.md).
 //
 // Incident this guards against (infra-d, 2026-08-19): a single node drain evicted
 // all three data pods at once, because nothing serialized the evictions. The
@@ -43,7 +43,7 @@ const pdbSettleTimeout = 60 * time.Second
 // prove that no PDB appears — long enough to cover several reconcile passes.
 const pdbSkipObservationWindow = 30 * time.Second
 
-// TestE2E_PodDisruptionBudget_SerializesEvictions is scenario T3: with
+// TestE2E_PodDisruptionBudget_SerializesEvictions is ADR 0004 D1, D2: with
 // spec.podDisruptionBudget.enabled, both budgets exist and the Eviction API
 // refuses the second concurrent disruption for data pods and for Sentinel.
 func TestE2E_PodDisruptionBudget_SerializesEvictions(t *testing.T) {

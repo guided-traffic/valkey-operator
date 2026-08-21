@@ -224,7 +224,7 @@ CI runs the E2E job twice, as a matrix in `.github/workflows/release.yml`:
 | `multi-node` | control-plane + 3 workers           | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
 
 The multi-node leg exists because two behaviors are meaningless on one node:
-eviction serialization (T3) and hard-mode anti-affinity spread (T5). Three
+eviction serialization and hard-mode anti-affinity spread. Three
 workers, not two: Kind keeps the control-plane `NoSchedule` taint on multi-node
 clusters, so spreading three replicas needs three schedulable workers.
 

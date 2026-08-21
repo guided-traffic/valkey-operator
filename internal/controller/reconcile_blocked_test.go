@@ -210,7 +210,7 @@ func newInterceptedReconciler(funcs interceptor.Funcs, objs ...client.Object) (*
 }
 
 // TestReconcile_SetsReconcileBlockedOnAdmissionRejection is the unit-level form
-// of T4: a webhook rejecting a managed write must be readable off the CR.
+// of ADR 0002 D1: a webhook rejecting a managed write must be readable off the CR.
 func TestReconcile_SetsReconcileBlockedOnAdmissionRejection(t *testing.T) {
 	v := newTestValkey("test", "default")
 	rejectConfigMaps := interceptor.Funcs{
@@ -237,7 +237,7 @@ func TestReconcile_SetsReconcileBlockedOnAdmissionRejection(t *testing.T) {
 }
 
 // TestReconcile_ClearsReconcileBlockedAfterSuccess covers the True->False
-// transition across a Reconcile pass, the second half of T4.
+// transition across a Reconcile pass, the second half of ADR 0002 D1.
 func TestReconcile_ClearsReconcileBlockedAfterSuccess(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, c := newTestReconciler(v)

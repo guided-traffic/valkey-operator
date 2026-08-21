@@ -3,12 +3,14 @@
 package e2e
 
 // Tests in this file cover the pod anti-affinity the operator renders into the
-// data and Sentinel pod templates (scenario T5 of the admission-gap ticket).
+// data and Sentinel pod templates
+// (docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md).
 //
 // Incident this guards against (infra-d, 2026-08-19): all three data pods of one
 // cluster sat on the same node, so a single drain took the whole data plane down
 // at once. Anti-affinity prevents that co-location up front; the PodDisruptionBudget
-// (T3) only serializes the evictions that remain.
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md) only serializes the evictions that
+// remain.
 //
 // The default is off — an operator upgrade must not change the scheduling of
 // existing clusters — so spreading is an explicit opt-in to soft or hard. The
@@ -53,9 +55,9 @@ const pendingObservationTimeout = 90 * time.Second
 // exists for, and a skip reads as green.
 const multiNodeRequiredEnv = "E2E_REQUIRE_MULTI_NODE"
 
-// TestE2E_AntiAffinity_OffByDefault guards the default half of T5: a CR that says
-// nothing about anti-affinity gets no term on either StatefulSet, so upgrading the
-// operator changes nothing about how existing clusters are scheduled.
+// TestE2E_AntiAffinity_OffByDefault guards ADR 0005 D1, D2: a CR that says nothing
+// about anti-affinity gets no term on either StatefulSet, so upgrading the operator
+// changes nothing about how existing clusters are scheduled.
 func TestE2E_AntiAffinity_OffByDefault(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)
@@ -85,9 +87,9 @@ func TestE2E_AntiAffinity_OffByDefault(t *testing.T) {
 	}
 }
 
-// TestE2E_AntiAffinity_SoftWhenRequested is the soft half of T5: with mode: soft
-// both StatefulSets get a preferred term on the hostname, and — because a
-// preference never blocks scheduling — the cluster becomes ready even when the
+// TestE2E_AntiAffinity_SoftWhenRequested is the soft half of ADR 0005 D2, D6: with
+// mode: soft both StatefulSets get a preferred term on the hostname, and — because
+// a preference never blocks scheduling — the cluster becomes ready even when the
 // nodes cannot satisfy the spread.
 func TestE2E_AntiAffinity_SoftWhenRequested(t *testing.T) {
 	t.Parallel()
@@ -129,9 +131,9 @@ func TestE2E_AntiAffinity_SoftWhenRequested(t *testing.T) {
 	})
 }
 
-// TestE2E_AntiAffinity_HardSpreadsAcrossNodes is the hard half of T5: with
-// mode: hard the three data pods and the three Sentinel pods each land on three
-// distinct nodes. Needs a cluster with at least three schedulable nodes.
+// TestE2E_AntiAffinity_HardSpreadsAcrossNodes is the hard half of ADR 0005 D2, D6:
+// with mode: hard the three data pods and the three Sentinel pods each land on
+// three distinct nodes. Needs a cluster with at least three schedulable nodes.
 func TestE2E_AntiAffinity_HardSpreadsAcrossNodes(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)

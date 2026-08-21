@@ -21,8 +21,8 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-// Tests in this file cover WP3 of the admission-gap ticket: a rejected write on
-// one sub-resource must not silence the rest of the reconcile pass.
+// Tests in this file cover ADR 0001: a rejected write on one sub-resource must not
+// silence the rest of the reconcile pass.
 
 // --- runReconcileSteps ---
 
@@ -183,9 +183,9 @@ func TestReconcileResources_NoErrorOnHealthyPass(t *testing.T) {
 
 // --- full Reconcile pass ---
 
-// TestReconcile_ReconcilesDataPlaneWhileBlocked is the unit-level form of T2:
-// while one managed write is rejected, the rest of the pass — including the
-// StatefulSet and the status update — still runs.
+// TestReconcile_ReconcilesDataPlaneWhileBlocked is the unit-level form of
+// ADR 0001 D1, D4: while one managed write is rejected, the rest of the pass —
+// including the StatefulSet and the status update — still runs.
 func TestReconcile_ReconcilesDataPlaneWhileBlocked(t *testing.T) {
 	v := newBlockedValkey()
 	r, c := newInterceptedReconciler(rejectCreateOf(&networkingv1.NetworkPolicy{}), v)

@@ -337,8 +337,9 @@ func TestNudgeShortStatefulSets_NudgesBothDuringDataRollingUpdate(t *testing.T) 
 }
 
 // TestReconcileWorkload_RequeuesWhileShortOfPods is the regression guard for the
-// defect that made T1 fail: a StatefulSet whose pod creates are rejected leaves the
-// CR in Provisioning, and Provisioning is not covered by the health-based requeue.
+// defect ADR 0003 D5 describes: a StatefulSet whose pod creates are rejected leaves
+// the CR in Provisioning, and Provisioning is not covered by the health-based
+// requeue.
 // Without a requeue of its own the operator goes dormant — no pods means no pod
 // events, an unwritten StatefulSet means no informer event, and
 // GenerationChangedPredicate swallows the status writes — so the nudge never fires.

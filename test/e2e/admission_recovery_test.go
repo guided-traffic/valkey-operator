@@ -41,8 +41,9 @@ import (
 // statefulset-controller resync (internal/builder.AnnotationNudge).
 const nudgeAnnotationKey = "vko.gtrfc.com/nudge"
 
-// blackholeWebhookName is the webhook name the API server quotes in its
-// rejection message; T4 asserts the CR condition carries exactly this string.
+// blackholeWebhookName is the webhook name the API server quotes in its rejection
+// message; TestE2E_AdmissionRejection_ReconcileBlockedCondition asserts the CR
+// condition carries exactly this string.
 const blackholeWebhookName = "blackhole.e2e.vko.gtrfc.com"
 
 // admissionBlockHold is how long pod creation stays blocked. It is long enough
@@ -86,7 +87,8 @@ func (tc *testClients) blockCoreResourceCreation(t *testing.T, namespace, name s
 
 // blockResourceOperations is the general form of blockCoreResourceCreation: it
 // blocks the given operations on the given apiGroup/apiVersion resources in one
-// namespace. T2 uses it for UPDATE on apps/v1 statefulsets.
+// namespace. TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite uses
+// it for UPDATE on apps/v1 statefulsets.
 func (tc *testClients) blockResourceOperations(t *testing.T, namespace, name, apiGroup, apiVersion string,
 	operations []admissionregistrationv1.OperationType, resources ...string) func() {
 	t.Helper()
@@ -182,8 +184,8 @@ func (tc *testClients) waitForStatefulSetCreatedPods(ctx context.Context, namesp
 	})
 }
 
-// TestE2E_AdmissionRejection_StatefulSetNudgeRecovery is scenario T1 of the
-// admission-gap ticket.
+// TestE2E_AdmissionRejection_StatefulSetNudgeRecovery is the e2e scenario for
+// ADR 0003.
 //
 // Step "all data pods return shortly after the webhook is removed" is a forward
 // assertion, not the regression guard for the nudge: against an operator without
@@ -330,14 +332,15 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	})
 }
 
-// TestE2E_AdmissionRejection_ReconcileBlockedCondition is scenario T4 of the
-// admission-gap ticket: while a fail-closed webhook rejects a write the operator
-// owns, the CR must name the webhook instead of leaving the user with a bare
-// "Error" phase and operator logs to read.
+// TestE2E_AdmissionRejection_ReconcileBlockedCondition is ADR 0002 D1, D2: while
+// a fail-closed webhook rejects a write the operator owns, the CR must name the
+// webhook instead of leaving the user with a bare "Error" phase and operator logs
+// to read.
 //
 // The webhook here blocks CREATE configmaps, not pods: the operator writes the
 // ConfigMap itself, whereas pod creation is the statefulset-controller's job and
-// never reaches the operator's error path (that failure mode is T1 above).
+// never reaches the operator's error path (that failure mode is
+// TestE2E_AdmissionRejection_StatefulSetNudgeRecovery above).
 func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
 	t.Parallel()
 	tc := newTestClients(t)
@@ -427,10 +430,10 @@ func (tc *testClients) waitForNetworkPolicies(t *testing.T, namespace string, ti
 	return count
 }
 
-// TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite is scenario T2
-// of the admission-gap ticket, guarding WP3: while a fail-closed webhook rejects
-// UPDATE on statefulsets, the steps behind the StatefulSet write must still run
-// and the CR status must keep telling the truth about the data plane.
+// TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite is ADR 0001 D1,
+// D4: while a fail-closed webhook rejects UPDATE on statefulsets, the steps behind
+// the StatefulSet write must still run and the CR status must keep telling the
+// truth about the data plane.
 //
 // On 1.10.46 reconcileResources returned on the first failing sub-resource, so a
 // single rejected StatefulSet write silenced NetworkPolicies, monitoring and the

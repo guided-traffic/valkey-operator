@@ -42,7 +42,7 @@ jobs:
             run_filter: ""
             require_multi_node: "false"
           # Multi-node leg: re-runs only the scenarios whose outcome depends on the
-          # node count - T3 (eviction serialization) and T5 (anti-affinity spread).
+          # node count - eviction serialization and anti-affinity spread.
           # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
           # multi-node clusters, so spreading three replicas needs three workers.
           - topology: multi-node
