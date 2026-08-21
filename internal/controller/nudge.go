@@ -38,17 +38,27 @@ const nudgeGracePeriod = 10 * time.Second
 // after the short state is first observed.
 const nudgeRequeueInterval = 5 * time.Second
 
-// nudgeTracker records when a StatefulSet was first observed short of pods.
-// It only implements the grace period; the rate limit between bumps lives in the
-// nudge annotation itself. Losing the map on operator restart is harmless — the
-// worst case is one extra annotation patch, which is the desired action anyway.
+// nudgeTracker records the first time a key was observed in a condition the
+// operator is waiting out. Losing the map on operator restart is harmless
+// everywhere it is used: the durable copy of every deadline lives on the API
+// objects, and the worst case here is that one wait starts counting again.
+//
+// It backs two disjoint sets of keys:
+//
+//   - the nudge grace period, keyed by StatefulSet (this file);
+//   - the rolling-update wait bounds, keyed by CR name plus a bound suffix
+//     (waitBoundKey in rolling_update.go), which back the annotation-based
+//     deadlines for the passes where the annotation write can fail.
+//
+// Only the grace period is implemented here; the rate limit between nudge bumps
+// lives in the nudge annotation itself.
 type nudgeTracker struct {
 	mu    sync.Mutex
 	first map[types.NamespacedName]time.Time
 }
 
-// observe returns the time key was first seen short of pods, recording now when
-// this is the first observation.
+// observe returns the time key was first seen, recording now when this is the
+// first observation.
 func (t *nudgeTracker) observe(key types.NamespacedName, now time.Time) time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -62,6 +72,15 @@ func (t *nudgeTracker) observe(key types.NamespacedName, now time.Time) time.Tim
 	return now
 }
 
+// firstSeen returns the recorded first observation for key without creating one.
+// Callers that only want to read a deadline must not arm it as a side effect.
+func (t *nudgeTracker) firstSeen(key types.NamespacedName) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	seen, ok := t.first[key]
+	return seen, ok
+}
+
 // forget drops the recorded observation for key.
 func (t *nudgeTracker) forget(key types.NamespacedName) {
 	t.mu.Lock()
@@ -70,13 +89,16 @@ func (t *nudgeTracker) forget(key types.NamespacedName) {
 }
 
 // forgetNudges drops the grace-period observations of both StatefulSets belonging
-// to the named CR.
+// to the named CR, plus the rolling-update wait bounds recorded for it.
 //
 // It exists for the two Reconcile exits that never look at a StatefulSet again:
 // the CR is gone, or it is being deleted. nudgeStatefulSet is the only other place
 // that forgets, and it is unreachable from there — so without this the tracker
 // keeps two entries per deleted CR until the operator restarts. The leak is
-// bytes-sized, but it is unbounded in a namespace that churns CRs.
+// bytes-sized, but it is unbounded in a namespace that churns CRs. The wait bounds
+// share the tracker and both exits, so they are dropped here for the same reason;
+// their own forget site is clearRollingUpdateState, equally unreachable once the
+// CR is gone.
 func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
 	v := &vkov1.Valkey{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	for _, component := range []string{common.ComponentValkey, common.ComponentSentinel} {
@@ -85,6 +107,7 @@ func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
 			Namespace: namespace,
 		})
 	}
+	r.forgetWaitBounds(namespace, name)
 }
 
 // nudgeShortStatefulSets patches a nudge annotation onto the data and Sentinel
