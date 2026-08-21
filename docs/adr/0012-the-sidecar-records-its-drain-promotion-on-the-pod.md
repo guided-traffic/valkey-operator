@@ -17,8 +17,16 @@ is now pinned by a regression test, `TestRunSidecar_LabelsThePodThenDrains` in
 Amended 2026-08-21: three of the four open items are closed — D8 step 1 (the Role
 now grants `patch` only), D9 (the outgoing master is demoted, guarded by
 `TestPromoteAndRedirect_DemotesTheOutgoingMaster`) and the dead `NewLabeler`
-(deleted). **Open:** D8 steps 2 and 3 — the observer's own token-less
-ServiceAccount, then `resourceNames`. See Residual risks.
+(deleted).
+
+Amended 2026-08-21 (second amendment): **D8 is complete.** Step 2 shipped — the observer
+runs under its own Role-less ServiceAccount `<cr-name>-observer` with
+`automountServiceAccountToken: false` — and so did step 3: the sidecar Role grants
+`patch` on named pods only. Step 3 is **wider than the original wording**: the name list
+is the union of the pods `spec.replicas` asks for and the pods that currently exist, not
+`spec.replicas` alone. D8 records why. Nothing in this ADR is open any more; the residual
+risks that remain are named in Residual risks and are consequences of the design, not
+unfinished work.
 
 ## Context
 
@@ -117,18 +125,43 @@ grep over both packages, not assumed. The order is:
    by `TestBuildSidecarRole`, and the operator rewrites the Role on every reconcile, so
    existing clusters narrow on the next pass;
 2. give the observer its own ServiceAccount with no Role at all, **and** set
-   `automountServiceAccountToken: false` on its pod spec
-   ([`internal/builder/observer.go`](../../internal/builder/observer.go)). No builder in this
-   repo sets that field — grep over `internal/builder` returns nothing — so without it the
-   observer keeps mounting a token even once its ServiceAccount grants nothing;
-3. then `verbs: [patch]` with `resourceNames: ["<sts>-0" … "<sts>-N-1"]`.
+   `automountServiceAccountToken: false` on its pod spec — **done 2026-08-21**. The
+   ServiceAccount is `<cr-name>-observer` (`BuildObserverServiceAccount`,
+   [`internal/builder/observer.go`](../../internal/builder/observer.go)); nothing binds a
+   Role to it, and `ObserverDeploymentHasChanged` compares both the ServiceAccount name and
+   the automount flag, so an observer created before this change is rolled onto the new
+   identity instead of keeping the sidecar token forever;
+3. then `verbs: [patch]` with `resourceNames` — **done 2026-08-21**, and the list is
+   **the union of the desired and the existing pods**, not `["<sts>-0" … "<sts>-N-1"]` as
+   this step originally read. The superseded wording covered scale-up and broke scale-down:
+   with the list derived from `spec.replicas` alone, scaling 5 -> 3 revokes the grant of
+   pods 3 and 4 while they are still terminating, and the departing master needs exactly
+   that grant to set `instanceRole=draining` on itself before it fails over — denying it
+   keeps writes flowing into a dying master. `BuildSidecarRole` therefore takes the live
+   pod names and `SidecarRolePodNames` unions them with the desired ordinals
+   ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)); a name leaves the grant
+   when its pod is gone, not when the spec stops asking for it.
 
-Dropping `list` is a **hard precondition** for step 3: `resourceNames` is incompatible with
-`list` in Kubernetes RBAC. Step 3 also needs a scale-up ordering guarantee — the name list
-derives from `spec.replicas`, so a scale-up must reconcile the Role *before* the new pod's
-sidecar starts patching, or that sidecar 403s until the next pass. The operator already
-writes the Role on every reconcile, so this is one builder change plus an ordering test, not
-a new mechanism.
+Dropping `list` was a **hard precondition** for step 3: `resourceNames` is incompatible with
+`list` in Kubernetes RBAC.
+
+Three properties of step 3 hold it together, each with its own guard:
+
+* **Scale-up ordering.** `reconcileResources` runs the `sidecar RBAC` step before the
+  `StatefulSet` step ([`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go),
+  `resourceReconcileSteps`), so pod N is named before the write that creates it. Pinned by
+  `TestResourceReconcileSteps_RBACBeforeStatefulSet`.
+* **An empty name list is not an empty grant.** In Kubernetes RBAC `resourceNames: []`
+  matches *every* object, so a cluster with no pod to patch gets **no rule at all** rather
+  than a namespace-wide one (`TestBuildSidecarRole_NoPodsYieldsNoRuleRatherThanAnOpenOne`).
+* **A label does not widen the grant.** The live names come from a label selector, and
+  labels are set by whoever creates the pod, so `SidecarRolePodNames` keeps only names of
+  the exact form `<sts>-<canonical ordinal>`
+  (`TestSidecarRolePodNames_IgnoresNamesThatAreNotThisStatefulSets`).
+
+The pod List is part of the step: if it fails, `reconcileSidecarRole` fails rather than
+narrowing the Role on incomplete information — the Role already in the cluster is the wider
+one, and leaving it is the safe direction.
 
 **D9 — The outgoing master is demoted, strictly after the promotion succeeds and before the
 redirect loop, and the demotion is best-effort.** Implemented 2026-08-21 in the
@@ -223,11 +256,24 @@ costs the injection seam the sidecar tests rely on.
 
 ## Residual risks
 
-* **The sidecar Role is namespace-wide `patch` (D8 step 1 done, steps 2 and 3 open).** The
-  unused `get`/`list` are gone, but any principal holding one cluster's sidecar token can
-  still patch every pod in the namespace — including another cluster's drain stamp, which
-  the operator consumes as promotion evidence. `resourceNames` (step 3) is what closes that,
-  after the observer ServiceAccount split (step 2).
+* **(Closed 2026-08-21) The sidecar Role is namespace-wide `patch`.** D8 is complete: the
+  grant is `patch` on this cluster's own data pods by name, so a stolen sidecar token no
+  longer reaches another cluster's pods — and therefore cannot forge the drain stamp the
+  operator consumes as promotion evidence. What the grant still permits, by construction:
+  patching **any metadata** on **this** cluster's pods, including its own `instanceRole`
+  and its peers' drain stamps. Nothing narrower is possible — those are the writes the
+  sidecar exists to make. A compromised sidecar can still lie about its own cluster.
+* **A pod keeps its grant until it is gone, not until the spec drops it.** The union in
+  `SidecarRolePodNames` is deliberate (D8 step 3). The cost: a pod that lingers — stuck
+  terminating, or orphaned with the cluster's labels — keeps a `patch` grant on its own
+  name for as long as it exists. That is strictly narrower than the previous
+  namespace-wide grant and it is bounded by the pod's own lifetime.
+* **The Role is written from a cache-backed List.** A pod that exists but has not reached
+  the operator's informer yet is not in the name list, so a sidecar starting in the same
+  instant can see a 403 until the next pass writes the wider list. The labeler logs the
+  failure and retries on its next poll without advancing `lastRole`
+  ([`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go)), and the drain
+  handler continues with the failover, so neither path loses work over it.
 * **(Closed 2026-08-21) The two-master termination window.** `promoteAndRedirect` now demotes
   the outgoing master per D9, so no two pods answer `role:master` beyond the seconds the
   demotion itself takes. What D9 cannot cover: a demotion that fails is logged and the window
@@ -238,16 +284,28 @@ costs the injection seam the sidecar tests rely on.
   that are already asserted directly elsewhere (`TestValkeyRoleDetector_TLSConfigError`,
   `TestNewKubernetesPodPatcher_OutsideClusterFails`), and in their wrapped form on the live
   path (`run_test.go`). The live wiring in `run.go` is now the only copy.
-* **The observer shares the sidecar ServiceAccount and mounts a token it never uses
-  (open).** Closing it needs both halves of step 2 in D8: its own Role-less ServiceAccount
-  *and* `automountServiceAccountToken: false`.
+* **(Closed 2026-08-21) The observer shares the sidecar ServiceAccount and mounts a token
+  it never uses.** Both halves of D8 step 2 shipped: `<cr-name>-observer`, bound to no Role,
+  with `automountServiceAccountToken: false`. Migration costs one observer Deployment roll
+  (stateless). What is **not** closed and is new with it: the observer ServiceAccount is
+  reconciled by name, so a pre-existing ServiceAccount that happens to carry the derived
+  name is adopted and relabelled rather than refused. The consequence is bounded — the
+  observer mounts no token, so it gains no capability from a foreign ServiceAccount — and
+  the *deletion* side is already guarded by an ownership check and a UID precondition
+  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)), so the operator never deletes a
+  ServiceAccount it does not own.
+* **The valkey and exporter containers still carry the sidecar token.** The grant is now
+  per-pod-name, but it is mounted into every container of the data pod, not only into the
+  sidecar. Closing that means a second ServiceAccount and a token-projection split that
+  Kubernetes does not offer per container — it is a pod-level field. Accepted.
 
 ## References
 
 * [`internal/sidecar/drain.go`](../../internal/sidecar/drain.go) — `Handle`, `findSyncedReplica`, `isSyncedReplica`, `reconfigureReplicas`, `stampPromotion`, `waitForRoleChange`
 * [`internal/sidecar/run.go`](../../internal/sidecar/run.go) — the labeler/drain shutdown ordering, the drain timeout
 * [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `patchMetadata`, `PatchLabel`, `PatchAnnotation`
-* [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarRole`, `BuildSidecarServiceAccount`
+* [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarRole`, `BuildSidecarServiceAccount`, `SidecarRolePodNames` (D8 step 3)
+* [`internal/builder/observer.go`](../../internal/builder/observer.go) — `BuildObserverServiceAccount`, the observer pod identity (D8 step 2)
 * [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — operator-side `promoteAndRedirect`, `waitForWriteSync` (D9)
 * [`internal/common/annotations.go`](../../internal/common/annotations.go) — `AnnotationDrainPromotedAt`
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — how the stamp is consumed, cleared and outranked

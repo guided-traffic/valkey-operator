@@ -97,8 +97,72 @@ func TestBuildObserverDeployment_Standalone(t *testing.T) {
 	assert.Empty(t, c.VolumeMounts)
 	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
 
-	// ServiceAccount.
-	assert.Equal(t, "test-sidecar", deploy.Spec.Template.Spec.ServiceAccountName)
+	// ServiceAccount: the observer's own, not the sidecar's, and no token mounted.
+	assert.Equal(t, "test-observer", deploy.Spec.Template.Spec.ServiceAccountName,
+		"the observer must not run under the sidecar ServiceAccount, which grants pods patch")
+	require.NotNil(t, deploy.Spec.Template.Spec.AutomountServiceAccountToken)
+	assert.False(t, *deploy.Spec.Template.Spec.AutomountServiceAccountToken,
+		"the observer calls no Kubernetes API, so it mounts no token (ADR 0012 D8 step 2)")
+}
+
+// --- ObserverServiceAccountName / BuildObserverServiceAccount ---
+
+func TestObserverServiceAccountName(t *testing.T) {
+	assert.Equal(t, "my-valkey-observer", ObserverServiceAccountName(newTestValkey("my-valkey")))
+}
+
+func TestBuildObserverServiceAccount(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) { v.Namespace = "production" })
+
+	sa := BuildObserverServiceAccount(v)
+
+	require.NotNil(t, sa)
+	assert.Equal(t, "my-valkey-observer", sa.Name)
+	assert.Equal(t, "production", sa.Namespace)
+	assert.Equal(t, ComponentObserver, sa.Labels[common.LabelComponent])
+	assert.Equal(t, "my-valkey", sa.Labels[common.LabelInstance])
+	assert.NotEqual(t, SidecarServiceAccountName(v), sa.Name,
+		"sharing the sidecar name would share its Role")
+}
+
+// --- ObserverDeploymentHasChanged: pod identity ---
+
+func TestObserverDeploymentHasChanged_ServiceAccountName(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+
+	// An observer created before ADR 0012 D8 step 2 ran under the sidecar SA and
+	// mounted its token. Nothing else about the pod changed, so without this
+	// comparison the narrowing would never reach an existing cluster.
+	legacy := desired.DeepCopy()
+	legacy.Spec.Template.Spec.ServiceAccountName = SidecarServiceAccountName(v)
+	legacy.Spec.Template.Spec.AutomountServiceAccountToken = nil
+
+	assert.True(t, ObserverDeploymentHasChanged(desired, legacy))
+	assert.False(t, ObserverDeploymentHasChanged(desired, desired.DeepCopy()),
+		"an already-migrated observer must not be rewritten on every pass")
+}
+
+func TestObserverDeploymentHasChanged_AutomountToken(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+
+	unset := desired.DeepCopy()
+	unset.Spec.Template.Spec.AutomountServiceAccountToken = nil
+	assert.True(t, ObserverDeploymentHasChanged(desired, unset),
+		"an unset field means the token is mounted, which is what the change removes")
+
+	explicitTrue := desired.DeepCopy()
+	explicitTrue.Spec.Template.Spec.AutomountServiceAccountToken = ptr.To(true)
+	assert.True(t, ObserverDeploymentHasChanged(desired, explicitTrue))
+
+	// nil and an explicit true are the same state and must not churn against each other.
+	bothMount := unset.DeepCopy()
+	assert.False(t, ObserverDeploymentHasChanged(explicitTrue, bothMount))
 }
 
 func TestBuildObserverDeployment_Args_Standalone(t *testing.T) {

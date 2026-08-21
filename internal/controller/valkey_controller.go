@@ -434,7 +434,19 @@ func needsReplicaConfigMap(v *vkov1.Valkey) bool {
 // The returned error joins every step that failed; the caller mirrors it into the
 // ReconcileBlocked condition and the CR phase.
 func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1.Valkey) error {
-	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+	return r.runReconcileSteps(ctx, valkey, r.resourceReconcileSteps())
+}
+
+// resourceReconcileSteps returns the steps of a resource pass, in the order they run.
+//
+// The order carries one guarantee: **"sidecar RBAC" runs before "StatefulSet"**. The
+// sidecar Role grants patch on named pods (ADR 0012 D8 step 3), so on a scale-up the
+// Role has to name pod N before the StatefulSet write creates it — otherwise the new
+// pod's sidecar 403s on its own role label until the next pass. Moving the StatefulSet
+// step ahead of the RBAC step reopens that window; TestResourceReconcileSteps_RBACBeforeStatefulSet
+// exists to catch that.
+func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
+	return []reconcileStep{
 		{name: "ConfigMap", run: r.reconcileConfigMap},
 		{name: "replica ConfigMap", when: needsReplicaConfigMap, run: r.reconcileReplicaConfigMap},
 		{name: "TLS Certificates", when: (*vkov1.Valkey).IsCertManagerEnabled, run: r.reconcileTLSCertificates},
@@ -445,7 +457,7 @@ func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1
 		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
 		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
 		{name: "monitoring", run: r.reconcileMonitoringResources},
-	})
+	}
 }
 
 // reconcileMonitoringResources reconciles the Observer deployment and the metrics
@@ -571,12 +583,52 @@ func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.V
 	return nil
 }
 
-// reconcileObserver creates the observer deployment when enabled, or cleans it up when disabled.
+// reconcileObserver creates the observer ServiceAccount and Deployment when enabled,
+// or cleans both up when disabled. The ServiceAccount is written first: the Deployment
+// names it, and a pod whose ServiceAccount does not exist yet is rejected by the
+// ServiceAccount admission plugin.
 func (r *ValkeyReconciler) reconcileObserver(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsObserverEnabled() {
+		if err := r.reconcileObserverServiceAccount(ctx, valkey); err != nil {
+			return err
+		}
 		return r.reconcileObserverDeployment(ctx, valkey)
 	}
 	return r.cleanupObserverDeployment(ctx, valkey)
+}
+
+// reconcileObserverServiceAccount creates or updates the observer ServiceAccount.
+// No Role and no RoleBinding accompany it — that is the point of it (ADR 0012 D8 step 2).
+func (r *ValkeyReconciler) reconcileObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildObserverServiceAccount(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on Observer ServiceAccount: %w", err)
+	}
+	current := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Observer ServiceAccount", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("creating Observer ServiceAccount: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
+		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
+		return nil
+	}
+	logger.Info("Updating Observer ServiceAccount", "name", desired.Name)
+	current.Labels = desired.Labels
+	current.Annotations = desired.Annotations
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating Observer ServiceAccount: %w", err)
+	}
+	return nil
 }
 
 // reconcileServices reconciles all Service resources: headless, -rw, and (for multi-replica)
@@ -757,16 +809,45 @@ func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v
 	return nil
 }
 
+// listDataPodNames returns the names of the pods that currently carry this cluster's
+// data-pod selector labels, including pods that are terminating — a pod on its way out
+// is exactly the one whose sidecar still needs to patch.
+func (r *ValkeyReconciler) listDataPodNames(ctx context.Context, v *vkov1.Valkey) ([]string, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(v.Namespace),
+		client.MatchingLabels(common.SelectorLabels(v, common.ComponentValkey)),
+	); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(podList.Items))
+	for i := range podList.Items {
+		names = append(names, podList.Items[i].Name)
+	}
+	return names, nil
+}
+
 // reconcileSidecarRole creates or updates the sidecar Role.
+//
+// The grant is scoped to named pods, so the pass has to know which pods exist: a
+// scale-down keeps a departing pod in the list until it is actually gone, or its
+// drain handler could not set its own draining label (builder.SidecarRolePodNames).
+// A failed List fails the step rather than narrowing the Role on incomplete
+// information — the Role already in the cluster is the wider one, and leaving it
+// is the safe direction.
 func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
-	desired := builder.BuildSidecarRole(v)
+	livePodNames, err := r.listDataPodNames(ctx, v)
+	if err != nil {
+		return fmt.Errorf("listing data pods for the sidecar Role: %w", err)
+	}
+	desired := builder.BuildSidecarRole(v, livePodNames)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on sidecar Role: %w", err)
 	}
 	current := &rbacv1.Role{}
-	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	err = r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating sidecar Role", "name", desired.Name)
 		if err := r.Create(ctx, desired); err != nil {
@@ -1478,6 +1559,17 @@ func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vko
 		}
 	}
 
+	// Delete the Observer ServiceAccount. A deleted CR garbage-collects it through the
+	// owner reference; this covers the observer being switched off instead.
+	//
+	// Ownership-checked and UID-preconditioned, unlike the two name-only cleanups above:
+	// <cr-name>-observer is a name a CR author can aim at a pre-existing ServiceAccount,
+	// and deleting a foreign one takes every Role bound to it out of service
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md).
+	if err := r.cleanupObserverServiceAccount(ctx, v); err != nil {
+		return err
+	}
+
 	// Delete Observer NetworkPolicy if NP is enabled.
 	if v.IsNetworkPolicyEnabled() {
 		np := &networkingv1.NetworkPolicy{}
@@ -1491,6 +1583,45 @@ func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vko
 	}
 
 	return nil
+}
+
+// cleanupObserverServiceAccount deletes the observer ServiceAccount, but only the one
+// this CR owns. A foreign ServiceAccount that merely shares the derived name is left
+// alone, and the UID precondition keeps the delete on the object that was inspected:
+// the ownership decision is made on a cache-backed read, so the name can hold a
+// different object by the time the Delete lands (ADR 0006 D8, D9).
+func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+
+	sa := &corev1.ServiceAccount{}
+	name := types.NamespacedName{Name: builder.ObserverServiceAccountName(v), Namespace: v.Namespace}
+	if err := r.Get(ctx, name, sa); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if !metav1.IsControlledBy(sa, v) {
+		logger.Info("Skipping Observer ServiceAccount deletion: not owned by this Valkey", "name", sa.Name)
+		return nil
+	}
+
+	logger.Info("Deleting Observer ServiceAccount", "name", sa.Name)
+	err := r.Delete(ctx, sa, client.Preconditions{UID: &sa.UID})
+	switch {
+	case err == nil || apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		// The name holds a different object than the one this pass inspected, so there
+		// is nothing of ours left to delete. The guard did its job; the pass is not
+		// failed over it.
+		logger.Info("Skipping Observer ServiceAccount deletion: the object was replaced under its name",
+			"name", sa.Name)
+		return nil
+	default:
+		return fmt.Errorf("deleting observer service account: %w", err)
+	}
 }
 
 // isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.

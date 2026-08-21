@@ -29,8 +29,8 @@ A `DEVELOPER.md` does not exist yet.
 |---|---|---|---|
 | **Operator manager** | ServiceAccount `<release>` in the release namespace, bound by a **ClusterRoleBinding** ([`clusterrolebinding.yaml`](deploy/helm/valkey-operator/templates/clusterrolebinding.yaml)) | **Cluster-wide, all namespaces** | Every rule in section 4. Reads every Secret in the cluster, writes RBAC, deletes pods and Secrets |
 | **Pre-upgrade hook** | ServiceAccount `<release>-upgrade`, cluster-wide, created and deleted per `helm upgrade` ([`pre-upgrade-rbac.yaml`](deploy/helm/valkey-operator/templates/pre-upgrade-rbac.yaml)) | Cluster-wide, lifetime of the hook Job | `valkeys` get/list/patch/update and `customresourcedefinitions` get/list/patch/update |
-| **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **One namespace**, `pods` patch on *all* pods in it | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
-| **Observer** | The **same** `<cr-name>-sidecar` ServiceAccount ([`internal/builder/observer.go:113`](internal/builder/observer.go)) | Same namespaced grant | Nothing — it makes no Kubernetes API call at all (verified: no `client-go` import in `internal/observer` or `cmd/observer`) |
+| **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **This cluster's own data pods**, by name: `pods` patch with `resourceNames` (section 4.2) | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
+| **Observer** | Its **own** ServiceAccount `<cr-name>-observer`, bound to no Role, with `automountServiceAccountToken: false` ([`BuildObserverServiceAccount`](internal/builder/observer.go)) | None — no Role, and no token mounted | Nothing — it makes no Kubernetes API call at all (verified: no `client-go` import in `internal/observer` or `cmd/observer`) |
 | **Valkey pods** | Same `<cr-name>-sidecar` ServiceAccount — the whole pod, so the `valkey`, `sidecar` and `exporter` containers all carry the token ([`statefulset.go:547`](internal/builder/statefulset.go)) | Same | The `valkey` process itself needs no API access; only the sidecar container uses the token |
 | **Sentinel pods** | The namespace `default` ServiceAccount ([`sentinel.go:368`](internal/builder/sentinel.go)) | Whatever `default` is bound to (nothing, in a stock cluster) | Nothing — Sentinel pods carry no labeler sidecar |
 | **CR author** | Any principal with `create valkeys` in a namespace | That namespace | Chooses images, the auth Secret name, the TLS mode — see section 3 for what that buys them |
@@ -39,22 +39,25 @@ A `DEVELOPER.md` does not exist yet.
         cluster scope                          namespace scope
   ┌───────────────────────────┐        ┌──────────────────────────────────┐
   │  ClusterRole              │        │  Role <cr>-sidecar               │
-  │  valkey-operator-role     │        │  pods: get,list,patch            │
+  │  valkey-operator-role     │        │  pods: patch                     │
+  │                           │        │  resourceNames: <cr>-0 … <cr>-N  │
   └───────────┬───────────────┘        └──────────────┬───────────────────┘
               │ ClusterRoleBinding                    │ RoleBinding
               ▼                                       ▼
   ┌───────────────────────────┐        ┌──────────────────────────────────┐
   │  SA <release>             │        │  SA <cr>-sidecar                 │
-  │  operator Deployment      │        │  ├── valkey pod                  │
-  │  (release namespace)      │        │  │   (valkey+sidecar+exporter)   │
-  └───────────┬───────────────┘        │  └── observer Deployment         │
+  │  operator Deployment      │        │  └── valkey pod                  │
+  │  (release namespace)      │        │      (valkey+sidecar+exporter)   │
+  └───────────┬───────────────┘        │                                  │
+              │                        │  SA <cr>-observer: no Role,      │
+              │                        │  no token (observer Deployment)  │
               │                        │  (sentinel pods use `default`)   │
               │                        └──────────────┬───────────────────┘
               │ creates + owns                        │
               ▼                                       │ patches
   StatefulSets, Deployments, Services, ConfigMaps,    │  metadata.labels
   SA/Role/RoleBinding, NetworkPolicies, PDBs,         │  metadata.annotations
-  cert-manager Certificates, ServiceMonitors  ────────┘  of pods in the namespace
+  cert-manager Certificates, ServiceMonitors  ────────┘  of its own cluster's pods
               │
               │ reads                       ┌──────────────────────────┐
               ├────────────────────────────►│ auth Secret (user-owned) │
@@ -101,7 +104,7 @@ remaining barrier is the network.
 | init container | same env var, used for the `-a` flag of its discovery probes | [`statefulset.go:321,506`](internal/builder/statefulset.go) |
 | `sidecar` container | same env var | [`statefulset.go:768`](internal/builder/statefulset.go) |
 | `exporter` sidecar | env `REDIS_PASSWORD` from the same `secretKeyRef` | [`statefulset.go:883`](internal/builder/statefulset.go) |
-| observer | same env var | [`internal/builder/observer.go:222`](internal/builder/observer.go) |
+| observer | same env var | [`internal/builder/observer.go:246`](internal/builder/observer.go) |
 | **operator** | reads the Secret through the API and holds the plaintext in memory for the duration of a call | [`readValkeyPassword`, `valkey_controller.go:143`](internal/controller/valkey_controller.go) |
 
 Consequences worth naming: the password is visible in every one of those
@@ -168,9 +171,12 @@ password.
   removes the whole cluster and nothing survives except user-owned Secrets and
   PVCs.
 - Each Valkey CR gets **its own** ServiceAccount, Role and RoleBinding
-  (`<cr-name>-sidecar`), so one cluster's sidecar credential is not another
-  cluster's credential — the blast radius of a stolen sidecar token is one
-  namespace, not the fleet.
+  (`<cr-name>-sidecar`), and the Role names the pods it may patch, so the blast
+  radius of a stolen sidecar token is **one cluster** — not the namespace, and not
+  the fleet (section 4.2).
+- The observer runs under `<cr-name>-observer`, which is bound to no Role and
+  mounts no token at all
+  ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 2).
 - `spec.networkPolicy.enabled` writes ingress-only NetworkPolicies
   ([`internal/builder/networkpolicy.go`](internal/builder/networkpolicy.go)):
   the data port accepts traffic from Valkey pods, Sentinel pods, observer pods and
@@ -186,13 +192,13 @@ password.
 - **The NetworkPolicies are ingress-only.** No egress rule is written, so a
   compromised Valkey pod may open connections anywhere, including to the API
   server.
-- **The Role is namespace-wide, not pod-wide.** `<cr-name>-sidecar` grants
-  `pods: patch` on **every pod in the namespace** with no `resourceNames`, so
-  cluster A's sidecar can patch cluster B's pods — and the label it patches is
-  the one the `-rw` Service selects on, while the annotation it patches steers a
-  topology decision. The unused `get`/`list` were dropped (D8 step 1); the
-  remaining narrowing steps and their ordering are
-  [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8.
+- **The sidecar can patch any metadata on its own cluster's pods.** The grant is
+  no longer namespace-wide — `resourceNames` limits it to `<cr-name>-0 …
+  <cr-name>-N` (section 4.2) — but within that list it is unrestricted: a
+  compromised sidecar can set `instanceRole=master` on any pod of *its* cluster
+  and can forge the drain stamp the operator consumes as promotion evidence.
+  Nothing narrower is expressible: those are the writes the sidecar exists to
+  make ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).
 - **The workload pods have no securityContext at all.** No `runAsNonRoot`, no
   `readOnlyRootFilesystem`, no `capabilities: drop [ALL]`, no
   `seccompProfile` — verified by the absence of any `SecurityContext` in
@@ -200,8 +206,11 @@ password.
   ([`deployment.yaml`](deploy/helm/valkey-operator/templates/deployment.yaml)); the
   clusters it creates inherit whatever the namespace's Pod Security admission
   level allows. A restricted-PSA namespace will reject these pods outright.
-- **`automountServiceAccountToken` is never disabled**, so the sidecar token is
-  mounted into the `valkey` container as well, not only into the sidecar.
+- **The data pod mounts the sidecar token into every container.**
+  `automountServiceAccountToken` is disabled on the observer pod and nowhere else,
+  so the `valkey` and `exporter` containers carry the sidecar token too. It is a
+  pod-level field, so splitting it per container is not expressible in Kubernetes;
+  a separate ServiceAccount per container would need a separate pod.
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
   arbitrary strings with no registry allowlist, and the pods run with the
   namespace's default security posture.
@@ -242,11 +251,11 @@ way you treat access to a cluster-admin credential.
 
 `escalate` and `bind` are not gratuitous: without them the API server refuses to
 let the operator create the `<cr-name>-sidecar` Role, since a principal may not
-grant permissions it does not itself hold — but it does hold `pods: get,list,patch`,
-so the narrower alternative (dropping `escalate` and keeping the sidecar Role a
-subset of the operator's own grants) is worth testing. **Not verified:** whether
-the current sidecar Role can in fact be created without `escalate` on this
-Kubernetes version.
+grant permissions it does not itself hold — but it does hold `pods: patch`
+cluster-wide, and the sidecar Role is now a strict subset of that (`patch` on named
+pods), so the narrower alternative (dropping `escalate`) is worth testing.
+**Not verified:** whether the sidecar Role can in fact be created without
+`escalate` on this Kubernetes version.
 
 ### 4.2 The per-instance sidecar Role
 
@@ -255,17 +264,30 @@ Kubernetes version.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["patch"]     # no resourceNames
+    verbs: ["patch"]
+    resourceNames: ["<cr-name>-0", "<cr-name>-1", "<cr-name>-2"]   # example: replicas 3
 ```
 
 What the sidecar actually calls: **`Pods(ns).Patch` and nothing else.** Verified
 by grep over `internal/sidecar` and `cmd/sidecar` — the only clientset call site is
 `patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
 used by `PatchLabel` (own pod, `instanceRole`) and `PatchAnnotation` (the peer pod
-the drain handler promoted). The grant matches that exactly since the unused
-`get`/`list` were dropped; `TestBuildSidecarRole` pins the verb set, and the
-operator rewrites the Role on every reconcile, so existing clusters narrow on
-their next pass. The observer, which shares this ServiceAccount, calls nothing.
+the drain handler promoted). The grant matches that exactly: one verb, and only the
+pods of this cluster. `TestBuildSidecarRole` pins verb set and name list together,
+and the operator rewrites the Role on every reconcile, so existing clusters narrow
+on their next pass with no migration step.
+
+**How the name list is built** ([`SidecarRolePodNames`](internal/builder/rbac.go)):
+the union of the pods `spec.replicas` asks for and the pods that currently carry the
+cluster's data-pod labels. The desired half covers scale-up — the `sidecar RBAC`
+reconcile step runs before the `StatefulSet` step, so pod N is granted before it is
+created. The live half covers scale-down: a pod being removed keeps its grant until
+it is actually gone, because its drain handler still sets `instanceRole=draining` on
+itself to leave the `-rw` Service before failing over. Two safety properties are
+pinned by tests: an empty list would match *every* pod in Kubernetes RBAC, so a
+cluster with no pods gets no rule at all; and names coming from the label selector
+are filtered to the `<cr-name>-<ordinal>` form, so a pod created with this cluster's
+labels under a foreign name cannot widen the grant.
 
 Two writes reach the operator's decisions through this grant:
 
@@ -275,10 +297,16 @@ Two writes reach the operator's decisions through this grant:
   evidence that a promotion it did not perform was legitimate, and on which it
   will demote other masters (`REPLICAOF`, destructive).
 
-Narrowing further to `resourceNames` limited to the cluster's own pods — which
-is what removes the cross-cluster patch — is
-[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
-steps 2 and 3, still open.
+Both writes are therefore confined to the cluster the sidecar belongs to. What the
+grant does **not** stop: a compromised sidecar lying about its *own* cluster — it can
+label any of its own pods master, and it can forge its own drain stamp. That is
+inherent to the mechanism, not a gap
+([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8,
+Residual risks).
+
+The observer no longer shares this ServiceAccount: it runs under `<cr-name>-observer`,
+which is bound to no Role, and its pod sets `automountServiceAccountToken: false`, so
+it mounts no token to steal.
 
 ### 4.3 The pre-upgrade hook
 
@@ -395,18 +423,25 @@ analysis.
       UID precondition and every refusal records a Warning. This bounds what the
       *reconcile path* touches; narrowing the cluster-wide `secrets` grant itself
       is the separate item above.
-- [ ] **Narrow the sidecar Role to `patch` with `resourceNames`
-      ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).** Dropping the unused
-      `list` verb is the precondition — `resourceNames` and `list` are
-      incompatible. Matters more since the drain stamp became evidence for a
-      destructive `REPLICAOF`.
+- [x] **Narrow the sidecar Role to `patch` with `resourceNames`
+      ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8, done
+      2026-08-21).** The unused `get`/`list` went first — `resourceNames` and `list`
+      are incompatible — and the grant now names this cluster's own data pods
+      (section 4.2). That removes the cross-cluster write, which mattered because
+      the drain stamp is evidence for a destructive `REPLICAOF`. What remains is
+      inherent: the sidecar can still forge that evidence for its *own* cluster.
 - [ ] **Give the workload pods a securityContext.** `runAsNonRoot`,
       `readOnlyRootFilesystem` where the data path allows it, `drop: [ALL]`,
       `seccompProfile: RuntimeDefault` — the operator already runs that way itself.
       Without it the clusters cannot be admitted into a `restricted` PSA namespace.
-- [ ] **Set `automountServiceAccountToken: false` where the token is not needed**,
-      and consider a separate ServiceAccount for the observer, which calls no API
-      at all.
+- [x] **Give the observer its own ServiceAccount and stop mounting its token**
+      ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 2,
+      done 2026-08-21). `<cr-name>-observer` is bound to no Role and the pod sets
+      `automountServiceAccountToken: false`.
+- [ ] **Stop mounting the sidecar token into the `valkey` and `exporter`
+      containers.** `automountServiceAccountToken` is a pod-level field, so the
+      only way to give the sidecar a token the other containers do not have is to
+      move it out of the pod — a design change, not a flag.
 - [ ] **Add egress NetworkPolicies.** Today's policies are ingress-only, so a
       compromised data pod can talk to anything, the API server included.
 - [ ] **Require client certificates where the deployment can.**

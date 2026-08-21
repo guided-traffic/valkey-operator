@@ -209,3 +209,29 @@ func TestReconcile_ReconcilesDataPlaneWhileBlocked(t *testing.T) {
 	assert.NotContains(t, stored.Status.Message, "\n",
 		"the phase message must stay readable in kubectl/Lens")
 }
+
+// --- step order ---
+
+// The sidecar Role grants patch on named pods (ADR 0012 D8 step 3). On a scale-up
+// the Role must name pod N before the StatefulSet write creates it, or that pod's
+// sidecar 403s on its own role label until the next pass. The order of these two
+// steps is the whole guarantee, so it is asserted rather than assumed.
+func TestResourceReconcileSteps_RBACBeforeStatefulSet(t *testing.T) {
+	v := newTestValkey("test", "default")
+	r, _ := newTestReconciler(v)
+
+	indexOf := func(name string) int {
+		for i, step := range r.resourceReconcileSteps() {
+			if step.name == name {
+				return i
+			}
+		}
+		return -1
+	}
+
+	rbac, sts := indexOf("sidecar RBAC"), indexOf("StatefulSet")
+	require.NotEqual(t, -1, rbac, "the sidecar RBAC step must exist")
+	require.NotEqual(t, -1, sts, "the StatefulSet step must exist")
+	assert.Less(t, rbac, sts,
+		"the sidecar Role has to name a scale-up pod before the StatefulSet creates it")
+}

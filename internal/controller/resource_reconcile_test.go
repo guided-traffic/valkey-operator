@@ -633,7 +633,7 @@ func TestReconcileSidecarRBAC_StopsAtFirstFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating sidecar ServiceAccount")
 	roleErr := c.Get(context.Background(), types.NamespacedName{
-		Name: builder.BuildSidecarRole(v).Name, Namespace: "default",
+		Name: builder.BuildSidecarRole(v, nil).Name, Namespace: "default",
 	}, &rbacv1.Role{})
 	assert.True(t, apierrors.IsNotFound(roleErr),
 		"the Role must not be created once the ServiceAccount step failed")
@@ -979,7 +979,7 @@ func TestReconcileSidecarRole_PropagatesCreateError(t *testing.T) {
 
 func TestReconcileSidecarRole_UpdatesDriftedRulesAndPropagatesUpdateError(t *testing.T) {
 	v := newTestValkey("test", "default")
-	desired := builder.BuildSidecarRole(v)
+	desired := builder.BuildSidecarRole(v, nil)
 
 	// A Role whose rules were narrowed by hand: the sidecar could no longer patch
 	// its own pod label, so the drift must be corrected.
@@ -1326,4 +1326,188 @@ func TestCleanseCertificateSpec_NilSpecIsSafe(t *testing.T) {
 	// unstructured.NestedMap returns nil for a Certificate stored without a spec;
 	// the cleanser must tolerate it rather than panic mid-reconcile.
 	assert.NotPanics(t, func() { cleanseCertificateSpec(nil) })
+}
+
+// --- reconcileSidecarRole: the resourceNames grant (ADR 0012 D8 step 3) ---
+
+func TestReconcileSidecarRole_GrantsPatchOnThisClustersPodsOnly(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v)
+
+	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, role))
+	require.Len(t, role.Rules, 1)
+	assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+	assert.Equal(t, []string{"test-0", "test-1", "test-2"}, role.Rules[0].ResourceNames,
+		"a namespace-wide patch grant lets one cluster's sidecar token stamp another "+
+			"cluster's pods, and the operator consumes that stamp as promotion evidence")
+}
+
+func TestReconcileSidecarRole_KeepsTerminatingPodsInTheGrant(t *testing.T) {
+	// Scale-down 5 -> 3: the spec asks for three, five pods still exist. The two on
+	// their way out still run a drain handler that patches its own draining label.
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	pods := []client.Object{
+		masterLabeledPod(v, 0, common.RoleMaster),
+		masterLabeledPod(v, 1, common.RoleReplica),
+		masterLabeledPod(v, 2, common.RoleReplica),
+		masterLabeledPod(v, 3, common.RoleReplica),
+		masterLabeledPod(v, 4, common.RoleReplica),
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, append([]client.Object{v}, pods...)...)
+
+	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, role))
+	require.Len(t, role.Rules, 1)
+	assert.Equal(t, []string{"test-0", "test-1", "test-2", "test-3", "test-4"},
+		role.Rules[0].ResourceNames,
+		"a departing master that cannot set its own draining label keeps taking writes "+
+			"while it fails over")
+}
+
+func TestReconcileSidecarRole_NarrowsALegacyNamespaceWideRole(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	legacy := builder.BuildSidecarRole(v, nil)
+	legacy.Rules = []rbacv1.PolicyRule{{
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+		Verbs:     []string{"get", "list", "patch"},
+	}}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, legacy)
+
+	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, role))
+	require.Len(t, role.Rules, 1)
+	assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+	assert.Equal(t, []string{"test-0", "test-1"}, role.Rules[0].ResourceNames,
+		"an existing cluster must narrow on its next reconcile, with no migration step")
+}
+
+func TestReconcileSidecarRole_FailsTheStepWhenThePodListFails(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	funcs := interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return internalErr("pod list denied")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", funcs, v)
+
+	err := r.reconcileSidecarRole(context.Background(), v)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "listing data pods for the sidecar Role")
+	// Narrowing on an incomplete pod list would revoke a live pod's grant, so the
+	// step writes nothing at all and the existing (wider) Role stays.
+	getErr := c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, &rbacv1.Role{})
+	assert.True(t, apierrors.IsNotFound(getErr))
+}
+
+// --- reconcileObserver: the observer's own Role-less ServiceAccount (ADR 0012 D8 step 2) ---
+
+func TestReconcileObserver_CreatesTheServiceAccountTheDeploymentNames(t *testing.T) {
+	v := observerValkey()
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v)
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileObserver(ctx, v))
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{
+		Name: builder.ObserverServiceAccountName(v), Namespace: "default",
+	}, sa))
+	assert.Len(t, sa.OwnerReferences, 1, "the ServiceAccount must be garbage-collected with the CR")
+
+	deploy := &appsv1.Deployment{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{
+		Name: builder.ObserverDeploymentName(v), Namespace: "default",
+	}, deploy))
+	assert.Equal(t, sa.Name, deploy.Spec.Template.Spec.ServiceAccountName)
+	assert.NotEqual(t, builder.SidecarServiceAccountName(v), deploy.Spec.Template.Spec.ServiceAccountName)
+
+	// Nothing binds a Role to it: that is the whole point of the split.
+	roleBindings := &rbacv1.RoleBindingList{}
+	require.NoError(t, c.List(ctx, roleBindings, client.InNamespace("default")))
+	for i := range roleBindings.Items {
+		for _, s := range roleBindings.Items[i].Subjects {
+			assert.NotEqual(t, sa.Name, s.Name,
+				"the observer ServiceAccount must stay bound to nothing")
+		}
+	}
+}
+
+func TestReconcileObserver_StopsBeforeTheDeploymentWhenTheServiceAccountFails(t *testing.T) {
+	v := observerValkey()
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.ServiceAccount); ok {
+				return internalErr("serviceaccount create denied")
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", funcs, v)
+	ctx := context.Background()
+
+	err := r.reconcileObserver(ctx, v)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating Observer ServiceAccount")
+	// A pod naming a ServiceAccount that does not exist is rejected by admission, so
+	// creating the Deployment first would only produce an unschedulable pod.
+	getErr := c.Get(ctx, types.NamespacedName{
+		Name: builder.ObserverDeploymentName(v), Namespace: "default",
+	}, &appsv1.Deployment{})
+	assert.True(t, apierrors.IsNotFound(getErr))
+}
+
+func TestCleanupObserver_DeletesTheOwnedServiceAccount(t *testing.T) {
+	v := observerValkey()
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v)
+	ctx := context.Background()
+	require.NoError(t, r.reconcileObserver(ctx, v))
+
+	v.Spec.Observer = &vkov1.ObserverSpec{Enabled: false}
+	require.NoError(t, r.reconcileObserver(ctx, v))
+
+	getErr := c.Get(ctx, types.NamespacedName{
+		Name: builder.ObserverServiceAccountName(v), Namespace: "default",
+	}, &corev1.ServiceAccount{})
+	assert.True(t, apierrors.IsNotFound(getErr))
+}
+
+func TestCleanupObserver_LeavesAForeignServiceAccountAlone(t *testing.T) {
+	v := observerValkey()
+	v.Spec.Observer = &vkov1.ObserverSpec{Enabled: false}
+
+	// <cr-name>-observer is a name a CR author can aim at a pre-existing
+	// ServiceAccount; deleting it would take every Role bound to it out of service
+	// (ADR 0006).
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: builder.ObserverServiceAccountName(v), Namespace: "default",
+	}}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileObserver(ctx, v))
+
+	assert.NoError(t, c.Get(ctx, types.NamespacedName{
+		Name: builder.ObserverServiceAccountName(v), Namespace: "default",
+	}, &corev1.ServiceAccount{}), "a ServiceAccount the operator does not own must survive")
 }

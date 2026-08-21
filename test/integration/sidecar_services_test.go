@@ -303,6 +303,9 @@ func TestSidecarServicesRouting_Integration(t *testing.T) {
 		assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs,
 			"patch is the only verb the sidecar calls; get/list were dropped (ADR 0012 D8)")
 		assert.Contains(t, role.Rules[0].Resources, "pods")
+		assert.Equal(t, []string{"sc-ha-svc-0", "sc-ha-svc-1", "sc-ha-svc-2"},
+			role.Rules[0].ResourceNames,
+			"the grant covers this cluster's data pods and nothing else (ADR 0012 D8 step 3)")
 
 		// RoleBinding.
 		rb := &rbacv1.RoleBinding{}

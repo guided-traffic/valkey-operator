@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/common"
@@ -24,6 +25,27 @@ const (
 // ObserverDeploymentName returns the name for the observer Deployment.
 func ObserverDeploymentName(v *vkov1.Valkey) string {
 	return fmt.Sprintf("%s-observer", v.Name)
+}
+
+// ObserverServiceAccountName returns the name of the ServiceAccount used by the
+// observer Deployment. The observer makes no Kubernetes API call at all, so this
+// ServiceAccount is bound to no Role and no RoleBinding — it exists to keep the
+// observer out of the sidecar's grant (ADR 0012 D8 step 2).
+func ObserverServiceAccountName(v *vkov1.Valkey) string {
+	return fmt.Sprintf("%s-observer", v.Name)
+}
+
+// BuildObserverServiceAccount builds the Role-less ServiceAccount for the observer.
+// Nothing binds a Role to it: the observer imports no Kubernetes client, and until
+// this ServiceAccount existed it ran under the sidecar's, which grants pods patch.
+func BuildObserverServiceAccount(v *vkov1.Valkey) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ObserverServiceAccountName(v),
+			Namespace: v.Namespace,
+			Labels:    ObserverLabels(v),
+		},
+	}
 }
 
 // ObserverLabels returns the labels for observer resources.
@@ -110,9 +132,13 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: fmt.Sprintf("%s-sidecar", v.Name),
-					Containers:         containers,
-					Volumes:            buildObserverVolumes(v),
+					ServiceAccountName: ObserverServiceAccountName(v),
+					// The observer never calls the Kubernetes API, so it gets no
+					// token either: an unmounted token cannot be stolen out of a
+					// compromised observer pod (ADR 0012 D8 step 2).
+					AutomountServiceAccountToken: ptr.To(false),
+					Containers:                   containers,
+					Volumes:                      buildObserverVolumes(v),
 				},
 			},
 		},
@@ -284,10 +310,34 @@ func observerTLSSecretName(v *vkov1.Valkey) string {
 	return ValkeyCertificateName(v)
 }
 
+// observerIdentityChanged reports whether the ServiceAccount the observer pod runs
+// under, or whether it mounts that ServiceAccount's token, differs between the two
+// pod specs. An unset AutomountServiceAccountToken means "mount it", so it compares
+// equal to an explicit true.
+func observerIdentityChanged(desired, current *corev1.PodSpec) bool {
+	if desired.ServiceAccountName != current.ServiceAccountName {
+		return true
+	}
+	return automountsToken(desired) != automountsToken(current)
+}
+
+// automountsToken reports whether the pod spec mounts its ServiceAccount token,
+// resolving the nil default (mount) to true.
+func automountsToken(spec *corev1.PodSpec) bool {
+	return spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken
+}
+
 // ObserverDeploymentHasChanged returns true if the desired observer
 // Deployment differs from the current one in meaningful ways.
 func ObserverDeploymentHasChanged(desired, current *appsv1.Deployment) bool {
 	if *desired.Spec.Replicas != *current.Spec.Replicas {
+		return true
+	}
+
+	// The pod identity is part of the comparison: without it an observer created
+	// before ADR 0012 D8 step 2 would keep the sidecar ServiceAccount and its
+	// mounted token forever, because nothing else about the pod changed.
+	if observerIdentityChanged(&desired.Spec.Template.Spec, &current.Spec.Template.Spec) {
 		return true
 	}
 
