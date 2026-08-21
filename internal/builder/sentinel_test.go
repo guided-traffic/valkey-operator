@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
 // --- SentinelConfigMapName ---
@@ -1563,4 +1564,21 @@ func TestSentinelInitContainer_NoTLSVolumeMount_WhenNoTLS(t *testing.T) {
 		assert.NotEqual(t, TLSVolumeName, vm.Name,
 			"init container must NOT mount TLS volume when TLS is disabled")
 	}
+}
+
+// BuildSentinelStatefulSet dereferences spec.sentinel for the user-supplied pod
+// labels. Every production caller is gated on spec.sentinel.enabled, so the nil
+// branch is a guard rather than a code path -- but it is the guard that keeps a CR
+// without a sentinel block from panicking the whole reconcile loop, and it must
+// still produce the base labels the Services and the operator select on.
+func TestBuildSentinelStatefulSet_NoSentinelBlock(t *testing.T) {
+	v := newTestValkey("test")
+	require.Nil(t, v.Spec.Sentinel, "the fixture must carry no sentinel block for this to pin anything")
+
+	sts := BuildSentinelStatefulSet(v)
+
+	assert.Equal(t, common.BaseLabels(v, common.ComponentSentinel), sts.Spec.Template.Labels,
+		"without user labels the pod template carries exactly the base labels")
+	assert.Equal(t, common.ComponentSentinel,
+		sts.Spec.Template.Labels["app.kubernetes.io/component"])
 }

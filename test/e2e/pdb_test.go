@@ -164,7 +164,8 @@ func TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone(t *testing.T) {
 		// The Warning Event is the operator's own report that the update path ran
 		// and refused; without it the assertion below could pass simply because no
 		// reconcile happened yet.
-		tc.waitForValkeyEvent(t, ns, name, "PodDisruptionBudgetNotOwned")
+		tc.waitForValkeyEvent(t, ns, name, "PodDisruptionBudgetNotOwned", pdbSettleTimeout,
+			"no PodDisruptionBudgetNotOwned Event appeared on Valkey %s/%s", ns, name)
 		tc.assertForeignPodDisruptionBudgetIntact(t, ns, name)
 	})
 }
@@ -404,10 +405,16 @@ func (tc *testClients) assertForeignPodDisruptionBudgetIntact(t *testing.T, name
 // waitForValkeyEvent waits for an Event with the given reason on a Valkey CR. The
 // recorder broadcasts asynchronously, hence the poll; Events travel through
 // events.k8s.io/v1, so a missing one can also mean missing operator RBAC (NA12).
-func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason string) {
+//
+// This is the single Event poll of the suite; it lives here because pdb_test.go is
+// where it started. Timeout and failure message are the caller's: what a missing
+// Event means differs per scenario (see the RBAC wording in
+// admission_recovery_test.go), and so does how long the emitting path may take.
+func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason string,
+	timeout time.Duration, failureMsg string, msgArgs ...interface{}) {
 	t.Helper()
 
-	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, pdbSettleTimeout, true,
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, timeout, true,
 		func(ctx context.Context) (bool, error) {
 			events, err := tc.kube.EventsV1().Events(namespace).List(ctx, metav1.ListOptions{})
 			if err != nil {
@@ -420,7 +427,7 @@ func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason 
 			}
 			return false, nil
 		})
-	require.NoError(t, err, "no %s Event appeared on Valkey %s/%s", reason, namespace, name)
+	require.NoError(t, err, append([]interface{}{failureMsg}, msgArgs...)...)
 }
 
 // statusOf renders a PDB status for assertion messages, tolerating a nil PDB.

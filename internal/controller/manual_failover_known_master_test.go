@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -239,4 +241,132 @@ func TestHandleMultiReplicaRollingUpdate_DoesNotDemotePromotedPod(t *testing.T) 
 		assert.NotContains(t, target, "test-1.",
 			"the promoted pod must not be demoted while the failover is in flight")
 	}
+}
+
+// --- NA29: the write that records the promotion gets a bounded conflict retry ---
+//
+// promoteAndRedirect runs before the three annotations are persisted, so a failed
+// write leaves the cluster failed over with an empty state: the next pass hands an
+// empty known master to the split-brain resolver, the two-replica tie goes to the
+// lowest ordinal — the old master being deleted — and the promoted pod is demoted
+// with the data on it. The dominant cause is a resourceVersion conflict against the
+// concurrent status writer, and that one is recoverable inside the same pass.
+
+// conflictOnCRUpdate fails the first n Update calls on the Valkey CR with a
+// conflict, and counts every attempt.
+func conflictOnCRUpdate(n int, attempts *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, isCR := obj.(*vkov1.Valkey); isCR {
+				*attempts++
+				if *attempts <= n {
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: vkov1.GroupVersion.Group, Resource: "valkeys"},
+						obj.GetName(), fmt.Errorf("the object has been modified"))
+				}
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}
+}
+
+func TestHandleManualFailover_RetriesTheStateWriteOnConflict(t *testing.T) {
+	v, pods, replicaCM := twoReplicaFailoverFixture(t)
+	promotedHost := fmt.Sprintf("test-1.test-headless.%s.svc.cluster.local", v.Namespace)
+
+	attempts := 0
+	r, c := newInterceptedReconciler(conflictOnCRUpdate(1, &attempts), v, replicaCM, pods[0].pod, pods[1].pod)
+
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+
+	result := r.handleManualFailover(context.Background(), v, pods, 0)
+
+	require.NoError(t, result.Error, "a conflict is retried, not surfaced as a failed pass")
+	assert.Greater(t, attempts, 1, "the conflicting write must be retried on a fresh object")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, updated))
+	assert.Equal(t, stateManualFailover, updated.Annotations[annotationRollingUpdateState],
+		"without the state the next pass does not know a failover is in flight")
+	assert.Equal(t, "test-1", updated.Annotations[annotationPromotedPod])
+	assert.Equal(t, promotedHost, updated.Annotations[builder.AnnotationKnownMaster],
+		"the known master is the split-brain authority for the passes that follow")
+
+	// The caller keeps using v after the retry: the ConfigMap it publishes and the
+	// delete it performs both depend on the object carrying the new annotations.
+	assert.Equal(t, promotedHost, v.Annotations[builder.AnnotationKnownMaster],
+		"the retried object must be copied back over the caller's CR")
+	assert.Contains(t, replicaConfigMapContent(t, c, v), "replicaof "+promotedHost)
+	assert.False(t, podExists(t, c, "test-0"), "the old master is deleted once the state is recorded")
+}
+
+// The retry is bounded: a conflict that never clears fails the pass instead of
+// spinning. The promotion has happened either way, which is the residual NA29
+// names and accepts.
+func TestHandleManualFailover_StateWriteRetryIsBounded(t *testing.T) {
+	v, pods, replicaCM := twoReplicaFailoverFixture(t)
+
+	attempts := 0
+	r, c := newInterceptedReconciler(conflictOnCRUpdate(1000, &attempts), v, replicaCM, pods[0].pod, pods[1].pod)
+
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+
+	result := r.handleManualFailover(context.Background(), v, pods, 0)
+
+	require.Error(t, result.Error)
+	assert.Contains(t, result.Error.Error(), "setting manual failover state")
+	assert.Greater(t, attempts, 1, "the write is retried")
+	assert.Less(t, attempts, 20, "and the retry is bounded, not a spin")
+	assert.True(t, podExists(t, c, "test-0"),
+		"the old master must not be deleted while the promotion is unrecorded")
+}
+
+// A non-conflict rejection is not retried: it is not going to clear by refetching,
+// and the pass has to surface it.
+func TestHandleManualFailover_DoesNotRetryNonConflictErrors(t *testing.T) {
+	v, pods, replicaCM := twoReplicaFailoverFixture(t)
+
+	attempts := 0
+	rejectCRUpdates := interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, isCR := obj.(*vkov1.Valkey); isCR {
+				attempts++
+				return apierrors.NewInternalError(fmt.Errorf("admission webhook denied the request"))
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}
+	r, _ := newInterceptedReconciler(rejectCRUpdates, v, replicaCM, pods[0].pod, pods[1].pod)
+
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+
+	result := r.handleManualFailover(context.Background(), v, pods, 0)
+
+	require.Error(t, result.Error)
+	assert.Equal(t, 1, attempts, "a rejection that refetching cannot fix must not be retried")
 }

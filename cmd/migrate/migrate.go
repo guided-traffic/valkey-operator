@@ -59,11 +59,23 @@ func Run() {
 
 	migrateLog.Info("starting Valkey CR migration", "total", len(list.Items))
 
-	failed := 0
-	migrated := 0
+	migrated, failed := migrateAll(ctx, c, list.Items)
 
-	for i := range list.Items {
-		vk := &list.Items[i]
+	migrateLog.Info("migration complete", "migrated", migrated, "failed", failed, "skipped", len(list.Items)-migrated-failed)
+
+	if failed > 0 {
+		migrateLog.Error(fmt.Errorf("%d patch(es) failed", failed), "migration finished with errors")
+		os.Exit(1)
+	}
+}
+
+// migrateAll applies the field defaults to every CR in items and patches the ones
+// that changed. A failing patch is counted and the loop continues, so one broken
+// CR cannot stop the remaining ones from being migrated.
+// Returns the number of patched and the number of failed CRs.
+func migrateAll(ctx context.Context, c client.Client, items []vkov1.Valkey) (migrated, failed int) {
+	for i := range items {
+		vk := &items[i]
 		original := vk.DeepCopy()
 
 		if !applyDefaults(vk) {
@@ -82,12 +94,7 @@ func Run() {
 		migrated++
 	}
 
-	migrateLog.Info("migration complete", "migrated", migrated, "failed", failed, "skipped", len(list.Items)-migrated-failed)
-
-	if failed > 0 {
-		migrateLog.Error(fmt.Errorf("%d patch(es) failed", failed), "migration finished with errors")
-		os.Exit(1)
-	}
+	return migrated, failed
 }
 
 // applyDefaults sets any missing field defaults on the Valkey CR spec.

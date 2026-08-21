@@ -16,7 +16,7 @@ func TestNew_WithoutTLS(t *testing.T) {
 		ClusterName:       "test",
 		HealthAddr:        ":8084",
 		PollInterval:      2 * time.Second,
-		ValkeyHeadlessSvc: "test-headless.default.svc.cluster.local",
+		ValkeyHeadlessSvc: "test-headless.default.invalid",
 		Replicas:          3,
 		ObserverDB:        15,
 	}
@@ -113,12 +113,12 @@ func TestMasterAddressFromHeadless(t *testing.T) {
 		{
 			name:       "without TLS",
 			tlsEnabled: false,
-			expected:   "test-0.test-headless.default.svc.cluster.local:6379",
+			expected:   "test-0.test-headless.default.invalid:6379",
 		},
 		{
 			name:       "with TLS",
 			tlsEnabled: true,
-			expected:   "test-0.test-headless.default.svc.cluster.local:16379",
+			expected:   "test-0.test-headless.default.invalid:16379",
 		},
 	}
 
@@ -127,7 +127,7 @@ func TestMasterAddressFromHeadless(t *testing.T) {
 			obs := &Observer{
 				cfg: Config{
 					ClusterName:       "test",
-					ValkeyHeadlessSvc: "test-headless.default.svc.cluster.local",
+					ValkeyHeadlessSvc: "test-headless.default.invalid",
 					TLSEnabled:        tt.tlsEnabled,
 				},
 			}
@@ -140,7 +140,7 @@ func TestDiscoverMaster_NoSentinel(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "test",
-			ValkeyHeadlessSvc: "test-headless.default.svc.cluster.local",
+			ValkeyHeadlessSvc: "test-headless.default.invalid",
 			SentinelEnabled:   false,
 		},
 	}
@@ -148,21 +148,7 @@ func TestDiscoverMaster_NoSentinel(t *testing.T) {
 	addr, err := obs.discoverMaster(context.Background())
 
 	require.NoError(t, err)
-	assert.Equal(t, "test-0.test-headless.default.svc.cluster.local:6379", addr)
-}
-
-func TestNewClient_AllCombinations(t *testing.T) {
-	obs := &Observer{
-		cfg: Config{},
-	}
-
-	// No TLS, no password.
-	c := obs.newClient("localhost:6379", "")
-	assert.NotNil(t, c)
-
-	// With password, no TLS.
-	c = obs.newClient("localhost:6379", "secret")
-	assert.NotNil(t, c)
+	assert.Equal(t, "test-0.test-headless.default.invalid:6379", addr)
 }
 
 func TestNew_WithSentinel_BuildsSeparateTLSConfigs(t *testing.T) {

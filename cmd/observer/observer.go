@@ -23,8 +23,8 @@ import (
 func Run() {
 	cfg := parseFlags()
 
-	if cfg.Namespace == "" || cfg.ClusterName == "" {
-		fmt.Fprintln(os.Stderr, "error: --namespace and --cluster-name (or POD_NAMESPACE / CLUSTER_NAME env vars) are required")
+	if msg := missingRequiredFlags(cfg); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 		os.Exit(1)
 	}
 
@@ -35,6 +35,15 @@ func Run() {
 		fmt.Fprintf(os.Stderr, "observer error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// missingRequiredFlags returns the message to print when the config lacks a
+// required value, or the empty string when the config is complete.
+func missingRequiredFlags(cfg observer.Config) string {
+	if cfg.Namespace == "" || cfg.ClusterName == "" {
+		return "error: --namespace and --cluster-name (or POD_NAMESPACE / CLUSTER_NAME env vars) are required"
+	}
+	return ""
 }
 
 // parseFlags parses CLI flags and falls back to environment variables.

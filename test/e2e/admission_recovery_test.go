@@ -58,6 +58,11 @@ const admissionBlockHold = 90 * time.Second
 // headroom on a loaded Kind cluster. In the incident the same step took 5 min 29 s.
 const admissionRecoveryDeadline = 60 * time.Second
 
+// nudgeEventTimeout is how long the StatefulSetNudged Event may take to appear.
+// The nudge itself is already observed on the StatefulSet by the subtest before
+// it, so this budget only covers the recorder's asynchronous broadcast.
+const nudgeEventTimeout = 60 * time.Second
+
 // blockPodCreation installs a fail-closed webhook that rejects CREATE pods in
 // the given namespace, as the incident's Kyverno webhook did.
 func (tc *testClients) blockPodCreation(t *testing.T, namespace, name string) func() {
@@ -276,19 +281,7 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	// above must therefore be re-observable as an Event on the Valkey CR. The
 	// recorder broadcasts asynchronously, hence the poll.
 	t.Run("nudge Event is visible on the Valkey CR", func(t *testing.T) {
-		err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
-			events, err := tc.kube.EventsV1().Events(ns).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return false, err
-			}
-			for _, ev := range events.Items {
-				if ev.Regarding.Kind == "Valkey" && ev.Regarding.Name == name && ev.Reason == "StatefulSetNudged" {
-					return true, nil
-				}
-			}
-			return false, nil
-		})
-		require.NoError(t, err,
+		tc.waitForValkeyEvent(t, ns, name, "StatefulSetNudged", nudgeEventTimeout,
 			"a StatefulSetNudged Event must appear on Valkey %s/%s; if it never does, the operator RBAC is missing create/patch on events.k8s.io", ns, name)
 	})
 
@@ -337,50 +330,6 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	})
 }
 
-// reconcileBlockedCondition returns the ReconcileBlocked condition of a Valkey
-// CR, or nil while the CR has no status or no such condition yet.
-func (tc *testClients) reconcileBlockedCondition(t *testing.T, namespace, name string) map[string]interface{} {
-	t.Helper()
-	ctx := context.Background()
-
-	cr, err := tc.dynamic.Resource(valkeyGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil
-	}
-	conditions, found, err := unstructured.NestedSlice(cr.Object, "status", "conditions")
-	if err != nil || !found {
-		return nil
-	}
-	for _, raw := range conditions {
-		cond, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if cond["type"] == "ReconcileBlocked" {
-			return cond
-		}
-	}
-	return nil
-}
-
-// waitForReconcileBlocked polls until the ReconcileBlocked condition reaches the
-// expected status, and returns it.
-func (tc *testClients) waitForReconcileBlocked(t *testing.T, namespace, name, status string,
-	timeout time.Duration) map[string]interface{} {
-	t.Helper()
-
-	var last map[string]interface{}
-	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, timeout, true,
-		func(_ context.Context) (bool, error) {
-			last = tc.reconcileBlockedCondition(t, namespace, name)
-			return last != nil && last["status"] == status, nil
-		})
-	require.NoError(t, err,
-		"Valkey %s/%s did not report ReconcileBlocked=%s within %v (last: %v)",
-		namespace, name, status, timeout, last)
-	return last
-}
-
 // TestE2E_AdmissionRejection_ReconcileBlockedCondition is scenario T4 of the
 // admission-gap ticket: while a fail-closed webhook rejects a write the operator
 // owns, the CR must name the webhook instead of leaving the user with a bare
@@ -414,7 +363,7 @@ func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
 	defer tc.deleteValkey(t, ns, name)
 
 	t.Run("CR names the rejecting webhook", func(t *testing.T) {
-		cond := tc.waitForReconcileBlocked(t, ns, name, "True", 90*time.Second)
+		cond := tc.waitForValkeyCondition(t, ns, name, "ReconcileBlocked", "True", 90*time.Second)
 		assert.Equal(t, "AdmissionWebhookDenied", cond["reason"],
 			"an admission rejection must be distinguishable from an ordinary write failure")
 		message, _ := cond["message"].(string)
@@ -424,7 +373,7 @@ func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
 
 	t.Run("condition clears once the block is gone", func(t *testing.T) {
 		removeWebhook()
-		cond := tc.waitForReconcileBlocked(t, ns, name, "False", 120*time.Second)
+		cond := tc.waitForValkeyCondition(t, ns, name, "ReconcileBlocked", "False", 120*time.Second)
 		assert.Equal(t, "ReconcileSucceeded", cond["reason"])
 		tc.waitForValkeyPhase(t, ns, name, "OK")
 	})
@@ -525,7 +474,7 @@ func TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite(t *testing.T
 	})
 
 	t.Run("CR names the rejected StatefulSet write", func(t *testing.T) {
-		cond := tc.waitForReconcileBlocked(t, ns, name, "True", 90*time.Second)
+		cond := tc.waitForValkeyCondition(t, ns, name, "ReconcileBlocked", "True", 90*time.Second)
 		assert.Equal(t, "AdmissionWebhookDenied", cond["reason"])
 		message, _ := cond["message"].(string)
 		assert.Contains(t, message, blackholeWebhookName)
@@ -547,7 +496,7 @@ func TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite(t *testing.T
 
 	t.Run("cluster converges once the block is gone", func(t *testing.T) {
 		removeWebhook()
-		tc.waitForReconcileBlocked(t, ns, name, "False", 120*time.Second)
+		tc.waitForValkeyCondition(t, ns, name, "ReconcileBlocked", "False", 120*time.Second)
 		tc.waitForStatefulSetReady(t, ns, name, 2)
 		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})

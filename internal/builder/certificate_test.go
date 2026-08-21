@@ -460,3 +460,44 @@ func TestCertificateOwnerRef(t *testing.T) {
 	assert.Equal(t, "test", ref.Name)
 	assert.Equal(t, "test-uid-12345", string(ref.UID))
 }
+
+// The DNS name list is assembled from generated names, the fixed "localhost" entry
+// and spec.tls.certManager.extraDNSNames, and nothing stops a user from repeating a
+// name that is already generated. cert-manager rejects nothing here, so the
+// duplicate travels into the certificate request and into the SAN list of the
+// issued certificate.
+//
+// The two existing unified-mode tests do NOT pin this: the per-component name
+// builders never emit "localhost" or the extras, so concatenating them cannot
+// produce a duplicate and dedupe never collapses anything there. A duplicate in the
+// user input is the only way to reach it.
+func TestBuildValkeyCertificate_DuplicateExtraDNSNamesCollapse(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.TLS = &vkov1.TLSSpec{
+			Enabled: true,
+			CertManager: &vkov1.CertManagerSpec{
+				Issuer: vkov1.CertManagerIssuerSpec{Kind: "ClusterIssuer", Name: "ca"},
+				// "localhost" is already generated, "valkey.example.com" is repeated
+				// by the user, and "test" duplicates the headless service name.
+				ExtraDNSNames: []string{
+					"valkey.example.com", "localhost", "valkey.example.com", "test",
+				},
+			},
+		}
+	})
+
+	spec := BuildValkeyCertificate(v).Object["spec"].(map[string]interface{})
+	names := stringsFromIface(spec["dnsNames"].([]interface{}))
+
+	counts := map[string]int{}
+	for _, n := range names {
+		counts[n]++
+	}
+	for name, n := range counts {
+		assert.Equal(t, 1, n, "%q must appear exactly once in the SAN list", name)
+	}
+	assert.Contains(t, names, "valkey.example.com", "the extra name is still requested")
+	assert.Contains(t, names, "localhost")
+	assert.Contains(t, names, "test")
+}

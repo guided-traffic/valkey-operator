@@ -2,6 +2,7 @@ package v1
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -1293,6 +1294,44 @@ func TestNeedsAntiAffinity(t *testing.T) {
 			})
 			assert.Equal(t, tt.expectedData, v.NeedsDataAntiAffinity())
 			assert.Equal(t, tt.expectedSentinel, v.NeedsSentinelAntiAffinity())
+		})
+	}
+}
+
+func TestGetSyncTimeout(t *testing.T) {
+	tests := []struct {
+		name          string
+		rollingUpdate *RollingUpdateSpec
+		expected      time.Duration
+	}{
+		{
+			name:          "no rollingUpdate block falls back to 5m",
+			rollingUpdate: nil,
+			expected:      5 * time.Minute,
+		},
+		{
+			name:          "rollingUpdate without syncTimeout falls back to 5m",
+			rollingUpdate: &RollingUpdateSpec{},
+			expected:      5 * time.Minute,
+		},
+		{
+			name:          "explicit syncTimeout wins",
+			rollingUpdate: &RollingUpdateSpec{SyncTimeout: &metav1.Duration{Duration: 90 * time.Second}},
+			expected:      90 * time.Second,
+		},
+		{
+			name:          "zero syncTimeout is honoured, not treated as unset",
+			rollingUpdate: &RollingUpdateSpec{SyncTimeout: &metav1.Duration{Duration: 0}},
+			expected:      0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.RollingUpdate = tt.rollingUpdate
+			})
+			assert.Equal(t, tt.expected, v.GetSyncTimeout())
 		})
 	}
 }

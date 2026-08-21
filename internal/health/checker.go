@@ -47,6 +47,12 @@ type ClusterState struct {
 // Checker performs health checks on Valkey and Sentinel instances.
 type Checker struct {
 	client client.Client
+
+	// NewValkeyClientFn builds the client used for every probe this Checker
+	// sends. It is nil in production, where newValkeyClient builds the client
+	// itself; tests set it to point the probes at a local responder. Mirrors
+	// ValkeyReconciler.NewValkeyClientFn.
+	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
 }
 
 // NewChecker creates a new health checker.
@@ -314,6 +320,9 @@ func (h *Checker) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretNam
 
 // newValkeyClient creates a valkeyclient.Client with the given TLS and auth settings.
 func (h *Checker) newValkeyClient(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if h.NewValkeyClientFn != nil {
+		return h.NewValkeyClientFn(addr, password, tlsConfig)
+	}
 	if tlsConfig != nil && password != "" {
 		return valkeyclient.NewTLSWithPassword(addr, tlsConfig, password)
 	}

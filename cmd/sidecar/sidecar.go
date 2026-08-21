@@ -23,8 +23,8 @@ import (
 func Run() {
 	cfg := parseFlags()
 
-	if cfg.PodName == "" || cfg.PodNamespace == "" {
-		fmt.Fprintln(os.Stderr, "error: --pod-name and --pod-namespace (or POD_NAME / POD_NAMESPACE env vars) are required")
+	if msg := missingRequiredFlags(cfg); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 		os.Exit(1)
 	}
 
@@ -35,6 +35,15 @@ func Run() {
 		fmt.Fprintf(os.Stderr, "sidecar error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// missingRequiredFlags returns the message to print when the config lacks a
+// required value, or the empty string when the config is complete.
+func missingRequiredFlags(cfg sidecar.Config) string {
+	if cfg.PodName == "" || cfg.PodNamespace == "" {
+		return "error: --pod-name and --pod-namespace (or POD_NAME / POD_NAMESPACE env vars) are required"
+	}
+	return ""
 }
 
 // parseFlags parses CLI flags and falls back to environment variables.
