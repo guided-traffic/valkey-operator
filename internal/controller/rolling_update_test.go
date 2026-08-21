@@ -3645,8 +3645,11 @@ func TestVerifyReplacedReplicasSynced_TimeoutPausesUpdate(t *testing.T) {
 
 func TestSyncWaitTimestamp_SetAndCheck(t *testing.T) {
 	v := newTestValkey("ts-test", "default")
-	r, _ := newTestReconciler(v)
+	r, c := newTestReconciler(v)
 	reconcileOnce(t, r, "ts-test", "default")
+	// The stored copy, so the arming write below actually lands — ensureWaitBound
+	// takes a rejected annotation back off the object (ADR 0010 D7/D8).
+	v = crGet(t, c, "ts-test")
 
 	// Initially not timed out.
 	assert.False(t, r.isSyncWaitTimedOut(v))

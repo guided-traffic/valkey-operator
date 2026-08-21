@@ -300,9 +300,8 @@ func TestSidecarServicesRouting_Integration(t *testing.T) {
 			Name: "sc-ha-svc-sidecar", Namespace: "default",
 		}, role))
 		require.Len(t, role.Rules, 1)
-		assert.Contains(t, role.Rules[0].Verbs, "patch")
-		assert.Contains(t, role.Rules[0].Verbs, "get")
-		assert.Contains(t, role.Rules[0].Verbs, "list")
+		assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs,
+			"patch is the only verb the sidecar calls; get/list were dropped (ADR 0012 D8)")
 		assert.Contains(t, role.Rules[0].Resources, "pods")
 
 		// RoleBinding.

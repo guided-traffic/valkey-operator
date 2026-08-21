@@ -14,9 +14,11 @@ is now pinned by a regression test, `TestRunSidecar_LabelsThePodThenDrains` in
 [`internal/sidecar/run_test.go`](../../internal/sidecar/run_test.go), reachable through the
 `runSidecar` seam this change extracted.
 
-**Four items are open:** narrowing the sidecar Role, the two-master termination window, the
-dead `NewLabeler`, and the token the observer mounts from the shared ServiceAccount. See
-Residual risks.
+Amended 2026-08-21: three of the four open items are closed — D8 step 1 (the Role
+now grants `patch` only), D9 (the outgoing master is demoted, guarded by
+`TestPromoteAndRedirect_DemotesTheOutgoingMaster`) and the dead `NewLabeler`
+(deleted). **Open:** D8 steps 2 and 3 — the observer's own token-less
+ServiceAccount, then `resourceNames`. See Residual risks.
 
 ## Context
 
@@ -105,14 +107,15 @@ authority input.
 
 **D8 — The sidecar Role is to be narrowed, in a fixed order.** `BuildSidecarRole`
 ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)) grants namespace-wide
-`pods: [get, list, patch]` with no `resourceNames`, per Valkey CR, while `internal/sidecar`
-and `cmd/sidecar` make exactly **one** Kubernetes API call —
+`pods: [patch]` with no `resourceNames`, per Valkey CR — exactly the one verb the sidecar
+calls: `internal/sidecar` and `cmd/sidecar` make exactly **one** Kubernetes API call,
 `clientset.CoreV1().Pods(namespace).Patch` in `patchMetadata`, reached from `PatchLabel`
-(own pod, `instanceRole`) and `PatchAnnotation` (a peer pod, the drain stamp). `get` and
-`list` are granted and never used; verified by grep over both packages, not assumed. The
-recommended order is:
+(own pod, `instanceRole`) and `PatchAnnotation` (a peer pod, the drain stamp). Verified by
+grep over both packages, not assumed. The order is:
 
-1. drop `get` and `list`, keep `patch` — one line, no ordering concern;
+1. drop `get` and `list`, keep `patch` — **done 2026-08-21**; the exact verb set is pinned
+   by `TestBuildSidecarRole`, and the operator rewrites the Role on every reconcile, so
+   existing clusters narrow on the next pass;
 2. give the observer its own ServiceAccount with no Role at all, **and** set
    `automountServiceAccountToken: false` on its pod spec
    ([`internal/builder/observer.go`](../../internal/builder/observer.go)). No builder in this
@@ -127,18 +130,20 @@ sidecar starts patching, or that sidecar 403s until the next pass. The operator 
 writes the Role on every reconcile, so this is one builder change plus an ordering test, not
 a new mechanism.
 
-**D9 — If the outgoing master is ever demoted, the demotion is ordered strictly after the
-promotion succeeds and before the redirect loop, and it is best-effort.** The redirect loop
-in question is the **operator's**: `promoteAndRedirect`
-([`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go))
-skips `masterIdx`, so it never demotes. Not to be conflated with the sidecar's own
-`reconfigureReplicas`, which skips by address (`addr == newMasterAddr`) and has no index to
-skip. Ordered *before* the promotion, such a demotion would demote the only master in the
-cluster with nothing promoted to replace it. Ordered after, the worst outcome — promotion
-succeeded but the ConfigMap republish or the delete then fails — leaves a demoted old master
-and a promoted new one, which is the intended end state anyway. It loses no data: the operator's
-`waitForWriteSync` (`WAIT`, same file, called immediately before the promotion) drained the
-pod of writes and it is deleted seconds later.
+**D9 — The outgoing master is demoted, strictly after the promotion succeeds and before the
+redirect loop, and the demotion is best-effort.** Implemented 2026-08-21 in the
+**operator's** `promoteAndRedirect`
+([`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go)),
+whose redirect loop still skips `masterIdx` — the demotion is its own step before that loop,
+`REPLICAOF <promotedHost>` against the outgoing master, log-and-continue on failure. Guarded
+by `TestPromoteAndRedirect_DemotesTheOutgoingMaster`. Not to be conflated with the sidecar's
+own `reconfigureReplicas`, which skips by address (`addr == newMasterAddr`) and has no index
+to skip. The ordering is load-bearing: ordered *before* the promotion, the demotion would
+demote the only master in the cluster with nothing promoted to replace it. Ordered after,
+the worst outcome — promotion succeeded but the ConfigMap republish or the delete then
+fails — leaves a demoted old master and a promoted new one, which is the intended end state
+anyway. It loses no data: the operator's `waitForWriteSync` (`WAIT`, same file, called
+immediately before the promotion) drained the pod of writes and it is deleted seconds later.
 
 ## Consequences
 
@@ -218,29 +223,21 @@ costs the injection seam the sidecar tests rely on.
 
 ## Residual risks
 
-* **The sidecar Role is still `get, list, patch`, namespace-wide (open).** D8 is the plan,
-  not the state of the tree.
-* **The two-master termination window is an accepted state (open).** Between the promotion
-  and the kubelet stopping `valkey-server`, two pods answer `role:master`. Not damaging today:
-  the outgoing sidecar patches its own label to `draining` first, so the `-rw` Service is not
-  split; the steady-state check returns early because a rolling-update state annotation is
-  set; and since D5 nothing acts on the window destructively. What remains is that **the
-  operator produces, on every rolling update, the exact state its own steady-state check
-  calls a split brain** — and the outgoing sidecar's `waitForRoleChange` polls until
-  `valkey-server` refuses connections rather than until a role change it will never observe
-  (bounded by the drain timeout — `--failover-timeout` / `SIDECAR_FAILOVER_TIMEOUT`, default
-  60 s — inside the data StatefulSet's 75 s termination grace period). Verified by reading;
-  not reproduced against a cluster.
-* **`NewLabeler` is dead code and duplicates the live wiring (open).** Its two call sites are
-  both in `labeler_test.go`. The live path in `run.go` re-implements the same four steps —
-  role detector, pod patcher, `Labeler` construction, Sentinel cross-check — and the two
-  cross-check blocks agree today. **That agreement is the hazard**: two copies of one wiring,
-  one unreachable, both plausible-looking, and only the reachable one has consequences if
-  they drift. A change made in the wrong copy is invisible in production *and* invisible in
-  the tests, because the tests exercise the other one. The decision is to delete it, not to
-  cover it — covering the happy path of a constructor nobody calls is coverage theatre.
-  Verified that nothing needs replacing: both deleted tests assert error strings that are
-  already asserted directly elsewhere, and in their wrapped form on the live path.
+* **The sidecar Role is namespace-wide `patch` (D8 step 1 done, steps 2 and 3 open).** The
+  unused `get`/`list` are gone, but any principal holding one cluster's sidecar token can
+  still patch every pod in the namespace — including another cluster's drain stamp, which
+  the operator consumes as promotion evidence. `resourceNames` (step 3) is what closes that,
+  after the observer ServiceAccount split (step 2).
+* **(Closed 2026-08-21) The two-master termination window.** `promoteAndRedirect` now demotes
+  the outgoing master per D9, so no two pods answer `role:master` beyond the seconds the
+  demotion itself takes. What D9 cannot cover: a demotion that fails is logged and the window
+  returns for that one failover — accepted, because failing the failover over it would be
+  worse. Verified by unit test; not reproduced against a cluster.
+* **(Closed 2026-08-21) `NewLabeler` was dead code and is deleted**, together with its two
+  tests. Verified that nothing needed replacing: both deleted tests asserted error strings
+  that are already asserted directly elsewhere (`TestValkeyRoleDetector_TLSConfigError`,
+  `TestNewKubernetesPodPatcher_OutsideClusterFails`), and in their wrapped form on the live
+  path (`run_test.go`). The live wiring in `run.go` is now the only copy.
 * **The observer shares the sidecar ServiceAccount and mounts a token it never uses
   (open).** Closing it needs both halves of step 2 in D8: its own Role-less ServiceAccount
   *and* `automountServiceAccountToken: false`.
@@ -249,7 +246,7 @@ costs the injection seam the sidecar tests rely on.
 
 * [`internal/sidecar/drain.go`](../../internal/sidecar/drain.go) — `Handle`, `findSyncedReplica`, `isSyncedReplica`, `reconfigureReplicas`, `stampPromotion`, `waitForRoleChange`
 * [`internal/sidecar/run.go`](../../internal/sidecar/run.go) — the labeler/drain shutdown ordering, the drain timeout
-* [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `patchMetadata`, `PatchLabel`, `PatchAnnotation`, `NewLabeler`
+* [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `patchMetadata`, `PatchLabel`, `PatchAnnotation`
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarRole`, `BuildSidecarServiceAccount`
 * [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — operator-side `promoteAndRedirect`, `waitForWriteSync` (D9)
 * [`internal/common/annotations.go`](../../internal/common/annotations.go) — `AnnotationDrainPromotedAt`

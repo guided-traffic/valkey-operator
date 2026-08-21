@@ -29,7 +29,7 @@ A `DEVELOPER.md` does not exist yet.
 |---|---|---|---|
 | **Operator manager** | ServiceAccount `<release>` in the release namespace, bound by a **ClusterRoleBinding** ([`clusterrolebinding.yaml`](deploy/helm/valkey-operator/templates/clusterrolebinding.yaml)) | **Cluster-wide, all namespaces** | Every rule in section 4. Reads every Secret in the cluster, writes RBAC, deletes pods and Secrets |
 | **Pre-upgrade hook** | ServiceAccount `<release>-upgrade`, cluster-wide, created and deleted per `helm upgrade` ([`pre-upgrade-rbac.yaml`](deploy/helm/valkey-operator/templates/pre-upgrade-rbac.yaml)) | Cluster-wide, lifetime of the hook Job | `valkeys` get/list/patch/update and `customresourcedefinitions` get/list/patch/update |
-| **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **One namespace**, `pods` get/list/patch on *all* pods in it | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
+| **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **One namespace**, `pods` patch on *all* pods in it | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
 | **Observer** | The **same** `<cr-name>-sidecar` ServiceAccount ([`internal/builder/observer.go:113`](internal/builder/observer.go)) | Same namespaced grant | Nothing — it makes no Kubernetes API call at all (verified: no `client-go` import in `internal/observer` or `cmd/observer`) |
 | **Valkey pods** | Same `<cr-name>-sidecar` ServiceAccount — the whole pod, so the `valkey`, `sidecar` and `exporter` containers all carry the token ([`statefulset.go:547`](internal/builder/statefulset.go)) | Same | The `valkey` process itself needs no API access; only the sidecar container uses the token |
 | **Sentinel pods** | The namespace `default` ServiceAccount ([`sentinel.go:368`](internal/builder/sentinel.go)) | Whatever `default` is bound to (nothing, in a stock cluster) | Nothing — Sentinel pods carry no labeler sidecar |
@@ -187,10 +187,11 @@ password.
   compromised Valkey pod may open connections anywhere, including to the API
   server.
 - **The Role is namespace-wide, not pod-wide.** `<cr-name>-sidecar` grants
-  `pods: get,list,patch` on **every pod in the namespace** with no
-  `resourceNames`, so cluster A's sidecar can patch cluster B's pods — and the
-  label it patches is the one the `-rw` Service selects on, while the annotation
-  it patches now steers a topology decision. The narrowing plan and its ordering are
+  `pods: patch` on **every pod in the namespace** with no `resourceNames`, so
+  cluster A's sidecar can patch cluster B's pods — and the label it patches is
+  the one the `-rw` Service selects on, while the annotation it patches steers a
+  topology decision. The unused `get`/`list` were dropped (D8 step 1); the
+  remaining narrowing steps and their ordering are
   [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8.
 - **The workload pods have no securityContext at all.** No `runAsNonRoot`, no
   `readOnlyRootFilesystem`, no `capabilities: drop [ALL]`, no
@@ -254,15 +255,17 @@ Kubernetes version.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "patch"]     # no resourceNames
+    verbs: ["patch"]     # no resourceNames
 ```
 
 What the sidecar actually calls: **`Pods(ns).Patch` and nothing else.** Verified
 by grep over `internal/sidecar` and `cmd/sidecar` — the only clientset call site is
-`patchMetadata` ([`internal/sidecar/labeler.go:283`](internal/sidecar/labeler.go)),
+`patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
 used by `PatchLabel` (own pod, `instanceRole`) and `PatchAnnotation` (the peer pod
-the drain handler promoted). `get` and `list` are granted and never used. The
-observer, which shares this ServiceAccount, calls nothing.
+the drain handler promoted). The grant matches that exactly since the unused
+`get`/`list` were dropped; `TestBuildSidecarRole` pins the verb set, and the
+operator rewrites the Role on every reconcile, so existing clusters narrow on
+their next pass. The observer, which shares this ServiceAccount, calls nothing.
 
 Two writes reach the operator's decisions through this grant:
 
@@ -272,8 +275,10 @@ Two writes reach the operator's decisions through this grant:
   evidence that a promotion it did not perform was legitimate, and on which it
   will demote other masters (`REPLICAOF`, destructive).
 
-Narrowing this Role to `verbs: [patch]` with `resourceNames` limited to the
-cluster's own pods is [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8.
+Narrowing further to `resourceNames` limited to the cluster's own pods — which
+is what removes the cross-cluster patch — is
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
+steps 2 and 3, still open.
 
 ### 4.3 The pre-upgrade hook
 

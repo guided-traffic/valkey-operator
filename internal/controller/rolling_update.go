@@ -768,9 +768,11 @@ func (r *ValkeyReconciler) recordPromotedMaster(ctx context.Context, v *vkov1.Va
 // Names of the in-memory copies of the rolling update wait bounds. They are
 // suffixes of the CR name in the tracker key, see waitBoundKey.
 const (
-	boundTopologyRestore = "topology-restore"
-	boundFinalization    = "finalization"
-	boundManualFailover  = "manual-failover"
+	boundTopologyRestore   = "topology-restore"
+	boundFinalization      = "finalization"
+	boundManualFailover    = "manual-failover"
+	boundSentinelAwareness = "sentinel-awareness"
+	boundSyncWait          = "sync-wait"
 )
 
 // waitBoundKey builds the tracker key of one wait bound of one CR.
@@ -826,17 +828,30 @@ func (r *ValkeyReconciler) ensureWaitBound(ctx context.Context, v *vkov1.Valkey,
 	}
 }
 
+// annotationTimestampExceeded reports whether the RFC3339 timestamp stored under
+// annotation is older than timeout. A missing or empty annotation reports false —
+// nothing was armed, so nothing can have expired. A corrupted timestamp reports
+// true: treating it as expired is the only answer that recovers, because no later
+// pass can repair a value nobody rewrites.
+func annotationTimestampExceeded(v *vkov1.Valkey, annotation string, timeout time.Duration) bool {
+	tsStr, ok := v.Annotations[annotation]
+	if !ok || tsStr == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return true
+	}
+	return time.Since(ts) > timeout
+}
+
 // waitBoundExceeded reports whether the wait armed by ensureWaitBound is older
 // than timeout. The annotation wins when it is present: it is the copy that
 // survives a restart, so a restarted operator must not hand the phase a fresh
 // budget. The in-memory first-seen answers whenever the annotation never landed.
 func (r *ValkeyReconciler) waitBoundExceeded(v *vkov1.Valkey, annotation, bound string, timeout time.Duration) bool {
 	if tsStr, ok := v.Annotations[annotation]; ok && tsStr != "" {
-		ts, err := time.Parse(time.RFC3339, tsStr)
-		if err != nil {
-			return true // corrupted timestamp -- treat as stalled to recover
-		}
-		return time.Since(ts) > timeout
+		return annotationTimestampExceeded(v, annotation, timeout)
 	}
 	started, tracked := r.nudges.firstSeen(waitBoundKey(v.Namespace, v.Name, bound))
 	return tracked && time.Since(started) > timeout
@@ -846,7 +861,10 @@ func (r *ValkeyReconciler) waitBoundExceeded(v *vkov1.Valkey, annotation, bound 
 // of one CR. Every path that ends a rolling update has to call this, or the next
 // rolling update starts with a spent budget.
 func (r *ValkeyReconciler) forgetWaitBounds(namespace, name string) {
-	for _, bound := range []string{boundTopologyRestore, boundFinalization, boundManualFailover} {
+	for _, bound := range []string{
+		boundTopologyRestore, boundFinalization, boundManualFailover,
+		boundSentinelAwareness, boundSyncWait,
+	} {
 		r.nudges.forget(waitBoundKey(namespace, name, bound))
 	}
 }
@@ -967,18 +985,17 @@ func podNameFromHost(addr string) string {
 	return addr
 }
 
-// ensureSentinelAwarenessTimestamp sets the sentinel-awareness-started annotation
-// if it is not already present. The timestamp is used by isSentinelAwarenessStalled
-// to detect when we have been waiting too long for sentinel to discover replicas.
+// ensureSentinelAwarenessTimestamp arms the sentinel-awareness bound if it is not
+// already armed. The deadline is read by isSentinelAwarenessStalled to detect when
+// we have been waiting too long for sentinel to discover replicas.
+//
+// It goes through ensureWaitBound so the deadline survives a CR write that keeps
+// failing: with the annotation alone, a discarded write error meant the bound
+// never armed, isSentinelAwarenessStalled answered false forever, and both call
+// sites requeued the Sentinel rolling update indefinitely — the ADR 0010 D7/D8
+// stall through the arming path, on the one bound that had not been converted.
 func (r *ValkeyReconciler) ensureSentinelAwarenessTimestamp(ctx context.Context, v *vkov1.Valkey) {
-	if v.Annotations == nil {
-		v.Annotations = make(map[string]string)
-	}
-	if _, ok := v.Annotations[annotationSentinelAwarenessStarted]; ok {
-		return // already set
-	}
-	v.Annotations[annotationSentinelAwarenessStarted] = time.Now().UTC().Format(time.RFC3339)
-	_ = r.Update(ctx, v)
+	r.ensureWaitBound(ctx, v, annotationSentinelAwarenessStarted, boundSentinelAwareness)
 }
 
 // isSentinelAwarenessStalled returns true if we have been waiting for sentinel
@@ -986,18 +1003,7 @@ func (r *ValkeyReconciler) ensureSentinelAwarenessTimestamp(ctx context.Context,
 // When stalled, callers should proceed with the failover rather than waiting
 // indefinitely; the existing NOGOODSLAVE retry cycle will handle recovery.
 func (r *ValkeyReconciler) isSentinelAwarenessStalled(v *vkov1.Valkey) bool {
-	if v.Annotations == nil {
-		return false
-	}
-	tsStr, ok := v.Annotations[annotationSentinelAwarenessStarted]
-	if !ok || tsStr == "" {
-		return false
-	}
-	ts, err := time.Parse(time.RFC3339, tsStr)
-	if err != nil {
-		return true // corrupted timestamp — treat as stalled to recover
-	}
-	return time.Since(ts) > sentinelAwarenessTimeout
+	return r.waitBoundExceeded(v, annotationSentinelAwarenessStarted, boundSentinelAwareness, sentinelAwarenessTimeout)
 }
 
 // isFinalizationStalled returns true if the finalizeRollingUpdate function has
@@ -1459,20 +1465,23 @@ func (r *ValkeyReconciler) pauseRollingUpdate(ctx context.Context, v *vkov1.Valk
 	return &RollingUpdateResult{}
 }
 
-// ensureSyncWaitTimestamp sets the sync-wait-started annotation if not already present.
+// ensureSyncWaitTimestamp arms the sync-wait bound if it is not already armed.
+// It goes through ensureWaitBound for the same reason ensureSentinelAwarenessTimestamp
+// does (ADR 0010 D7/D8/D14): with the annotation alone, a CR write that keeps
+// failing meant the bound never armed, isSyncWaitTimedOut answered false forever,
+// and the replica-replacement phase requeued indefinitely without ever reaching
+// pauseRollingUpdate.
 func (r *ValkeyReconciler) ensureSyncWaitTimestamp(ctx context.Context, v *vkov1.Valkey) {
-	if v.Annotations == nil {
-		v.Annotations = make(map[string]string)
-	}
-	if _, ok := v.Annotations[annotationSyncWaitStarted]; ok {
-		return
-	}
-	v.Annotations[annotationSyncWaitStarted] = time.Now().UTC().Format(time.RFC3339)
-	_ = r.Update(ctx, v)
+	r.ensureWaitBound(ctx, v, annotationSyncWaitStarted, boundSyncWait)
 }
 
-// clearSyncWaitTimestamp removes the sync-wait-started annotation.
+// clearSyncWaitTimestamp removes the sync-wait-started annotation and the
+// in-memory copy of the bound. Both must go: this runs mid-update once every
+// replaced replica is synced, and a leftover first-seen would pre-expire the
+// budget of the next sync wait of the same rolling update, pausing it for a
+// timeout that never elapsed.
 func (r *ValkeyReconciler) clearSyncWaitTimestamp(ctx context.Context, v *vkov1.Valkey) {
+	r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundSyncWait))
 	if v.Annotations == nil {
 		return
 	}
@@ -1485,18 +1494,7 @@ func (r *ValkeyReconciler) clearSyncWaitTimestamp(ctx context.Context, v *vkov1.
 
 // isSyncWaitTimedOut returns true if the sync wait has exceeded the configured timeout.
 func (r *ValkeyReconciler) isSyncWaitTimedOut(v *vkov1.Valkey) bool {
-	if v.Annotations == nil {
-		return false
-	}
-	tsStr, ok := v.Annotations[annotationSyncWaitStarted]
-	if !ok || tsStr == "" {
-		return false
-	}
-	ts, err := time.Parse(time.RFC3339, tsStr)
-	if err != nil {
-		return true // corrupted timestamp — treat as timed out to recover
-	}
-	return time.Since(ts) > v.GetSyncTimeout()
+	return r.waitBoundExceeded(v, annotationSyncWaitStarted, boundSyncWait, v.GetSyncTimeout())
 }
 
 // recordEvent emits a Kubernetes Event on the Valkey CR if an EventRecorder
@@ -1902,8 +1900,12 @@ func (r *ValkeyReconciler) incrementReconnectResetCount(ctx context.Context, v *
 	v.Annotations[annotationReconnectResetCount] = fmt.Sprintf("%d", newCount)
 	v.Annotations[annotationFailoverTimestamp] = time.Now().UTC().Format(time.RFC3339)
 	// Also clear the sentinel-awareness timestamp so the next failover attempt's
-	// stall-detection starts from a fresh baseline after this sentinel reset.
+	// stall-detection starts from a fresh baseline after this sentinel reset. The
+	// in-memory copy is first-seen-wins, so it has to be dropped along with the
+	// annotation — a leftover entry would pre-expire the next attempt's budget and
+	// push the operator into a failover Sentinel is not ready for.
 	delete(v.Annotations, annotationSentinelAwarenessStarted)
+	r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundSentinelAwareness))
 	return r.Update(ctx, v)
 }
 
@@ -1922,11 +1924,13 @@ func (r *ValkeyReconciler) clearReconnectResetCount(ctx context.Context, v *vkov
 // clearSentinelAwarenessTimestamp removes the sentinel-awareness-started annotation
 // from the Valkey CR. This must be called whenever sentinel is reset so that the
 // next failover attempt's stall-detection starts from a fresh baseline, not from a
-// timestamp that predates the most recent SENTINEL REMOVE+MONITOR.
+// timestamp that predates the most recent SENTINEL REMOVE+MONITOR. The in-memory
+// copy of the bound is dropped for the same reason (see incrementReconnectResetCount).
 func (r *ValkeyReconciler) clearSentinelAwarenessTimestamp(v *vkov1.Valkey) {
 	if v.Annotations != nil {
 		delete(v.Annotations, annotationSentinelAwarenessStarted)
 	}
+	r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundSentinelAwareness))
 }
 
 // handleNoMasterFound handles the case where no new-image master was detected
@@ -2126,18 +2130,7 @@ func (r *ValkeyReconciler) setFailoverTimestamp(ctx context.Context, v *vkov1.Va
 // failoverRetryTimeout ago, indicating that it likely failed (e.g., due to
 // sentinel cooldown) and should be retried.
 func (r *ValkeyReconciler) isFailoverTimedOut(v *vkov1.Valkey) bool {
-	if v.Annotations == nil {
-		return false
-	}
-	tsStr, ok := v.Annotations[annotationFailoverTimestamp]
-	if !ok || tsStr == "" {
-		return false
-	}
-	ts, err := time.Parse(time.RFC3339, tsStr)
-	if err != nil {
-		return true // Corrupted timestamp — treat as timed out to recover.
-	}
-	return time.Since(ts) > failoverRetryTimeout
+	return annotationTimestampExceeded(v, annotationFailoverTimestamp, failoverRetryTimeout)
 }
 
 // isReplicaReconnectTimedOut checks whether the failover was triggered more
@@ -2146,36 +2139,20 @@ func (r *ValkeyReconciler) isFailoverTimedOut(v *vkov1.Valkey) bool {
 // the rolling update from stalling indefinitely in handlePostFailover when
 // ConnectedSlaves remains 0 (common in resource-constrained CI environments).
 func (r *ValkeyReconciler) isReplicaReconnectTimedOut(v *vkov1.Valkey) bool {
-	if v.Annotations == nil {
-		return false
-	}
-	tsStr, ok := v.Annotations[annotationFailoverTimestamp]
-	if !ok || tsStr == "" {
-		return false
-	}
-	ts, err := time.Parse(time.RFC3339, tsStr)
-	if err != nil {
-		return true // Corrupted timestamp — treat as timed out to recover.
-	}
-	return time.Since(ts) > replicaReconnectTimeout
+	return annotationTimestampExceeded(v, annotationFailoverTimestamp, replicaReconnectTimeout)
 }
 
 // hasMinWaitElapsed checks whether at least failoverResetMinWait has elapsed
 // since the failover timestamp. Used to prevent retriggering failover too
 // quickly after a SENTINEL RESET, giving sentinel time to rediscover replicas.
+// Unlike the timeout checks above, a missing timestamp means there is nothing
+// to wait out, so it reports true.
 func (r *ValkeyReconciler) hasMinWaitElapsed(v *vkov1.Valkey) bool {
-	if v.Annotations == nil {
-		return true
-	}
 	tsStr, ok := v.Annotations[annotationFailoverTimestamp]
 	if !ok || tsStr == "" {
 		return true
 	}
-	ts, err := time.Parse(time.RFC3339, tsStr)
-	if err != nil {
-		return true // Corrupted timestamp — allow to proceed.
-	}
-	return time.Since(ts) >= failoverResetMinWait
+	return annotationTimestampExceeded(v, annotationFailoverTimestamp, failoverResetMinWait)
 }
 
 // isSentinelAwareOfReplicas queries sentinel to check whether it has discovered the
@@ -2756,11 +2733,31 @@ func (r *ValkeyReconciler) promoteAndRedirect(ctx context.Context, v *vkov1.Valk
 	}
 	logger.Info("Promoted replica to temporary master", "pod", promotedPod.name)
 
-	// Redirect all other replicas to the promoted pod.
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	promotedHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", promotedPod.name, headlessName, v.Namespace)
 	portStr := fmt.Sprintf("%d", port)
 
+	// Demote the outgoing master so it stops answering role:master for its
+	// termination window — without this, two pods answer role:master between the
+	// promotion above and the kubelet actually stopping valkey-server, which is
+	// the exact state the steady-state check calls a split brain. Strictly after
+	// the promotion (the demotion must never run against the only master) and
+	// best-effort: the pod was drained of writes by waitForWriteSync before the
+	// promotion and is deleted moments later, so a failure here must not abort
+	// the failover.
+	if masterIdx >= 0 && masterIdx < len(pods) && pods[masterIdx].exists {
+		addr := health.PodAddressForComponent(v, pods[masterIdx].name, common.ComponentValkey, port)
+		mc := r.newValkeyClient(addr, password, tlsConfig)
+		if err := mc.ReplicaOf(promotedHost, portStr); err != nil {
+			logger.Info("REPLICAOF demotion of the outgoing master failed (best-effort)",
+				"pod", pods[masterIdx].name, "target", promotedHost, "error", err)
+		} else {
+			logger.Info("Demoted outgoing master to replica of the promoted pod",
+				"pod", pods[masterIdx].name, "target", promotedHost)
+		}
+	}
+
+	// Redirect all other replicas to the promoted pod.
 	for i, ps := range pods {
 		if i == masterIdx || i == promotedIdx || !ps.exists || !ps.ready {
 			continue

@@ -13,8 +13,15 @@ and, end-to-end for D1–D3, `TestE2E_RollingUpdate_TopologyRestoreAbandoned` in
 Every bound was revert-verified during development; that run leaves no artifact in this
 repository and is not reproducible from it.
 
-**Two bounds are still unconverted and the item is open:**
-`ensureSentinelAwarenessTimestamp` and `ensureSyncWaitTimestamp` — see Residual risks.
+Amended 2026-08-21: the last two unconverted bounds,
+`ensureSentinelAwarenessTimestamp` and `ensureSyncWaitTimestamp`, now go through
+`ensureWaitBound` / `waitBoundExceeded` (D14 closed for both). Their reset sites
+(`incrementReconnectResetCount`, `clearSentinelAwarenessTimestamp`,
+`clearSyncWaitTimestamp`) drop the in-memory copy alongside the annotation, and
+`forgetWaitBounds` covers the end-of-update and CR-deletion paths. Guarded by
+`TestSentinelAwarenessBound_*`, `TestSyncWaitBound_HoldsWhenArmingWriteFails` and
+`TestClearSyncWaitTimestamp_ForgetsTheBound` in
+[`rolling_update_bounds_test.go`](../../internal/controller/rolling_update_bounds_test.go).
 
 ## Context
 
@@ -242,33 +249,22 @@ Rejected once the discarded error in two of the five was noticed — see D14.
 
 ## Residual risks
 
-* **`ensureSentinelAwarenessTimestamp` is one of two bounds never converted (open).** It writes
-  `vko.gtrfc.com/sentinel-awareness-started` with `_ = r.Update(ctx, v)` and keeps no second
-  copy, and `isSentinelAwarenessStalled` reads the annotation and nothing else, so absent
-  reads as `false`. With CR writes failing persistently and Sentinel not yet aware of the
-  replicas, the Sentinel rolling update parks before it ever sends `SENTINEL FAILOVER`,
-  indefinitely — this ADR's shape on the Sentinel path. Nothing bounds it from outside.
-  Scope, per case: Sentinel-enabled clusters only, reachable only while CR writes fail
-  persistently, costs availability of the rolling update and **not** data — no destructive
-  command is issued and the cluster keeps serving on the old image. Not reproduced against a
-  cluster; no test fails on it today.
-  Converting it carries an obligation that must not be missed: `nudgeTracker.observe` is
-  first-seen-wins, so the in-memory copy has to be dropped wherever the annotation is cleared
-  today (`incrementReconnectResetCount` and `clearSentinelAwarenessTimestamp`, both of which
-  re-baseline after a `SENTINEL RESET`). Without those `forget` calls a stale entry
-  pre-expires the next attempt's budget and the operator proceeds into a failover Sentinel is
-  not ready for — D10's defect one layer down.
-* **`ensureSyncWaitTimestamp` is the other one (open), and its scope is wider.** It writes
-  `vko.gtrfc.com/sync-wait-started` with `_ = r.Update(ctx, v)`, keeps no in-memory copy and
-  does not delete the key it could not persist (D8); `isSyncWaitTimedOut` reads the annotation
-  and nothing else, so absent reads as `false`. Its wait site `verifyReplacedReplicasSynced`
-  arms and evaluates in the same pass, so with CR writes failing persistently the check is
-  `false` on every pass, the replica-replacement phase requeues forever and never reaches
-  `pauseRollingUpdate` — the exact stall D7 describes. Scope, per case: every non-Sentinel
-  multi-replica rolling update, not Sentinel-enabled clusters only, reachable only while CR
-  writes fail persistently, costs availability of the rolling update and **not** data — the
-  phase blocks before the next deletion rather than issuing one. Not reproduced against a
-  cluster; no test fails on it today.
+* **(Closed 2026-08-21) `ensureSentinelAwarenessTimestamp` and `ensureSyncWaitTimestamp` were
+  the two bounds never converted.** Both wrote their annotation with `_ = r.Update(ctx, v)`
+  and kept no second copy, so with CR writes failing persistently their stall checks answered
+  `false` forever — the Sentinel rolling update parked before ever sending
+  `SENTINEL FAILOVER`, and `verifyReplacedReplicasSynced` requeued without ever reaching
+  `pauseRollingUpdate`. Both now go through `ensureWaitBound` / `waitBoundExceeded`, and the
+  conversion carried the obligation this entry named: the tracker is first-seen-wins, so
+  every site that clears the annotation also forgets the in-memory copy
+  (`incrementReconnectResetCount` and `clearSentinelAwarenessTimestamp` for the Sentinel
+  bound, `clearSyncWaitTimestamp` for the sync bound) — without those `forget` calls a stale
+  entry pre-expires the next attempt's budget, D10's defect one layer down. Still not
+  reproduced against a cluster; the guards are unit tests
+  (`TestSentinelAwarenessBound_HoldsWhenArmingWriteFails`,
+  `TestSentinelAwarenessBound_ResetRebaselines`,
+  `TestSyncWaitBound_HoldsWhenArmingWriteFails`,
+  `TestClearSyncWaitTimestamp_ForgetsTheBound`).
 * **The in-memory half of a bound is per operator process**, so a restart before the
   annotation ever lands restarts the budget. Deliberate.
 * **The manual-failover hand-over does not bound the outer loop.** After Phase 2 consolidates

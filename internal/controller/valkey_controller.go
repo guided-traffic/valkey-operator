@@ -83,8 +83,10 @@ type ValkeyReconciler struct {
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
 
-	// nudges tracks how long each StatefulSet has been short of pods.
-	// See nudgeShortStatefulSets.
+	// nudges tracks first-seen timestamps for two disjoint key sets: how long
+	// each StatefulSet has been short of pods (nudgeShortStatefulSets), and the
+	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
+	// a bound suffix (waitBoundKey). See the nudgeTracker type doc.
 	nudges nudgeTracker
 }
 

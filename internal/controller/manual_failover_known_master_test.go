@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,8 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/health"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
@@ -369,4 +372,54 @@ func TestHandleManualFailover_DoesNotRetryNonConflictErrors(t *testing.T) {
 
 	require.Error(t, result.Error)
 	assert.Equal(t, 1, attempts, "a rejection that refetching cannot fix must not be retried")
+}
+
+// The outgoing master must not keep answering role:master for its whole
+// termination window: promoteAndRedirect demotes it to a replica of the promoted
+// pod, strictly after the promotion and before its deletion, so the operator does
+// not produce on every failover the very state its steady-state check calls a
+// split brain (ADR 0012 D9). One recording server per target pod, because the
+// assertion is which command reached which pod, not only which commands ran.
+func TestPromoteAndRedirect_DemotesTheOutgoingMaster(t *testing.T) {
+	v, pods, replicaCM := twoReplicaFailoverFixture(t)
+	promotedHost := fmt.Sprintf("test-1.test-headless.%s.svc.cluster.local", v.Namespace)
+	port := int(builder.ServicePort(v))
+
+	var mu sync.Mutex
+	serverByTarget := map[string]string{}
+	commandsByTarget := map[string]func() []string{}
+
+	r, _ := newTestReconciler(v, replicaCM, pods[0].pod, pods[1].pod)
+	r.NewValkeyClientFn = func(addr, _ string, _ *tls.Config) *valkeyclient.Client {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := serverByTarget[addr]; !ok {
+			fakeAddr, commands := recordingValkeyServer(t)
+			serverByTarget[addr] = fakeAddr
+			commandsByTarget[addr] = commands
+		}
+		return valkeyclient.New(serverByTarget[addr])
+	}
+
+	require.NoError(t, r.promoteAndRedirect(context.Background(), v, pods, pods[1], 0, 1))
+
+	commandsTo := func(pod string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		commands, ok := commandsByTarget[health.PodAddressForComponent(v, pod, common.ComponentValkey, port)]
+		if !ok {
+			return ""
+		}
+		return strings.Join(commands(), "\n")
+	}
+
+	promotion := strings.ToUpper(commandsTo("test-1"))
+	assert.Contains(t, promotion, "REPLICAOF", "the promotion must reach the promoted pod")
+	assert.Contains(t, promotion, "NO", "the promoted pod is promoted with REPLICAOF NO ONE")
+
+	demotion := commandsTo("test-0")
+	assert.Contains(t, demotion, "REPLICAOF",
+		"the outgoing master must be demoted instead of answering role:master until the kubelet kills it")
+	assert.Contains(t, demotion, promotedHost,
+		"the demotion must point the outgoing master at the promoted pod")
 }

@@ -55,14 +55,14 @@ func TestBuildSidecarRole(t *testing.T) {
 	assert.Equal(t, "default", role.Namespace)
 	assert.Equal(t, common.ManagedBy, role.Labels[common.LabelManagedBy])
 
-	// Role must grant patch access to pods.
+	// patch is the only verb the sidecar calls; nothing else may be granted.
+	// Exact match, not Contains: a reintroduced get/list would widen the grant
+	// silently, and list would also break a future resourceNames restriction.
 	require.Len(t, role.Rules, 1)
 	rule := role.Rules[0]
 	assert.Equal(t, []string{""}, rule.APIGroups)
 	assert.Equal(t, []string{"pods"}, rule.Resources)
-	assert.Contains(t, rule.Verbs, "patch")
-	assert.Contains(t, rule.Verbs, "get")
-	assert.Contains(t, rule.Verbs, "list")
+	assert.Equal(t, []string{"patch"}, rule.Verbs)
 }
 
 func TestBuildSidecarRole_Namespace(t *testing.T) {

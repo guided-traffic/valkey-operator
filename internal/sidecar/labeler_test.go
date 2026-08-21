@@ -700,22 +700,3 @@ func TestSentinelMasterQuerier_NoAddressesConfigured(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no sentinel addresses configured")
 }
-
-// --- NewLabeler ---
-
-func TestNewLabeler_TLSConfigError(t *testing.T) {
-	_, err := NewLabeler(Config{TLSEnabled: true, TLSCACert: filepath.Join(t.TempDir(), "absent.crt")})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "building TLS config")
-}
-
-func TestNewLabeler_NeedsAnInClusterConfig(t *testing.T) {
-	t.Setenv("KUBERNETES_SERVICE_HOST", "")
-	t.Setenv("KUBERNETES_SERVICE_PORT", "")
-
-	_, err := NewLabeler(Config{ValkeyAddr: "127.0.0.1:6379"})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "getting in-cluster config")
-}

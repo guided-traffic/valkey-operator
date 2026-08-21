@@ -710,3 +710,115 @@ func TestClearRollingUpdateState_ForgetsTheManualFailoverBound(t *testing.T) {
 	assert.Empty(t, crGet(t, c, name).Annotations[annotationManualFailoverStarted])
 	assert.False(t, waitBoundArmed(r, name, boundManualFailover))
 }
+
+// --- ADR 0010 D14: the two bounds that used to arm with a discarded write error ---
+
+// rejectAnnotationArming refuses every CR update that carries the given
+// annotation — a fail-closed admission webhook on the CR, or any other permanent
+// rejection, seen from the arming write's perspective.
+func rejectAnnotationArming(annotation string, attempts *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			cr, isCR := obj.(*vkov1.Valkey)
+			if isCR && cr.Annotations[annotation] != "" {
+				*attempts++
+				return apierrors.NewInternalError(fmt.Errorf("admission webhook denied the annotation"))
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}
+}
+
+// A CR whose writes keep failing used to leave the sentinel-awareness bound
+// unarmed forever: isSentinelAwarenessStalled read an annotation that never
+// landed, answered false on every pass, and both of its call sites requeued the
+// Sentinel rolling update indefinitely. The in-memory copy must carry the
+// deadline instead.
+func TestSentinelAwarenessBound_HoldsWhenArmingWriteFails(t *testing.T) {
+	const name = "sentinel-arm-blocked"
+	attempts := 0
+	funcs := rejectAnnotationArming(annotationSentinelAwarenessStarted, &attempts)
+	r, c, v, _ := multiReplicaFixture(t, name, nil, &funcs)
+
+	r.ensureSentinelAwarenessTimestamp(context.Background(), v)
+
+	require.Positive(t, attempts, "the arming write must have been attempted")
+	require.Empty(t, crGet(t, c, name).Annotations[annotationSentinelAwarenessStarted],
+		"the fixture only works while the annotation truly cannot be persisted")
+	assert.Empty(t, v.Annotations[annotationSentinelAwarenessStarted],
+		"the in-memory object must reflect what was persisted")
+	require.True(t, waitBoundArmed(r, name, boundSentinelAwareness),
+		"a rejected annotation write must still leave the bound armed in memory")
+
+	assert.False(t, r.isSentinelAwarenessStalled(crGet(t, c, name)),
+		"a freshly armed bound must not already report stalled")
+	rewindWaitBound(t, r, name, boundSentinelAwareness, sentinelAwarenessTimeout+time.Second)
+	assert.True(t, r.isSentinelAwarenessStalled(crGet(t, c, name)),
+		"the in-memory deadline must end the wait when the annotation can never be written")
+}
+
+// Both re-baselining sites of a SENTINEL RESET must drop the in-memory copy along
+// with the annotation: the tracker is first-seen-wins, so a leftover entry would
+// pre-expire the next attempt's budget and push the operator into a failover
+// Sentinel is not ready for.
+func TestSentinelAwarenessBound_ResetRebaselines(t *testing.T) {
+	const name = "sentinel-rebaseline"
+	r, _, v, _ := multiReplicaFixture(t, name, nil, nil)
+	ctx := context.Background()
+
+	r.ensureSentinelAwarenessTimestamp(ctx, v)
+	require.True(t, waitBoundArmed(r, name, boundSentinelAwareness))
+
+	require.NoError(t, r.incrementReconnectResetCount(ctx, v, 1))
+	assert.False(t, waitBoundArmed(r, name, boundSentinelAwareness),
+		"incrementReconnectResetCount re-baselines after a reset and must drop the in-memory copy")
+
+	r.ensureSentinelAwarenessTimestamp(ctx, v)
+	require.True(t, waitBoundArmed(r, name, boundSentinelAwareness))
+
+	r.clearSentinelAwarenessTimestamp(v)
+	assert.False(t, waitBoundArmed(r, name, boundSentinelAwareness),
+		"clearSentinelAwarenessTimestamp must drop the in-memory copy for the same reason")
+}
+
+// The sync-wait bound had the same defect on the non-Sentinel path: with CR
+// writes failing persistently, verifyReplacedReplicasSynced requeued forever and
+// never reached pauseRollingUpdate.
+func TestSyncWaitBound_HoldsWhenArmingWriteFails(t *testing.T) {
+	const name = "syncwait-arm-blocked"
+	attempts := 0
+	funcs := rejectAnnotationArming(annotationSyncWaitStarted, &attempts)
+	r, c, v, _ := multiReplicaFixture(t, name, nil, &funcs)
+
+	r.ensureSyncWaitTimestamp(context.Background(), v)
+
+	require.Positive(t, attempts, "the arming write must have been attempted")
+	require.Empty(t, crGet(t, c, name).Annotations[annotationSyncWaitStarted],
+		"the fixture only works while the annotation truly cannot be persisted")
+	require.True(t, waitBoundArmed(r, name, boundSyncWait),
+		"a rejected annotation write must still leave the bound armed in memory")
+
+	assert.False(t, r.isSyncWaitTimedOut(crGet(t, c, name)))
+	rewindWaitBound(t, r, name, boundSyncWait, v.GetSyncTimeout()+time.Minute)
+	assert.True(t, r.isSyncWaitTimedOut(crGet(t, c, name)),
+		"the in-memory deadline must end the wait when the annotation can never be written")
+}
+
+// clearSyncWaitTimestamp runs mid-update, once every replaced replica is synced.
+// It must drop the in-memory copy too: the next sync wait of the same rolling
+// update would otherwise start against a spent budget and pause the update for a
+// timeout that never elapsed.
+func TestClearSyncWaitTimestamp_ForgetsTheBound(t *testing.T) {
+	const name = "syncwait-clear"
+	r, c, v, _ := multiReplicaFixture(t, name, nil, nil)
+	ctx := context.Background()
+
+	r.ensureSyncWaitTimestamp(ctx, v)
+	require.True(t, waitBoundArmed(r, name, boundSyncWait))
+	require.NotEmpty(t, crGet(t, c, name).Annotations[annotationSyncWaitStarted])
+
+	r.clearSyncWaitTimestamp(ctx, v)
+
+	assert.False(t, waitBoundArmed(r, name, boundSyncWait))
+	assert.Empty(t, crGet(t, c, name).Annotations[annotationSyncWaitStarted])
+}

@@ -65,38 +65,11 @@ type Labeler struct {
 	myFQDN          string
 }
 
-// NewLabeler creates a new Labeler from the sidecar config.
-func NewLabeler(cfg Config) (*Labeler, error) {
-	detector, err := newValkeyRoleDetector(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	patcher, err := newKubernetesPodPatcher()
-	if err != nil {
-		return nil, err
-	}
-
-	l := &Labeler{
-		detector:     detector,
-		patcher:      patcher,
-		podName:      cfg.PodName,
-		podNamespace: cfg.PodNamespace,
-		pollInterval: cfg.PollInterval,
-	}
-
-	if cfg.SentinelEnabled && cfg.SentinelAddrs != "" {
-		querier, err := newSentinelMasterQuerier(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("creating sentinel master querier: %w", err)
-		}
-		l.SetSentinelCrossCheck(querier, cfg.SentinelMonitor, cfg.PodName+"."+cfg.HeadlessSvc)
-	}
-
-	return l, nil
-}
-
-// NewLabelerWithDeps creates a Labeler with injected dependencies (for testing).
+// NewLabelerWithDeps creates a Labeler with injected dependencies. The live
+// wiring is runSidecar (run.go), which builds the detector and patcher once and
+// shares them with the drain handler — which is why there is no constructor here
+// that builds its own: a second wiring path with its own detector/patcher pair
+// was dead code that could drift from the reachable one unnoticed.
 func NewLabelerWithDeps(detector RoleDetector, patcher PodPatcher, podName, podNamespace string, pollInterval time.Duration) *Labeler {
 	return &Labeler{
 		detector:     detector,

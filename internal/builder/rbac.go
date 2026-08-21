@@ -27,8 +27,14 @@ func BuildSidecarServiceAccount(v *vkov1.Valkey) *corev1.ServiceAccount {
 }
 
 // BuildSidecarRole builds the namespaced Role for the sidecar container.
-// The role grants patch access to pods owned by this Valkey instance so the sidecar
-// can update the instanceRole label on its own pod.
+// The role grants patch access to pods so the sidecar can update the
+// instanceRole label on its own pod and the drain stamp on a peer pod.
+//
+// patch is the only verb the sidecar calls — patchMetadata in
+// internal/sidecar/labeler.go is the package's single clientset call site — so
+// nothing else is granted. Dropping the unused get/list is also the
+// precondition for a future resourceNames restriction, which is incompatible
+// with list (SECURITY_ARCHITECTURE.md section 4.2, ADR 0012 D8).
 func BuildSidecarRole(v *vkov1.Valkey) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
@@ -40,7 +46,7 @@ func BuildSidecarRole(v *vkov1.Valkey) *rbacv1.Role {
 			{
 				APIGroups: []string{""},
 				Resources: []string{"pods"},
-				Verbs:     []string{"get", "list", "patch"},
+				Verbs:     []string{"patch"},
 			},
 		},
 	}
