@@ -27,6 +27,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 | Document | What it covers |
 |---|---|
 | [SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md) | Trust boundaries, every RBAC rule the operator and the per-instance sidecar hold and what each one permits, where the password and the TLS material live, what the isolation does **not** cover, and the hardening checklist |
+| [docs/adr/](docs/adr/README.md) | Architecture Decision Records — what was decided, why, what was rejected and what it costs, for the reconcile model, the rolling update, the master authority and split-brain resolution, the privilege model, and the test/CI policy |
 | [CRD Reference](#crd-reference) (below) | Every `spec` field, its default and its effect |
 | [Valkey documentation](https://valkey.io/topics/) | Upstream server, replication and Sentinel behaviour |
 | [cert-manager](https://cert-manager.io/docs/) | Issuers referenced by `spec.tls.certManager` |
@@ -98,12 +99,11 @@ kubectl get valkey <name> -o jsonpath='{range .status.conditions[?(@.type=="Side
 kubectl delete pod <name>-0        # the deferred sidecar update applies on recreation
 ```
 
-Do not read the condition as a live signal. A clearing branch exists, but the
-operator does not reach it on the transition you care about: once the pod runs the
-current sidecar, no pod needs an update any more and the pass returns before it
-dispatches to the code that would clear the condition. The branch is only reached
-when a rolling-update state is still recorded on the CR — so a `True` can outlive
-the drift it reported. Read the running images to confirm, not the condition:
+The condition clears itself once the deferred update has applied: the operator clears it
+in the one place that provably knows every pod matches the live template — the pass where
+no pod needs an update and no rolling-update state is recorded
+([ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10). To confirm the
+running sidecar directly rather than through the condition:
 
 ```bash
 kubectl get pod <name>-0 -o jsonpath='{range .spec.containers[*]}{.name}={.image}{"\n"}{end}'

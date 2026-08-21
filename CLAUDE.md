@@ -6,6 +6,37 @@ Repo: https://github.com/guided-traffic/valkey-operator
 
 All code, comments, commit messages, documentation, and CRD fields in this repository **must be written in English**.
 
+## Architecture Decision Records
+
+Every durable architecture decision lives in [`docs/adr/`](docs/adr/README.md), one file per
+decision family, named `NNNN-kebab-case-title.md`. The index in
+[`docs/adr/README.md`](docs/adr/README.md) lists all of them grouped by theme. Read the
+relevant ADR before changing the behaviour it describes.
+
+Structure of an ADR:
+
+| Section | Content |
+|---|---|
+| `# ADR NNNN: Title` | the decision as a title, not a topic |
+| `## Status` | `Accepted` / `Superseded by ADR NNNN` / `Amended`, with `Date:` and what is implemented versus open |
+| `## Context` | the forces and the concrete failure that made the decision necessary |
+| `## Decision` | `D1 … Dn`, each a rule that holds going forward, in present tense |
+| `## Consequences` | what it costs, including the parts nobody likes |
+| `## Alternatives Considered` | each option and why it lost |
+| `## Residual risks` | accepted risks, open items, and what was **not** verified |
+| `## References` | relative links to the code and to sibling ADRs |
+
+**ADRs must be kept current. They are part of the code, not a historical note.**
+
+- Changing behaviour an ADR describes means updating that ADR **in the same change**, never
+  afterwards.
+- **On a re-decision**, the `Decision` section states the new rule, `Status` records the
+  amendment with its date, and the superseded rule is marked in place rather than deleted.
+  A reader must never find the old rule stated as current.
+- A new durable decision — a rule, an invariant, a default, a refusal to act — gets its own
+  ADR and a line in the index.
+- Every claim is verified against the code; anything unverified says so explicitly.
+
 ## CRD
 
 Namespace: `vko.gtrfc.com`
@@ -132,8 +163,16 @@ The CRD status must be visible in Lens and show the current operator task per in
 ## Testing
 
 - **Unit tests**: High coverage for all reconciliation logic
-- **Integration tests**: Must write actual values to Valkey and verify replication to replicas
-- **E2E tests**: Required for rolling update scenarios (image change, failover verification)
+- **Integration tests** (`test/integration`, envtest): cover what only a real API server decides —
+  CRD defaulting, delete preconditions, controller-manager wiring. envtest starts a
+  kube-apiserver and etcd and **no kubelet**, so no pod runs there and nothing in this tier
+  opens a Valkey connection.
+- **E2E tests**: rolling updates, failover and recovery against real Valkey instances. This is
+  the tier that **must write actual values into Valkey and verify replication reaches the
+  replicas**, and the only one that can.
+
+Tier responsibilities, the verification rules (mutation and revert checks, what may be an e2e
+and what may not) and the CI matrix: [ADR 0017](docs/adr/0017-test-and-ci-policy.md).
 
 ### Makefile as Entry Point
 
@@ -165,11 +204,15 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 The unit targets deliberately do **not** pass `-short`, and no test in this
 repo may gate itself behind `testing.Short()`. Both rules exist because the
 combination silently removed eight `internal/controller` tests from CI, three
-of which had been failing unnoticed (NA22). Unit tests reach no real Valkey:
+of which had been failing unnoticed. Unit tests reach no real Valkey:
 `newTestReconciler` redirects every client to `127.0.0.1` for an instant
 refusal, and tests that need a command to succeed use `fakeValkeyServer(t)`
 (`internal/controller/manual_failover_known_master_test.go`) via
 `NewValkeyClientFn`. There is no runtime left to save by skipping.
+
+The full verification policy — mutation and revert checks, what may be an e2e and what may
+not, fixture rules, coverage boundaries — is
+[ADR 0017](docs/adr/0017-test-and-ci-policy.md).
 
 ### E2E cluster topology
 
@@ -193,33 +236,24 @@ clusters, so spreading three replicas needs three schedulable workers.
 - Locally: `make kind-create` already builds control-plane + 3 workers, so
   `make e2e-local` covers both.
 
+Rationale and the rest of the CI policy: [ADR 0017](docs/adr/0017-test-and-ci-policy.md).
+
 ### RBAC lives in three places — keep them in sync
 
-The full privilege footprint — every rule, what it permits, the operator versus
-sidecar split, and the hardening checklist — is documented in
-`SECURITY_ARCHITECTURE.md` (linked from `README.md`). Update it in the same change
-whenever a marker, the chart ClusterRole or `BuildSidecarRole` changes.
-
 The kubebuilder markers in `internal/controller/valkey_controller.go` generate
-`config/rbac/role.yaml` (`make manifests`), but the ClusterRole that actually
-reaches users is the hand-maintained
-`deploy/helm/valkey-operator/templates/clusterrole.yaml`. Only convention kept
-them aligned, and the drift shipped twice: NA12 (all operator Events silently
-discarded) and a missing `delete` on core `secrets` that wedged every cluster
-migrating to `spec.tls.unifiedCertificate` (NA37) — the apiserver evaluates authz
-before existence, so a missing verb returns 403 even for an object that is gone.
+`config/rbac/role.yaml` (`make manifests`), but the ClusterRole that actually reaches users is
+the hand-maintained `deploy/helm/valkey-operator/templates/clusterrole.yaml`.
+**A new marker needs the chart rule in the same change**, plus an entry in
+`SECURITY_ARCHITECTURE.md`. `TestHelmClusterRoleCoversGeneratedRole`
+(`internal/controller/rbac_drift_test.go`) asserts generated ⊆ chart and names the missing
+triple; the `generated-manifests` CI job covers the half it cannot see by running
+`make generate-all` and failing on a dirty tree.
 
-`TestHelmClusterRoleCoversGeneratedRole` (`internal/controller/rbac_drift_test.go`)
-expands both manifests into `(group, resource, verb)` triples and asserts
-generated ⊆ chart, so chart-only extras (leader-election leases) stay legal.
-**A new marker needs the chart rule in the same change**; the test names the
-missing triple. It compares manifest against manifest, never marker against
-manifest, so a stale `config/rbac/role.yaml` would pass it — that half is covered
-by the `generated-manifests` job in `.github/workflows/release.yml`, which runs
-`make generate-all` on every push and PR and fails on a dirty tree (NA44).
-`make generate-all` regenerates the CRDs, the DeepCopy code **and**
-`config/rbac/role.yaml`, and syncs the CRD into the chart; the chart ClusterRole is
-hand-maintained and is not generated by it.
+Why it is a test and not a convention, what "legal drift" means, and the one supported
+upgrade path: [ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md). The privilege footprint
+itself — every rule, what it permits, the hardening checklist — is
+[`SECURITY_ARCHITECTURE.md`](SECURITY_ARCHITECTURE.md) and
+[ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md).
 
 ## Rolling Update Strategy
 
@@ -230,343 +264,57 @@ hand-maintained and is not generated by it.
 5. Verify failover succeeded
 6. Replace last pod (former master)
 
-### Known master (`vko.gtrfc.com/known-master`)
+The data StatefulSet uses `updateStrategy: OnDelete` and `podManagementPolicy: Parallel`, so
+pod replacement is the operator's job, not the StatefulSet controller's — which is also why a
+PodDisruptionBudget never constrains it. The rolling update compares pods against the
+**persisted StatefulSet template**, never against the CR, so a rejected StatefulSet write
+cannot turn an image change into a pod-delete loop.
+→ [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md)
 
-The annotation carries the address of the pod the operator currently considers
-master. It feeds the `replicaof` directive of the replica ConfigMap
-(`GenerateValkeyConf`), never the config hash (`GenerateValkeyConfForHash`
-ignores it), so publishing it during a failover cannot trigger a rolling restart.
+## The non-Sentinel master authority, in five rules
 
-Both init containers consult it, and the operator maintains it on both paths:
+Without Sentinel nothing external arbitrates who the master is, and every mistake in this area
+is a `REPLICAOF` that discards a dataset. Five ADRs carry the design; the load-bearing
+sentences are repeated here so nothing is changed without them.
 
-- Sentinel path: `syncSentinelWithMaster` persists the confirmed master at
-  finalization; the init container uses it when no Sentinel answers.
-- Non-Sentinel path: `handleManualFailover` publishes the promoted pod **and
-  republishes the replica ConfigMap before deleting the old master**;
-  `promotePod0AndRedirect` points it back at pod-0 after the topology is
-  restored. The init container consults it only after peer discovery fails, only
-  when the address is not the pod itself, and only when that peer answers
-  `role:master`.
-
-Why it is needed without Sentinel: with 2 replicas the promoted pod has no
-replicas attached, so the init container's `role:master && connected_slaves > 0`
-test rejects it and a returning pod-0 would elect itself master (NA20).
-
-Related: while the manual failover is in flight, `detectAndResolveSplitBrain`
-must be told that the promoted pod is the real master (`handleMultiReplicaRollingUpdate`
-passes `annotationPromotedPod` for the `manualFailover`/`replacingMaster` states).
-Otherwise its "most connected slaves" fallback ties at zero, picks the lowest
-ordinal — the old master that was just deleted — and demotes the promoted pod,
-losing the data (NA21).
-
-### Steady-state split brain and the drain stamp (`vko.gtrfc.com/drain-promoted-at`)
-
-Outside a rolling update `checkSteadyStateSplitBrain`
-(`internal/controller/steady_state_master.go`) is the only thing that re-detects a
-second master. A demotion there is a `REPLICAOF`, which discards the demoted
-dataset, so it never acts on the known-master annotation alone: the sidecar drain
-handler promotes a replica on every SIGTERM of a master pod and has no CR access
-to record it, so the annotation is trustworthy exactly when the operator promoted
-and untrustworthy exactly when the sidecar did.
-
-Three independent pieces of evidence separate the two, and none is required:
-
-- **The stamp.** `internal/sidecar/drain.go` patches
-  `vko.gtrfc.com/drain-promoted-at` (RFC3339 UTC) onto the pod it promotes, right
-  after the promotion and before any best-effort step. Best-effort itself: a lost
-  stamp is a degradation, never a corruption. Non-Sentinel path only, and it does
-  not survive a delete-recreate of the promoted pod (it lives on the Pod object).
-  The handler writes no stamp when a peer already answers `role:master`
-  (`findSyncedReplica` sweeps every peer first): during a rolling update the
-  operator promotes a replica itself and then deletes the old master without
-  demoting it, so the drain runs on a pod that is still master while the topology
-  already has a new one, and promoting again would stamp a third pod nobody
-  promoted.
-- **The structural rule.** The init script (Phase 3) grants the master config to
-  ordinal 0 on the ordinal fallback, and otherwise only via the NA35 self-claim,
-  which needs the mounted replica config to name the pod itself. A labeled master
-  with ordinal > 0 that the **live** replica ConfigMap does not name therefore
-  cannot have elected itself. The live ConfigMap, not the CR annotation: the two
-  diverge whenever a republish did not land, and it is the ConfigMap the pod reads.
-- **The recorded pod yielded.** The pod the annotation names answers a probe and
-  reports a role other than master (`recordedGaveUpTheRole`). A pod that replicates
-  from somewhere else has already given up its dataset, so republishing the replica
-  ConfigMap away from it destroys nothing — the record is simply out of date.
-  Unreachable, absent or still-master all read as **no** evidence: that pod may be
-  a master that is merely restarting, and the writes it holds are exactly the ones
-  an adoption would discard.
-
-The third rule exists because the second is blind to exactly the pod a drain
-promotes most often: `buildReplicaAddrs` walks the ordinals ascending and
-`findSyncedReplica` takes the first synced peer, so draining a non-pod-0 master
-promotes **pod-0** whenever pod-0 is healthy — and `couldNotHaveSelfElected` can
-never exonerate pod-0. A non-pod-0 master is not exotic either: it is the routine
-output of this design, since every adoption leaves one behind. So the
-operator-upgrade window, in which old sidecars write no stamp, rests on the
-structural rule for a pod-0 master and on the recorded pod's own answer for every
-other one.
-
-**The creation order may only ever REFUSE a demotion, never grant an adoption.**
-"The pod the annotation names is the younger Pod object" is true after a drain, and
-just as true after the recorded master's node hard-failed with no SIGTERM (hence no
-drain and no stamp) while a peer that could reach nobody took the ordinal fallback
-and elected itself. Adopting there republishes the replica ConfigMap toward the
-self-elected pod and the real master full-resyncs its newer dataset away the moment
-it boots — silently, and caused by the operator. Being newer is evidence of
-nothing. The same signal is safe in the refusing direction, where the worst outcome
-is two masters a human can see, so `refuseDemotion` uses it and
-`promotionEvidence` does not.
-
-`recreatedAfter` is deliberately strict about the order (`metav1.Time.Before`,
-one-second resolution), fails closed on an unreadable or absent pod, and is
-**bounded**: the recreation must be inside `spec.rollingUpdate.syncTimeout`
-(default 5 m, the same budget the replica replacement and Phase 1 of the topology
-restoration use for a deleted pod to come back). Unbounded it would be a permanent
-property of two Pod objects — true after any reschedule, forever — and the operator
-would never consolidate that pair again. Past the window it resolves toward the
-annotation, as it did before the rule existed.
-
-Where the refusal does **not** fire, so nobody reads more into it: a simultaneous
-restart of the whole pod set. The data StatefulSet runs
-`PodManagementPolicy: Parallel`, so a co-restart recreates every pod at once and
-**ties** the timestamps; `Before` is strict, so the rule is inert and the
-annotation decides. (An earlier version of this section claimed a StatefulSet
-recreates in ordinal order — it does not, for the data set.) Its accepted cost
-stays: inside the window it cannot tell a returning drained master from a master
-that merely crashed and came back while a peer self-elected in the gap, and that
-case stays a visible split brain until a human resolves it or the window expires.
-
-Decision table (`labeled` = pods carrying `instanceRole=master`):
-
-| State | Outcome |
-|---|---|
-| `len == 0` | return; `checkAndRecoverNoMaster` owns it |
-| `len == 1`, annotation names it | no-op, **no probe at all** |
-| `len == 1`, stamped and confirms master | adopt |
-| `len == 1`, ordinal > 0 and the ConfigMap names someone else | adopt |
-| `len == 1`, the recorded pod answers and is **not** master | adopt |
-| `len == 1`, the recorded pod is unreachable, gone, or still master | refuse, `MasterAdoptionRefused` |
-| `len == 1`, none of them | refuse, `MasterAdoptionRefused` (no requeue: one master is not a split brain) |
-| `len >= 2`, exactly one stamped master confirms | record it, demote the others toward it |
-| `len >= 2`, more than one stamped master confirms | refuse, `SplitBrainDemotionRefused` |
-| `len >= 2`, annotation names pod-0 and another confirmed master could not have self-elected | refuse, `SplitBrainDemotionRefused` |
-| `len >= 2`, annotation names a pod recreated after a confirmed master, inside `syncTimeout` | refuse, `SplitBrainDemotionRefused` |
-| `len >= 2`, annotation names a confirmed master | demote the others toward it |
-| `len >= 2`, no admissible authority | refuse, `SplitBrainUnresolved` |
-
-Ambiguous evidence routes into the refusal, never past it: two live stamped masters
-used to fall through to the annotation, which then demoted **both** of them and
-discarded two drain windows at once — the most destructive action in the file,
-taken precisely because nothing said which dataset mattered.
-
-Both **demotion** refusals keep the recheck requeue (`steadyStateRecheckDelay`,
-15 s) and never suppress `updateStatus` — the cluster is still split, so the
-operator owes it another look. The **adoption** refusal does not requeue: one
-labeled master is not a split brain (writes reach exactly one dataset), and no
-amount of polling fixes a record only a human can correct. Neither does the
-no-admissible-authority branch, for the same reason.
-
-**The stamp is cleared from every pod of the cluster at two sites**, and both are
-correctness rather than hygiene: the stamp means "a promotion nobody recorded", so
-once the operator has recorded one the stamp is spent evidence — and evidence beats
-the annotation on the next pass, so a leftover stamp would have the operator adopt
-the stale pod and `REPLICAOF` the master it legitimately promoted.
-
-- `recordPromotedMaster`, after the known-master write succeeded.
-- `clearRollingUpdateState`, after the state annotations were removed.
-  `recordPromotedMaster` is **not** the single funnel for the known-master
-  annotation: `persistManualFailoverState` writes it directly (one `Update`, for
-  its conflict retry) and `syncSentinelWithMaster` goes through
-  `persistKnownMaster`, while `verifyTopologyRestored`,
-  `finalizeMultiReplicaRollingUpdate` and `handlePostManualFailover` end a rolling
-  update without recording a master at all. `clearRollingUpdateState` is where all
-  of them converge.
-
-  The call sits **below** the early returns on purpose: `checkAndHandleRollingUpdate`
-  calls the function on every pass that reports `Completed`, including passes where
-  nothing was running, and it runs before `checkSteadyStateSplitBrain` in the same
-  reconcile — clearing unconditionally would delete a fresh drain stamp in the pass
-  before the check that exists to read it.
-
-Accepted residuals:
-
-- An in-place sandbox recreation within kubelet's ConfigMap refresh window (~1 min)
-  can self-claim off a stale mount and be adopted by the structural rule.
-- The stamp lives on the Pod object, so a promoted pod that loses its node before
-  the operator adopts the promotion returns without it. That degrades to the
-  structural rule, the recorded pod's own answer, or a refusal.
-- The creation-order refusal turns a crash-and-self-elect race into a visible split
-  brain instead of resolving it toward the annotation — for the length of
-  `spec.rollingUpdate.syncTimeout`, after which the annotation decides again.
-
-### Topology restoration (non-Sentinel, two phases)
-
-After the master was replaced, `handleTopologyRestoration` (Phase 1,
-`stateRestoringTopology`) waits for pod-0 to sync back from the promoted replica
-and then promotes it again; `verifyTopologyRestored` (Phase 2,
-`stateVerifyingTopology`) confirms every replica reconnected.
-
-Both phases are bounded, and they end differently:
-
-- Phase 1 is bounded by `spec.rollingUpdate.syncTimeout` (default 5m), tracked in
-  `vko.gtrfc.com/topology-restore-started`. On timeout `abandonTopologyRestoration`
-  gives up the canonical topology, not the data: pod-0 is never force-promoted
-  (an unsynced pod-0 would come up empty and discard the promoted replica's
-  writes). It records `TopologyRestoreAbandoned` + `TopologyRestored=False` and
-  hands over to **Phase 2**, not to a cleared state — once the state annotation is
-  gone, `checkAndHandleRollingUpdate` returns early and nothing calls
-  `detectAndResolveSplitBrain` again, so Phase 2 is the last pass that can
-  consolidate the masters (NA23).
-- Phase 2 is bounded by `finalizationStallTimeout` (2m, own annotation) on both
-  its rogue-master branch and its pod-lookup-error branch.
-
-**The known-master annotation is the split-brain authority for both states.**
-`promotePod0AndRedirect` moves it to pod-0 only after the promotion succeeded, so
-on the abandoned path it still names the promoted replica. Without naming it, the
-"most connected slaves" fallback ties at zero in a shrunken cluster and picks the
-returning pod-0 by lowest ordinal — NA21, one state later.
-
-A non-pod-0 master is a supported end state: the `-rw`/`-r` Services select on
-`instanceRole`, not on ordinal.
-
-The same annotation is also the authority of the steady-state check below, and of
-the init container's self-claim — three consumers, one recorded truth.
-
-**Contract, sharpened (NA50): the annotation is the tie-breaker AMONG MULTIPLE
-masters; it is never used to overrule a single, undisputed master.** The reason is
-data, not tidiness: demoting a master is a `REPLICAOF` that discards its dataset,
-so an operator that overrules the only master in the cluster destroys the writes of
-whatever promoted it — including promotions the operator did not perform itself.
-The sidecar performs exactly such a promotion on every SIGTERM of a master pod
-(`internal/sidecar/drain.go`, any node drain or eviction) and cannot record it: its
-Role grants `pods get/list/patch` and no CR access at all
-(`internal/builder/rbac.go`) — it records the promotion on the promoted **pod**
-instead (`vko.gtrfc.com/drain-promoted-at`). Where one labeled master disagrees
-with the annotation, `adoptUnrecordedPromotion` moves the annotation to it **only
-with evidence** that somebody else promoted it: the stamp, the structural rule, or
-the recorded pod answering that it is no longer master. The label alone is not
-evidence — a pod that elected itself off a stale mount answers `role:master` just
-as convincingly.
-
-**Invariant: a promotion the operator could not record is not a completed
-promotion.** Once the steady-state check demotes *toward* this annotation and the
-init script boots a pod as master *from* it, the annotation is a data-plane
-authority, not telemetry — so every write that records a promotion is part of the
-promotion, never best-effort. `persistManualFailoverState` therefore retries and
-then fails the pass instead of deleting the old master with the promotion
-unrecorded, and `promotePod0AndRedirect` moves the annotation only after the
-promotion actually succeeded. Do not relax either write back to `_ = r.Update(...)`.
-
-### Steady-state split brain (non-Sentinel)
-
-`checkSteadyStateSplitBrain` (`internal/controller/steady_state_master.go`, wired
-into `handlePostRollingUpdateChecks`) is the only split-brain check that runs
-**outside** a rolling update. Without it nothing re-detects a second master once
-the rolling-update state annotation is cleared, and the `-rw` Service keeps
-round-robining writes across two independent datasets (NA26).
-
-- It probes only when at least two pods carry `instanceRole=master`, so the
-  healthy case costs no connection. Skipped with Sentinel, for single-replica
-  clusters, and while a rolling-update state is set.
-- **The known-master annotation is its only authority among two or more masters.**
-  It demotes a rogue only toward the pod that annotation names, and only when that
-  pod itself answers `role:master` on a live probe.
-- **With exactly one labeled master it adopts instead of demoting.**
-  `adoptUnrecordedPromotion` runs at `len(labeled) == 1`: if the annotation names a
-  different pod, the labeled one confirms `role:master` **and one of the three
-  pieces of evidence above holds**, the annotation is moved to it and a
-  `MasterAdopted` Event is recorded. This is the drain case — the sidecar promoted
-  a replica on SIGTERM and had no way to record it on the CR — and adopting is what
-  keeps the later demotion pointed at the pod that does **not** hold the
-  drain-window writes (NA50). A pod that is unreachable or reports `role:replica`
-  is not adopted (a stale label is not a promotion), and neither is one with no
-  evidence behind it: that ends in a `MasterAdoptionRefused` Warning. With two or
-  more labeled masters the same adoption runs on an unambiguous drain stamp
-  (`adoptAndConsolidate`); two stamped masters refuse instead of consolidating.
-- **It never tie-breaks.** Inside a rolling update the operator knows which pod it
-  promoted; in steady state it does not, and the "most connected slaves" fallback
-  ties at zero in a shrunken cluster and picks the lowest ordinal — the mechanism
-  that destroyed the promoted pod's data in NA21. A refusal for lack of an
-  admissible authority (no annotation, named pod unreachable, named pod reports
-  replica) records a `SplitBrainUnresolved` Warning; a refusal because the shape
-  says a drain promoted the rogue records `SplitBrainDemotionRefused`. Both change
-  nothing.
-- The demotion path performs no API writes (cached List, Valkey commands, Events),
-  so it still runs during a blocked pass. Intended: a split brain is a data-plane
-  emergency and an admission gap must not suppress it. The adoption path is the one
-  exception — it writes the annotation and the replica ConfigMap — and a blocked
-  pass simply fails it with a log line; the next pass retries, and nothing is left
-  half-applied (`persistKnownMaster` restores the in-memory value it could not
-  write).
-- A confirmed second master it could **not** demote asks for a recheck without
-  ending the pass: the `steadyStateRecheckDelay` (15 s) travels back as a
-  non-terminal `ctrl.Result` that `reconcileWorkload` applies after `updateStatus`.
-  Ending the pass instead would skip the status write and freeze the CR at its last
-  verdict (usually `OK`) while the operator loops on a split brain invisibly, and
-  dropping the requeue would leave the next look to the 10 h cache resync — the CR
-  watch is generation-gated and there is no Pod watch. Only the unresolved case
-  requeues; a merely stale label does not, because the operator cannot fix a label
-  it does not own.
-
-It is therefore inert without the annotation — a cluster whose CR annotations were
-stripped (a GitOps prune) keeps two masters with only a Warning, and the adoption
-does not re-establish a missing annotation either (nothing recorded means nothing
-to contradict). That is the decision, not an oversight.
-
-### Init container: a pod named in its own `replicaof` boots as master
-
-The non-Sentinel init script (`internal/builder/statefulset.go`) ranks its master
-decision: peer discovery > **self-claim** > ordinal fallback. When the mounted
-replica config names the pod itself, `SELF_IS_KNOWN_MASTER` is set and the pod
-boots with the master config instead of taking the ordinal fallback (NA35).
-
-- Below peer discovery, so an established master with replicas always wins.
-- Above the ordinal fallback, because peer discovery rejects a master reporting
-  `connected_slaves: 0` — exactly what a freshly promoted pod looks like after a
-  full pod-set restart. That is the case where the promoted pod used to full-sync
-  its own post-failover writes away.
-- **It must not ship without the check above.** The self-claim can produce two
-  masters when pod-0 already elected itself; `checkSteadyStateSplitBrain`
-  consolidates them, using the same annotation as authority on both sides.
-- **It is only as good as the annotation, which is why adoption matters.** After a
-  node drain the sidecar promotes a replica and cannot record it, so the annotation
-  keeps naming the drained pod — and its replica ConfigMap keeps naming it too.
-  Without `adoptUnrecordedPromotion` the returning pod self-claims on a stale
-  record, becomes a second master, and the steady-state check then demotes the pod
-  that took every write during the drain (NA50). The self-claim is not what causes
-  that loss — a returning pod-0 reaches master through the ordinal fallback anyway —
-  but it widens the set of ordinals it applies to.
-- Accepted residual: a stale mounted ConfigMap (kubelet refresh lag, up to ~1 min)
-  can make a pod self-claim after the operator re-pointed the annotation. The CR
-  annotation is already correct then, so the first steady-state pass demotes the
-  claimant.
+1. **`vko.gtrfc.com/known-master` is the operator's recorded master authority.** It feeds the
+   `replicaof` directive of the replica ConfigMap, is deliberately excluded from the config
+   hash, and is read by three consumers: the init container, the rolling-update split-brain
+   resolver and the steady-state check. A non-pod-0 master is a supported end state — the
+   `-rw`/`-r` Services select on `instanceRole`, never on ordinal.
+   → [ADR 0008](docs/adr/0008-known-master-annotation-is-the-recorded-authority.md)
+2. **A promotion the operator could not record is not a completed promotion.** Every write
+   that records a promotion is *part of* the promotion: it retries where retrying helps, and
+   on failure it fails the pass rather than letting the promotion stand unrecorded. Do not
+   relax any of them back to `_ = r.Update(...)`.
+   → [ADR 0009](docs/adr/0009-an-unrecorded-promotion-is-not-a-promotion.md)
+3. **Every rolling-update wait is bounded, and expiry hands over to another bounded state** —
+   never to a cleared rolling-update state, because once the state annotation is gone nothing
+   calls `detectAndResolveSplitBrain` again. A bound that can silently fail to arm is not a
+   bound.
+   → [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md)
+4. **In steady state the annotation is a tie-breaker among multiple masters; it never
+   overrules a single, undisputed one.** Adoption requires evidence — the drain stamp, the
+   structural rule, or the recorded pod answering that it is no longer master. **Pod creation
+   order may only ever REFUSE a demotion, never grant an adoption.** The normative decision
+   table lives in the ADR.
+   → [ADR 0011](docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md)
+5. **The sidecar has no CR access and records its drain promotion on the pod**
+   (`vko.gtrfc.com/drain-promoted-at`), which is why the operator has to reason from evidence
+   at all. The labeler exits before the drain handler runs, so exactly one pod carries the
+   master label during a drain.
+   → [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
 
 ## Metrics / Exporter
 
-`spec.metrics.enabled` adds an exporter sidecar (default `oliver006/redis_exporter`)
-to every Valkey pod, serving `/metrics` on `spec.metrics.port` (default 9121, named
-port `metrics`). Implementation:
-
-- Sidecar container: `buildExporterContainer` in `internal/builder/statefulset.go`,
-  appended via `buildPodContainers`. Connects to `localhost` (TLS port + skip-verify
-  when TLS is on), reads the auth password from the Secret as `REDIS_PASSWORD`. It
-  carries **no readiness probe** so a failing exporter never removes the pod from the
-  `-rw`/`-r` Services.
-- Service: `BuildMetricsService` (`<name>-metrics`) carries the marker label
-  `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it.
-- ServiceMonitor: `BuildServiceMonitor` in `internal/builder/servicemonitor.go` is an
-  `unstructured.Unstructured` (`monitoring.coreos.com/v1`) — no typed dependency,
-  mirroring the cert-manager Certificate handling. Gated behind
-  `spec.metrics.serviceMonitor.enabled`; skipped gracefully when the CRD is absent.
-- Controller: `reconcileMetrics` (create-or-cleanup) in `valkey_controller.go`,
-  wired via `reconcileMonitoringResources`.
-- NetworkPolicy: the exporter port is opened on the Valkey ingress rule when metrics
-  are enabled.
-- **Lossless migration:** enabling metrics on a running cluster changes the pod-spec
-  hash, so the existing failover-aware rolling update migrates pods without data loss
-  — no persistence required. Exception: a single standalone pod (`replicas: 1`, no
-  persistence) has no failover target, so adding the sidecar restarts it and loses
-  in-memory data (physically unavoidable).
+`spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on
+`spec.metrics.port` (default 9121). It carries **no readiness probe**, so a failing exporter
+never removes the pod from the `-rw`/`-r` Services. The `<name>-metrics` Service carries the
+marker label `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it; the
+ServiceMonitor is `unstructured` (`monitoring.coreos.com/v1`) and skipped when the CRD is
+absent. Enabling metrics changes the pod-spec hash and therefore rides the failover-aware
+rolling update — lossless except for a single standalone pod without persistence.
+→ [ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
 
 # Important Notes
 
@@ -578,6 +326,10 @@ port `metrics`). Implementation:
 - Do not commit to git, ask the user for a review and let the user commit to git. This ensures that the user is aware of all changes and can provide feedback before they are finalized.
 - if you need to write temporary files, write them to local tmp-folder. Do not use the system tmp folder at /tmp
 - persist important information about the project and implementation in this file
+- **architecture decisions belong in `docs/adr/`, not here.** This file carries project-wide
+  working rules and short pointers; the reasoning, the alternatives and the residual risks
+  live in the ADR. When a decision changes, update its ADR in the same change and mark the
+  superseded rule in place — see [Architecture Decision Records](#architecture-decision-records).
 - if you are done with your task, always report a conventional commit message to the user, but do not commit to git. Let the user review and commit to git. This ensures that the user is aware of all changes and can provide feedback before they are finalized.
 - If I ask you to investigate in my kubernetes cluster use this kube_config: /Users/hfi/repos/business_onpremise/kubernetes_configs/wds18-k8s-main
 

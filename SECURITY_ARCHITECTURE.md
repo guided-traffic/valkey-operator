@@ -13,8 +13,13 @@ and the per-instance Role builder
 ([`internal/builder/rbac.go`](internal/builder/rbac.go)). Where a statement is
 **not** verified against this repository, it says so.
 
-Related: [README.md](README.md) (user-facing reference) — a `DEVELOPER.md` does
-not exist yet.
+Related: [README.md](README.md) (user-facing reference) and
+[docs/adr/](docs/adr/README.md), which holds the decisions behind this document —
+[ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) (the privilege model),
+[ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md) (how the rules stay in sync),
+[ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) (auth and TLS) and
+[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (the delete guards).
+A `DEVELOPER.md` does not exist yet.
 
 ---
 
@@ -69,8 +74,8 @@ not exist yet.
    the cluster topology (`REPLICAOF`), and it is cluster-wide. A compromised
    operator is a cluster-wide compromise (section 4).
 2. **Sidecar ↔ operator.** The sidecar cannot write the CR — deliberately
-   ([NA50](local_valkey_operator_admission_gap.md)) — so it reports a promotion it
-   performed by patching a **pod annotation**
+   ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)) — so it
+   reports a promotion it performed by patching a **pod annotation**
    (`vko.gtrfc.com/drain-promoted-at`, [`internal/common/annotations.go`](internal/common/annotations.go)).
    The operator consumes that annotation as evidence and may issue a destructive
    `REPLICAOF` on the strength of it. Everything that can patch a pod in the
@@ -185,8 +190,8 @@ password.
   `pods: get,list,patch` on **every pod in the namespace** with no
   `resourceNames`, so cluster A's sidecar can patch cluster B's pods — and the
   label it patches is the one the `-rw` Service selects on, while the annotation
-  it patches now steers a topology decision. Filed as
-  [NA54](local_valkey_operator_admission_gap.md).
+  it patches now steers a topology decision. The narrowing plan and its ordering are
+  [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8.
 - **The workload pods have no securityContext at all.** No `runAsNonRoot`, no
   `readOnlyRootFilesystem`, no `capabilities: drop [ALL]`, no
   `seccompProfile` — verified by the absence of any `SecurityContext` in
@@ -217,10 +222,10 @@ consequence for a compromised or misbehaving operator.
 | `vko.gtrfc.com` | `valkeys/status`, `valkeys/finalizers` | get/update/patch, update | Status authority; finalizer updates |
 | `""` | `configmaps`, `serviceaccounts`, `services` | get, list, watch, create, update, patch, delete | Can rewrite or delete **any** ConfigMap, ServiceAccount or Service in the cluster, not only its own. Deleting a foreign ServiceAccount invalidates its tokens |
 | `""` | `pods` | get, list, watch, **delete**, patch | Can delete any pod in the cluster. This is the rolling-update primitive; it is not scoped to owned pods |
-| `""` | `secrets` | get, list, watch, **delete** | **Reads every Secret in the cluster** (the heaviest confidentiality exposure) and can destroy any of them. `delete` exists for one caller: the legacy `<name>-sentinel-tls` cleanup on the `unifiedCertificate` migration. That caller no longer deletes on the name alone — it requires either a Certificate this Valkey controls issuing into that name, or cert-manager's `cert-manager.io/certificate-name` annotation, plus `type: kubernetes.io/tls`, plus a UID precondition ([NA49](local_valkey_operator_admission_gap.md)). The *grant* is still cluster-wide, so a compromised operator is unaffected by that guard |
-| `""` + `events.k8s.io` | `events` | create, patch | Can write Events anywhere. Both groups are listed because the operator records through `events.k8s.io/v1` while older tooling still reads the core group (NA12) |
+| `""` | `secrets` | get, list, watch, **delete** | **Reads every Secret in the cluster** (the heaviest confidentiality exposure) and can destroy any of them. `delete` exists for one caller: the legacy `<name>-sentinel-tls` cleanup on the `unifiedCertificate` migration. That caller no longer deletes on the name alone — it requires either a Certificate this Valkey controls issuing into that name, or cert-manager's `cert-manager.io/certificate-name` annotation, plus `type: kubernetes.io/tls`, plus a UID precondition ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)). The *grant* is still cluster-wide, so a compromised operator is unaffected by that guard |
+| `""` + `events.k8s.io` | `events` | create, patch | Can write Events anywhere. Both groups are listed because the operator records through `events.k8s.io/v1` while older tooling still reads the core group ([ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md)) |
 | `apps` | `deployments`, `statefulsets` | get, list, watch, create, update, patch, delete | Can replace the pod template — hence the image, hence the code — of **any** Deployment or StatefulSet in the cluster |
-| `cert-manager.io` | `certificates` | full CRUD | Can request certificates from any Issuer/ClusterIssuer the namespace can reference, and delete existing ones. The legacy-Sentinel cleanup deletes only Certificates this Valkey controls by ownerReference ([NA49](local_valkey_operator_admission_gap.md)); no other path deletes a Certificate |
+| `cert-manager.io` | `certificates` | full CRUD | Can request certificates from any Issuer/ClusterIssuer the namespace can reference, and delete existing ones. The legacy-Sentinel cleanup deletes only Certificates this Valkey controls by ownerReference ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)); no other path deletes a Certificate |
 | `monitoring.coreos.com` | `servicemonitors` | full CRUD | Scrape configuration; used only when `spec.metrics.serviceMonitor.enabled` |
 | `networking.k8s.io` | `networkpolicies` | full CRUD | **Can delete any NetworkPolicy in the cluster**, including policies that protect unrelated workloads |
 | `policy` | `poddisruptionbudgets` | full CRUD | Availability guarantees of any workload can be removed or tightened |
@@ -268,7 +273,7 @@ Two writes reach the operator's decisions through this grant:
   will demote other masters (`REPLICAOF`, destructive).
 
 Narrowing this Role to `verbs: [patch]` with `resourceNames` limited to the
-cluster's own pods is filed as [NA54](local_valkey_operator_admission_gap.md).
+cluster's own pods is [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8.
 
 ### 4.3 The pre-upgrade hook
 
@@ -377,16 +382,16 @@ analysis.
       be created without `escalate` now that it is a strict subset of the
       operator's own pod grant (section 4.1) — and if so, drop the verb.
 - [x] **Gate the legacy Sentinel TLS Secret delete on provenance
-      ([NA49](local_valkey_operator_admission_gap.md), done 2026-08-21).** It used
+      ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md), done 2026-08-21).** It used
       to delete by name, with no ownerReference check and no UID precondition —
-      the opposite of the rule NA14/NA31 enforce for PDBs. The Secret now needs a
+      the opposite of the rule the PDB cleanup enforces. The Secret now needs a
       Certificate this Valkey controls or cert-manager's provenance annotation,
       and the Certificate beside it needs the ownerReference; both deletes carry a
       UID precondition and every refusal records a Warning. This bounds what the
       *reconcile path* touches; narrowing the cluster-wide `secrets` grant itself
       is the separate item above.
 - [ ] **Narrow the sidecar Role to `patch` with `resourceNames`
-      ([NA54](local_valkey_operator_admission_gap.md)).** Dropping the unused
+      ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).** Dropping the unused
       `list` verb is the precondition — `resourceNames` and `list` are
       incompatible. Matters more since the drain stamp became evidence for a
       destructive `REPLICAOF`.
@@ -407,10 +412,10 @@ analysis.
       plain HTTP with no authentication filter — and `--metrics-bind-address` is
       parsed but never applied to the manager options, so it cannot be moved or
       switched off from the chart
-      ([NA55](local_valkey_operator_admission_gap.md)).
+      ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md) D8).
 - [ ] **Restrict who may `create valkeys`.** A CR author chooses the image the
       cluster runs and the name every generated object gets, and generated names
-      collide with existing objects by design. [NA49](local_valkey_operator_admission_gap.md)
+      collide with existing objects by design. [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)
       closed the one path where such a collision was destructive; the general
       property — an attacker-chosen CR name drives every generated name — remains,
       so any new delete-by-generated-name needs the same provenance discipline.
