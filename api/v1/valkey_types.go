@@ -743,12 +743,12 @@ func (v *Valkey) IsCertManagerEnabled() bool {
 // is informational (both StatefulSets already mount the same Secret).
 //
 // With Sentinel disabled the flag still has one observable effect: it admits
-// reconcileLegacySentinelCertificateCleanup, which garbage-collects the legacy
-// <name>-sentinel-tls Certificate and Secret left behind by an instance that used
-// to run Sentinel. sentinelRolloutComplete short-circuits to "complete" in that
-// case (no pods are bound to the legacy Secret), so the cleanup runs on the first
-// pass with no rollout to wait for. It only ever removes material it can prove is
-// the operator's own — see deleteLegacySentinelSecret (NA49).
+// reconcileLegacySentinelCertificateCleanup, which garbage-collects the legacy <name>-sentinel-tls
+// Certificate and Secret left behind by an instance that used to run Sentinel.
+// sentinelRolloutComplete short-circuits to "complete" in that case (no pods are bound to the
+// legacy Secret), so the cleanup runs on the first pass with no rollout to wait for. It only ever
+// removes material it can prove is the operator's own — see deleteLegacySentinelSecret
+// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11).
 func (v *Valkey) IsUnifiedCertificateEnabled() bool {
 	return v.IsTLSEnabled() && v.Spec.TLS.UnifiedCertificate
 }

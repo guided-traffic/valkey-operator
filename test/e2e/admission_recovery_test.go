@@ -275,7 +275,7 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 		require.NoError(t, err, "operator must bump %s while the StatefulSet is short of pods", nudgeAnnotationKey)
 	})
 
-	// NA12 regression guard: the operator records through events.k8s.io/v1, so a
+	// ADR 0014 D7 regression guard: the operator records through events.k8s.io/v1, so a
 	// ClusterRole granting only core-group events silently discards every Event
 	// ("Server rejected event" in the operator log, nothing on the CR). The nudge
 	// above must therefore be re-observable as an Event on the Valkey CR. The
@@ -307,7 +307,7 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
 	})
 
-	// Second half of the NA12 guard: no Event write may be denied by RBAC. The
+	// Second half of the ADR 0014 D7 guard: no Event write may be denied by RBAC. The
 	// assertion is scoped to forbidden-rejections because a namespace being torn
 	// down by a parallel test can legitimately reject an Event create without any
 	// RBAC involvement, and to this test's time window so pre-fix history in a

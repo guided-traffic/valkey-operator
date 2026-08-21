@@ -7,7 +7,7 @@ package controller
 // config/rbac/role.yaml, but the Helm chart - the canonical install path -
 // carries a hand-maintained ClusterRole that nothing compares against the
 // generated one. Both known occurrences of that drift were silent until they
-// hit a cluster: NA12 (Events discarded for every Helm install) and the
+// hit a cluster: ADR 0014 D7 (Events discarded for every Helm install) and the
 // missing `delete` on secrets, which wedged the reconciler on the unified-TLS
 // migration.
 //

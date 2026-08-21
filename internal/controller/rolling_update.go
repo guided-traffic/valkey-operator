@@ -76,9 +76,9 @@ const annotationSyncWaitStarted = "vko.gtrfc.com/sync-wait-started"
 // owns -- sharing it would let a long Phase 1 consume Phase 2 budget).
 const annotationTopologyRestoreStarted = "vko.gtrfc.com/topology-restore-started"
 
-// annotationManualFailoverStarted records when the state machine entered
-// stateManualFailover -- the pass that promoted a replica and deleted the old
-// master. Every wait of handlePostManualFailover is bounded by it (NA47).
+// annotationManualFailoverStarted records when the state machine entered stateManualFailover -- the
+// pass that promoted a replica and deleted the old master. Every wait of handlePostManualFailover
+// is bounded by it (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6).
 //
 // It gets its own key for the same reason Phase 1 does: annotationSyncWaitStarted
 // belongs to the replica-replacement phase, annotationTopologyRestoreStarted to
@@ -197,10 +197,10 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		// Proceed to handleRollingUpdate so the updatedCount == totalPods check
 		// triggers finalizeRollingUpdate and cleans up the state.
 		if r.getRollingUpdateState(v) == "" {
-			// The one place that provably knows every pod matches the live template,
-			// and therefore the only place a deferred sidecar update can be declared
-			// applied (NA48). It is a no-op for every CR that does not carry the
-			// condition.
+			// The one place that provably knows every pod matches the live template, and therefore the only
+			// place a deferred sidecar update can be declared applied
+			// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D10). It is a no-op for every CR that
+			// does not carry the condition.
 			r.clearSidecarUpdatePending(ctx, v)
 			return RollingUpdateResult{} // No rolling update needed.
 		}
@@ -226,7 +226,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	// flips IsMultiReplicaWithoutSentinel and re-routes the very next pass here.
 	// The rolling-update state, the promoted pod and the wait bounds then stayed
 	// on the CR forever, and the in-memory bounds pre-expired the budget of the
-	// next update (NA28 again).
+	// next update (ADR 0010 D10 again).
 	//
 	// The call is idempotent: clearRollingUpdateState returns without an API call
 	// when no annotation is left, so the targets that already cleared their own
@@ -788,16 +788,16 @@ func waitBoundKey(namespace, name, bound string) types.NamespacedName {
 // on the CR, which survives an operator restart, and the in-memory tracker, which
 // survives a failing API server.
 //
-// The annotation alone is not enough. Its write can fail indefinitely — a
-// fail-closed admission webhook on the CR, a permanently conflicting writer — and
-// the discarded error meant the bound then never armed at all: the matching
-// "is it stalled" check reads an annotation that is never there, answers false on
-// every pass, and the phase it bounds requeues forever. That is exactly the stall
-// the bound exists to break, reintroduced through the arming path (NA27).
+// The annotation alone is not enough. Its write can fail indefinitely — a fail-closed admission
+// webhook on the CR, a permanently conflicting writer — and the discarded error meant the bound
+// then never armed at all: the matching "is it stalled" check reads an annotation that is never
+// there, answers false on every pass, and the phase it bounds requeues forever. That is exactly the
+// stall the bound exists to break, reintroduced through the arming path
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D7, D8).
 //
 // The in-memory copy must be dropped wherever the rolling update state is cleared
 // (clearRollingUpdateState) — a leftover entry pre-expires the budget of the next
-// rolling update, which is NA28 one layer down.
+// rolling update, which is ADR 0010 D10 one layer down.
 func (r *ValkeyReconciler) ensureWaitBound(ctx context.Context, v *vkov1.Valkey, annotation, bound string) {
 	logger := log.FromContext(ctx)
 
@@ -819,7 +819,7 @@ func (r *ValkeyReconciler) ensureWaitBound(ctx context.Context, v *vkov1.Valkey,
 		// was actually persisted. Leaving it would be worse than useless: every
 		// later pass would re-arm it in memory, waitBoundExceeded would read that
 		// always-fresh value instead of the tracker, and the deadline would never
-		// be reached — the NA27 stall, one indirection further in.
+		// be reached — the ADR 0010 D7, D8 stall, one indirection further in.
 		delete(v.Annotations, annotation)
 		logger.Error(err, "Failed to persist a rolling update wait bound, falling back to the in-memory deadline",
 			"annotation", annotation)
@@ -869,7 +869,7 @@ func (r *ValkeyReconciler) ensureTopologyRestoreTimestamp(ctx context.Context, v
 // overwriting whatever was armed before -- in the annotation and in the in-memory
 // tracker alike.
 //
-// Re-arming rather than only filling a gap (ensureWaitBound) is the NA28 fix. A
+// Re-arming rather than only filling a gap (ensureWaitBound) is the ADR 0010 D10 fix. A
 // rolling update that died mid-state leaves its annotation behind: clearRollingUpdateState
 // deletes it, but an operator killed in flight never reaches that call, and
 // clearStaleRollingUpdateState only clears on the "nothing replaced yet" branch. The
@@ -890,18 +890,18 @@ func (r *ValkeyReconciler) armWaitBound(v *vkov1.Valkey, annotation, bound strin
 	r.nudges.observe(key, now)
 }
 
-// armTopologyRestoreBound starts the Phase 1 budget on entry to
-// stateRestoringTopology (NA28).
+// armTopologyRestoreBound starts the Phase 1 budget on entry to stateRestoringTopology
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10).
 func (r *ValkeyReconciler) armTopologyRestoreBound(v *vkov1.Valkey) {
 	r.armWaitBound(v, annotationTopologyRestoreStarted, boundTopologyRestore)
 }
 
 // armFinalizationBound starts the Phase 2 budget on entry to stateVerifyingTopology,
 // which both entries -- abandonTopologyRestoration and promotePod0AndRedirect -- have
-// to do (NA40).
+// to do (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10).
 //
 // Without it Phase 2 inherited whatever annotationFinalizationTimestamp was left on
-// the CR, under exactly the NA28 conditions. An hours-old timestamp made
+// the CR, under exactly the ADR 0010 D10 conditions. An hours-old timestamp made
 // isFinalizationStalled true on the first pass, so Phase 2 completed the rolling
 // update immediately and WITHOUT consolidating rogue masters -- on the abandoned path
 // the only job it has, and the last pass that can do it, because once the state
@@ -2053,7 +2053,7 @@ func (r *ValkeyReconciler) setRollingUpdateState(ctx context.Context, v *vkov1.V
 func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1.Valkey) error {
 	// Drop the in-memory copies of the wait bounds first, and unconditionally: a
 	// leftover first-seen would pre-expire the budget of the next rolling update
-	// even when no annotation survived to do it (NA27/NA28).
+	// even when no annotation survived to do it (ADR 0010 D7, D8, D10).
 	//
 	// Every completion reaches this function, because checkAndHandleRollingUpdate
 	// calls it for any dispatch target that reports Completed. Calling it earlier,
@@ -2667,7 +2667,7 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 // the state annotation is still empty; the next pass feeds an empty known master
 // into the split-brain resolver, which with two replicas ties at zero connected
 // slaves, picks the lowest ordinal — the old master that is about to be deleted —
-// and demotes the pod holding the data (the NA21 loss).
+// and demotes the pod holding the data (the ADR 0008 D10, D11 loss).
 //
 // The dominant failure cause is a resourceVersion conflict against the concurrent
 // status writer, so the write gets a bounded conflict retry: refetch, re-apply the
@@ -2676,12 +2676,13 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 // update — and needs both the annotations and a current resourceVersion.
 //
 // Accepted residual: an operator crash or a total API outage between the promotion
-// and a successful write here still leaves the NA21 window open. Closing that would
+// and a successful write here still leaves the ADR 0008 D10, D11 window open. Closing that would
 // require persisting before promoting, which the state machine does not support.
 func (r *ValkeyReconciler) persistManualFailoverState(ctx context.Context, v *vkov1.Valkey, promotedPodName, promotedHost string) error {
-	// The fourth annotation is the bound of the state this write enters (NA47). It is
-	// armed once, before the first attempt, so a conflict retry re-applies the same
-	// deadline rather than handing the state a fresh budget on every attempt.
+	// The fourth annotation is the bound of the state this write enters
+	// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6). It is armed once, before the first
+	// attempt, so a conflict retry re-applies the same deadline rather than handing the state a fresh
+	// budget on every attempt.
 	startedAt := r.armManualFailoverBound(v)
 	apply := func(target *vkov1.Valkey) {
 		if target.Annotations == nil {
@@ -2777,8 +2778,9 @@ func (r *ValkeyReconciler) promoteAndRedirect(ctx context.Context, v *vkov1.Valk
 // handlePostManualFailover waits for the old master pod (pod-0) to come back
 // after deletion, then configures it to sync from the promoted replica.
 //
-// Every wait here is bounded by waitOrAbandonManualFailover (NA47): pod-0 can fail to
-// come back for reasons no requeue resolves, and this state has no other escape.
+// Every wait here is bounded by waitOrAbandonManualFailover
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6): pod-0 can fail to come back for
+// reasons no requeue resolves, and this state has no other escape.
 func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -2816,13 +2818,12 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 	// this check, REPLICAOF is sent to the old pod that is about to be deleted,
 	// and the new pod starts as a standalone master with no data.
 	//
-	// The comparison is podNeedsUpdate against the live StatefulSet template — the
-	// same verdict the rest of the rolling update uses — and not the image alone.
-	// An image-only guard is void for a config-hash-only or resources-only update
-	// (image unchanged, so every pod passes it), which left the DeletionTimestamp
-	// check above as the only protection, and that one misses a stale cache read
-	// (NA30). The image check is not dropped, it is subsumed: podNeedsUpdate
-	// compares the Valkey and sidecar images first.
+	// The comparison is podNeedsUpdate against the live StatefulSet template — the same verdict the
+	// rest of the rolling update uses — and not the image alone. An image-only guard is void for a
+	// config-hash-only or resources-only update (image unchanged, so every pod passes it), which left
+	// the DeletionTimestamp check above as the only protection, and that one misses a stale cache read
+	// (docs/adr/0007-failover-aware-rolling-update.md, D4). The image check is not dropped, it is
+	// subsumed: podNeedsUpdate compares the Valkey and sidecar images first.
 	if podNeedsUpdate(masterPod, valkeyImageFromSts(currentSts), sidecarImageFromSts(currentSts),
 		configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
 		logger.Info("Master pod does not match the StatefulSet template yet, waiting for replacement",
@@ -2861,10 +2862,10 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 	}
 	logger.Info("Configured pod-0 as replica of promoted pod", "pod", masterPodName, common.RoleMaster, promotedHost)
 
-	// Move to topology restoration state. The Phase 1 budget starts here, at the
-	// state transition, so a timestamp left behind by an earlier update cannot
-	// spend it before the restoration ever runs (NA28). Both annotations are
-	// persisted by the single Update below.
+	// Move to topology restoration state. The Phase 1 budget starts here, at the state transition, so
+	// a timestamp left behind by an earlier update cannot spend it before the restoration ever runs
+	// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10). Both annotations are persisted by
+	// the single Update below.
 	r.armTopologyRestoreBound(v)
 	if err := r.setRollingUpdateState(ctx, v, stateRestoringTopology); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -2876,28 +2877,28 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 // waitOrAbandonManualFailover requeues while the deleted master may still come back,
 // and hands the rolling update over to Phase 2 once the budget is spent.
 //
-// All six waits of handlePostManualFailover used to return a bare requeue (NA47), so
-// a pod-0 that never came back ready on the current template parked the state machine
-// in manual-failover forever. It is not exotic: a PVC that cannot bind, an
-// ImagePullBackOff on the new tag, a fail-closed webhook rejecting the pod CREATE, a
-// rejected Delete that left the state annotation behind, or the operator killed
-// between the promote and the delete. clearStaleRollingUpdateState rescues none of
-// them -- it only clears when nothing was replaced yet, and the replicas were replaced
-// before the failover.
+// All six waits of handlePostManualFailover used to return a bare requeue
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6), so a pod-0 that never came back
+// ready on the current template parked the state machine in manual-failover forever. It is not
+// exotic: a PVC that cannot bind, an ImagePullBackOff on the new tag, a fail-closed webhook
+// rejecting the pod CREATE, a rejected Delete that left the state annotation behind, or the
+// operator killed between the promote and the delete. clearStaleRollingUpdateState rescues none of
+// them -- it only clears when nothing was replaced yet, and the replicas were replaced before the
+// failover.
 //
 // The cost of the stall was four things at once: the cluster served from the
 // temporary master with nothing declaring that the end state, TopologyRestored was
 // never written, the phase froze at "Rolling Update N/M", and -- because Reconcile
-// returns on NeedsRequeue -- the whole tail of the pass never ran, the NA26
+// returns on NeedsRequeue -- the whole tail of the pass never ran, the ADR 0011 D1
 // steady-state split-brain check included.
 //
-// The escape is stateVerifyingTopology and not a cleared state, for the reason NA23
-// recorded one state later: once the state annotation is gone,
-// checkAndHandleRollingUpdate early-returns whenever no pod needs an update, and
-// nothing calls detectAndResolveSplitBrain again. Phase 2 is the last pass that can
-// consolidate the masters a half-finished failover leaves behind, and
-// abandonTopologyRestoration is exactly that handover: the Event, TopologyRestored=False,
-// and a Phase 2 budget armed on entry (NA40) rather than inherited.
+// The escape is stateVerifyingTopology and not a cleared state, for the reason ADR 0010 D2-D4
+// recorded one state later: once the state annotation is gone, checkAndHandleRollingUpdate
+// early-returns whenever no pod needs an update, and nothing calls detectAndResolveSplitBrain
+// again. Phase 2 is the last pass that can consolidate the masters a half-finished failover leaves
+// behind, and abandonTopologyRestoration is exactly that handover: the Event,
+// TopologyRestored=False, and a Phase 2 budget armed on entry
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10) rather than inherited.
 func (r *ValkeyReconciler) waitOrAbandonManualFailover(ctx context.Context, v *vkov1.Valkey, reason string) RollingUpdateResult {
 	r.ensureManualFailoverTimestamp(ctx, v)
 	if !r.isManualFailoverStalled(v) {
@@ -2993,11 +2994,12 @@ func (r *ValkeyReconciler) waitOrAbandonTopologyRestoration(ctx context.Context,
 // known-master annotation names -- still the promoted replica, because
 // promotePod0AndRedirect never ran.
 //
-// It is the escape of two states, not one: Phase 1 calls it when pod-0 never syncs
-// back (NA23), and waitOrAbandonManualFailover calls it when pod-0 never comes back
-// at all (NA47). Both end in the same place for the same reason -- the promoted
-// replica holds the writes and Phase 2 is the last pass that can consolidate the
-// cluster on it.
+// It is the escape of two states, not one: Phase 1 calls it when pod-0 never syncs back
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D2-D4), and waitOrAbandonManualFailover
+// calls it when pod-0 never comes back at all
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6). Both end in the same place for the
+// same reason -- the promoted replica holds the writes and Phase 2 is the last pass that can
+// consolidate the cluster on it.
 //
 // Forcing the promotion instead is not an option: an unsynced pod-0 would come up
 // as an empty master and discard every write the promoted replica accepted since
@@ -3016,8 +3018,9 @@ func (r *ValkeyReconciler) abandonTopologyRestoration(ctx context.Context, v *vk
 	r.recordEvent(v, corev1.EventTypeWarning, "TopologyRestoreAbandoned",
 		"Topology restoration abandoned after %v (%s); %s stays master", timeout, reason, promotedPod)
 
-	// Phase 2 gets its own budget, armed here rather than inherited (NA40). Both
-	// annotations are persisted by the single Update below.
+	// Phase 2 gets its own budget, armed here rather than inherited
+	// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10). Both annotations are persisted by
+	// the single Update below.
 	r.armFinalizationBound(v)
 	if err := r.setRollingUpdateState(ctx, v, stateVerifyingTopology); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -3115,9 +3118,9 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 		}
 	}
 
-	// Transition to Phase 2: verify replicas reconnected on next reconcile. Its
-	// budget is armed here, at the transition, so a timestamp left behind by an
-	// earlier update cannot spend it before the verification ever runs (NA40).
+	// Transition to Phase 2: verify replicas reconnected on next reconcile. Its budget is armed here,
+	// at the transition, so a timestamp left behind by an earlier update cannot spend it before the
+	// verification ever runs (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10).
 	r.armFinalizationBound(v)
 	if err := r.setRollingUpdateState(ctx, v, stateVerifyingTopology); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -3211,7 +3214,7 @@ func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.
 		// restoration abandoned the real master is the promoted replica, and a
 		// returning pod-0 that reports master ties it at zero connected slaves --
 		// the resolver would then pick pod-0 by lowest ordinal and demote the pod
-		// holding the data (the NA21 failure mode). The known-master annotation
+		// holding the data (the ADR 0008 D10, D11 failure mode). The known-master annotation
 		// names pod-0 on the normal path and the promoted replica otherwise.
 		r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, knownMasterPodName(v))
 

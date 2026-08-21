@@ -16,7 +16,7 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
 
-// Tests in this file cover NA17 of the admission-gap ticket: conditions written
+// Tests in this file cover ADR 0002 D9: conditions written
 // through setStatusCondition (ReconcileBlocked, SidecarUpdatePending,
 // RollingUpdatePaused) carried no ObservedGeneration, so anything judging
 // condition staleness by observedGeneration — kstatus and the tooling modelled
@@ -194,7 +194,7 @@ func TestSetReconcileBlockedCondition_MessageChangeStillWrites(t *testing.T) {
 	assert.Contains(t, cond.Message, "validate.kyverno.svc-fail")
 }
 
-// --- NA34.2: no status write when the condition would not change ---
+// --- ADR 0002 D8: no status write when the condition would not change ---
 
 // statusWriteCounter counts status subresource writes of a Valkey CR.
 type statusWriteCounter struct{ writes int }
@@ -211,7 +211,7 @@ func (s *statusWriteCounter) intercept() interceptor.Funcs {
 	}
 }
 
-// TestSetStatusCondition_SkipsWriteWhenNothingChanged pins NA34.2: the helper
+// TestSetStatusCondition_SkipsWriteWhenNothingChanged pins ADR 0002 D8: the helper
 // used to issue a status update on every call, so any caller reporting a steady
 // state cost one write per reconcile pass.
 func TestSetStatusCondition_SkipsWriteWhenNothingChanged(t *testing.T) {
@@ -282,7 +282,7 @@ func TestSetStatusCondition_WritesOnReasonOrMessageChange(t *testing.T) {
 	assert.Equal(t, "validate.kyverno.svc-fail", cond.Message)
 }
 
-// TestSetSidecarUpdatePendingCondition_NoWritePerPass covers the live NA34.2 call
+// TestSetSidecarUpdatePendingCondition_NoWritePerPass covers the live ADR 0002 D8 call
 // site: handleStandaloneRollingUpdate calls this on every pass of every
 // standalone cluster, drift or no drift.
 func TestSetSidecarUpdatePendingCondition_NoWritePerPass(t *testing.T) {

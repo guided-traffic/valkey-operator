@@ -69,9 +69,10 @@ const reasonPodDisruptionBudgetTooPermissive = "PodDisruptionBudgetTooPermissive
 // that costs is the Event, and the recorder aggregates a repeated Event into one
 // series instead of new objects.
 //
-// It is called only when the budget is actually in effect: against a foreign budget
-// under the same name nothing was written, and reporting maxUnavailable of an object
-// that does not exist contradicts the PodDisruptionBudgetNotOwned warning (NA32).
+// It is called only when the budget is actually in effect: against a foreign budget under the same
+// name nothing was written, and reporting maxUnavailable of an object that does not exist
+// contradicts the PodDisruptionBudgetNotOwned warning
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
 func (r *ValkeyReconciler) warnIfDataBudgetProtectsNothing(ctx context.Context, v *vkov1.Valkey) {
 	maxUnavailable := v.PodDisruptionBudgetMaxUnavailable()
 	if maxUnavailable < v.Spec.Replicas {
@@ -121,7 +122,7 @@ const reasonSentinelPodDisruptionBudgetBlocksDrains = "SentinelPodDisruptionBudg
 // a Sentinel pod never completes without manual intervention.
 //
 // The formula stays: minAvailable below the quorum would let a drain take the
-// Sentinel majority and thereby automatic failover. The gap NA7 closes is that the
+// Sentinel majority and thereby automatic failover. The gap ADR 0004 D7 closes is that the
 // consequence was documented in a builder comment only and invisible at runtime.
 //
 // Like the data-side warning, it runs on every pass in which the budget applies
@@ -129,9 +130,9 @@ const reasonSentinelPodDisruptionBudgetBlocksDrains = "SentinelPodDisruptionBudg
 // at 2, so the PDB object is byte-identical and a write-gated warning would stay
 // silent for exactly the change that turned the budget into a drain blocker.
 //
-// Like the data-side warning it is called only when the budget is in effect; a
-// foreign budget under the same name has a minAvailable of its own and the operator
-// must not describe it with values it never wrote (NA32).
+// Like the data-side warning it is called only when the budget is in effect; a foreign budget under
+// the same name has a minAvailable of its own and the operator must not describe it with values it
+// never wrote (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
 func (r *ValkeyReconciler) warnIfSentinelBudgetBlocksEveryDrain(ctx context.Context, v *vkov1.Valkey) {
 	replicas := v.Spec.Sentinel.Replicas
 	minAvailable := builder.SentinelQuorumFor(replicas)
@@ -162,11 +163,11 @@ func logPodDisruptionBudgetSkip(ctx context.Context, name string, replicas int32
 
 // reconcilePodDisruptionBudget ensures a single PDB matches the desired state.
 //
-// It reports whether the desired budget is in effect. False means a
-// PodDisruptionBudget under that name exists but is controlled by something else:
-// nothing was written, so every value in spec.podDisruptionBudget describes no live
-// object. Callers use the verdict to suppress the content warnings, which would
-// otherwise report on a budget that was never created (NA32).
+// It reports whether the desired budget is in effect. False means a PodDisruptionBudget under that
+// name exists but is controlled by something else: nothing was written, so every value in
+// spec.podDisruptionBudget describes no live object. Callers use the verdict to suppress the
+// content warnings, which would otherwise report on a budget that was never created
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
 func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *vkov1.Valkey,
 	desired *policyv1.PodDisruptionBudget) (bool, error) {
 	logger := log.FromContext(ctx)
@@ -217,11 +218,11 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 // cleanupPodDisruptionBudget deletes the named PDB if it exists and this Valkey
 // owns it.
 //
-// The foreign-budget warning is gated on the feature being switched on (NA32).
-// The cleanup path runs on every pass of every CR that never opted in, so an
-// ungated warning turned the documented pre-feature workaround — a hand-written PDB
-// under the StatefulSet name — into a permanent Warning stream for users who changed
-// nothing when they upgraded the operator. With the feature off, the operator has no
+// The foreign-budget warning is gated on the feature being switched on
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D11). The cleanup path runs on every pass of every
+// CR that never opted in, so an ungated warning turned the documented pre-feature workaround — a
+// hand-written PDB under the StatefulSet name — into a permanent Warning stream for users who
+// changed nothing when they upgraded the operator. With the feature off, the operator has no
 // intention towards that budget and therefore nothing to report.
 //
 // The warning does fire while the feature is enabled but not applicable (fewer than
@@ -248,13 +249,12 @@ func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vk
 	}
 
 	logger.Info("Deleting PodDisruptionBudget", "name", name)
-	// The ownership decision above was made on a cache-backed read, so the object
-	// under this name can have been replaced between the Get and the Delete: the
-	// operator budget is gone and the user recreated their own under the same name
-	// before the cache caught up. Deleting by name alone would then destroy the
-	// user's object — precisely what the ownership guard promises not to do (NA31).
-	// The UID precondition makes the Delete apply to the object that was inspected
-	// or to none at all.
+	// The ownership decision above was made on a cache-backed read, so the object under this name can
+	// have been replaced between the Get and the Delete: the operator budget is gone and the user
+	// recreated their own under the same name before the cache caught up. Deleting by name alone would
+	// then destroy the user's object — precisely what the ownership guard promises not to do
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D8, D9). The UID precondition makes the
+	// Delete apply to the object that was inspected or to none at all.
 	//
 	// UID only, no ResourceVersion: the disruption controller rewrites PDB .status
 	// (disruptionsAllowed, currentHealthy) continuously, so a cached read is
@@ -294,11 +294,11 @@ const reasonPodDisruptionBudgetNotOwned = "PodDisruptionBudgetNotOwned"
 // overwriting it by name would remove a protection the user built, silently and on
 // every pass.
 //
-// Like the NA6/NA7 budget warnings this fires on every applicable pass rather than
-// on writes: the condition is a property of the cluster, not of a transition, and
-// the recorder aggregates a repeated Event into one series instead of new objects.
-// "Applicable" excludes the cleanup path of a CR that never enabled the feature —
-// see cleanupPodDisruptionBudget for why (NA32).
+// Like the ADR 0004 D7, D8 budget warnings this fires on every applicable pass rather than on
+// writes: the condition is a property of the cluster, not of a transition, and the recorder
+// aggregates a repeated Event into one series instead of new objects. "Applicable" excludes the
+// cleanup path of a CR that never enabled the feature — see cleanupPodDisruptionBudget for why
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D11).
 func (r *ValkeyReconciler) warnPodDisruptionBudgetNotOwned(ctx context.Context, v *vkov1.Valkey,
 	name, consequence string) {
 	log.FromContext(ctx).Info("PodDisruptionBudget exists but is not owned by this Valkey; "+

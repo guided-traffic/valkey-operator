@@ -13,7 +13,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 )
 
-// NA48. SidecarUpdatePending has a False branch, and on the transition that matters
+// ADR 0002 D10. SidecarUpdatePending has a False branch, and on the transition that matters
 // it was unreachable. Its only caller sits at the end of handleStandaloneRollingUpdate,
 // which is only entered while a rolling update is needed or a state annotation is set
 // -- so the moment the deferred update actually applies (the pod is deleted, comes

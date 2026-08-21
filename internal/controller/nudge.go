@@ -122,12 +122,17 @@ func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
 // with zero pods there are no pod events either. Bumping an annotation is the
 // operator's only lever, so it uses it.
 //
-// There is no rolling-update suppression, for either StatefulSet. Both rolling
-// updates delete a pod and then block on exactly that pod coming back
-// (replaceNextReplica, replaceRemainingPods, handleManualFailover — every delete
-// site requeues into a "waiting for pod to be recreated" branch), so a blocked
-// recreation is precisely when the nudge is needed, not a case to stand back
-// from. Bumping the annotation of a StatefulSet whose pod the operator itself
+// There is no rolling-update suppression, for either StatefulSet. Every delete site requeues and
+// then blocks on exactly that pod coming back, so a blocked recreation is precisely when the nudge
+// is needed, not a case to stand back from. Three sites say so literally, with a "waiting for pod
+// to be recreated" branch: replaceNextReplica, replaceRemainingPods and
+// handleStandaloneRollingUpdate. deleteNextPendingPod has no such branch — it skips a pod that does
+// not exist and falls through to a bare terminal requeue — and the Sentinel path skips a missing
+// pod so that its quorum guard blocks the next delete. Same net effect, different shape; the
+// argument rests on the requeue, not on the log line
+// (docs/adr/0003-nudge-a-short-of-pods-statefulset.md, D8).
+//
+// Bumping the annotation of a StatefulSet whose pod the operator itself
 // deleted is at worst a no-op:
 //
 //   - Under OnDelete with Parallel pod management, creating a missing ordinal is

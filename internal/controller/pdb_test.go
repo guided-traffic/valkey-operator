@@ -26,7 +26,7 @@ import (
 
 // haWithPDB is a three-replica Sentinel cluster with PodDisruptionBudgets enabled.
 // The UID is set so the ownerReference the operator writes is distinguishable from
-// the empty one of a foreign object (NA14).
+// the empty one of a foreign object (docs/adr/0006-delete-only-what-the-operator-owns.md, D1, D2).
 func haWithPDB(v *vkov1.Valkey) {
 	v.UID = testValkeyUID
 	v.Spec.Replicas = 3
@@ -219,7 +219,7 @@ func TestReconcile_CreatesPodDisruptionBudgets(t *testing.T) {
 	require.NoError(t, err, "full reconcile must create the sentinel PDB")
 }
 
-// --- NA6: the too-permissive-budget warning must not be gated on a PDB write ---
+// --- ADR 0004 D8: the too-permissive-budget warning must not be gated on a PDB write ---
 
 // recordedEvent is one Event the reconciler handed to its recorder.
 type recordedEvent struct {
@@ -283,7 +283,7 @@ func (p *pdbWriteCounter) intercept() interceptor.Funcs {
 
 func (p *pdbWriteCounter) reset() { p.writes = 0 }
 
-// TestReconcileDataPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite is NA6:
+// TestReconcileDataPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite is ADR 0004 D8:
 // scaling spec.replicas down into maxUnavailable >= replicas leaves the PDB object
 // unchanged, so a warning gated on the write never fired for the very change that
 // removed the protection.
@@ -357,7 +357,7 @@ func TestReconcileDataPodDisruptionBudget_NoWarningBelowReplicas(t *testing.T) {
 	assert.Empty(t, rec.events, "the default maxUnavailable 1 with 3 replicas is not a warning")
 }
 
-// TestReconcileSentinelPodDisruptionBudget_WarnsWhenQuorumEqualsReplicas is NA7:
+// TestReconcileSentinelPodDisruptionBudget_WarnsWhenQuorumEqualsReplicas is ADR 0004 D7:
 // with 2 Sentinels the quorum equals the replica count, so the budget refuses every
 // eviction and a node drain hosting a Sentinel pod stalls. Only a builder comment
 // said so before; nothing warned at runtime.
@@ -386,7 +386,7 @@ func TestReconcileSentinelPodDisruptionBudget_WarnsWhenQuorumEqualsReplicas(t *t
 }
 
 // TestReconcileSentinelPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite is the
-// Sentinel counterpart of the NA6 scale-down path: 3 -> 2 Sentinels keeps the
+// Sentinel counterpart of the ADR 0004 D8 scale-down path: 3 -> 2 Sentinels keeps the
 // quorum at 2, so the PDB object never changes while the budget turns into a drain
 // blocker. A write-gated warning would be silent for exactly that transition.
 func TestReconcileSentinelPodDisruptionBudget_WarnsAfterScaleDownWithoutWrite(t *testing.T) {
@@ -450,7 +450,7 @@ func TestReconcileSentinelPodDisruptionBudget_NoWarningAtOddCount(t *testing.T) 
 	}
 }
 
-// --- NA14: PDBs the operator does not own are never deleted and never adopted ---
+// --- ADR 0006 D1, D2: PDBs the operator does not own are never deleted and never adopted ---
 
 // testValkeyUID is the UID of the Valkey CR in the PDB tests. metav1.IsControlledBy
 // compares UIDs, so an empty one would make every ownerReference-less object look
@@ -495,7 +495,8 @@ func assertPDBUntouched(t *testing.T, r *ValkeyReconciler, name string) {
 		"the operator must not stamp its version on a foreign object")
 }
 
-// TestCleanupPodDisruptionBudget_KeepsForeignBudget is NA14's severe half: the
+// TestCleanupPodDisruptionBudget_KeepsForeignBudget is the severe half of ADR 0006
+// D1, D2: the
 // cleanup path runs on every pass of every CR whose PDBs are absent or disabled —
 // which is every pre-existing CR after the operator upgrade — and deleted the
 // same-named PDB by name. A hand-written budget for the data pods is called exactly
@@ -538,7 +539,7 @@ func TestCleanupPodDisruptionBudget_KeepsForeignBudget(t *testing.T) {
 			assertPDBUntouched(t, r, "test")
 			assertPDBUntouched(t, r, "test-sentinel")
 
-			// NA32(a) flipped this expectation. It used to require four Warning
+			// ADR 0004 D11 flipped this expectation. It used to require four Warning
 			// Events (both budgets, both passes) and pinned that as intended. The
 			// cleanup path runs on every pass of every CR whose spec.podDisruptionBudget
 			// is absent, so after the operator upgrade every user who had hand-written
@@ -553,7 +554,7 @@ func TestCleanupPodDisruptionBudget_KeepsForeignBudget(t *testing.T) {
 }
 
 // TestCleanupPodDisruptionBudget_WarnsWhenEnabledButNotApplicable is the other half
-// of NA32(a): the gate is the opt-in, not the cleanup path itself. With the feature
+// of ADR 0004 D11: the gate is the opt-in, not the cleanup path itself. With the feature
 // enabled but no budget applicable (fewer than MinPDBReplicas replicas on both
 // StatefulSets) the CR asked for operator-managed budgets and the names are taken by
 // someone else, so scaling back up would silently produce no budget at all. That
@@ -582,8 +583,9 @@ func TestCleanupPodDisruptionBudget_WarnsWhenEnabledButNotApplicable(t *testing.
 	assert.Contains(t, warnings[0].note, "the operator only deletes budgets it created")
 }
 
-// TestReconcilePodDisruptionBudget_NoContentWarningsForForeignBudget is NA32(b): with
-// the feature enabled against a foreign budget nothing is written, so the NA6/NA7
+// TestReconcilePodDisruptionBudget_NoContentWarningsForForeignBudget is ADR 0004 D10:
+// with the feature enabled against a foreign budget nothing is written, so the
+// ADR 0004 D7, D8
 // content warnings would describe spec values that reached no object — and contradict
 // the PodDisruptionBudgetNotOwned warning emitted in the same pass. Both conditions
 // hold here (maxUnavailable 2 >= replicas 2, Sentinel quorum 2 == 2 replicas), so a
@@ -636,7 +638,8 @@ func TestCleanupPodDisruptionBudget_DeletesOwnedBudget(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err), "an owned sentinel budget is still deleted")
 }
 
-// TestReconcilePodDisruptionBudget_DoesNotAdoptForeignBudget is NA14's mirror image:
+// TestReconcilePodDisruptionBudget_DoesNotAdoptForeignBudget is the mirror image of
+// ADR 0006 D1, D2:
 // enabling the feature next to a same-named hand-written budget silently adopted it —
 // Get, HasChanged, Update overwrote the budget fields and the selector without ever
 // asking who owns the object.
@@ -665,7 +668,7 @@ func TestReconcilePodDisruptionBudget_DoesNotAdoptForeignBudget(t *testing.T) {
 		"spec.podDisruptionBudget cannot take effect until that budget is deleted or renamed")
 }
 
-// --- NA31: the cleanup delete is bound to the object the pass inspected ---
+// --- ADR 0006 D8, D9: the cleanup delete is bound to the object the pass inspected ---
 
 // operatorOwnedPDB is a budget controlled by the Valkey CR, carrying an explicit UID.
 // The UID matters: the cleanup delete sends it as a precondition, and the fake client
@@ -716,7 +719,7 @@ func (c *capturedDeleteOptions) intercept() interceptor.Funcs {
 	}
 }
 
-// TestCleanupPodDisruptionBudget_DeletesWithUIDPrecondition is NA31: the ownership
+// TestCleanupPodDisruptionBudget_DeletesWithUIDPrecondition is ADR 0006 D8, D9: the ownership
 // decision is made on a cache-backed Get, and a delete by name alone still lands on
 // whatever holds the name at that moment. If the operator budget was already removed
 // and the user recreated their own under the same name before the cache caught up,

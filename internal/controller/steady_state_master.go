@@ -37,13 +37,13 @@ const (
 		"master role, so the record has already been overtaken by the topology"
 )
 
-// checkSteadyStateSplitBrain consolidates a multi-master state that appears
-// outside a rolling update (NA26). Nothing else re-detects one: after
-// verifyTopologyRestored clears the state annotation, checkAndHandleRollingUpdate
-// early-returns and detectAndResolveSplitBrain has no other caller, while
-// checkAndRecoverNoMaster only handles masterCount == 0. The -rw Service selects
-// on the instanceRole label, so two labeled masters means writes round-robin
-// across two independent datasets.
+// checkSteadyStateSplitBrain consolidates a multi-master state that appears outside a rolling
+// update (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D1). Nothing else
+// re-detects one: after verifyTopologyRestored clears the state annotation,
+// checkAndHandleRollingUpdate early-returns and detectAndResolveSplitBrain has no other caller,
+// while checkAndRecoverNoMaster only handles masterCount == 0. The -rw Service selects on the
+// instanceRole label, so two labeled masters means writes round-robin across two independent
+// datasets.
 //
 // The trigger is free: the pod label the -rw Service already selects on. A single
 // labeled master that the annotation also names costs nothing beyond the cached
@@ -66,7 +66,7 @@ const (
 //     the pod it promotes. Positive evidence of a promotion nobody recorded.
 //   - The structural rule. The init script (internal/builder/statefulset.go, Phase 3)
 //     grants the master config to ordinal 0 on the ordinal fallback, and otherwise
-//     only through the NA35 self-claim, which requires the mounted replica config to
+//     only through the ADR 0008 D8, D9 self-claim, which requires the mounted replica config to
 //     name the pod itself. A labeled master with ordinal > 0 that the live replica
 //     ConfigMap does not name therefore cannot have elected itself -- it was promoted
 //     out of a running replication chain.
@@ -256,12 +256,13 @@ func (r *ValkeyReconciler) adoptUnrecordedPromotion(ctx context.Context, v *vkov
 // connection -- to the pod the annotation names, and only on a disagreement between
 // that annotation and the label, which is not the steady state.
 //
-// The third rule is what keeps a refusal here from manufacturing the destructive
-// shape one state later. Refusing leaves the annotation and the replica ConfigMap
-// naming the drained pod, so that pod self-claims off its own mount when it returns
-// (NA35), and the cluster arrives at two masters -- where the operator can then only
-// refuse again. Adopting the pod the drain promoted while the drained one is back as
-// a replica republishes the ConfigMap, so the next restart keeps it a replica.
+// The third rule is what keeps a refusal here from manufacturing the destructive shape one state
+// later. Refusing leaves the annotation and the replica ConfigMap naming the drained pod, so that
+// pod self-claims off its own mount when it returns
+// (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D8, D9), and the cluster
+// arrives at two masters -- where the operator can then only refuse again. Adopting the pod the
+// drain promoted while the drained one is back as a replica republishes the ConfigMap, so the next
+// restart keeps it a replica.
 func (r *ValkeyReconciler) promotionEvidence(ctx context.Context, v *vkov1.Valkey,
 	pod *corev1.Pod, recorded string) (string, bool) {
 	if hasDrainStamp(pod) {
@@ -494,12 +495,12 @@ func (r *ValkeyReconciler) stampedMasters(ctx context.Context, v *vkov1.Valkey,
 // confirmedMasterAuthority returns the pod name the known-master annotation names,
 // but only when that pod answers and itself reports role:master.
 //
-// The annotation is the only admissible authority here. Outside a rolling update
-// there is no Sentinel, no promoted-pod annotation and no safe tie-break: with a
-// shrunken cluster both masters report zero connected slaves, and picking by
-// ordinal demotes the pod that holds the post-failover writes (NA21). Refusing is
-// the correct outcome -- the cluster keeps two masters, visibly, instead of
-// silently losing a dataset.
+// The annotation is the only admissible authority here. Outside a rolling update there is no
+// Sentinel, no promoted-pod annotation and no safe tie-break: with a shrunken cluster both masters
+// report zero connected slaves, and picking by ordinal demotes the pod that holds the post-failover
+// writes (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D10, D11). Refusing
+// is the correct outcome -- the cluster keeps two masters, visibly, instead of silently losing a
+// dataset.
 func (r *ValkeyReconciler) confirmedMasterAuthority(ctx context.Context, v *vkov1.Valkey) (string, bool) {
 	logger := log.FromContext(ctx)
 
@@ -686,7 +687,7 @@ func (r *ValkeyReconciler) clearDrainStamps(ctx context.Context, v *vkov1.Valkey
 // the master role without anybody promoting it.
 //
 // It could, in exactly two ways (internal/builder/statefulset.go, Phase 3): the
-// ordinal fallback, which only ever applies to ordinal 0, and the NA35 self-claim,
+// ordinal fallback, which only ever applies to ordinal 0, and the ADR 0008 D8, D9 self-claim,
 // which requires the mounted replica config to name the pod itself. So a pod with
 // ordinal > 0 that the replica ConfigMap does not name was promoted from a live
 // replica by somebody -- the drain handler, or a human.

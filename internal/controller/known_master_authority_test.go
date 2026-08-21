@@ -23,8 +23,8 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
-// The tests in this file pin the invariant that NA26 (checkSteadyStateSplitBrain)
-// and NA35 (the init-script self-claim) turned the known-master annotation into:
+// The tests in this file pin the invariant that ADR 0011 D1 (checkSteadyStateSplitBrain)
+// and ADR 0008 D8, D9 (the init-script self-claim) turned the known-master annotation into:
 // it names the pod the operator last promoted, and a promotion the operator could
 // not record is not a completed promotion.
 //
@@ -110,14 +110,14 @@ func TestPersistKnownMaster_DropsTheKeyItCouldNotCreate(t *testing.T) {
 
 // --- promotePod0AndRedirect: an unrecorded promotion must not advance Phase 1 ---
 
-// The NA26/NA35 loss, reproduced at its origin: pod-0 is promoted, the annotation
-// write is rejected, and the pass used to carry on into Phase 2 anyway. The state
-// then cleared with pod-0 as master and the annotation still naming pod-1, and
-// nothing could ever correct it -- pod0SyncWaitReason rejects a pod-0 that already
-// reports master, so this function never runs again, and clearRollingUpdateState
-// deliberately keeps the annotation. The next restart of pod-1 self-claimed master
-// and checkSteadyStateSplitBrain demoted pod-0, discarding every write since the
-// failover.
+// The loss ADR 0011 D1 and ADR 0008 D8, D9 describe, reproduced at its origin:
+// pod-0 is promoted, the annotation write is rejected, and the pass used to carry
+// on into Phase 2 anyway. The state then cleared with pod-0 as master and the
+// annotation still naming pod-1, and nothing could ever correct it --
+// pod0SyncWaitReason rejects a pod-0 that already reports master, so this function
+// never runs again, and clearRollingUpdateState deliberately keeps the annotation.
+// The next restart of pod-1 self-claimed master and checkSteadyStateSplitBrain
+// demoted pod-0, discarding every write since the failover.
 func TestPromotePod0AndRedirect_DoesNotAdvanceWhenTheRecordFails(t *testing.T) {
 	const name = "promote-blocked"
 	promotedHost := podHost(name, 1)

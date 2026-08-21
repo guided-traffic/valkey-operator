@@ -28,22 +28,22 @@ import (
 // restoration could fail to do its job, plus the guard that decides whether the
 // returning pod-0 is the new pod at all:
 //
-//   - NA27: the bound is armed by an annotation write whose error was discarded.
+//   - ADR 0010 D7, D8: the bound is armed by an annotation write whose error was discarded.
 //     A CR write that keeps failing left the bound unarmed forever, so the phase it
 //     bounds requeued forever — the stall the bound exists to break.
-//   - NA28: the bound was only set when absent, so a timestamp left behind by a
+//   - ADR 0010 D10: the bound was only set when absent, so a timestamp left behind by a
 //     rolling update that died in restoring-topology spent the budget of the next
 //     one before it started.
-//   - NA30: the "is this the new pod" guard compared the image only, which a
+//   - ADR 0007 D4: the "is this the new pod" guard compared the image only, which a
 //     config-hash-only rolling update passes trivially.
 
 // testNamespace is the namespace every fixture in this file lives in.
 const testNamespace = "default"
 
-// crGet reads the CR back from the API. It is the only CR reader in the package
-// tests: status_phase_test.go carried storedValkey and condition_generation_test.go
-// an inline copy inside conditionOf, both folded onto this one (NA45). Every fixture
-// in the package lives in testNamespace, which is why the namespace is not a
+// crGet reads the CR back from the API. It is the only CR reader in the package tests:
+// status_phase_test.go carried storedValkey and condition_generation_test.go an inline copy inside
+// conditionOf, both folded onto this one (docs/adr/0010-every-rolling-update-wait-is-bounded.md,
+// D14). Every fixture in the package lives in testNamespace, which is why the namespace is not a
 // parameter.
 func crGet(t *testing.T, c client.Client, name string) *vkov1.Valkey {
 	t.Helper()
@@ -101,7 +101,7 @@ func multiReplicaFixture(t *testing.T, name string, annotations map[string]strin
 	return r, c, crGet(t, c, name), sts
 }
 
-// --- NA28: entering Phase 1 must restart its budget ---
+// --- ADR 0010 D10: entering Phase 1 must restart its budget ---
 
 // A rolling update that died in restoring-topology leaves topology-restore-started
 // behind, and clearStaleRollingUpdateState only fires when nothing has been replaced
@@ -151,7 +151,7 @@ func TestHandlePostManualFailover_ReArmsPhase1BudgetOnEntry(t *testing.T) {
 		"no TopologyRestoreAbandoned verdict on the first pass of a fresh budget")
 }
 
-// --- NA27: the bound must survive a CR write that never lands ---
+// --- ADR 0010 D7, D8: the bound must survive a CR write that never lands ---
 
 // rejectTopologyRestoreArming refuses exactly the write that arms Phase 1 — an
 // admission webhook on the CR, or any other permanent rejection. The abandon write
@@ -239,10 +239,10 @@ func TestEnsureWaitBound_DropsTheAnnotationItCouldNotPersist(t *testing.T) {
 	assert.True(t, r.isTopologyRestoreStalled(v))
 }
 
-// --- NA27/NA28: the in-memory copy must not outlive the rolling update ---
+// --- ADR 0010 D7, D8, D10: the in-memory copy must not outlive the rolling update ---
 
 // A first-seen left behind after the update finished pre-expires the budget of the
-// next one, which is NA28 reproduced in memory. clearRollingUpdateState is the one
+// next one, which is ADR 0010 D10 reproduced in memory. clearRollingUpdateState is the one
 // place every completion path funnels through.
 func TestClearRollingUpdateState_ForgetsInMemoryWaitBounds(t *testing.T) {
 	const name = "bound-clear"
@@ -300,7 +300,7 @@ func TestWaitBoundKey_CannotCollideWithNudgeKey(t *testing.T) {
 		waitBoundKey(v.Namespace, v.Name, boundFinalization))
 }
 
-// --- NA30: the new-pod guard has to see a config-only change ---
+// --- ADR 0007 D4: the new-pod guard has to see a config-only change ---
 
 // The guard keeps REPLICAOF away from the old master pod that a stale cache still
 // shows. Comparing the image alone made it void for every rolling update that does
@@ -445,7 +445,7 @@ func TestHandlePostManualFailover_WaitsForTerminatingPod(t *testing.T) {
 	require.NoError(t, c.Update(context.Background(), held))
 }
 
-// --- NA28 through the dispatch: completion must clear the state on every target ---
+// --- ADR 0010 D10 through the dispatch: completion must clear the state on every target ---
 
 // handleStandaloneRollingUpdate reports Completed without clearing anything, and it
 // is reachable with rolling-update state on the CR: scaling a multi-replica cluster
@@ -490,9 +490,9 @@ func TestCheckAndHandleRollingUpdate_StandaloneDispatchClearsState(t *testing.T)
 	assert.False(t, waitBoundArmed(r, name, boundFinalization))
 }
 
-// --- NA40: entering Phase 2 must restart its budget ---
+// --- ADR 0010 D10: entering Phase 2 must restart its budget ---
 
-// The mirror of NA28 one state later. clearRollingUpdateState deletes
+// The mirror of ADR 0010 D10 one state later. clearRollingUpdateState deletes
 // finalization-started, but a rolling update that died in flight never reaches it and
 // clearStaleRollingUpdateState only clears on the "nothing replaced yet" branch. Phase
 // 2 therefore started against an hours-old timestamp, declared itself stalled on its
@@ -573,7 +573,7 @@ func TestPromotePod0AndRedirect_ArmsPhase2BudgetOnEntry(t *testing.T) {
 	assert.True(t, waitBoundArmed(r, name, boundFinalization))
 }
 
-// --- NA47: the manual-failover wait needs a bound of its own ---
+// --- ADR 0010 D6: the manual-failover wait needs a bound of its own ---
 
 // manualFailoverFixture builds the state the operator is in right after
 // handleManualFailover: a replica promoted, the state persisted, pod-0 deleted and
@@ -607,7 +607,7 @@ func manualFailoverFixture(t *testing.T, name, started string) (*ValkeyReconcile
 // so a pod-0 that never comes back parks the state machine in manual-failover forever:
 // the cluster serves from the temporary master with nothing declaring it the end
 // state, TopologyRestored is never written, the phase freezes at "Rolling Update N/M",
-// and because Reconcile returns on NeedsRequeue the NA26 steady-state check and
+// and because Reconcile returns on NeedsRequeue the ADR 0011 D1 steady-state check and
 // updateStatus never run for the whole duration.
 //
 // The escape has to be Phase 2 rather than a cleared state: Phase 2 is the last pass
@@ -640,7 +640,7 @@ func TestHandlePostManualFailover_AbandonsIntoPhase2WhenPodZeroNeverReturns(t *t
 	require.Len(t, abandoned, 1)
 	assert.Contains(t, abandoned[0].note, name+"-0", "the Event has to name the pod that never came back")
 
-	// NA40 is what makes this handover worth anything: Phase 2 arrives with a budget
+	// ADR 0010 D10 is what makes this handover worth anything: Phase 2 arrives with a budget
 	// of its own instead of one an earlier update already spent.
 	started, err := time.Parse(time.RFC3339, final.Annotations[annotationFinalizationTimestamp])
 	require.NoError(t, err)
@@ -670,7 +670,7 @@ func TestHandlePostManualFailover_ArmsTheBoundAndKeepsWaiting(t *testing.T) {
 }
 
 // The bound is armed where the state is written, not only where it is waited on, for
-// the NA28 reason: a manual-failover timestamp left behind by a rolling update that
+// the ADR 0010 D10 reason: a manual-failover timestamp left behind by a rolling update that
 // died would otherwise be inherited by the next one and expire on its first pass.
 func TestPersistManualFailoverState_ArmsTheBoundOnEntry(t *testing.T) {
 	const name = "mf-arm"
@@ -692,7 +692,7 @@ func TestPersistManualFailoverState_ArmsTheBoundOnEntry(t *testing.T) {
 }
 
 // The spent bound must not outlive the rolling update, in either copy: the annotation
-// or the tracker. A leftover is NA28 for the next failover.
+// or the tracker. A leftover is ADR 0010 D10 for the next failover.
 func TestClearRollingUpdateState_ForgetsTheManualFailoverBound(t *testing.T) {
 	const name = "mf-clear"
 	r, c, v, _ := multiReplicaFixture(t, name, map[string]string{

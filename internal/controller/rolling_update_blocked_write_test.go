@@ -20,7 +20,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-// The tests in this file pin NA19: while the StatefulSet write is rejected (an
+// The tests in this file pin ADR 0007 D2: while the StatefulSet write is rejected (an
 // admission webhook, a quota, any write failure), the aggregate-reconcile design
 // still runs the workload pass. The rolling update must then compare pods
 // against the *persisted* template, not against the CR, or it deletes pods that
@@ -83,7 +83,7 @@ func podExists(t *testing.T, c client.Client, name string) bool {
 	return err == nil
 }
 
-// TestCheckAndHandleRollingUpdate_NoUpdateWhenImageWriteBlocked is the NA19
+// TestCheckAndHandleRollingUpdate_NoUpdateWhenImageWriteBlocked is the ADR 0007 D2
 // regression guard: the CR asks for a new image, the StatefulSet still carries
 // the old one because its Update was rejected, and the pod matches the
 // StatefulSet. Deleting that pod would achieve nothing — it comes back on the

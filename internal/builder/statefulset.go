@@ -441,11 +441,11 @@ done
 # actually reports role:master, so a stale entry degrades to the ordinal fallback.
 #
 # When the address names THIS pod, the pod is the master the operator recorded and
-# re-claims the role instead of taking the ordinal fallback (NA35). Falling back
-# would make the recorded master a replica of the ordinal-0 pod, and the full sync
-# would overwrite the only copy of the post-failover writes. The two-master state
-# this can produce is transient: the operator's steady-state check consolidates it,
-# with this same address as its authority.
+# re-claims the role instead of taking the ordinal fallback (ADR 0008 D8, D9).
+# Falling back would make the recorded master a replica of the ordinal-0 pod, and
+# the full sync would overwrite the only copy of the post-failover writes. The
+# two-master state this can produce is transient: the operator's steady-state check
+# consolidates it, with this same address as its authority.
 if [ -z "$MASTER_ADDR" ]; then
   KNOWN_MASTER=$(grep '^replicaof ' %[4]s/%[3]s 2>/dev/null | awk '{print $2}')
   if [ "$KNOWN_MASTER" = "$MY_HOST" ]; then

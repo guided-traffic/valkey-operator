@@ -2381,9 +2381,9 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 	}, pod2))
 }
 
-// --- NA5: a Sentinel rolling-update error must lead to a retry ---
+// --- ADR 0001 D7: a Sentinel rolling-update error must lead to a retry ---
 
-// TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError pins the NA5 fix.
+// TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError pins the ADR 0001 D7 fix.
 // The Sentinel rolling-update error path used to return (ctrl.Result{}, true) with
 // no error and no RequeueAfter, so the pass ended without any retry — and since a
 // status write does not re-trigger the CR watch (GenerationChangedPredicate),

@@ -116,7 +116,7 @@ func TestE2E_PodDisruptionBudget_SerializesEvictions(t *testing.T) {
 	})
 }
 
-// TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone is NA14: the operator must
+// TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone is ADR 0006 D1, D2: the operator must
 // touch only budgets it owns.
 //
 // Both budget names are the StatefulSet names, which is exactly what a hand-written
@@ -402,9 +402,9 @@ func (tc *testClients) assertForeignPodDisruptionBudgetIntact(t *testing.T, name
 		namespace, name)
 }
 
-// waitForValkeyEvent waits for an Event with the given reason on a Valkey CR. The
-// recorder broadcasts asynchronously, hence the poll; Events travel through
-// events.k8s.io/v1, so a missing one can also mean missing operator RBAC (NA12).
+// waitForValkeyEvent waits for an Event with the given reason on a Valkey CR. The recorder
+// broadcasts asynchronously, hence the poll; Events travel through events.k8s.io/v1, so a missing
+// one can also mean missing operator RBAC (docs/adr/0014-rbac-lives-in-three-places.md, D7).
 //
 // This is the single Event poll of the suite; it lives here because pdb_test.go is
 // where it started. Timeout and failure message are the caller's: what a missing

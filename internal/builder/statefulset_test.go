@@ -1522,7 +1522,7 @@ func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnounceIP(t 
 // The init script is one indexed fmt.Sprintf, so a wrong verb index surfaces as a
 // literal "%!" in the rendered text rather than as a compile error. This renders
 // both flag combinations (plain, and TLS plus auth, which populate the optional
-// valkey-cli flag verbs) and pins the self-claim branch that NA35 added.
+// valkey-cli flag verbs) and pins the self-claim branch that ADR 0008 D8, D9 added.
 func TestBuildStatefulSet_MultiReplica_InitScript_RendersSelfClaimBranch(t *testing.T) {
 	plain := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3

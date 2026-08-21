@@ -2,7 +2,7 @@
 
 package e2e
 
-// Tests in this file cover NA23: the bounded escape from Phase 1 of the topology
+// Tests in this file cover ADR 0010 D2-D4: the bounded escape from Phase 1 of the topology
 // restoration. After a two-replica non-Sentinel rolling update the operator waits
 // for the returning pod-0 to sync back from the promoted replica; when that never
 // happens the wait must end within spec.rollingUpdate.syncTimeout, emit
@@ -93,7 +93,7 @@ const (
 )
 
 // TestE2E_RollingUpdate_TopologyRestoreAbandoned drives a two-replica non-Sentinel
-// rolling update into the NA23 abandon path and asserts the end state it is meant
+// rolling update into the ADR 0010 D2-D4 abandon path and asserts the end state it is meant
 // to produce: a serviceable cluster whose master is the promoted replica, not pod-0.
 func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	t.Parallel()
@@ -124,7 +124,7 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
 	require.Equal(t, pod0, tc.findMasterPod(t, ns, name, replicas),
-		"the initial master must be pod-0, otherwise this test does not exercise the NA23 shape")
+		"the initial master must be pod-0, otherwise this test does not exercise the ADR 0010 D2-D4 shape")
 	tc.waitForConnectedReplicas(t, ns, pod0, 6379, replicas-1)
 
 	// The payload has to be on pod-1 before the failover promotes it, otherwise a
@@ -292,7 +292,8 @@ func (tc *testClients) jamPod0Replication(t *testing.T, namespace, name string) 
 //
 // It is the only condition reader in the suite: admission_recovery_test.go used to
 // carry a ReconcileBlocked-specific twin of it, which was folded onto this one
-// (NA45) the same way NA38 folded the duplicated Event pollers.
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D14) the same way ADR 0017 D25, D26
+// folded the duplicated Event pollers.
 func (tc *testClients) valkeyStatusCondition(t *testing.T, namespace, name, condType string) map[string]interface{} {
 	t.Helper()
 

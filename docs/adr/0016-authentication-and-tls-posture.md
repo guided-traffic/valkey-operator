@@ -135,7 +135,7 @@ cleanup remains reachable with Sentinel disabled, on the first reconcile:
 legacy Secret. A Sentinel gate would strand the legacy material of any instance that turns
 Sentinel off, which nothing else cleans up. **The protection is the provenance guard, not the
 reachability of the path** — and the zero-rollout-window shape is pinned by its own test
-(`TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete`).
+(`TestReconcileLegacySentinelCleanup_NoSentinelStillGuardsTheDelete`).
 
 **D12 — Propagation is hash-driven, so Secret *names* propagate and Secret *values* do not.**
 `spec.image`, resources, probes and config changes alter the pod-spec or config hash and ride

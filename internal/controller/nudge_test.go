@@ -196,7 +196,7 @@ func TestNudgeShortStatefulSets_RebumpsStaleNudge(t *testing.T) {
 }
 
 // TestNudgeShortStatefulSets_NudgesDataStatefulSetDuringRollingUpdate is the unit
-// half of NA15. The rolling-update state is a phase marker, not a liveness marker:
+// half of ADR 0003 D8. The rolling-update state is a phase marker, not a liveness marker:
 // it stays set for as long as the phase runs, including while a pod recreation is
 // stuck, so it cannot tell "deleted on purpose, back in two seconds" from "deleted
 // on purpose, never coming back". Duration can, and nudgeGracePeriod measures it —
@@ -394,9 +394,9 @@ func TestNudgeTracker_ObserveKeepsFirstObservation(t *testing.T) {
 	assert.Equal(t, now, tracker.observe(key, now), "forget must restart the grace period")
 }
 
-// --- NA4: the nudge must survive a Sentinel rolling update parked on quorum ---
+// --- ADR 0003 D7, D8: the nudge must survive a Sentinel rolling update parked on quorum ---
 
-// sentinelQuorumWaitFixture builds the constellation NA4 describes: no data
+// sentinelQuorumWaitFixture builds the constellation ADR 0003 D7, D8 describes: no data
 // rolling update is in progress, and the Sentinel rolling update is parked on its
 // quorum guard because sentinel-2 was deleted and its replacement has not been
 // created (a rejected pod create). The two surviving Sentinel pods are ready and
@@ -422,7 +422,7 @@ func sentinelQuorumWaitFixture(dataCreated int32) (*vkov1.Valkey, []client.Objec
 }
 
 // TestReconcileWorkload_NudgesDataStatefulSetDuringSentinelQuorumWait is the
-// regression guard for NA4. The Sentinel quorum guard requeues forever while the
+// regression guard for ADR 0003 D7, D8. The Sentinel quorum guard requeues forever while the
 // deleted Sentinel pod cannot be recreated; with the nudge placed after the
 // rolling-update checks, the data StatefulSet was never nudged in that state and
 // the statefulset-controller backoff (measured at 5 min 29 s) was back.
@@ -443,7 +443,7 @@ func TestReconcileWorkload_NudgesDataStatefulSetDuringSentinelQuorumWait(t *test
 }
 
 // TestReconcileWorkload_NudgesSentinelStatefulSetWhileRecreationBlocked covers the
-// second half of NA4: the Sentinel StatefulSet whose own pod recreation is blocked
+// second half of ADR 0003 D7, D8: the Sentinel StatefulSet whose own pod recreation is blocked
 // must be nudged as well. Suppressing it during a Sentinel rolling update would be
 // self-defeating — the quorum guard is waiting for exactly that pod, and the nudge
 // annotation lives on the StatefulSet metadata, so it cannot disturb the update.
@@ -463,7 +463,7 @@ func TestReconcileWorkload_NudgesSentinelStatefulSetWhileRecreationBlocked(t *te
 		"a Sentinel pod whose recreation is blocked must be nudged, not waited out")
 }
 
-// dataRecreationBlockedFixture builds the NA15 constellation: a data rolling
+// dataRecreationBlockedFixture builds the ADR 0003 D8 constellation: a data rolling
 // update in progress (state annotation set, image bumped), pod-2 deleted by that
 // update and never recreated because pod creation is rejected. pod-0 and pod-1
 // still run the outdated image, so the rolling update is not finished and its
@@ -491,7 +491,7 @@ func dataRecreationBlockedFixture() (*vkov1.Valkey, []client.Object) {
 }
 
 // TestReconcileWorkload_NudgesDataStatefulSetWhenRecreationBlocked is the
-// regression guard for NA15. NA4 removed the Sentinel-rolling-update suppression
+// regression guard for ADR 0003 D8. ADR 0003 D7, D8 removed the Sentinel-rolling-update suppression
 // on the argument that the update deletes one pod and then waits for that exact
 // pod to come back; the data rolling update does the same thing, so suppressing
 // its nudge suppressed it precisely where it was the only lever. The rolling
@@ -514,7 +514,7 @@ func TestReconcileWorkload_NudgesDataStatefulSetWhenRecreationBlocked(t *testing
 }
 
 // TestReconcileWorkload_RollingUpdateKeepsRequeueAuthority is the other half of
-// NA15: the data nudge is now live during a rolling update, and that is only
+// ADR 0003 D8: the data nudge is now live during a rolling update, and that is only
 // harmless because reconcileWorkload returns the rolling-update result before it
 // reads shortOfPods. Without this guard a later refactor that hoists the
 // shortOfPods check would silently replace the rolling update's 10 s clock with
@@ -551,7 +551,7 @@ func failStatefulSetGet(name string) interceptor.Funcs {
 	}
 }
 
-// TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue is the NA16 guard.
+// TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue is the ADR 0003 D10 guard.
 // In Provisioning the nudge requeue is the only wakeup source, so treating an
 // unreadable StatefulSet as "not short" would end the requeue chain on the exact
 // path the nudge exists for. Unknown must mean come back, not give up.
@@ -569,7 +569,7 @@ func TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue(t *testing.T) {
 }
 
 // TestNudgeShortStatefulSets_TransientGetErrorKeepsObservation is the other half
-// of NA16: forgetting on a transient error restarts the 10 s grace period, so a
+// of ADR 0003 D10: forgetting on a transient error restarts the 10 s grace period, so a
 // repeating error would postpone the first bump indefinitely.
 func TestNudgeShortStatefulSets_TransientGetErrorKeepsObservation(t *testing.T) {
 	v := newSentinelValkey()

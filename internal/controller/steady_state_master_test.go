@@ -24,7 +24,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
-// The tests in this file pin NA26: once the rolling-update state annotation is
+// The tests in this file pin ADR 0011 D1: once the rolling-update state annotation is
 // cleared, nothing else re-detects a second master, and the -rw Service routes
 // writes to every pod the sidecar labels master. The steady-state check closes
 // that gap -- but a demotion is a REPLICAOF, which discards a dataset, so it never
@@ -383,14 +383,13 @@ func TestSteadyStateSplitBrain_AdoptsAMasterThatCannotHaveSelfElected(t *testing
 // [REGRESSION] The drain the structural rule cannot see, caught one state earlier
 // than the split brain it used to produce.
 //
-// buildReplicaAddrs walks the ordinals ascending and findSyncedReplica takes the
-// first synced peer, so draining a non-pod-0 master promotes pod-0 -- and pod-0 is
-// the one pod couldNotHaveSelfElected can never exonerate. With the stamp lost (an
-// old sidecar mid-upgrade, or a rejected patch) the operator had no evidence at all
-// and refused, which is worse than it sounds: the annotation and the replica
-// ConfigMap keep naming the drained pod, so that pod self-claims off its own mount
-// when it returns (NA35), and the refusal has manufactured a two-master state whose
-// only remaining resolution is another refusal.
+// buildReplicaAddrs walks the ordinals ascending and findSyncedReplica takes the first synced peer,
+// so draining a non-pod-0 master promotes pod-0 -- and pod-0 is the one pod couldNotHaveSelfElected
+// can never exonerate. With the stamp lost (an old sidecar mid-upgrade, or a rejected patch) the
+// operator had no evidence at all and refused, which is worse than it sounds: the annotation and
+// the replica ConfigMap keep naming the drained pod, so that pod self-claims off its own mount when
+// it returns (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D8, D9), and the
+// refusal has manufactured a two-master state whose only remaining resolution is another refusal.
 //
 // The recorded pod's own answer breaks it: test-1 came back, found test-0 serving as
 // master and joined it as a replica, so whatever it held it has already given up.
@@ -567,7 +566,7 @@ func TestSteadyStateSplitBrain_RefusesToAdoptOrdinalZero(t *testing.T) {
 	assert.Contains(t, refusals[0].note, "test-2")
 }
 
-// Row 8. The NA35 self-claim: the mounted replica config names this very pod, so
+// Row 8. The ADR 0008 D8, D9 self-claim: the mounted replica config names this very pod, so
 // the init script gave it the master role and nobody promoted it. Adopting would
 // bless a pod that may hold the older dataset.
 func TestSteadyStateSplitBrain_RefusesToAdoptAPodTheConfigMapNames(t *testing.T) {
@@ -683,7 +682,7 @@ func TestSteadyStateSplitBrain_DoesNotAdoptDuringRollingUpdate(t *testing.T) {
 
 // --- two labeled masters: evidence first, annotation second ---
 
-// The NA26 regression test: no stamp anywhere, the annotation names one of them and
+// The ADR 0011 D1 regression test: no stamp anywhere, the annotation names one of them and
 // it confirms role:master, so the other one is demoted toward it. The authority is
 // not pod-0, so the missed-drain shape does not apply.
 func TestSteadyStateSplitBrain_DemotesConfirmedRogue(t *testing.T) {
@@ -714,7 +713,8 @@ func TestSteadyStateSplitBrain_DemotesConfirmedRogue(t *testing.T) {
 // [REGRESSION] Row 10, the two-replica missed drain -- the case the whole design
 // exists for. pod-0 was drained, its sidecar promoted pod-1 and stamped it, pod-1
 // took every write of the drain window, and the returning pod-0 self-claimed off
-// the replica ConfigMap (NA35). The annotation still names pod-0.
+// the replica ConfigMap (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D8,
+// D9). The annotation still names pod-0.
 //
 // Resolving toward the annotation would REPLICAOF pod-1 and discard those writes,
 // which is worse than doing nothing at all -- before the steady-state check existed
@@ -1002,7 +1002,7 @@ func TestSteadyStateSplitBrain_DemotesASelfElectedOrdinalZero(t *testing.T) {
 	assert.Empty(t, rec.withReason("SplitBrainDemotionRefused"))
 }
 
-// The NA21 guard: without a recorded master the check has nothing to demote
+// The ADR 0008 D10, D11 guard: without a recorded master the check has nothing to demote
 // toward, and picking by ordinal would discard the post-failover writes. It must
 // refuse -- visibly.
 func TestSteadyStateSplitBrain_RefusesWithoutKnownMaster(t *testing.T) {
@@ -1368,7 +1368,7 @@ func TestCouldNotHaveSelfElected(t *testing.T) {
 	assert.False(t, couldNotHaveSelfElected("test-0", "test-2"),
 		"ordinal 0 is the init script's unconditional fallback")
 	assert.False(t, couldNotHaveSelfElected("test-1", "test-1"),
-		"the NA35 self-claim: the ConfigMap names this very pod")
+		"the ADR 0008 D8, D9 self-claim: the ConfigMap names this very pod")
 	assert.True(t, couldNotHaveSelfElected("test-1", ""))
 }
 

@@ -24,7 +24,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
-// --- NA23: Phase 1 (stateRestoringTopology) must not requeue forever ---
+// --- ADR 0010 D2-D4: Phase 1 (stateRestoringTopology) must not requeue forever ---
 //
 // Phase 1 waits for pod-0 to sync back from the promoted replica. Every failure it
 // can hit returned a bare requeue, and the outer loop offers no escape either:
@@ -99,7 +99,7 @@ func TestHandleTopologyRestoration_ArmsStallTimestampAndWaits(t *testing.T) {
 		"no verdict on the topology while the wait is still legitimate")
 }
 
-// TestHandleTopologyRestoration_AbandonsAfterSyncTimeout is the NA23 fix: once the
+// TestHandleTopologyRestoration_AbandonsAfterSyncTimeout is the ADR 0010 D2-D4 fix: once the
 // wait exceeds the sync timeout, Phase 1 hands over to Phase 2 instead of requeueing
 // forever. Forcing the promotion is not the escape — an unsynced pod-0 would come up
 // as an empty master and discard the writes the promoted replica accepted.
@@ -221,12 +221,12 @@ func TestHandleTopologyRestoration_SuccessRecordsRestoredCondition(t *testing.T)
 		"pod-0 is master again, so the known-master must point back at it")
 }
 
-// TestVerifyTopologyRestored_PrefersKnownMasterOverLowestOrdinal covers the reason
-// Phase 1 escapes into Phase 2 rather than into a cleared state — and the trap that
-// comes with it. After an abandoned restoration the real master is the promoted
-// replica, which in a shrunken cluster holds no connected slaves. A returning pod-0
-// that reports master ties it at zero, and the "most connected slaves" fallback then
-// picks pod-0 by lowest ordinal and demotes the pod holding the data (NA21).
+// TestVerifyTopologyRestored_PrefersKnownMasterOverLowestOrdinal covers the reason Phase 1 escapes
+// into Phase 2 rather than into a cleared state — and the trap that comes with it. After an
+// abandoned restoration the real master is the promoted replica, which in a shrunken cluster holds
+// no connected slaves. A returning pod-0 that reports master ties it at zero, and the "most
+// connected slaves" fallback then picks pod-0 by lowest ordinal and demotes the pod holding the
+// data (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D10, D11).
 func TestVerifyTopologyRestored_PrefersKnownMasterOverLowestOrdinal(t *testing.T) {
 	const name = "topo-km"
 	promotedHost := fmt.Sprintf("%s-1.%s-headless.default.svc.cluster.local", name, name)

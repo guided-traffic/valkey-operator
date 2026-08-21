@@ -167,7 +167,7 @@ func TestInitScript_Pod0NamedAsMasterKeepsMasterConfig(t *testing.T) {
 	assert.Contains(t, logs, "Replica config names this pod as master")
 }
 
-// NA35: the pod the operator recorded as master must re-claim the role after a
+// ADR 0008 D8, D9: the pod the operator recorded as master must re-claim the role after a
 // full pod-set restart. Pod-0 came back first and self-elected without replicas,
 // so Phase 1 rejects it; taking the ordinal fallback here would make the recorded
 // master a replica of pod-0 and the full sync would discard the post-failover

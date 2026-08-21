@@ -637,11 +637,12 @@ jobs:
 
       # Runs the generator itself, so the kubebuilder markers in the Go sources
       # are compared against the checked-in manifests. The RBAC drift test
-      # (internal/controller/rbac_drift_test.go, NA37) only compares the
-      # generated role against the Helm ClusterRole - manifest against manifest -
-      # so a stale config/rbac/role.yaml passes it while the operator ships
-      # without a verb its markers grant. build.yml runs the same check, but only
-      # on `release: published`; this job moves it to every push and PR (NA44).
+      # (internal/controller/rbac_drift_test.go, docs/adr/0006-delete-only-what-the-operator-owns.md,
+      # D12, D13) only compares the generated role against the Helm ClusterRole -
+      # manifest against manifest - so a stale config/rbac/role.yaml passes it while
+      # the operator ships without a verb its markers grant. build.yml runs the same
+      # check, but only on `release: published`; this job moves it to every push and
+      # PR (docs/adr/0014-rbac-lives-in-three-places.md, D5).
       - name: Regenerate CRDs, RBAC and DeepCopy
         run: make generate-all
 

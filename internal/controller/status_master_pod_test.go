@@ -14,7 +14,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-// NA39. status.masterPod was pod-0 unconditionally on the non-Sentinel path, which
+// ADR 0002 D11. status.masterPod was pod-0 unconditionally on the non-Sentinel path, which
 // contradicts two end states the operator produces on purpose: an abandoned topology
 // restoration leaves the promoted replica as master (TopologyRestored=False records
 // it), and every drain adoption leaves a non-pod-0 master behind. The field lied

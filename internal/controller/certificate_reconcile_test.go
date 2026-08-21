@@ -569,13 +569,13 @@ func TestReconcileLegacySentinelCleanup_ToleratesConcurrentDeletion(t *testing.T
 		"a concurrent deletion must not fail the reconcile")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignSecretUnderLegacyName is
-// the closed form of NA49. <cr>-sentinel-tls is derived from a CR name, and a
+// TestReconcileLegacySentinelCleanup_LeavesForeignSecretUnderLegacyName is
+// the closed form of ADR 0006 D4-D11. <cr>-sentinel-tls is derived from a CR name, and a
 // principal who may create Valkey CRs in a namespace picks that name — so the
 // name is attacker-chosen input, not evidence. A Secret the operator never
 // created (no owning Certificate, no cert-manager provenance annotation,
 // unrelated payload) survives, and the refusal is reported as an Event.
-func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignSecretUnderLegacyName(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_LeavesForeignSecretUnderLegacyName(t *testing.T) {
 	v := newTestValkeyUnified() // name oauth2-valkey, namespace iam
 	legacyName := builder.SentinelCertificateName(v)
 
@@ -603,19 +603,19 @@ func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignSecretUnderLegacyName(
 	got := &corev1.Secret{}
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Name: legacyName, Namespace: "iam"}, got),
-		"NA49: a foreign Secret under the legacy name must survive")
+		"ADR 0006 D4-D11: a foreign Secret under the legacy name must survive")
 	assert.Equal(t, []byte("s3cr3t"), got.Data["api-token"], "its payload must be untouched")
 	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
 		"the refusal must be reported, not silent")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete keeps the
-// sharpest shape of NA49 pinned: with Sentinel disabled sentinelRolloutComplete
+// TestReconcileLegacySentinelCleanup_NoSentinelStillGuardsTheDelete keeps the
+// sharpest shape of ADR 0006 D4-D11 pinned: with Sentinel disabled sentinelRolloutComplete
 // short-circuits to "complete", so the delete is reached on the very first
 // reconcile with no rollout window to wait for. certManager plus
 // unifiedCertificate on a Sentinel-less instance is a valid spec. The guard, not
 // the timing, is what protects the Secret — so it must hold here too.
-func TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_NoSentinelStillGuardsTheDelete(t *testing.T) {
 	v := newTestValkey("payments", "prod", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 1
 		// Sentinel deliberately left disabled.
@@ -645,18 +645,18 @@ func TestReconcileLegacySentinelCleanup_NA49_NoSentinelStillGuardsTheDelete(t *t
 
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Name: foreign.Name, Namespace: "prod"}, &corev1.Secret{}),
-		"NA49: without a rollout window the provenance guard is the only protection")
+		"ADR 0006 D4-D11: without a rollout window the provenance guard is the only protection")
 	assert.Len(t, rec.withReason(reasonLegacySentinelTLSNotOwned), 1,
 		"the refusal must be reported, not silent")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificate covers the
-// other half of the same hazard, which predates NA37 entirely: the chart always
+// TestReconcileLegacySentinelCleanup_LeavesForeignCertificate covers the
+// other half of the same hazard, which predates ADR 0006 D12, D13 entirely: the chart always
 // granted delete on cert-manager Certificates. A foreign Certificate under the
 // legacy name is left alone — deleting it would stop somebody else's issuance and
 // renewal. Ownership is decided by ownerReference because the operator sets that
 // reference itself on every Certificate it creates.
-func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificate(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_LeavesForeignCertificate(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	foreignCert := newForeignLegacySentinelCert(legacyName, "iam")
@@ -675,12 +675,12 @@ func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificate(t *testing
 		"the refusal must be reported, not silent")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificateAndItsSecret
+// TestReconcileLegacySentinelCleanup_LeavesForeignCertificateAndItsSecret
 // pins the composition of the two guards: a foreign Certificate is not deleted,
 // and because it is foreign it also grants no provenance to the Secret beside it.
 // The Secret carries the annotation of a DIFFERENT Certificate, so neither proof
 // holds and both objects survive.
-func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificateAndItsSecret(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_LeavesForeignCertificateAndItsSecret(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	foreignCert := newForeignLegacySentinelCert(legacyName, "iam")
@@ -697,13 +697,13 @@ func TestReconcileLegacySentinelCleanup_NA49_LeavesForeignCertificateAndItsSecre
 		types.NamespacedName{Name: legacyName, Namespace: "iam"}, &corev1.Secret{}))
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_AnnotationAloneAuthorisesTheDelete is
+// TestReconcileLegacySentinelCleanup_AnnotationAloneAuthorisesTheDelete is
 // the migration path that matters in practice. The Certificate is already gone —
 // an earlier pass deleted it and the Secret delete then failed 403, which is
-// exactly the state NA37 repaired — so the in-pass ownership proof is unavailable
+// exactly the state ADR 0006 D12, D13 repaired — so the in-pass ownership proof is unavailable
 // and only the retroactive cert-manager annotation remains. Without this path the
 // guard would strand every Secret it exists to clean up.
-func TestReconcileLegacySentinelCleanup_NA49_AnnotationAloneAuthorisesTheDelete(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_AnnotationAloneAuthorisesTheDelete(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	orphaned := newLegacySentinelSecret(legacyName, "iam")
@@ -718,12 +718,12 @@ func TestReconcileLegacySentinelCleanup_NA49_AnnotationAloneAuthorisesTheDelete(
 		"the cert-manager provenance annotation must authorise the delete on its own: %v", err)
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_OwnedCertificateAuthorisesUnstampedSecret
+// TestReconcileLegacySentinelCleanup_OwnedCertificateAuthorisesUnstampedSecret
 // covers the reverse asymmetry: a Secret with no provenance annotation is still
 // deleted when this same pass found a Certificate this Valkey controls that issues
 // into that exact name. Guards against a cert-manager release that drops or renames
 // the annotation — the in-pass proof is self-issued and survives that.
-func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificateAuthorisesUnstampedSecret(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_OwnedCertificateAuthorisesUnstampedSecret(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	ownedCert := newLegacySentinelCert(v, legacyName)
@@ -739,12 +739,12 @@ func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificateAuthorisesUnstamped
 	assert.True(t, apierrors.IsNotFound(err), "the owned Certificate must authorise the delete: %v", err)
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_OwnedCertificatePointingElsewhere shows
+// TestReconcileLegacySentinelCleanup_OwnedCertificatePointingElsewhere shows
 // why the secretName comparison is explicit rather than assumed. The Certificate is
 // ours, but it issues into a different Secret, so it says nothing about the object
 // under the legacy name. Today the two names coincide by construction; if that
 // derivation is ever split, this fails instead of authorising the wrong Secret.
-func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificatePointingElsewhere(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_OwnedCertificatePointingElsewhere(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	ownedCert := newLegacySentinelCert(v, legacyName)
@@ -766,12 +766,12 @@ func TestReconcileLegacySentinelCleanup_NA49_OwnedCertificatePointingElsewhere(t
 		"a Certificate that issues elsewhere proves nothing about this Secret")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_NonTLSTypeIsNeverDeleted pins the type
+// TestReconcileLegacySentinelCleanup_NonTLSTypeIsNeverDeleted pins the type
 // precondition. It does not establish provenance on its own — an attacker can
 // point the name at a real TLS Secret — but it removes the whole class of
 // accidental collateral, and it outranks the annotation: a Secret that is not
 // kubernetes.io/tls was not issued by cert-manager whatever it claims.
-func TestReconcileLegacySentinelCleanup_NA49_NonTLSTypeIsNeverDeleted(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_NonTLSTypeIsNeverDeleted(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	ownedCert := newLegacySentinelCert(v, legacyName)
@@ -791,11 +791,11 @@ func TestReconcileLegacySentinelCleanup_NA49_NonTLSTypeIsNeverDeleted(t *testing
 		"the refusal must be reported, not silent")
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_UIDPreconditionOnBothDeletes pins the
-// NA31 discipline on this path: both ownership decisions are made on cache-backed
+// TestReconcileLegacySentinelCleanup_UIDPreconditionOnBothDeletes pins the
+// ADR 0006 D8, D9 discipline on this path: both ownership decisions are made on cache-backed
 // reads, so both Deletes must name the UID they inspected. A Conflict means the
 // name now holds a different object and is not an error.
-func TestReconcileLegacySentinelCleanup_NA49_UIDPreconditionOnBothDeletes(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_UIDPreconditionOnBothDeletes(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	ownedCert := newLegacySentinelCert(v, legacyName)
@@ -826,12 +826,12 @@ func TestReconcileLegacySentinelCleanup_NA49_UIDPreconditionOnBothDeletes(t *tes
 	assert.Equal(t, []string{"cert-uid", "secret-uid"}, seen)
 }
 
-// TestReconcileLegacySentinelCleanup_NA49_CertificateConflictRevokesInPassProof
+// TestReconcileLegacySentinelCleanup_CertificateConflictRevokesInPassProof
 // isolates what a failed Certificate precondition actually costs. The object under
 // that name is no longer the one this pass inspected, so it proves nothing about
 // the Secret beside it — and a Secret with no annotation of its own then has no
 // admissible proof left and survives.
-func TestReconcileLegacySentinelCleanup_NA49_CertificateConflictRevokesInPassProof(t *testing.T) {
+func TestReconcileLegacySentinelCleanup_CertificateConflictRevokesInPassProof(t *testing.T) {
 	v := newTestValkeyUnified()
 	legacyName := builder.SentinelCertificateName(v)
 	ownedCert := newLegacySentinelCert(v, legacyName)

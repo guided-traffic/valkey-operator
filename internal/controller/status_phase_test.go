@@ -19,7 +19,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
-// Tests in this file cover NA3 of the admission-gap ticket: while
+// Tests in this file cover ADR 0002 D3-D6: while
 // reconcileResources fails but the data plane is healthy, the pass used to write
 // the phase twice with opposite values (health phase from updateStatus, then
 // Error), so watchers saw the CR oscillate on every pass.
@@ -77,7 +77,7 @@ func reconcileFor(t *testing.T, r *ValkeyReconciler, v *vkov1.Valkey) error {
 	return err
 }
 
-// TestReconcile_BlockedPassDoesNotFlapPhase is the unit-level form of NA3: a
+// TestReconcile_BlockedPassDoesNotFlapPhase is the unit-level form of ADR 0002 D3-D6: a
 // healthy data plane behind a rejected managed write must not produce an OK write
 // followed by an Error write on every pass.
 func TestReconcile_BlockedPassDoesNotFlapPhase(t *testing.T) {
@@ -145,7 +145,7 @@ func TestReconcile_BlockedPassRecoversToHealthPhase(t *testing.T) {
 }
 
 // TestReconcile_BlockedPassWritesPhaseEvenWhenWorkloadFails settles the open datum
-// recorded with NA3: a CR was sampled as Provisioning while blocked, which the
+// recorded with ADR 0002 D3-D6: a CR was sampled as Provisioning while blocked, which the
 // final Error write should have overwritten. An early return from the workload
 // pass used to skip that write entirely.
 func TestReconcile_BlockedPassWritesPhaseEvenWhenWorkloadFails(t *testing.T) {
@@ -198,7 +198,7 @@ func TestUpdatePhase_WritesWhenPassIsNotBlocked(t *testing.T) {
 	assert.Equal(t, vkov1.ValkeyPhaseOK, crGet(t, c, v.Name).Status.Phase)
 }
 
-// TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked pins the middle ground NA3
+// TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked pins the middle ground ADR 0002 D3-D6
 // asks for: only the phase and its message are suppressed, everything the data
 // plane reports keeps flowing into the status.
 func TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked(t *testing.T) {
@@ -225,11 +225,11 @@ func TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked(t *testing.T) {
 		"masterPod must keep tracking the data plane while blocked")
 }
 
-// --- NA33: a rejected initial phase write must not own the pass ---
+// --- ADR 0002 D7: a rejected initial phase write must not own the pass ---
 
 // rejectFirstValkeyStatusWrite fails the first status subresource write of a
 // Valkey CR and lets every later one through, keeping whatever else funcs
-// already does. It reproduces the NA33 trigger: a webhook guarding the CR status
+// already does. It reproduces the ADR 0002 D7 trigger: a webhook guarding the CR status
 // subresource, or a momentarily lost valkeys/status RBAC, catching the initial
 // Provisioning write of a brand-new CR.
 func rejectFirstValkeyStatusWrite(funcs interceptor.Funcs, rejected *int) interceptor.Funcs {
@@ -244,7 +244,7 @@ func rejectFirstValkeyStatusWrite(funcs interceptor.Funcs, rejected *int) interc
 	return funcs
 }
 
-// TestReconcile_InitialPhaseWriteFailureDoesNotAbortPass pins NA33: the initial
+// TestReconcile_InitialPhaseWriteFailureDoesNotAbortPass pins ADR 0002 D7: the initial
 // Provisioning write used to return the pass, so a rejected status write meant
 // reconcileResources never ran and the CR got neither its managed resources nor
 // a phase.
@@ -268,7 +268,7 @@ func TestReconcile_InitialPhaseWriteFailureDoesNotAbortPass(t *testing.T) {
 }
 
 // TestReconcile_InitialPhaseWriteFailureStillReportsReconcileBlocked is the half
-// of NA33 that matters for observability: with the early return, a CR whose first
+// of ADR 0002 D7 that matters for observability: with the early return, a CR whose first
 // status write was rejected carried no ReconcileBlocked condition either, so the
 // exact failure class that condition exists to surface stayed invisible.
 func TestReconcile_InitialPhaseWriteFailureStillReportsReconcileBlocked(t *testing.T) {

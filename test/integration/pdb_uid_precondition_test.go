@@ -19,14 +19,13 @@ import (
 // TestPodDisruptionBudgetUIDPrecondition_Integration proves that a real API
 // server enforces the UID delete precondition the PDB cleanup sends
 // (internal/controller/pdb.go: r.Delete(ctx, pdb, client.Preconditions{UID: &pdb.UID}),
-// NA31).
+// ADR 0006 D8, D9).
 //
-// Why this lives here and not in a unit test (NA42): the controller-runtime
-// fake client implements only the ResourceVersion precondition
-// (sigs.k8s.io/controller-runtime@v0.24.1/pkg/client/fake/client.go, deleteObject)
-// and ignores the UID one, so a unit test can assert that the option is sent and
-// can inject a Conflict, but it can never show the rejection actually happening.
-// Against envtest it happens for real.
+// Why this lives here and not in a unit test (docs/adr/0017-test-and-ci-policy.md, D12): the
+// controller-runtime fake client implements only the ResourceVersion precondition
+// (sigs.k8s.io/controller-runtime@v0.24.1/pkg/client/fake/client.go, deleteObject) and ignores the
+// UID one, so a unit test can assert that the option is sent and can inject a Conflict, but it can
+// never show the rejection actually happening. Against envtest it happens for real.
 //
 // What this test does NOT prove, stated so nobody reads more into it: it does not
 // schedule the interleaving itself. The race the precondition guards is a
@@ -65,7 +64,7 @@ func TestPodDisruptionBudgetUIDPrecondition_Integration(t *testing.T) {
 	require.NotEmpty(t, inspectedUID)
 
 	// It disappears and a different object takes the name over - the user's own
-	// budget in the NA31 scenario. Same name, new identity.
+	// budget in the ADR 0006 D8, D9 scenario. Same name, new identity.
 	require.NoError(t, direct.Delete(ctx, inspected))
 	foreign := build()
 	require.NoError(t, direct.Create(ctx, foreign))

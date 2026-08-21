@@ -37,17 +37,22 @@ const (
 	// how long a CR can report something that is no longer true.
 	reconcileRetryMaxDelay = 30 * time.Second
 
-	// reconcileRetryQPS and reconcileRetryBurst are controller-runtime's default
-	// overall (not per-item) token bucket, kept unchanged so that many CRs failing
-	// at once still cannot saturate the API client.
+	// reconcileRetryQPS and reconcileRetryBurst are the overall (not per-item) token
+	// bucket of client-go's DefaultTypedControllerRateLimiter, added back so that many
+	// CRs failing at once still cannot saturate the API client.
 	reconcileRetryQPS   = 10
 	reconcileRetryBurst = 100
 )
 
 // newReconcileRateLimiter builds the work queue rate limiter for the Valkey
-// controller: controller-runtime's default shape — the maximum of a per-item
-// exponential backoff and an overall token bucket — with the exponential part
-// capped at reconcileRetryMaxDelay instead of 1000 s.
+// controller: client-go's classic DefaultTypedControllerRateLimiter shape — the
+// maximum of a per-item exponential backoff and an overall token bucket — with the
+// exponential part capped at reconcileRetryMaxDelay instead of 1000 s.
+//
+// The bucket is added, not kept: controller-runtime v0.24.1 defaults to the bare
+// per-item exponential limiter whenever the priority queue is on, and it is on
+// unless UsePriorityQueue is set to false, which SetupWithManager does not do
+// (docs/adr/0001-continue-reconciling-past-a-rejected-write.md, D6).
 func newReconcileRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
 	return workqueue.NewTypedMaxOfRateLimiter(
 		workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](

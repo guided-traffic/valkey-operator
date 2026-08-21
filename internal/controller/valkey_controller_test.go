@@ -888,7 +888,7 @@ func newLegacySentinelCert(v *vkov1.Valkey, name string) *unstructured.Unstructu
 }
 
 // newForeignLegacySentinelCert builds a Certificate that merely carries the legacy
-// name — no ownerReference to any Valkey. Models the NA49 collision: a name the
+// name — no ownerReference to any Valkey. Models the ADR 0006 D4-D11 collision: a name the
 // operator would clean up, on an object it never created.
 func newForeignLegacySentinelCert(name, namespace string) *unstructured.Unstructured {
 	c := &unstructured.Unstructured{}

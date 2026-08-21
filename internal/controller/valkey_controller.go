@@ -54,8 +54,9 @@ const (
 	// reference cluster, and the value is the Certificate name — not the Secret
 	// name, which can differ (spec.secretName).
 	certManagerCertificateNameAnnotation = "cert-manager.io/certificate-name"
-	// reasonLegacySentinelTLSNotOwned is the Event reason for legacy Sentinel TLS
-	// material that the operator refused to delete for lack of provenance (NA49).
+	// reasonLegacySentinelTLSNotOwned is the Event reason for legacy Sentinel TLS material that the
+	// operator refused to delete for lack of provenance
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11).
 	reasonLegacySentinelTLSNotOwned = "LegacySentinelTLSNotOwned"
 )
 
@@ -377,8 +378,9 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 		}
 	}
 
-	// Outside a rolling update nothing else re-detects a split brain (NA26).
-	// The function self-gates on topology and rolling-update state.
+	// Outside a rolling update nothing else re-detects a split brain
+	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D1). The function
+	// self-gates on topology and rolling-update state.
 	//
 	// Its result is returned even when the pass continues: a split brain it could
 	// confirm but not resolve asks for a recheck without ending the pass, because
@@ -1031,7 +1033,8 @@ func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov
 // Neither object is deleted on its name alone. <cr>-sentinel-tls is a name a user
 // object can legitimately carry, and a principal who may create Valkey CRs in a
 // namespace picks the CR name — so the name is attacker-chosen input, not evidence
-// of ownership (NA49). The two helpers below each establish provenance first.
+// of ownership (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11). The two helpers below
+// each establish provenance first.
 func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context.Context, v *vkov1.Valkey) error {
 	if !v.IsCertManagerEnabled() || !v.IsUnifiedCertificateEnabled() {
 		return nil
@@ -1068,11 +1071,11 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 // provenance proof the Secret deletion below consumes; it is returned rather than
 // re-read so the Secret decision costs no second API call.
 //
-// A Certificate that is NOT controlled by this Valkey is left untouched (NA49).
-// The operator sets the ownerReference itself on every Certificate it creates
-// (see reconcileCertificate), so ownership is a self-issued fact here and needs no
-// external convention. A foreign Certificate under this name belongs to someone
-// else; deleting it stops their issuance and renewal.
+// A Certificate that is NOT controlled by this Valkey is left untouched
+// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11). The operator sets the
+// ownerReference itself on every Certificate it creates (see reconcileCertificate), so ownership is
+// a self-issued fact here and needs no external convention. A foreign Certificate under this name
+// belongs to someone else; deleting it stops their issuance and renewal.
 //
 // We GET first so a missing resource costs zero delete-permission attempts: the
 // apiserver evaluates authz before existence, so a Delete against a non-existent
@@ -1110,9 +1113,10 @@ func (r *ValkeyReconciler) deleteLegacySentinelCertificate(
 	// fails loudly instead of silently authorising the wrong Secret.
 	secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
 
-	// UID precondition, same reasoning as cleanupPodDisruptionBudget (NA31): the
-	// ownership decision above was made on a cache-backed read, so the name can
-	// hold a different object by the time the Delete lands.
+	// UID precondition, same reasoning as cleanupPodDisruptionBudget
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D8, D9): the ownership decision above was
+	// made on a cache-backed read, so the name can hold a different object by the time the Delete
+	// lands.
 	uid := cert.GetUID()
 	switch err := r.Delete(ctx, cert, client.Preconditions{UID: &uid}); {
 	case err == nil || apierrors.IsNotFound(err):
@@ -1137,8 +1141,9 @@ func (r *ValkeyReconciler) deleteLegacySentinelCertificate(
 // (verified absent on the reference cluster) — so without this delete the stale TLS
 // material lingers and the name stays occupied.
 //
-// The delete is never taken on the name alone (NA49). One of two provenance proofs
-// must hold, and the Secret must additionally be a TLS Secret:
+// The delete is never taken on the name alone (docs/adr/0006-delete-only-what-the-operator-owns.md,
+// D4-D11). One of two provenance proofs must hold, and the Secret must additionally be a TLS
+// Secret:
 //
 //   - ourCertificate: this same pass found a Certificate under legacyName that this
 //     Valkey controls and that issues into legacyName. Fully self-issued evidence,
@@ -1612,7 +1617,8 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 // (checkSteadyStateSplitBrain) leaves a non-pod-0 master behind. A non-pod-0 master
 // is a supported end state -- the -rw/-r Services select on the instanceRole label,
 // not on the ordinal -- so the status field was lying exactly where the condition
-// next to it was trying to tell the truth (NA39).
+// next to it was trying to tell the truth (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md,
+// D11).
 //
 // The order of the three answers is the order of their authority:
 //
@@ -1905,14 +1911,13 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 // that actually carries the condition.
 //
 // The False branch of setSidecarUpdatePendingCondition had exactly one caller,
-// handleStandaloneRollingUpdate, and it was unreachable on the transition that
-// matters (NA48). That function is only entered while a rolling update is needed or a
-// state annotation is set; the moment the deferred sidecar update actually applies --
-// an admin deletes the pod, it comes back on the current template -- neither holds,
-// checkAndHandleRollingUpdate returns before dispatching, and the condition stays
-// True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable
-// from a cluster that never applied it, and permanent drift for anything keyed on the
-// condition.
+// handleStandaloneRollingUpdate, and it was unreachable on the transition that matters
+// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D10). That function is only entered
+// while a rolling update is needed or a state annotation is set; the moment the deferred sidecar
+// update actually applies -- an admin deletes the pod, it comes back on the current template --
+// neither holds, checkAndHandleRollingUpdate returns before dispatching, and the condition stays
+// True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable from a
+// cluster that never applied it, and permanent drift for anything keyed on the condition.
 //
 // The presence check is what keeps this from being a new condition on every CR in the
 // fleet: meta.SetStatusCondition adds an absent condition and reports a change, so

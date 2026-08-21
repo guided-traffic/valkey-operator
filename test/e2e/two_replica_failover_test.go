@@ -14,7 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// TestE2E_RollingUpdate_TwoReplicasNoSentinel pins NA20 in a real cluster.
+// TestE2E_RollingUpdate_TwoReplicasNoSentinel pins ADR 0008 D4-D7 in a real cluster.
 //
 // With two replicas and no Sentinel the rolling update promotes pod-1 and deletes
 // pod-0, and at that moment the promoted master has no replicas attached. The
@@ -53,7 +53,7 @@ func TestE2E_RollingUpdate_TwoReplicasNoSentinel(t *testing.T) {
 
 	masterPod := tc.findMasterPod(t, ns, name, int(replicas))
 	require.Equal(t, fmt.Sprintf("%s-0", name), masterPod,
-		"the initial master must be pod-0, otherwise this test does not exercise the NA20 shape")
+		"the initial master must be pod-0, otherwise this test does not exercise the ADR 0008 D4-D7 shape")
 	tc.waitForConnectedReplicas(t, ns, masterPod, 6379, int(replicas)-1)
 
 	tc.valkeyMSET(t, ns, masterPod, 6379, map[string]string{
@@ -74,7 +74,7 @@ func TestE2E_RollingUpdate_TwoReplicasNoSentinel(t *testing.T) {
 
 		assert.NotContains(t, logs, "using ordinal-based config",
 			"pod-0 must not fall back to the ordinal config while pod-1 holds the data — "+
-				"that is the NA20 split-brain branch")
+				"that is the ADR 0008 D4-D7 split-brain branch")
 		assert.True(t,
 			strings.Contains(logs, "Using known master from replica config") ||
 				strings.Contains(logs, "Discovered existing master"),

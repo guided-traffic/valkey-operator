@@ -22,7 +22,7 @@ import (
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
-// The tests in this file pin NA20: in a 2-replica cluster without Sentinel the
+// The tests in this file pin ADR 0008 D4-D7: in a 2-replica cluster without Sentinel the
 // manual failover promotes pod-1 and deletes pod-0, and the promoted pod has no
 // replicas attached at that moment. The returning pod-0 therefore cannot identify
 // pod-1 as master from peer state alone — the operator has to hand it the answer
@@ -64,7 +64,7 @@ func fakeValkeyServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// twoReplicaFailoverFixture builds the NA20 shape: pod-0 is the master and still
+// twoReplicaFailoverFixture builds the ADR 0008 D4-D7 shape: pod-0 is the master and still
 // needs the update, pod-1 is already updated and ready to be promoted.
 func twoReplicaFailoverFixture(t *testing.T) (*vkov1.Valkey, []podState, *corev1.ConfigMap) {
 	t.Helper()
@@ -243,7 +243,7 @@ func TestHandleMultiReplicaRollingUpdate_DoesNotDemotePromotedPod(t *testing.T) 
 	}
 }
 
-// --- NA29: the write that records the promotion gets a bounded conflict retry ---
+// --- ADR 0009 D2, D3: the write that records the promotion gets a bounded conflict retry ---
 //
 // promoteAndRedirect runs before the three annotations are persisted, so a failed
 // write leaves the cluster failed over with an empty state: the next pass hands an
@@ -310,7 +310,7 @@ func TestHandleManualFailover_RetriesTheStateWriteOnConflict(t *testing.T) {
 }
 
 // The retry is bounded: a conflict that never clears fails the pass instead of
-// spinning. The promotion has happened either way, which is the residual NA29
+// spinning. The promotion has happened either way, which is the residual ADR 0009 D2, D3
 // names and accepts.
 func TestHandleManualFailover_StateWriteRetryIsBounded(t *testing.T) {
 	v, pods, replicaCM := twoReplicaFailoverFixture(t)
