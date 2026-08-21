@@ -22,6 +22,18 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md) | Trust boundaries, every RBAC rule the operator and the per-instance sidecar hold and what each one permits, where the password and the TLS material live, what the isolation does **not** cover, and the hardening checklist |
+| [CRD Reference](#crd-reference) (below) | Every `spec` field, its default and its effect |
+| [Valkey documentation](https://valkey.io/topics/) | Upstream server, replication and Sentinel behaviour |
+| [cert-manager](https://cert-manager.io/docs/) | Issuers referenced by `spec.tls.certManager` |
+
+Read the security document before granting anyone `create valkeys`: the operator
+holds a cluster-wide grant that includes reading every Secret and writing RBAC.
+
 ## Quick Start
 
 ### Prerequisites
@@ -37,6 +49,112 @@ helm install valkey-operator deploy/helm/valkey-operator \
   --namespace valkey-operator-system \
   --create-namespace
 ```
+
+### Upgrade the Operator
+
+`helm upgrade` with the chart is the supported path. The CRD, the operator
+ClusterRole and the Deployment all live in the chart's `templates/`, so one
+command carries schema, permissions and image forward together:
+
+```bash
+helm upgrade valkey-operator deploy/helm/valkey-operator \
+  --namespace valkey-operator-system
+```
+
+Updating the operator image on its own — `kubectl set image`, or a bumped tag
+applied against an older chart — leaves the CRD and the ClusterRole behind and is
+not a supported upgrade path.
+
+<details>
+<summary>What the upgrade does, how to verify it, rollback and uninstall</summary>
+
+**Before the new operator starts.** The chart runs a `pre-upgrade` hook Job
+(`valkey-operator-pre-upgrade`) that executes `manager migrate` and writes the
+current field defaults into existing `Valkey` CRs, so the new operator never
+reconciles a CR that predates its defaults. It is enabled by default; skip it
+with `--set preUpgradeHook.enabled=false`.
+
+**What it does to running clusters.** The sidecar that runs in every Valkey pod
+uses the operator image (`--operator-image`, set by the chart from
+`image.repository:tag`), so an upgrade that changes the operator tag changes the
+managed pod spec. Every multi-replica cluster is then migrated once through the
+failover-aware rolling update — replicas first, then a controlled failover, then
+the former master — without data loss.
+
+**A single-replica cluster without Sentinel is not restarted for this.** A
+sidecar-only delta on the only pod has no failover target, so the operator
+deliberately does not apply it: it sets the `SidecarUpdatePending` condition on the
+`Valkey` CR and leaves the pod running the **old** sidecar image. There is no
+downtime and nothing to schedule — but there is also no automatic convergence: the
+pod keeps the old sidecar until something restarts it, which means a manual
+`kubectl delete pod`, an eviction, or a spec change that alters the pod template
+(a new `spec.image`, for example). Force it when you want it — but the restart is
+not free on the only pod of the cluster: it has no failover target, so an instance
+without `persistence.enabled` comes back empty (with persistence it reloads its
+RDB/AOF). This is the same exception as the metrics note further down.
+
+```bash
+kubectl get valkey <name> -o jsonpath='{range .status.conditions[?(@.type=="SidecarUpdatePending")]}{.status}{"\n"}{end}'
+kubectl delete pod <name>-0        # the deferred sidecar update applies on recreation
+```
+
+Do not read the condition as a live signal. A clearing branch exists, but the
+operator does not reach it on the transition you care about: once the pod runs the
+current sidecar, no pod needs an update any more and the pass returns before it
+dispatches to the code that would clear the condition. The branch is only reached
+when a rolling-update state is still recorded on the CR — so a `True` can outlive
+the drift it reported. Read the running images to confirm, not the condition:
+
+```bash
+kubectl get pod <name>-0 -o jsonpath='{range .spec.containers[*]}{.name}={.image}{"\n"}{end}'
+```
+
+**Verify.**
+
+```bash
+kubectl -n valkey-operator-system rollout status deployment/valkey-operator
+kubectl get valkey -A
+```
+
+Every instance returns to `PHASE=OK` with `READY` equal to `REPLICAS`. `Rolling
+Update` means the migration above is still running; `kubectl describe valkey
+<name>` shows the current step and any `ReconcileBlocked` condition.
+
+**Upgrading from the released chart repository** instead of a checked-out tree:
+
+```bash
+helm repo add valkey-operator https://guided-traffic.github.io/valkey-operator/
+helm repo update
+helm upgrade valkey-operator valkey-operator/valkey-operator \
+  --namespace valkey-operator-system
+```
+
+**Rollback.**
+
+```bash
+helm rollback valkey-operator --namespace valkey-operator-system
+```
+
+The CRD is part of the release, so a rollback restores the previous CRD schema as
+well. Spec fields that only the newer schema knows are pruned from existing CRs by
+the API server, so roll back before adopting new fields, or re-apply them after
+upgrading again.
+
+**Uninstall.**
+
+```bash
+kubectl delete valkey --all --all-namespaces   # do this knowingly, see below
+helm uninstall valkey-operator --namespace valkey-operator-system
+```
+
+The CRD is a normal chart template with no `helm.sh/resource-policy: keep`, so
+`helm uninstall` deletes it — and deleting a CRD removes every `Valkey` CR with
+it, which garbage-collects the StatefulSets, Services and ConfigMaps those CRs
+own. PersistentVolumeClaims created for `spec.persistence` are **not** removed
+(the StatefulSets set no PVC retention policy): the data stays on disk and is
+reattached when a cluster of the same name is created again.
+
+</details>
 
 ### Deploy a Standalone Valkey Instance
 
@@ -559,9 +677,16 @@ The ownerReference is also what the operator goes by: **a PodDisruptionBudget it
 does not own is never deleted and never adopted**, even under exactly those names.
 A hand-written budget for the same pods therefore survives every reconcile — the
 operator leaves it untouched and records a `PodDisruptionBudgetNotOwned` Warning
-Event on the CR instead. While such a budget exists, `spec.podDisruptionBudget` has
-no effect for that StatefulSet; delete or rename the foreign budget to hand the
-name over to the operator.
+Event on the CR instead. That Event is only recorded while
+`spec.podDisruptionBudget.enabled` is `true`: a CR that never opted in leaves a
+foreign budget alone silently, without a permanent warning stream. It **is**
+recorded while the feature is on but not applicable to that StatefulSet (fewer
+than two replicas, or Sentinel disabled): the name is taken, so scaling back up
+would silently produce no budget at all. While such a budget exists,
+`spec.podDisruptionBudget` has no effect for that StatefulSet — and
+the operator suppresses the two content warnings below for it, because they would
+describe values that never reached an object. Delete or rename the foreign budget
+to hand the name over to the operator.
 
 Both budgets are **opt-in**. The operator creates none unless the block is present
 and `enabled: true` — a budget created next to a user-managed one would cover the
@@ -734,7 +859,7 @@ does not fit in five minutes.
 |------|---------------------|
 | `RollingUpdatePaused` | A rolling update stopped because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. It resumes on the next spec change. |
 | `TopologyRestored` | The last multi-replica rolling update handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. |
-| `SidecarUpdatePending` | A standalone pod carries an outdated sidecar image; it updates on the next pod restart. |
+| `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. A clearing branch exists but is not reached when the drift resolves (a pass with nothing to update returns before dispatching), so a `True` can outlive it — confirm the running image rather than this field. |
 | `ReconcileBlocked` | A managed resource could not be written. The reason distinguishes an admission-webhook rejection from any other write failure. |
 
 #### Phase Values
