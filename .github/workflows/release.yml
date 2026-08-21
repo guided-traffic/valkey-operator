@@ -615,6 +615,47 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Threshold: 15 (functions above this are flagged)" >> $GITHUB_STEP_SUMMARY
 
+  generated-manifests:
+    name: Generated Manifests Up To Date
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # Runs the generator itself, so the kubebuilder markers in the Go sources
+      # are compared against the checked-in manifests. The RBAC drift test
+      # (internal/controller/rbac_drift_test.go, NA37) only compares the
+      # generated role against the Helm ClusterRole - manifest against manifest -
+      # so a stale config/rbac/role.yaml passes it while the operator ships
+      # without a verb its markers grant. build.yml runs the same check, but only
+      # on `release: published`; this job moves it to every push and PR (NA44).
+      - name: Regenerate CRDs, RBAC and DeepCopy
+        run: make generate-all
+
+      - name: Verify generated artifacts are committed
+        run: |
+          if ! git diff --quiet || [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+            echo "::error::Generated CRDs / RBAC role / DeepCopy / Helm chart CRD are out of sync with the Go sources."
+            echo "Run 'make generate-all' locally and commit the result."
+            git --no-pager diff --stat
+            git --no-pager diff
+            git status --porcelain
+            exit 1
+          fi
+
   integration-tests:
     name: Integration Tests (envtest)
     runs-on: self-hosted
@@ -940,7 +981,7 @@ jobs:
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, coverage-report]
     name: Semantic Release
     runs-on: self-hosted
     permissions:
