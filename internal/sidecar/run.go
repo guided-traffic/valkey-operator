@@ -38,11 +38,43 @@ type Config struct {
 	FailoverTimeout     time.Duration
 }
 
+// drainRunner performs the graceful drain after the sidecar context is
+// cancelled. *DrainHandler is the production implementation; the interface
+// exists so the run loop can be exercised without a Valkey or an API server.
+type drainRunner interface {
+	Handle(ctx context.Context) error
+}
+
 // Run starts the sidecar polling loop and health server. It blocks until
 // the context is cancelled (SIGTERM/SIGINT), then runs the graceful drain
 // handler before shutting down.
+//
+// Run only constructs the production collaborators; the loop itself lives in
+// runSidecar.
 func Run(ctx context.Context, cfg Config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	detector, err := newValkeyRoleDetector(cfg)
+	if err != nil {
+		return fmt.Errorf("creating role detector: %w", err)
+	}
+
+	patcher, err := newKubernetesPodPatcher()
+	if err != nil {
+		return fmt.Errorf("creating pod patcher: %w", err)
+	}
+
+	drainHandler, err := buildDrainHandler(cfg, detector, patcher)
+	if err != nil {
+		return fmt.Errorf("creating drain handler: %w", err)
+	}
+
+	return runSidecar(ctx, cfg, detector, patcher, drainHandler)
+}
+
+// runSidecar wires the labeler, the health server and the drain handler and
+// runs them until ctx is cancelled.
+func runSidecar(ctx context.Context, cfg Config, detector RoleDetector, patcher PodPatcher, drain drainRunner) error {
 	logger := ctrl.Log.WithName("sidecar")
 
 	logger.Info("starting sidecar",
@@ -53,17 +85,6 @@ func Run(ctx context.Context, cfg Config) error {
 		"tlsEnabled", cfg.TLSEnabled,
 		"sentinelEnabled", cfg.SentinelEnabled,
 	)
-
-	// Create shared dependencies used by both the labeler and drain handler.
-	detector, err := newValkeyRoleDetector(cfg)
-	if err != nil {
-		return fmt.Errorf("creating role detector: %w", err)
-	}
-
-	patcher, err := newKubernetesPodPatcher()
-	if err != nil {
-		return fmt.Errorf("creating pod patcher: %w", err)
-	}
 
 	labeler := NewLabelerWithDeps(detector, patcher, cfg.PodName, cfg.PodNamespace, cfg.PollInterval)
 
@@ -76,11 +97,6 @@ func Run(ctx context.Context, cfg Config) error {
 		myFQDN := cfg.PodName + "." + cfg.HeadlessSvc
 		labeler.SetSentinelCrossCheck(querier, cfg.SentinelMonitor, myFQDN)
 		logger.Info("sentinel cross-check enabled", "monitor", cfg.SentinelMonitor, "myFQDN", myFQDN)
-	}
-
-	drainHandler, err := buildDrainHandler(cfg, detector, patcher)
-	if err != nil {
-		return fmt.Errorf("creating drain handler: %w", err)
 	}
 
 	healthSrv := NewHealthServer(cfg.HealthAddr)
@@ -103,7 +119,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer drainCancel()
-	if drainErr := drainHandler.Handle(drainCtx); drainErr != nil {
+	if drainErr := drain.Handle(drainCtx); drainErr != nil {
 		logger.Error(drainErr, "drain handler error")
 	}
 
