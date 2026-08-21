@@ -28,6 +28,13 @@ is the union of the pods `spec.replicas` asks for and the pods that currently ex
 risks that remain are named in Residual risks and are consequences of the design, not
 unfinished work.
 
+Amended 2026-08-21 (third amendment): the residual this ADR filed against its own D8
+step 2 — that the observer ServiceAccount is reconciled by name and a pre-existing one
+under that name is relabelled rather than refused — is **closed** by
+[ADR 0020](0020-write-only-what-the-operator-owns.md). Its bounded-consequence
+reasoning held for the observer and did **not** transfer to the sidecar, which is the
+finding that made ADR 0020 necessary; the bullet below is corrected in place.
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -294,6 +301,17 @@ costs the injection seam the sidecar tests rely on.
   the *deletion* side is already guarded by an ownership check and a UID precondition
   ([ADR 0006](0006-delete-only-what-the-operator-owns.md)), so the operator never deletes a
   ServiceAccount it does not own.
+
+  **(Closed 2026-08-21.)** [ADR 0020](0020-write-only-what-the-operator-owns.md) refuses
+  the write and reports it. Two corrections to the paragraph above, both of which that
+  ADR records: the damage was never "limited to labels" — the annotation map was assigned
+  rather than merged, so every annotation on the target was erased — and the
+  bounded-consequence argument is observer-specific. It does not carry to the sidecar
+  ServiceAccount of the same shape: that token *is* mounted into every data pod, and
+  `BuildSidecarRoleBinding` names the ServiceAccount by name without a UID, so a foreign
+  object holding it was granted `pods: patch` on this cluster's own pods — the label the
+  `-rw` Service selects on and the drain stamp this ADR's D6 has the operator consume as
+  evidence.
 * **The valkey and exporter containers still carry the sidecar token.** The grant is now
   per-pod-name, but it is mounted into every container of the data pod, not only into the
   sidecar. Closing that means a second ServiceAccount and a token-projection split that

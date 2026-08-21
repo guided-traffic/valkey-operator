@@ -1,0 +1,310 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/builder"
+)
+
+// The write half of docs/adr/0020-write-only-what-the-operator-owns.md: a generated
+// name held by an object this Valkey does not control is left alone, and the sidecar
+// grant is refused rather than handed to whatever identity holds the name.
+
+// foreignServiceAccount returns a ServiceAccount under name that carries no
+// ownerReference to any Valkey, plus the metadata a real one would have — the
+// annotations are the point, because assigning the whole map instead of merging it
+// is what used to erase an IRSA or Workload-Identity binding.
+func foreignServiceAccount(name string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   "default",
+			Labels:      map[string]string{"owner": "someone-else"},
+			Annotations: map[string]string{"eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/theirs"},
+		},
+	}
+}
+
+// observerEnabled switches the observer on, which is what gates its ServiceAccount
+// and Deployment.
+func observerEnabled(v *vkov1.Valkey) { v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true} }
+
+// passCtx returns a context carrying per-pass state, the way Reconcile builds it,
+// plus the state so a test can read what the pass asked for.
+func passCtx() (context.Context, *passState) {
+	state := &passState{}
+	return withPassState(context.Background(), state), state
+}
+
+// --- observer ServiceAccount: refuse, report, keep going ---
+
+func TestReconcileObserverServiceAccount_LeavesAForeignServiceAccountUntouched(t *testing.T) {
+	v := newTestValkey("test", "default", observerEnabled)
+	foreign := foreignServiceAccount(builder.ObserverServiceAccountName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	ctx, state := passCtx()
+	require.NoError(t, r.reconcileObserverServiceAccount(ctx, v),
+		"a refusal must not fail the step: the observer Deployment is still written")
+
+	got := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Labels, got.Labels, "a foreign ServiceAccount keeps its labels")
+	assert.Equal(t, foreign.Annotations, got.Annotations,
+		"erasing these breaks whatever else runs under that identity")
+	assert.Empty(t, got.OwnerReferences, "the operator must not take ownership of it either")
+
+	require.Len(t, rec.withReason(reasonObserverServiceAccountNotOwned), 1,
+		"the collision is only findable if it is reported on the CR")
+	assert.Equal(t, foreignObjectRecheckInterval, state.interval(),
+		"nothing else re-enters Reconcile once the administrator removes the collision")
+}
+
+func TestReconcileObserver_StillWritesTheDeploymentWhenTheServiceAccountIsForeign(t *testing.T) {
+	// The observer gains nothing from a foreign identity — it mounts no token and
+	// makes no API call — so a name collision must not take the diagnostic
+	// component down with it (ADR 0020 D2).
+	v := newTestValkey("test", "default", observerEnabled)
+	foreign := foreignServiceAccount(builder.ObserverServiceAccountName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	r.Recorder = &fakeEventRecorder{}
+
+	ctx, _ := passCtx()
+	require.NoError(t, r.reconcileObserver(ctx, v))
+
+	deploy := &appsv1.Deployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ObserverDeploymentName(v), Namespace: "default",
+	}, deploy), "the observer Deployment must still be created")
+}
+
+func TestReconcileObserverServiceAccount_MergesAnnotationsOnAnOwnedServiceAccount(t *testing.T) {
+	// The case no ownership guard covers: the ServiceAccount is ours, and a second
+	// writer annotated it (ADR 0020 D4).
+	v := newTestValkey("test", "default", observerEnabled)
+	owned := builder.BuildObserverServiceAccount(v)
+	owned.Labels = map[string]string{"stale": "yes"}
+	owned.Annotations = map[string]string{"iam.gke.io/gcp-service-account": "svc@project.iam"}
+	ownedByValkey(t, v, owned)
+
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, owned)
+
+	ctx, _ := passCtx()
+	require.NoError(t, r.reconcileObserverServiceAccount(ctx, v))
+
+	got := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: owned.Name, Namespace: "default"}, got))
+	assert.Equal(t, builder.ObserverLabels(v), got.Labels, "labels are operator-owned and are replaced")
+	assert.Equal(t, "svc@project.iam", got.Annotations["iam.gke.io/gcp-service-account"],
+		"a foreign annotation on an owned ServiceAccount must survive the update")
+	assert.Equal(t, "1.0.0", got.Annotations[builder.AnnotationOperatorVersion],
+		"the operator-owned annotation is still written")
+}
+
+// --- sidecar: the grant follows the name, so a refusal has to reach the binding ---
+
+func TestReconcileSidecarRBAC_WritesNoGrantWhenTheServiceAccountIsForeign(t *testing.T) {
+	v := newTestValkey("test", "default")
+	name := builder.SidecarServiceAccountName(v)
+	foreign := foreignServiceAccount(name)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileSidecarRBAC(context.Background(), v)
+
+	require.Error(t, err, "the cluster cannot work without the grant, so the pass must report it")
+	assert.ErrorIs(t, err, errForeignObject)
+
+	roleErr := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &rbacv1.Role{})
+	assert.True(t, apierrors.IsNotFound(roleErr), "no Role for a ServiceAccount we do not own")
+	bindErr := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &rbacv1.RoleBinding{})
+	assert.True(t, apierrors.IsNotFound(bindErr),
+		"the RoleBinding names the ServiceAccount by name, so writing it would grant pods/patch to a stranger")
+
+	got := &corev1.ServiceAccount{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Annotations, got.Annotations)
+	require.Len(t, rec.withReason(reasonSidecarServiceAccountNotOwned), 1)
+}
+
+func TestReconcileSidecarRBAC_WritesNoBindingWhenTheRoleIsForeign(t *testing.T) {
+	// The other direction: RoleRef names the Role, so binding our ServiceAccount to
+	// a Role the operator did not write grants the sidecar whatever it carries.
+	v := newTestValkey("test", "default")
+	name := builder.SidecarServiceAccountName(v)
+	foreignRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list"},
+		}},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreignRole)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileSidecarRBAC(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	gotRole := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, gotRole))
+	assert.Equal(t, foreignRole.Rules, gotRole.Rules, "a foreign Role keeps its rules")
+	bindErr := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &rbacv1.RoleBinding{})
+	assert.True(t, apierrors.IsNotFound(bindErr))
+	require.Len(t, rec.withReason(reasonSidecarRoleNotOwned), 1)
+}
+
+func TestReconcileSidecarRoleBinding_LeavesAForeignRoleBindingAlone(t *testing.T) {
+	// RoleRef is immutable, so a hand-written binding under this name points at a
+	// different Role by construction — which used to make the delete-and-recreate
+	// path fire on it every pass. ADR 0006 carried this as an open residual.
+	v := newTestValkey("test", "default")
+	name := builder.SidecarServiceAccountName(v)
+	foreign := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "cluster-admin",
+		},
+	}
+	deletes := 0
+	funcs := interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deletes++
+			return cl.Delete(ctx, obj, opts...)
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", funcs, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileSidecarRoleBinding(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+	assert.Zero(t, deletes, "a RoleBinding the operator did not create must not be deleted")
+	got := &rbacv1.RoleBinding{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got))
+	assert.Equal(t, "cluster-admin", got.RoleRef.Name)
+	require.Len(t, rec.withReason(reasonSidecarRoleBindingNotOwned), 1)
+}
+
+func TestReconcileSidecarRoleBinding_RecreateCarriesTheUIDPrecondition(t *testing.T) {
+	// The ownership decision above is made on a cache-backed read, so the name can
+	// hold a different object by the time the Delete lands (ADR 0006 D8, D9).
+	v := newTestValkey("test", "default")
+	stale := staleRoleRefBinding(t, v)
+	stale.UID = types.UID("the-binding-we-inspected")
+
+	var seen *client.DeleteOptions
+	funcs := interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			seen = &client.DeleteOptions{}
+			seen.ApplyOptions(opts)
+			return cl.Delete(ctx, obj, opts...)
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, stale)
+
+	require.NoError(t, r.reconcileSidecarRoleBinding(context.Background(), v))
+
+	require.NotNil(t, seen, "the RoleRef change must take the delete-and-recreate path")
+	require.NotNil(t, seen.Preconditions, "a name collision passes a bare delete perfectly")
+	require.NotNil(t, seen.Preconditions.UID)
+	assert.Equal(t, stale.UID, *seen.Preconditions.UID)
+	assert.Nil(t, seen.Preconditions.ResourceVersion,
+		"a changed ResourceVersion is still the same object; only a changed UID is a different one")
+}
+
+func TestReconcileSidecarRoleBinding_RecreateConflictIsTheGuardWorking(t *testing.T) {
+	// The name holds a different object than the one this pass inspected, so there
+	// is nothing of ours to replace and the pass is not failed over it (ADR 0006 D10).
+	v := newTestValkey("test", "default")
+	stale := staleRoleRefBinding(t, v)
+	creates := 0
+	funcs := interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+			return apierrors.NewConflict(
+				rbacv1.Resource("rolebindings"), stale.Name, assert.AnError)
+		},
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			creates++
+			return cl.Create(ctx, obj, opts...)
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, stale)
+
+	require.NoError(t, r.reconcileSidecarRoleBinding(context.Background(), v))
+	assert.Zero(t, creates, "recreating after a lost precondition would write over the replacement")
+}
+
+// --- the refusal reaches the CR ---
+
+func TestReconcileBlockedReason_ForeignObjectOutranksAnAdmissionRejection(t *testing.T) {
+	admission := internalErr("failed calling webhook \"mutate.kyverno.svc-fail\"")
+
+	assert.Equal(t, vkov1.ReasonAdmissionWebhookDenied, reconcileBlockedReason(admission))
+	assert.Equal(t, vkov1.ReasonForeignObject,
+		reconcileBlockedReason(foreignObjectError("sidecar ServiceAccount", "test-sidecar")))
+	assert.Equal(t, vkov1.ReasonForeignObject,
+		reconcileBlockedReason(errors.Join(admission, foreignObjectError("sidecar Role", "test-sidecar"))),
+		"the admission gate reopens on its own; a name collision needs a human")
+	assert.Equal(t, vkov1.ReasonWriteFailed, reconcileBlockedReason(internalErr("quota exceeded")))
+}
+
+// --- the recheck cadence ---
+
+func TestApplyRecheck_NeverLengthensARequeueThePassAlreadyAskedFor(t *testing.T) {
+	tests := []struct {
+		name    string
+		result  ctrl.Result
+		recheck time.Duration
+		want    time.Duration
+	}{
+		{"no request leaves the result alone", ctrl.Result{RequeueAfter: 5 * time.Second}, 0, 5 * time.Second},
+		{"no requeue yet takes the request", ctrl.Result{}, 30 * time.Second, 30 * time.Second},
+		{"the shorter of the two wins", ctrl.Result{RequeueAfter: 5 * time.Second}, 30 * time.Second, 5 * time.Second},
+		{"a shorter request tightens it", ctrl.Result{RequeueAfter: time.Minute}, 30 * time.Second, 30 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, applyRecheck(tc.result, tc.recheck).RequeueAfter)
+		})
+	}
+}
+
+func TestPassState_KeepsTheShortestRequest(t *testing.T) {
+	state := &passState{}
+	assert.Zero(t, state.interval())
+	state.requestRecheck(time.Minute)
+	state.requestRecheck(0)
+	state.requestRecheck(30 * time.Second)
+	state.requestRecheck(time.Hour)
+	assert.Equal(t, 30*time.Second, state.interval())
+}
+
+func TestRequestRecheck_IsANoOpWithoutPassState(t *testing.T) {
+	// Unit tests call a single step directly, without the state Reconcile builds.
+	assert.NotPanics(t, func() { requestRecheck(context.Background(), time.Second) })
+}

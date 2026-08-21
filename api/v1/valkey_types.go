@@ -64,6 +64,14 @@ const (
 	// write a managed resource (RBAC, quota, conflict, API server unreachable).
 	ReasonWriteFailed = "WriteFailed"
 
+	// ReasonForeignObject is the ReconcileBlocked reason for a write the operator
+	// refused to take because one of its generated names is held by an object this
+	// Valkey does not control. It is deliberately distinct from ReasonWriteFailed:
+	// nothing failed, the operator could have written and chose not to, and the
+	// condition clears only when a human deletes or renames the colliding object
+	// (docs/adr/0020-write-only-what-the-operator-owns.md).
+	ReasonForeignObject = "ForeignObject"
+
 	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
 	// reconcile pass over all managed resources.
 	ReasonReconcileSucceeded = "ReconcileSucceeded"

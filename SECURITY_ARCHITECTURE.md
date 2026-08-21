@@ -186,6 +186,13 @@ password.
 - The PDB cleanup never deletes a budget it does not own (ownerReference check)
   and sends a **UID delete precondition** so a name reused between the read and
   the delete is not destroyed ([`internal/controller/pdb.go`](internal/controller/pdb.go)).
+- The operator **refuses to write** the observer ServiceAccount and the sidecar
+  ServiceAccount, Role and RoleBinding when a generated name is held by an object
+  it does not control, and it never grants the sidecar Role to a subject it does
+  not own. A collision leaves that CR unwritable and visibly blocked instead of
+  handing `pods: patch` to a stranger
+  ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md),
+  [`internal/controller/foreign_object.go`](internal/controller/foreign_object.go)).
 
 **What does not hold — read this before treating a namespace as a tenant boundary.**
 
@@ -214,6 +221,20 @@ password.
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
   arbitrary strings with no registry allowlist, and the pods run with the
   namespace's default security posture.
+- **Every managed object name is derived from the CR name, and most writes still
+  do not check who owns the name.** There is no admission webhook constraining CR
+  names ([ADR 0015](docs/adr/0015-one-crd-validated-by-schema-only.md)), so whoever
+  may `create valkeys` in a namespace chooses the names of that CR's derived
+  objects. Guarded today: every delete
+  ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)), the
+  PodDisruptionBudget write, and the four writes of
+  [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md). **Not** guarded:
+  the data and Sentinel StatefulSets, Services, ConfigMaps, NetworkPolicies, the
+  observer Deployment, the ServiceMonitor and the cert-manager Certificate — each
+  is written by name onto whatever object holds it. The last two go further and
+  stamp this CR's controller ownerReference onto an object they never verified, so
+  deleting the CR garbage-collects a foreign object. Tracked as NA61 and NA62;
+  ADR 0020 D7 says why they were not taken together with the rest.
 - **Namespace is not a trust boundary for the operator itself.** It watches and
   writes everywhere.
 
@@ -430,6 +451,16 @@ analysis.
       (section 4.2). That removes the cross-cluster write, which mattered because
       the drain stamp is evidence for a destructive `REPLICAOF`. What remains is
       inherent: the sidecar can still forge that evidence for its *own* cluster.
+- [x] **Refuse the sidecar grant when the name is held by a foreign object
+      ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md), done 2026-08-21).**
+      `BuildSidecarRoleBinding` names its subject by name, without a UID, so the
+      Role above was granted to whatever identity held `<cr-name>-sidecar` —
+      created by the operator or not. The ServiceAccount, Role and RoleBinding now
+      each require the controller ownerReference, and a refusal on any of them
+      stops the binding, fails the pass and reports `ReconcileBlocked/ForeignObject`
+      with the colliding name. The same change stopped both ServiceAccount
+      reconcilers from erasing a target's annotations, and the observer refusal
+      keeps the Deployment running because that identity grants it nothing.
 - [ ] **Give the workload pods a securityContext.** `runAsNonRoot`,
       `readOnlyRootFilesystem` where the data path allows it, `drop: [ALL]`,
       `seccompProfile: RuntimeDefault` — the operator already runs that way itself.
@@ -456,10 +487,14 @@ analysis.
       ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md) D9/D10).
 - [ ] **Restrict who may `create valkeys`.** A CR author chooses the image the
       cluster runs and the name every generated object gets, and generated names
-      collide with existing objects by design. [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)
-      closed the one path where such a collision was destructive; the general
-      property — an attacker-chosen CR name drives every generated name — remains,
-      so any new delete-by-generated-name needs the same provenance discipline.
+      collide with existing objects by design.
+      [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) closed the
+      deletes and [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md)
+      closed four writes, but **most writes are still unguarded** — the
+      StatefulSets, Services, ConfigMaps, NetworkPolicies, the observer Deployment,
+      the ServiceMonitor and the Certificate (section 3, NA61 and NA62). Until
+      those are taken, the CR-name grant is the control that bounds this, and any
+      new write or delete by generated name needs the same provenance discipline.
 - [ ] **Disable the pre-upgrade hook (`preUpgradeHook.enabled: false`) unless a
       migration needs it**, or accept a cluster-wide CRD write grant during every
       upgrade.

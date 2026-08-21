@@ -249,6 +249,12 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// A failure no longer aborts the pass: the data plane (rolling update,
 	// nudge, status) is handled either way, so a rejected write on one
 	// sub-resource cannot leave the CR status stale about everything else.
+	// Per-pass state a step can widen but only the pass can act on. Today that is
+	// the recheck a refused-but-not-failed write asks for; it rides on the context
+	// so it stays per-CR at MaxConcurrentReconciles > 1 (ADR 0019 D3).
+	state := &passState{}
+	ctx = withPassState(ctx, state)
+
 	resourceErr := r.reconcileResources(ctx, valkey)
 	r.setReconcileBlockedCondition(ctx, valkey, resourceErr)
 
@@ -274,7 +280,17 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, errors.Join(resourceErr, workloadErr)
 	}
 
-	return result, workloadErr
+	if workloadErr != nil {
+		return result, workloadErr
+	}
+
+	// A pass that refused a write without failing has no other way back: the
+	// colliding object carries no ownerReference to this CR, so no Owns() watch
+	// fires when an administrator removes it, and GenerationChangedPredicate drops
+	// the operator's own status writes (ADR 0020 D6). The requeue is folded in only
+	// here, on the error-free path — controller-runtime drives the retry from the
+	// error otherwise.
+	return applyRecheck(result, state.interval()), nil
 }
 
 // reconcileWorkload handles everything that depends on the running data plane
@@ -604,6 +620,17 @@ func (r *ValkeyReconciler) reconcileObserver(ctx context.Context, valkey *vkov1.
 
 // reconcileObserverServiceAccount creates or updates the observer ServiceAccount.
 // No Role and no RoleBinding accompany it — that is the point of it (ADR 0012 D8 step 2).
+//
+// A pre-existing ServiceAccount under the derived name is left alone and reported,
+// and the pass still writes the Deployment. That is the opposite of what the
+// PodDisruptionBudget path does with a foreign object, and deliberately so: an
+// unwritten budget silently protects nothing, whereas the observer under a
+// ServiceAccount the operator did not create does exactly what it would have done
+// anyway — the pod mounts no token (builder.BuildObserverDeployment), no RoleBinding
+// names that ServiceAccount, and the observer makes no Kubernetes API call at all.
+// Refusing the Deployment too would turn a name collision into an outage of the
+// diagnostic component and buy nothing
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D2).
 func (r *ValkeyReconciler) reconcileObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildObserverServiceAccount(v)
@@ -623,13 +650,32 @@ func (r *ValkeyReconciler) reconcileObserverServiceAccount(ctx context.Context, 
 	if err != nil {
 		return err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonObserverServiceAccountNotOwned, "ServiceAccount", desired.Name,
+			"the observer Deployment still runs, under that ServiceAccount; it mounts no token and no Role "+
+				"is bound to it, so it gains no permission from it")
+		// The pass ends without an error, so nothing else would bring it back:
+		// the colliding object carries no ownerReference to this CR, so the
+		// ServiceAccount watch never fires for it, and the operator's own status
+		// writes are filtered by GenerationChangedPredicate.
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
 	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
-		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		return nil
 	}
 	logger.Info("Updating Observer ServiceAccount", "name", desired.Name)
 	current.Labels = desired.Labels
-	current.Annotations = desired.Annotations
+	// Labels are assigned and annotations are merged, which is what every other
+	// reconciler in this package does. Assigning the whole annotation map — as this
+	// function used to — erases every key the operator does not set, and the desired
+	// object carries at most the operator-version one. On an owned ServiceAccount
+	// that silently drops what an IRSA or Workload-Identity injector wrote, which no
+	// ownership guard can prevent (ADR 0020 D4).
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
 	if err := r.Update(ctx, current); err != nil {
 		return fmt.Errorf("updating Observer ServiceAccount: %w", err)
 	}
@@ -771,47 +817,90 @@ func (r *ValkeyReconciler) deleteLegacyServices(ctx context.Context, v *vkov1.Va
 }
 
 // reconcileSidecarRBAC ensures the sidecar ServiceAccount, Role, and RoleBinding exist.
+//
+// The three objects share the derived name <cr-name>-sidecar, and the grant follows
+// that **name** rather than any particular object: BuildSidecarRoleBinding names the
+// ServiceAccount as its subject without a UID, and this function never reads the
+// ServiceAccount back. Writing the binding while a foreign ServiceAccount holds the
+// name would therefore hand `pods: patch` on this cluster's data pods to whatever
+// identity that is — which is the label the -rw Service selects on and the drain
+// stamp the split-brain resolver consumes as evidence.
+//
+// So a refusal on the ServiceAccount or on the Role stops the binding too, and the
+// step fails rather than returning quietly: the resulting cluster has no sidecar
+// able to set instanceRole, so the -rw Service selects no pod at all and the CR is
+// not writable. The failure carries that into the ReconcileBlocked condition and the
+// Error phase, and the rate limiter re-enters the pass at most
+// reconcileRetryMaxDelay later, so removing the colliding object is enough to finish
+// the provisioning — no operator restart
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D1, D3, D6).
 func (r *ValkeyReconciler) reconcileSidecarRBAC(ctx context.Context, v *vkov1.Valkey) error {
-	if err := r.reconcileSidecarServiceAccount(ctx, v); err != nil {
+	saOwned, err := r.reconcileSidecarServiceAccount(ctx, v)
+	if err != nil {
 		return err
 	}
-	if err := r.reconcileSidecarRole(ctx, v); err != nil {
+	if !saOwned {
+		return foreignObjectError("sidecar ServiceAccount", builder.SidecarServiceAccountName(v))
+	}
+
+	roleOwned, err := r.reconcileSidecarRole(ctx, v)
+	if err != nil {
 		return err
 	}
+	if !roleOwned {
+		// The other direction of the same hazard: RoleRef names the Role, so
+		// binding our ServiceAccount to a Role the operator did not write would
+		// grant the sidecar whatever that Role happens to carry.
+		return foreignObjectError("sidecar Role", builder.SidecarServiceAccountName(v))
+	}
+
 	return r.reconcileSidecarRoleBinding(ctx, v)
 }
 
 // reconcileSidecarServiceAccount creates or updates the sidecar ServiceAccount.
-func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+//
+// It reports whether the name is held by an object this Valkey controls. False means
+// nothing was written and the caller must not write the Role or the RoleBinding
+// either; see reconcileSidecarRBAC for why the binding is the part that matters.
+func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSidecarServiceAccount(v)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
+		return false, fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
 	}
 	current := &corev1.ServiceAccount{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating sidecar ServiceAccount", "name", desired.Name)
 		if err := r.Create(ctx, desired); err != nil {
-			return fmt.Errorf("creating sidecar ServiceAccount: %w", err)
+			return false, fmt.Errorf("creating sidecar ServiceAccount: %w", err)
 		}
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSidecarServiceAccountNotOwned, "ServiceAccount", desired.Name,
+			"no Role and no RoleBinding are written for it, so it is granted nothing; this Valkey stays "+
+				"unwritable until that ServiceAccount is deleted or the Valkey is renamed")
+		return false, nil
+	}
+
 	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
-		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
-		return nil
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		return true, nil
 	}
 	logger.Info("Updating sidecar ServiceAccount", "name", desired.Name)
 	current.Labels = desired.Labels
-	current.Annotations = desired.Annotations
+	// Merge, do not assign — see reconcileObserverServiceAccount for why (ADR 0020 D4).
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
 	if err := r.Update(ctx, current); err != nil {
-		return fmt.Errorf("updating sidecar ServiceAccount: %w", err)
+		return false, fmt.Errorf("updating sidecar ServiceAccount: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // listDataPodNames returns the names of the pods that currently carry this cluster's
@@ -840,40 +929,51 @@ func (r *ValkeyReconciler) listDataPodNames(ctx context.Context, v *vkov1.Valkey
 // A failed List fails the step rather than narrowing the Role on incomplete
 // information — the Role already in the cluster is the wider one, and leaving it
 // is the safe direction.
-func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) error {
+// It reports whether the name is held by an object this Valkey controls, the same
+// way reconcileSidecarServiceAccount does. Overwriting a foreign Role would destroy
+// whatever it grants; binding to one would grant the sidecar whatever it carries.
+func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
 	livePodNames, err := r.listDataPodNames(ctx, v)
 	if err != nil {
-		return fmt.Errorf("listing data pods for the sidecar Role: %w", err)
+		return false, fmt.Errorf("listing data pods for the sidecar Role: %w", err)
 	}
 	desired := builder.BuildSidecarRole(v, livePodNames)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on sidecar Role: %w", err)
+		return false, fmt.Errorf("setting owner reference on sidecar Role: %w", err)
 	}
 	current := &rbacv1.Role{}
 	err = r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating sidecar Role", "name", desired.Name)
 		if err := r.Create(ctx, desired); err != nil {
-			return fmt.Errorf("creating sidecar Role: %w", err)
+			return false, fmt.Errorf("creating sidecar Role: %w", err)
 		}
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSidecarRoleNotOwned, "Role", desired.Name,
+			"its rules are left as they are and no RoleBinding is written, so the sidecar is granted "+
+				"nothing; this Valkey stays unwritable until that Role is deleted or the Valkey is renamed")
+		return false, nil
+	}
+
 	if equality.Semantic.DeepEqual(current.Rules, desired.Rules) &&
 		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
-		return nil
+		return true, nil
 	}
 	logger.Info("Updating sidecar Role", "name", desired.Name)
 	current.Rules = desired.Rules
 	builder.ApplyOperatorVersion(current, r.OperatorVersion)
 	if err := r.Update(ctx, current); err != nil {
-		return fmt.Errorf("updating sidecar Role: %w", err)
+		return false, fmt.Errorf("updating sidecar Role: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // reconcileSidecarRoleBinding creates or updates the sidecar RoleBinding.
@@ -897,11 +997,39 @@ func (r *ValkeyReconciler) reconcileSidecarRoleBinding(ctx context.Context, v *v
 	if err != nil {
 		return err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		// Before this guard the branch below deleted and recreated whatever held
+		// the name, and RoleRef being immutable made that trigger *certain* for a
+		// foreign binding: a hand-written one points at a different Role by
+		// construction. ADR 0006 named it as an open residual; this closes it.
+		r.warnForeignObject(ctx, v, reasonSidecarRoleBindingNotOwned, "RoleBinding", desired.Name,
+			"it is neither rewritten nor recreated, so the sidecar is granted nothing; this Valkey stays "+
+				"unwritable until that RoleBinding is deleted or the Valkey is renamed")
+		return foreignObjectError("sidecar RoleBinding", desired.Name)
+	}
+
 	if !equality.Semantic.DeepEqual(current.RoleRef, desired.RoleRef) {
-		// RoleRef is immutable — delete and recreate.
+		// RoleRef is immutable — delete and recreate. The UID precondition keeps
+		// the delete on the object this pass inspected: the ownership decision
+		// above was made on a cache-backed read, so the name can hold a different
+		// object by the time the Delete lands (ADR 0006 D8, D9).
 		logger.Info("Recreating sidecar RoleBinding (RoleRef changed)", "name", desired.Name)
-		if err := r.Delete(ctx, current); err != nil {
-			return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+		if err := r.Delete(ctx, current, client.Preconditions{UID: &current.UID}); err != nil {
+			switch {
+			case apierrors.IsNotFound(err):
+				// Already gone; the Create below puts ours in its place.
+			case apierrors.IsConflict(err):
+				// The name holds a different object than the one this pass
+				// inspected, so there is nothing of ours to replace. The next
+				// pass re-Gets the name and takes the ownership branch above
+				// (ADR 0006 D10).
+				logger.Info("Skipping sidecar RoleBinding recreation: the object was replaced under its name",
+					"name", desired.Name)
+				return nil
+			default:
+				return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+			}
 		}
 		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("recreating sidecar RoleBinding: %w", err)

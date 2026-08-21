@@ -70,6 +70,7 @@ A reader must never find the old rule stated as current.
 | [0014](0014-rbac-lives-in-three-places.md) | RBAC lives in three places, and drift is guarded by a test and a CI job |
 | [0015](0015-one-crd-validated-by-schema-only.md) | One CRD, validated by schema only — no admission webhook |
 | [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture |
+| [0020](0020-write-only-what-the-operator-owns.md) | Write only what the operator can prove it owns, and grant only to a subject it owns |
 
 ### Process
 

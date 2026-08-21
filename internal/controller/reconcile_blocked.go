@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -49,11 +50,21 @@ func isAdmissionRejection(err error) bool {
 }
 
 // reconcileBlockedReason maps a reconcile error to the ReconcileBlocked reason.
+//
+// A refused write outranks an admission rejection when a pass produced both. The
+// two differ in how they end: an admission gate reopens on its own and the next
+// pass clears the condition, while a name collision persists until a human deletes
+// or renames the colliding object. Reporting the transient cause would hide the one
+// that needs an operator (docs/adr/0020-write-only-what-the-operator-owns.md).
 func reconcileBlockedReason(err error) string {
-	if isAdmissionRejection(err) {
+	switch {
+	case errors.Is(err, errForeignObject):
+		return vkov1.ReasonForeignObject
+	case isAdmissionRejection(err):
 		return vkov1.ReasonAdmissionWebhookDenied
+	default:
+		return vkov1.ReasonWriteFailed
 	}
-	return vkov1.ReasonWriteFailed
 }
 
 // compactErrorMessage renders an error as a single line. A reconcile pass joins

@@ -21,11 +21,29 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
 )
+
+// ownedByValkey stamps the controller ownerReference every reconciler writes on the
+// objects it creates. A fixture that stands in for an operator-created object needs
+// it: without one the ownership guards read it as foreign and refuse to touch it
+// (docs/adr/0020-write-only-what-the-operator-owns.md).
+func ownedByValkey(t *testing.T, v *vkov1.Valkey, obj client.Object) {
+	t.Helper()
+	require.NoError(t, controllerutil.SetControllerReference(v, obj, testScheme()))
+}
+
+// mustReconcileSidecarRole runs the step and asserts it neither failed nor refused.
+func mustReconcileSidecarRole(t *testing.T, r *ValkeyReconciler, v *vkov1.Valkey) {
+	t.Helper()
+	owned, err := r.reconcileSidecarRole(context.Background(), v)
+	require.NoError(t, err)
+	require.True(t, owned, "the sidecar Role must be owned by this Valkey")
+}
 
 // --- owner-reference failure seam ---
 
@@ -90,10 +108,12 @@ func TestReconcilers_AbortWithoutWriting_WhenOwnerReferenceCannotBeSet(t *testin
 			return r.reconcileStatefulSet(ctx, v)
 		}, "setting owner reference on StatefulSet"},
 		{"sidecarServiceAccount", func(r *ValkeyReconciler, ctx context.Context) error {
-			return r.reconcileSidecarServiceAccount(ctx, v)
+			_, err := r.reconcileSidecarServiceAccount(ctx, v)
+			return err
 		}, "setting owner reference on sidecar ServiceAccount"},
 		{"sidecarRole", func(r *ValkeyReconciler, ctx context.Context) error {
-			return r.reconcileSidecarRole(ctx, v)
+			_, err := r.reconcileSidecarRole(ctx, v)
+			return err
 		}, "setting owner reference on sidecar Role"},
 		{"sidecarRoleBinding", func(r *ValkeyReconciler, ctx context.Context) error {
 			return r.reconcileSidecarRoleBinding(ctx, v)
@@ -643,6 +663,7 @@ func TestReconcileSidecarServiceAccount_PropagatesUpdateError(t *testing.T) {
 	v := newTestValkey("test", "default")
 	stale := builder.BuildSidecarServiceAccount(v)
 	stale.Labels = map[string]string{"stale": "yes"}
+	ownedByValkey(t, v, stale)
 
 	funcs := interceptor.Funcs{
 		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
@@ -651,7 +672,7 @@ func TestReconcileSidecarServiceAccount_PropagatesUpdateError(t *testing.T) {
 	}
 	r, c := newReconcilerWithInterceptor("1.0.0", funcs, v, stale)
 
-	err := r.reconcileSidecarServiceAccount(context.Background(), v)
+	_, err := r.reconcileSidecarServiceAccount(context.Background(), v)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updating sidecar ServiceAccount")
@@ -928,10 +949,12 @@ func TestReconcilers_PropagateNonNotFoundGetErrors(t *testing.T) {
 			return r.reconcileSentinelStatefulSet(ctx, v)
 		}},
 		{"sidecarServiceAccount", isServiceAccount, func(r *ValkeyReconciler, ctx context.Context) error {
-			return r.reconcileSidecarServiceAccount(ctx, v)
+			_, err := r.reconcileSidecarServiceAccount(ctx, v)
+			return err
 		}},
 		{"sidecarRole", isRole, func(r *ValkeyReconciler, ctx context.Context) error {
-			return r.reconcileSidecarRole(ctx, v)
+			_, err := r.reconcileSidecarRole(ctx, v)
+			return err
 		}},
 		{"sidecarRoleBinding", isRoleBinding, func(r *ValkeyReconciler, ctx context.Context) error {
 			return r.reconcileSidecarRoleBinding(ctx, v)
@@ -971,7 +994,7 @@ func TestReconcileSidecarRole_PropagatesCreateError(t *testing.T) {
 	}
 	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v)
 
-	err := r.reconcileSidecarRole(context.Background(), v)
+	_, err := r.reconcileSidecarRole(context.Background(), v)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating sidecar Role")
@@ -985,11 +1008,12 @@ func TestReconcileSidecarRole_UpdatesDriftedRulesAndPropagatesUpdateError(t *tes
 	// its own pod label, so the drift must be corrected.
 	stale := desired.DeepCopy()
 	stale.Rules = []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}}}
+	ownedByValkey(t, v, stale)
 
 	t.Run("update succeeds", func(t *testing.T) {
 		r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, stale.DeepCopy())
 
-		require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+		mustReconcileSidecarRole(t, r, v)
 
 		got := &rbacv1.Role{}
 		require.NoError(t, c.Get(context.Background(),
@@ -1005,7 +1029,7 @@ func TestReconcileSidecarRole_UpdatesDriftedRulesAndPropagatesUpdateError(t *tes
 		}
 		r, c := newReconcilerWithInterceptor("1.0.0", funcs, v, stale.DeepCopy())
 
-		err := r.reconcileSidecarRole(context.Background(), v)
+		_, err := r.reconcileSidecarRole(context.Background(), v)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "updating sidecar Role")
@@ -1038,6 +1062,7 @@ func TestReconcileSidecarRoleBinding_PropagatesUpdateError(t *testing.T) {
 	v := newTestValkey("test", "default")
 	stale := builder.BuildSidecarRoleBinding(v)
 	stale.Subjects = nil // drift: the binding no longer names the sidecar ServiceAccount
+	ownedByValkey(t, v, stale)
 
 	funcs := interceptor.Funcs{
 		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
@@ -1056,17 +1081,21 @@ func TestReconcileSidecarRoleBinding_PropagatesUpdateError(t *testing.T) {
 	assert.Empty(t, got.Subjects, "the stored RoleBinding must be unchanged")
 }
 
-// staleRoleRefBinding returns a RoleBinding under the managed name whose
-// immutable RoleRef points somewhere else, forcing the delete-and-recreate path.
-func staleRoleRefBinding(v *vkov1.Valkey) *rbacv1.RoleBinding {
+// staleRoleRefBinding returns a RoleBinding this Valkey owns whose immutable
+// RoleRef points somewhere else, forcing the delete-and-recreate path. Ownership is
+// part of the fixture: a binding the operator does not own is refused before the
+// RoleRef is ever compared.
+func staleRoleRefBinding(t *testing.T, v *vkov1.Valkey) *rbacv1.RoleBinding {
+	t.Helper()
 	rb := builder.BuildSidecarRoleBinding(v)
 	rb.RoleRef = rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "cluster-admin"}
+	ownedByValkey(t, v, rb)
 	return rb
 }
 
 func TestReconcileSidecarRoleBinding_PropagatesDeleteErrorOnRoleRefChange(t *testing.T) {
 	v := newTestValkey("test", "default")
-	stale := staleRoleRefBinding(v)
+	stale := staleRoleRefBinding(t, v)
 
 	creates := 0
 	funcs := interceptor.Funcs{
@@ -1097,7 +1126,7 @@ func TestReconcileSidecarRoleBinding_PropagatesDeleteErrorOnRoleRefChange(t *tes
 // the error must surface rather than be swallowed.
 func TestReconcileSidecarRoleBinding_PropagatesRecreateError(t *testing.T) {
 	v := newTestValkey("test", "default")
-	stale := staleRoleRefBinding(v)
+	stale := staleRoleRefBinding(t, v)
 
 	funcs := interceptor.Funcs{
 		Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
@@ -1334,7 +1363,7 @@ func TestReconcileSidecarRole_GrantsPatchOnThisClustersPodsOnly(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v)
 
-	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+	mustReconcileSidecarRole(t, r, v)
 
 	role := &rbacv1.Role{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
@@ -1360,7 +1389,7 @@ func TestReconcileSidecarRole_KeepsTerminatingPodsInTheGrant(t *testing.T) {
 	}
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, append([]client.Object{v}, pods...)...)
 
-	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+	mustReconcileSidecarRole(t, r, v)
 
 	role := &rbacv1.Role{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
@@ -1381,9 +1410,10 @@ func TestReconcileSidecarRole_NarrowsALegacyNamespaceWideRole(t *testing.T) {
 		Resources: []string{"pods"},
 		Verbs:     []string{"get", "list", "patch"},
 	}}
+	ownedByValkey(t, v, legacy)
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, legacy)
 
-	require.NoError(t, r.reconcileSidecarRole(context.Background(), v))
+	mustReconcileSidecarRole(t, r, v)
 
 	role := &rbacv1.Role{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
@@ -1407,7 +1437,7 @@ func TestReconcileSidecarRole_FailsTheStepWhenThePodListFails(t *testing.T) {
 	}
 	r, c := newReconcilerWithInterceptor("1.0.0", funcs, v)
 
-	err := r.reconcileSidecarRole(context.Background(), v)
+	_, err := r.reconcileSidecarRole(context.Background(), v)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "listing data pods for the sidecar Role")

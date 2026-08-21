@@ -12,10 +12,18 @@ assert the guard is verified by reading; whether they ever ran green in CI is no
 verifiable from this repository. The legacy Sentinel TLS half landed as commit `b81e0ed`
 ("fix(controller): gate the legacy Sentinel TLS cleanup on provenance").
 
-Three items stay **open**: the name-only cleanups (`cleanupMetricsService`,
-`cleanupObserverDeployment`, `cleanupServiceMonitor`), the delete-and-recreate in
-`reconcileSidecarRoleBinding`, and `deleteLegacyServices`, which scans ownerReferences
-but takes its Delete without a UID precondition — see Residual risks.
+Amended 2026-08-21: the `reconcileSidecarRoleBinding` residual is **closed** by
+[ADR 0020](0020-write-only-what-the-operator-owns.md), which added the ownership check
+that keeps the delete-and-recreate off a foreign binding and the UID precondition on
+the operator's own. Two items stay **open**: the name-only cleanups
+(`cleanupMetricsService`, `cleanupObserverDeployment`, `cleanupServiceMonitor`) and
+`deleteLegacyServices`, which scans ownerReferences but takes its Delete without a UID
+precondition — see Residual risks.
+
+This ADR is the **deletion** half. The write half — no write onto a generated name the
+operator cannot prove it owns, and no grant to a subject it does not own — is
+[ADR 0020](0020-write-only-what-the-operator-owns.md). D1 below is deliberately scoped
+to deletions and stays that way; ADR 0020 explains why widening this ADR was rejected.
 
 ## Context
 
@@ -285,14 +293,17 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
   one of those names is still deleted on every pass. `cleanupObserverDeployment` deletes
   two objects this way: the `-observer` Deployment and, with NetworkPolicies enabled, the
   `-observer` NetworkPolicy.
-* **`reconcileSidecarRoleBinding` deletes and recreates by name.** `RoleRef` is
-  immutable, so a live RoleBinding under `<cr>-sidecar` whose `RoleRef` differs from the
-  desired one is deleted and rebuilt — with neither `IsControlledBy` nor a UID
-  precondition; the only `SetControllerReference` in that function is on the *desired*
-  object. The suffix makes an accidental collision unlikely, but unlike the `-metrics`
-  and `-observer` cases the trigger is guaranteed to fire for a foreign object: a
-  hand-written RoleBinding under that name points at a different Role by construction.
-  The step is wired unconditionally, so it runs on every pass of every CR.
+* **(Closed 2026-08-21) `reconcileSidecarRoleBinding` deleted and recreated by name.**
+  `RoleRef` is immutable, so a live RoleBinding under `<cr>-sidecar` whose `RoleRef`
+  differs from the desired one was deleted and rebuilt — with neither `IsControlledBy`
+  nor a UID precondition; the only `SetControllerReference` in that function was on the
+  *desired* object. The suffix made an accidental collision unlikely, but unlike the
+  `-metrics` and `-observer` cases the trigger was guaranteed to fire for a foreign
+  object: a hand-written RoleBinding under that name points at a different Role by
+  construction. The step is wired unconditionally, so it ran on every pass of every CR.
+  [ADR 0020](0020-write-only-what-the-operator-owns.md) closed both halves — a foreign
+  binding is refused and reported instead of destroyed, and the recreate of the
+  operator's own binding carries `client.Preconditions{UID: …}` per D8.
 * **`deleteLegacyServices` has a provenance scan but no UID precondition.** It deletes
   Services named `<cr>` — the same generated name the data StatefulSet and the data PDB
   carry — and `<cr>-read`, only when an ownerReference UID matches the CR. Two deviations
@@ -315,6 +326,15 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
   and no Delete is attempted.
 * Any new resource kind — especially `unstructured` ones that bypass `controllerutil` —
   must set the ownerReference explicitly, or D14's argument breaks silently.
+* **The write path is a separate rule and only partly guarded.** D1 binds deletions. On
+  the reconcile *write* path, `reconcilePodDisruptionBudget` and the four paths
+  [ADR 0020](0020-write-only-what-the-operator-owns.md) covers are the only ones that
+  check provenance; StatefulSet, Service, ConfigMap, NetworkPolicy, Deployment,
+  ServiceMonitor and Certificate are still written by generated name with no ownership
+  check. Two of those go further than an overwrite — `reconcileServiceMonitor` and
+  `reconcileCertificate` write `current.SetOwnerReferences(desired.GetOwnerReferences())`
+  onto an object they never verified, so deleting the CR garbage-collects a foreign
+  object. That is a deletion D1 does not watch, because the operator never issues it.
 
 ## References
 

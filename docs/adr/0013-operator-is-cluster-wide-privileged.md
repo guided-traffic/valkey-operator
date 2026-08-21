@@ -249,15 +249,30 @@ Every item below except the last is on the hardening checklist in
   what makes either one unnecessary.
 * **Workload pods have no `securityContext` (open)** while the operator's own Deployment sets
   all five `securityContext` controls listed in D8.
-* **`automountServiceAccountToken` is never disabled (open)** — the whole pod runs under
-  `<cr-name>-sidecar`, so the `valkey`, `sidecar` and `exporter` containers all carry the
-  token although only the sidecar uses it. A compromise of the `valkey` or `exporter`
-  container — **including via an attacker-chosen `spec.metrics.image`** — yields a
-  namespace-wide `pods get,list,patch` token, i.e. the ability to move the `instanceRole`
-  label and to write drain stamps.
-* **The observer shares the sidecar ServiceAccount (open)** while making no API call at all.
-  Giving it its own ServiceAccount with no Role is cheap and orthogonal
-  ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8, step 2).
+* **`automountServiceAccountToken` is never disabled on the data pods (open)** — the whole
+  pod runs under `<cr-name>-sidecar`, so the `valkey`, `sidecar` and `exporter` containers
+  all carry the token although only the sidecar uses it. A compromise of the `valkey` or
+  `exporter` container — **including via an attacker-chosen `spec.metrics.image`** — yields
+  that token. Corrected 2026-08-21: the grant it carries is no longer namespace-wide
+  `pods get,list,patch`. Since [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+  D8 step 3 it is `pods: patch` restricted by `resourceNames` to this cluster's own data
+  pods — still the ability to move the `instanceRole` label and to write drain stamps, but
+  only on this cluster. The observer half of this bullet is **closed**: it has its own pod
+  spec with `automountServiceAccountToken: false`.
+* **(Closed 2026-08-21) The observer shared the sidecar ServiceAccount** while making no API
+  call at all. [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
+  step 2 shipped: the observer runs under `<cr-name>-observer`, bound to no Role, mounting
+  no token. A pre-existing ServiceAccount under that derived name is refused rather than
+  overwritten ([ADR 0020](0020-write-only-what-the-operator-owns.md) D1, D2).
+* **A generated name can be held by an object the operator did not create (partly open).**
+  There is no admission webhook constraining CR names
+  ([ADR 0015](0015-one-crd-validated-by-schema-only.md)), so whoever may `create valkeys`
+  picks the names of every derived object. Deletes are guarded
+  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)); writes are guarded for the
+  observer ServiceAccount and the sidecar ServiceAccount, Role and RoleBinding
+  ([ADR 0020](0020-write-only-what-the-operator-owns.md)). Every other managed kind is
+  still written by generated name with no ownership check — ADR 0020 D7 and its Residual
+  risks name what that leaves open.
 * **No egress NetworkPolicies (open).**
 * **The pre-upgrade hook's cluster-wide CRD write grant (open)** — taken on every upgrade
   unless disabled.
