@@ -18,6 +18,7 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
+	"github.com/guided-traffic/valkey-operator/internal/health"
 )
 
 // Package-level shared test infrastructure.
@@ -30,6 +31,11 @@ var (
 	testCancel context.CancelFunc
 	k8sClient  client.Client
 	testEnv    *envtest.Environment
+
+	// slowProbes is the InstanceChecker of the shared reconciler. It delegates to
+	// the real Checker unless a test arms it, so only the CR of
+	// TestReconcileConcurrency_StuckClusterDoesNotBlockOthers is ever delayed.
+	slowProbes *slowProbeChecker
 )
 
 // TestMain sets up a shared envtest environment, registers schemes, starts
@@ -65,10 +71,13 @@ func TestMain(m *testing.M) {
 		panic("failed to create manager: " + err.Error())
 	}
 
+	slowProbes = &slowProbeChecker{delegate: health.NewChecker(mgr.GetClient())}
+
 	reconciler := &controller.ValkeyReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		OperatorImage: "valkey-operator:test",
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		OperatorImage:   "valkey-operator:test",
+		InstanceChecker: slowProbes,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic("failed to setup controller: " + err.Error())

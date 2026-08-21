@@ -83,6 +83,11 @@ type ValkeyReconciler struct {
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
 
+	// MaxConcurrentReconciles is how many Valkey CRs are reconciled at the same
+	// time. Zero means DefaultMaxConcurrentReconciles; see
+	// reconcileControllerOptions.
+	MaxConcurrentReconciles int
+
 	// nudges tracks first-seen timestamps for two disjoint key sets: how long
 	// each StatefulSet has been short of pods (nudgeShortStatefulSets), and the
 	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
@@ -2182,7 +2187,7 @@ func (r *ValkeyReconciler) verifyValkeyConnectivity(ctx context.Context, v *vkov
 // SetupWithManager sets up the controller with the Manager.
 func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		WithOptions(reconcileControllerOptions()).
+		WithOptions(reconcileControllerOptions(r.MaxConcurrentReconciles)).
 		For(&vkov1.Valkey{}, ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).

@@ -271,6 +271,18 @@ PodDisruptionBudget never constrains it. The rolling update compares pods agains
 cannot turn an image change into a pod-delete loop.
 → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md)
 
+## Reconcile concurrency
+
+The operator reconciles **4 Valkey CRs at a time** (`--max-concurrent-reconciles`, chart value
+`maxConcurrentReconciles`); passes for the *same* CR stay serialised by the work queue at any
+value. Concurrency is only safe because no reconciler state is fleet-wide — the `nudgeTracker`
+keys carry namespace and CR name, the blocked-pass marker rides on the context, there is no
+package-level mutable state, and every managed object name contains the CR name. **That is a
+standing constraint on new code**, not a one-time audit. The same ADR carries the second half:
+`findMaster` probes pods concurrently and collects them indexed by ordinal, so the answer never
+depends on which pod replied first.
+→ [ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)
+
 ## The non-Sentinel master authority, in five rules
 
 Without Sentinel nothing external arbitrates who the master is, and every mistake in this area

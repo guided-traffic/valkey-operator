@@ -49,10 +49,11 @@ func stripSubcommand(args []string) []string {
 
 // operatorFlags holds the command line options of the operator mode.
 type operatorFlags struct {
-	metricsAddr          string
-	probeAddr            string
-	enableLeaderElection bool
-	operatorImage        string
+	metricsAddr             string
+	probeAddr               string
+	enableLeaderElection    bool
+	operatorImage           string
+	maxConcurrentReconciles int
 }
 
 // bindOperatorFlags declares the operator flags on fs and returns the struct
@@ -67,6 +68,10 @@ func bindOperatorFlags(fs *flag.FlagSet) *operatorFlags {
 			"Enabling this will ensure there is only one active controller manager.")
 	fs.StringVar(&f.operatorImage, "operator-image", os.Getenv("OPERATOR_IMAGE"),
 		"The operator container image, used for the sidecar. Can also be set via OPERATOR_IMAGE env var.")
+	fs.IntVar(&f.maxConcurrentReconciles, "max-concurrent-reconciles", controller.DefaultMaxConcurrentReconciles,
+		"How many Valkey resources are reconciled at the same time. One worker couples every "+
+			"cluster to the slowest of them, because a pass dials its pods with a 5 s timeout each. "+
+			"Passes for the same resource stay serialised at any value.")
 
 	return f
 }
@@ -85,12 +90,13 @@ func managerOptions(f *operatorFlags) ctrl.Options {
 // newReconciler builds the Valkey reconciler from the manager and the parsed flags.
 func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string) *controller.ValkeyReconciler {
 	return &controller.ValkeyReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		Recorder:          mgr.GetEventRecorder("valkey-operator"),
-		OperatorImage:     f.operatorImage,
-		OperatorNamespace: operatorNamespace,
-		OperatorVersion:   version,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                mgr.GetEventRecorder("valkey-operator"),
+		OperatorImage:           f.operatorImage,
+		OperatorNamespace:       operatorNamespace,
+		OperatorVersion:         version,
+		MaxConcurrentReconciles: f.maxConcurrentReconciles,
 	}
 }
 

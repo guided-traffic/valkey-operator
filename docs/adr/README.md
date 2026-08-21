@@ -41,6 +41,7 @@ A reader must never find the old rule stated as current.
 | [0001](0001-continue-reconciling-past-a-rejected-write.md) | Continue reconciling past a rejected sub-resource write |
 | [0002](0002-surface-a-blocked-reconcile-on-the-cr.md) | Surface a blocked reconcile on the CR |
 | [0003](0003-nudge-a-short-of-pods-statefulset.md) | Nudge a short-of-pods StatefulSet |
+| [0019](0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md) | Reconcile concurrency, and the cost of a stuck pass |
 
 ### Workload guarantees
 

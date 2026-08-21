@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +139,16 @@ func (r *probeRouter) dialedAddrs() []string {
 	return append([]string(nil), r.dialed...)
 }
 
+// dialedAddrsSorted returns the same multiset sorted, for the assertions that
+// have to survive findMaster probing its pods concurrently: the count per address
+// still carries the meaning (a master is dialled a second time for its own
+// replication info), the arrival order no longer does.
+func (r *probeRouter) dialedAddrsSorted() []string {
+	addrs := r.dialedAddrs()
+	sort.Strings(addrs)
+	return addrs
+}
+
 // podNameOf strips the headless-service suffix and port from a pod FQDN.
 func podNameOf(addr string) string {
 	return strings.SplitN(addr, ".", 2)[0]
@@ -240,10 +251,10 @@ func TestCheckCluster_ReportsTheMasterAndItsSyncedReplicas(t *testing.T) {
 	assert.Equal(t, []string{
 		"test-0.test-headless.default.svc.cluster.local:6379",
 		"test-1.test-headless.default.svc.cluster.local:6379",
-		"test-2.test-headless.default.svc.cluster.local:6379",
 		// The master is dialled a second time for its own replication info.
 		"test-1.test-headless.default.svc.cluster.local:6379",
-	}, router.dialedAddrs())
+		"test-2.test-headless.default.svc.cluster.local:6379",
+	}, router.dialedAddrsSorted())
 }
 
 func TestCheckCluster_ReplicaAccounting(t *testing.T) {

@@ -359,17 +359,25 @@ func TestFindMaster_SkipsPodsThatAreNotRunning(t *testing.T) {
 		"a pod that is not Running must not be dialled at all")
 }
 
+// TestFindMaster_ScansEveryOrdinalOfTheStatefulSet pins the coverage of the scan:
+// no ordinal may be skipped. The visit *order* is deliberately not asserted —
+// the probes run concurrently since ADR 0019, so the arrival order carries no
+// meaning, and the answer must not depend on it either
+// (TestFindMaster_TiedMastersResolveToTheLowestOrdinal).
 func TestFindMaster_ScansEveryOrdinalOfTheStatefulSet(t *testing.T) {
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 5 })
 
+	var mu sync.Mutex
 	var gets []string
 	c := fake.NewClientBuilder().
 		WithScheme(testScheme()).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
 				obj client.Object, opts ...client.GetOption) error {
+				mu.Lock()
 				gets = append(gets, key.String())
+				mu.Unlock()
 				return cl.Get(ctx, key, obj, opts...)
 			},
 		}).Build()
@@ -377,9 +385,12 @@ func TestFindMaster_ScansEveryOrdinalOfTheStatefulSet(t *testing.T) {
 	_, _, err := NewChecker(c).findMaster(ctx, v, "", nil)
 
 	require.EqualError(t, err, "no master found among 5 pods")
+	mu.Lock()
+	defer mu.Unlock()
+	sort.Strings(gets)
 	assert.Equal(t, []string{
 		"default/test-0", "default/test-1", "default/test-2", "default/test-3", "default/test-4",
-	}, gets, "every ordinal is visited in order")
+	}, gets, "every ordinal is visited exactly once")
 }
 
 func TestFindMaster_ZeroReplicasScansNothing(t *testing.T) {

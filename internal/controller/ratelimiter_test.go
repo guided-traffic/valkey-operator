@@ -107,7 +107,7 @@ func TestReconcileRateLimiter_IsPerItem(t *testing.T) {
 // TestReconcileControllerOptions_UsesCappedRateLimiter guards the wiring: the
 // capped limiter is worthless if SetupWithManager does not actually pass it.
 func TestReconcileControllerOptions_UsesCappedRateLimiter(t *testing.T) {
-	limiter := reconcileControllerOptions().RateLimiter
+	limiter := reconcileControllerOptions(DefaultMaxConcurrentReconciles).RateLimiter
 	require.NotNil(t, limiter, "the controller must be configured with an explicit rate limiter")
 
 	req := rateLimiterRequest("test")
@@ -122,4 +122,28 @@ func TestReconcileControllerOptions_UsesCappedRateLimiter(t *testing.T) {
 		"SetupWithManager must use the capped limiter, not controller-runtime's 1000 s default")
 	assert.Equal(t, reconcileRetryMaxDelay, worst,
 		"the options must carry the same limiter newReconcileRateLimiter builds")
+}
+
+// TestReconcileControllerOptions_ConcurrencyIsWired guards the fleet decoupling of
+// ADR 0019. controller-runtime defaults MaxConcurrentReconciles to 1, and with one
+// worker a cluster whose pods stopped answering holds the queue for replicas x the
+// 5 s client timeout while every other Valkey CR waits.
+func TestReconcileControllerOptions_ConcurrencyIsWired(t *testing.T) {
+	assert.Greater(t, DefaultMaxConcurrentReconciles, 1,
+		"a single worker is the defect this default exists to close")
+
+	assert.Equal(t, 7, reconcileControllerOptions(7).MaxConcurrentReconciles,
+		"an explicitly configured worker count must reach the controller")
+}
+
+// TestReconcileControllerOptions_UnsetConcurrencyFallsBack covers the reconcilers
+// built without the field — the integration suite and every test helper. Leaving
+// them at controller-runtime's implicit 1 would mean the decoupling is untested
+// exactly where it is observable.
+func TestReconcileControllerOptions_UnsetConcurrencyFallsBack(t *testing.T) {
+	for _, unset := range []int{0, -1} {
+		assert.Equal(t, DefaultMaxConcurrentReconciles,
+			reconcileControllerOptions(unset).MaxConcurrentReconciles,
+			"an unconfigured worker count must fall back to the default, not to one worker")
+	}
 }

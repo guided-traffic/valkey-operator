@@ -44,6 +44,21 @@ const (
 	reconcileRetryBurst = 100
 )
 
+// DefaultMaxConcurrentReconciles is how many Valkey CRs the operator reconciles at
+// the same time when the flag is not set.
+//
+// controller-runtime defaults this to 1, and one worker couples every CR in the
+// fleet to the slowest of them: a reconcile pass dials the pods of its cluster with
+// a 5 s timeout each (internal/valkeyclient), so a cluster whose pods stopped
+// answering — a node drain in progress, a NetworkPolicy mistake, a hung Valkey —
+// holds the single worker for tens of seconds while every other Valkey CR waits.
+//
+// 4 is a bar, not a guarantee: with four clusters stuck at once the coupling is
+// back. The per-CR serialisation everything in this package relies on is unaffected,
+// because the work queue never runs two passes for the same key
+// (docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md).
+const DefaultMaxConcurrentReconciles = 4
+
 // newReconcileRateLimiter builds the work queue rate limiter for the Valkey
 // controller: client-go's classic DefaultTypedControllerRateLimiter shape — the
 // maximum of a per-item exponential backoff and an overall token bucket — with the
@@ -65,8 +80,17 @@ func newReconcileRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
 
 // reconcileControllerOptions returns the controller options used by
 // SetupWithManager. It exists so the wiring itself is unit-testable.
-func reconcileControllerOptions() ctrlcontroller.Options {
+//
+// maxConcurrent of zero or less means "not configured" and falls back to
+// DefaultMaxConcurrentReconciles, so a reconciler built without the field — every
+// test helper, and the integration suite — still gets the fleet decoupling rather
+// than controller-runtime's single worker.
+func reconcileControllerOptions(maxConcurrent int) ctrlcontroller.Options {
+	if maxConcurrent <= 0 {
+		maxConcurrent = DefaultMaxConcurrentReconciles
+	}
 	return ctrlcontroller.Options{
-		RateLimiter: newReconcileRateLimiter(),
+		RateLimiter:             newReconcileRateLimiter(),
+		MaxConcurrentReconciles: maxConcurrent,
 	}
 }

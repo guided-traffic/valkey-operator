@@ -13,6 +13,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/controller"
 )
 
 // newTestFlagSet returns a FlagSet that reports parse errors instead of calling
@@ -158,6 +159,11 @@ func TestBindOperatorFlags_Defaults(t *testing.T) {
 	if f.operatorImage != "" {
 		t.Errorf("operatorImage = %q, want empty when OPERATOR_IMAGE is unset", f.operatorImage)
 	}
+	if f.maxConcurrentReconciles != controller.DefaultMaxConcurrentReconciles {
+		t.Errorf("maxConcurrentReconciles = %d, want %d: an operator started without the flag must "+
+			"not fall back to controller-runtime's single worker",
+			f.maxConcurrentReconciles, controller.DefaultMaxConcurrentReconciles)
+	}
 }
 
 func TestBindOperatorFlags_OperatorImageFromEnv(t *testing.T) {
@@ -198,6 +204,7 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 		"--health-probe-bind-address=127.0.0.1:9091",
 		"--leader-elect",
 		"--operator-image=repo/img:tag",
+		"--max-concurrent-reconciles=9",
 	}
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse: %v", err)
@@ -214,6 +221,9 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 	}
 	if f.operatorImage != "repo/img:tag" {
 		t.Errorf("operatorImage = %q, want repo/img:tag", f.operatorImage)
+	}
+	if f.maxConcurrentReconciles != 9 {
+		t.Errorf("maxConcurrentReconciles = %d, want 9", f.maxConcurrentReconciles)
 	}
 }
 
@@ -290,7 +300,7 @@ func TestNewReconciler(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	f := &operatorFlags{operatorImage: "guidedtraffic/valkey-operator:v9"}
+	f := &operatorFlags{operatorImage: "guidedtraffic/valkey-operator:v9", maxConcurrentReconciles: 6}
 	r := newReconciler(mgr, f, "valkey-system")
 
 	if r.Client == nil {
@@ -312,5 +322,11 @@ func TestNewReconciler(t *testing.T) {
 	}
 	if r.OperatorVersion != version {
 		t.Errorf("OperatorVersion = %q, want the ldflags build version %q", r.OperatorVersion, version)
+	}
+	// The flag is only worth having if it reaches the reconciler; SetupWithManager
+	// reads it from there (ADR 0019).
+	if r.MaxConcurrentReconciles != 6 {
+		t.Errorf("MaxConcurrentReconciles = %d, want the --max-concurrent-reconciles value 6",
+			r.MaxConcurrentReconciles)
 	}
 }

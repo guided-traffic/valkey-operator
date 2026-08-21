@@ -1086,7 +1086,16 @@ resources:
 
 leaderElection:
   enabled: true      # required for HA operator deployment
+
+maxConcurrentReconciles: 4   # default; how many Valkey resources are reconciled at once
 ```
+
+`maxConcurrentReconciles` bounds how far one unhealthy cluster can slow down the rest:
+a reconcile pass dials the pods of its cluster with a 5 s timeout each, so with a single
+worker a cluster whose pods stopped answering delays every other Valkey resource in the
+fleet. Passes for the *same* resource stay serialised at any value. Raise it for large
+fleets, lower it to reduce concurrent API-server load
+([ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)).
 
 ---
 
