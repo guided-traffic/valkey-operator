@@ -392,6 +392,7 @@ ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
 REPLICAS=%[9]d
 PORT=%[7]d
 MASTER_ADDR=""
+SELF_IS_KNOWN_MASTER=0
 
 # Phase 1: Discover existing master by querying peer pods.
 # Uses a retry loop to handle the case where peers are still starting.
@@ -438,9 +439,19 @@ done
 # step the returning pod-0 would take the ordinal fallback and boot as a second,
 # independent master. The address is only trusted when that peer is reachable and
 # actually reports role:master, so a stale entry degrades to the ordinal fallback.
+#
+# When the address names THIS pod, the pod is the master the operator recorded and
+# re-claims the role instead of taking the ordinal fallback (NA35). Falling back
+# would make the recorded master a replica of the ordinal-0 pod, and the full sync
+# would overwrite the only copy of the post-failover writes. The two-master state
+# this can produce is transient: the operator's steady-state check consolidates it,
+# with this same address as its authority.
 if [ -z "$MASTER_ADDR" ]; then
   KNOWN_MASTER=$(grep '^replicaof ' %[4]s/%[3]s 2>/dev/null | awk '{print $2}')
-  if [ -n "$KNOWN_MASTER" ] && [ "$KNOWN_MASTER" != "$MY_HOST" ]; then
+  if [ "$KNOWN_MASTER" = "$MY_HOST" ]; then
+    SELF_IS_KNOWN_MASTER=1
+    echo "Replica config names this pod as master, booting as master"
+  elif [ -n "$KNOWN_MASTER" ]; then
     KNOWN_INFO=$(timeout 2 valkey-cli %[10]s %[11]s -h "$KNOWN_MASTER" -p $PORT INFO replication 2>/dev/null)
     KNOWN_ROLE=$(echo "$KNOWN_INFO" | grep "^role:" | tr -d '\r' | cut -d: -f2)
     if [ "$KNOWN_ROLE" = "master" ]; then
@@ -452,13 +463,16 @@ if [ -z "$MASTER_ADDR" ]; then
   fi
 fi
 
-# Phase 3: Apply discovery result or fall back to ordinal-based config.
+# Phase 3: Apply discovery result, the self-claim, or fall back to ordinal-based config.
 if [ -n "$MASTER_ADDR" ]; then
   echo "This pod is a replica, discovered master=$MASTER_ADDR"
   cp %[1]s/%[3]s %[2]s/%[3]s
   echo "" >> %[2]s/%[3]s
   echo "# Replication (configured by init container via master discovery)" >> %[2]s/%[3]s
   echo "replicaof $MASTER_ADDR %[7]d" >> %[2]s/%[3]s
+elif [ "$SELF_IS_KNOWN_MASTER" = "1" ]; then
+  echo "This pod is the known master, using master config (ordinal=$ORDINAL)"
+  cp %[1]s/%[3]s %[2]s/%[3]s
 else
   echo "No existing master discovered, using ordinal-based config (ordinal=$ORDINAL)"
   if [ "$ORDINAL" = "0" ]; then

@@ -152,9 +152,11 @@ func TestInitScript_ReturningPod0FollowsKnownMaster(t *testing.T) {
 	assert.Contains(t, logs, "Using known master from replica config")
 }
 
-// Without a failover in progress the replica config points at pod-0 itself.
-// Pod-0 must ignore that self-reference and keep the master config.
-func TestInitScript_Pod0IgnoresSelfAsKnownMaster(t *testing.T) {
+// Without a failover in progress the replica config points at pod-0 itself, which
+// is also the default the operator writes. Pod-0 takes the self-claim branch and
+// keeps the master config: the produced config is byte-identical to the ordinal
+// fallback it used to take, only the recorded reason changed.
+func TestInitScript_Pod0NamedAsMasterKeepsMasterConfig(t *testing.T) {
 	env := newInitScriptEnv(t, podFQDN(0))
 	env.stubValkeyCLI(t, map[string]string{podFQDN(1): infoReplica(podFQDN(0))})
 
@@ -162,6 +164,49 @@ func TestInitScript_Pod0IgnoresSelfAsKnownMaster(t *testing.T) {
 
 	assert.NotContains(t, conf, "replicaof ",
 		"pod-0 must not be configured as a replica of itself")
+	assert.Contains(t, logs, "Replica config names this pod as master")
+}
+
+// NA35: the pod the operator recorded as master must re-claim the role after a
+// full pod-set restart. Pod-0 came back first and self-elected without replicas,
+// so Phase 1 rejects it; taking the ordinal fallback here would make the recorded
+// master a replica of pod-0 and the full sync would discard the post-failover
+// writes it is the only copy of.
+func TestInitScript_PromotedPodSelfNamedBootsAsMaster(t *testing.T) {
+	env := newInitScriptEnv(t, podFQDN(1))
+	env.stubValkeyCLI(t, map[string]string{podFQDN(0): infoMaster(0)})
+
+	conf, logs := env.run(t, testValkeyForInitScript(2), "test-1")
+
+	assert.NotContains(t, conf, "replicaof ",
+		"the recorded master must not sync from the self-elected pod-0")
+	assert.Contains(t, logs, "Replica config names this pod as master")
+}
+
+// The self-claim must never displace an established master: a master with
+// connected replicas is found in Phase 1 and outranks the recorded address, even
+// when that address names this pod.
+func TestInitScript_EstablishedMasterOutranksSelfClaim(t *testing.T) {
+	env := newInitScriptEnv(t, podFQDN(1))
+	env.stubValkeyCLI(t, map[string]string{podFQDN(0): infoMaster(1)})
+
+	conf, logs := env.run(t, testValkeyForInitScript(3), "test-1")
+
+	assert.Contains(t, conf, "replicaof "+podFQDN(0))
+	assert.Contains(t, logs, "Discovered existing master")
+}
+
+// No recorded address at all (a cluster that never failed over, or a replica
+// config without a replicaof directive) still takes the ordinal fallback — the
+// self-claim must not fire on an empty value.
+func TestInitScript_NoKnownMasterFallsBackToOrdinal(t *testing.T) {
+	env := newInitScriptEnv(t, "")
+	env.stubValkeyCLI(t, map[string]string{podFQDN(0): infoReplica(podFQDN(1))})
+
+	conf, logs := env.run(t, testValkeyForInitScript(2), "test-1")
+
+	assert.Contains(t, conf, "# replica config",
+		"a non-zero ordinal without a recorded master must use the replica config")
 	assert.Contains(t, logs, "using ordinal-based config")
 }
 
