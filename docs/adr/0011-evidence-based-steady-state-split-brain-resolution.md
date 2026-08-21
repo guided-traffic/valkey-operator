@@ -68,9 +68,8 @@ state annotation is set. The healthy case costs no connection at all.
 so the "most connected slaves" fallback stays unreachable from outside a rolling update.
 Inside an update the operator knows which pod it promoted; in steady state it does not,
 and that fallback ties at zero in a shrunken cluster and picks the lowest ordinal — the
-exact mechanism that destroyed a promoted pod's data (the incident the code comments label
-NA21; the loss was observed on a cluster, what is checkable in this repository is the
-tie-at-zero fallback itself).
+exact mechanism that destroyed a promoted pod's data (the loss was observed on a cluster;
+what is checkable in this repository is the tie-at-zero fallback itself).
 
 **D4 — The contract on the annotation, sharpened rather than widened:**
 

@@ -67,7 +67,7 @@ on an object under an operator-generated name requires a **provenance proof** an
 **UID delete precondition**. The canonical implementation is `cleanupPodDisruptionBudget`
 ([`internal/controller/pdb.go`](../../internal/controller/pdb.go)).
 
-The rule binds every site added since NA31. Three pre-existing sites do not yet satisfy
+The rule binds every site added since the UID precondition landed. Three pre-existing sites do not yet satisfy
 it and are tracked under Residual risks; `deleteLegacyServices` is the closest of them —
 it scans `svc.OwnerReferences` for the CR UID, but matches *any* ownerReference rather
 than the controller one D2 designates, and takes the Delete with no precondition.

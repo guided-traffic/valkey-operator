@@ -111,9 +111,9 @@ against manifest**, so a stale `config/rbac/role.yaml` would pass it; only `make
 makes the **marker-to-manifest** comparison. The pre-existing check lived in a job that
 triggers on `release: published` only, so drift was caught after review, at release time.
 Both halves start from the markers, so **a permission no marker ever expressed falls outside
-both**: in NA12 all three places agreed and all three were wrong, and neither guard has
-anything to compare against. That class is caught only on a cluster, which is why the NA12 fix
-landed with two e2e assertions instead of a manifest check
+both**: in the discarded-Events incident all three places agreed and all three were wrong,
+and neither guard has anything to compare against. That class is caught only on a cluster,
+which is why its fix landed with two e2e assertions instead of a manifest check
 ([`test/e2e/admission_recovery_test.go`](../../test/e2e/admission_recovery_test.go), lines
 278-330): the `StatefulSetNudged` Event must appear on the CR, and the operator log must stay
 free of `Server rejected event`.

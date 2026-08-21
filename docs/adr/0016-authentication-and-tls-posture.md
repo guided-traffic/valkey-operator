@@ -179,8 +179,8 @@ Context, and were not reproduced against a cluster.
 * Clients that cannot do TLS or auth need an explicit, auditable opt-in field in the CR — the
   weakened posture is visible in the spec.
 * The `unifiedCertificate` migration is why the operator needs `delete` on core `secrets` at
-  all, and the missing verb wedged every migrating cluster once — NA37, observed on a cluster
-  and not reproducible from this repository
+  all, and the missing verb wedged every migrating cluster once — observed on a cluster and
+  not reproducible from this repository
   ([ADR 0014](0014-rbac-lives-in-three-places.md)).
 * A password rotation degrades the cluster until it is manually rolled.
 

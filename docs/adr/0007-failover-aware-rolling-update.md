@@ -245,8 +245,8 @@ Rejected for the data loss on an unreplicated standalone.
 
 ### Let the connected-slaves heuristic decide during a rolling update
 
-Rejected: it is the mechanism that destroyed a promoted pod's data (NA21 — observed on a
-cluster, not reproducible from this repository). The tie itself is verified by reading
+Rejected: it is the mechanism that destroyed a promoted pod's data (observed on a cluster,
+not reproducible from this repository). The tie itself is verified by reading
 `detectAndResolveSplitBrain`, and the guard against it is
 `TestDetectAndResolveSplitBrain_PrefersPromotedPodDuringFailover`.
 

@@ -60,8 +60,8 @@ deliberately exempt — see D8.
 promotion unrecorded.** `handleManualFailover` runs `promoteAndRedirect` first, then
 `persistManualFailoverState` writes four annotations in one `Update` under a bounded
 `retry.RetryOnConflict`: `promoted-pod`, `rolling-update-state`, `known-master` and
-`manual-failover-started` — the NA47 bound of the state this write enters
-([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)). The bound is armed once by
+`manual-failover-started` — the bound of the state this write enters
+([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D6). The bound is armed once by
 `armManualFailoverBound`, before the first attempt, so a conflict retry re-applies the same
 deadline instead of handing the state a fresh budget per attempt. If the write still does
 not land, **the pass fails and the old master is not deleted**. Losing that
