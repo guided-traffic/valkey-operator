@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 )
@@ -25,10 +26,7 @@ import (
 // conditionOf reads a named condition from the stored CR.
 func conditionOf(t *testing.T, c client.Client, v *vkov1.Valkey, condType string) *metav1.Condition {
 	t.Helper()
-	stored := &vkov1.Valkey{}
-	require.NoError(t, c.Get(context.Background(),
-		types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, stored))
-	return meta.FindStatusCondition(stored.Status.Conditions, condType)
+	return meta.FindStatusCondition(crGet(t, c, v.Name).Status.Conditions, condType)
 }
 
 // bumpGeneration simulates a spec edit: the stored CR moves to a new generation
@@ -194,4 +192,115 @@ func TestSetReconcileBlockedCondition_MessageChangeStillWrites(t *testing.T) {
 	cond := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
 	require.NotNil(t, cond)
 	assert.Contains(t, cond.Message, "validate.kyverno.svc-fail")
+}
+
+// --- NA34.2: no status write when the condition would not change ---
+
+// statusWriteCounter counts status subresource writes of a Valkey CR.
+type statusWriteCounter struct{ writes int }
+
+func (s *statusWriteCounter) intercept() interceptor.Funcs {
+	return interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*vkov1.Valkey); ok && subResource == "status" {
+				s.writes++
+			}
+			return c.SubResource(subResource).Update(ctx, obj, opts...)
+		},
+	}
+}
+
+// TestSetStatusCondition_SkipsWriteWhenNothingChanged pins NA34.2: the helper
+// used to issue a status update on every call, so any caller reporting a steady
+// state cost one write per reconcile pass.
+func TestSetStatusCondition_SkipsWriteWhenNothingChanged(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Generation = 1 })
+	counter := &statusWriteCounter{}
+	r, _ := newInterceptedReconciler(counter.intercept(), v)
+	ctx := context.Background()
+
+	for i := 0; i < 4; i++ {
+		r.setStatusCondition(ctx, v, vkov1.ConditionTypeSidecarUpdatePending,
+			metav1.ConditionFalse, "SidecarUpToDate", "All sidecar containers are running the desired image")
+	}
+
+	assert.Equal(t, 1, counter.writes,
+		"an unchanged condition must not cost a status write per reconcile pass")
+}
+
+// TestSetStatusCondition_WritesOnObservedGenerationBump guards the skip against
+// the one change meta.SetStatusCondition could plausibly have ignored: an
+// otherwise identical condition on a new generation. It counts as a change, so
+// the bump must still be persisted.
+func TestSetStatusCondition_WritesOnObservedGenerationBump(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Generation = 1 })
+	counter := &statusWriteCounter{}
+	r, c := newInterceptedReconciler(counter.intercept(), v)
+	ctx := context.Background()
+
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeSidecarUpdatePending,
+		metav1.ConditionFalse, "SidecarUpToDate", "All sidecar containers are running the desired image")
+	require.Equal(t, 1, counter.writes)
+
+	bumpGeneration(t, c, v, 2)
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeSidecarUpdatePending,
+		metav1.ConditionFalse, "SidecarUpToDate", "All sidecar containers are running the desired image")
+
+	assert.Equal(t, 2, counter.writes, "a new generation must be persisted even on an identical condition")
+	cond := conditionOf(t, c, v, vkov1.ConditionTypeSidecarUpdatePending)
+	require.NotNil(t, cond)
+	assert.Equal(t, int64(2), cond.ObservedGeneration)
+}
+
+// TestSetStatusCondition_WritesOnReasonOrMessageChange pins the other half of
+// what the skip must not swallow: reason and message changes without a status
+// flip. meta.SetStatusCondition counts both as changes.
+func TestSetStatusCondition_WritesOnReasonOrMessageChange(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Generation = 1 })
+	counter := &statusWriteCounter{}
+	r, c := newInterceptedReconciler(counter.intercept(), v)
+	ctx := context.Background()
+
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeReconcileBlocked,
+		metav1.ConditionTrue, vkov1.ReasonAdmissionWebhookDenied, "mutate.kyverno.svc-fail")
+	require.Equal(t, 1, counter.writes)
+
+	// Same status, different message: another webhook now rejects the write.
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeReconcileBlocked,
+		metav1.ConditionTrue, vkov1.ReasonAdmissionWebhookDenied, "validate.kyverno.svc-fail")
+	assert.Equal(t, 2, counter.writes)
+
+	// Same status and message, different reason.
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeReconcileBlocked,
+		metav1.ConditionTrue, vkov1.ReasonWriteFailed, "validate.kyverno.svc-fail")
+	assert.Equal(t, 3, counter.writes)
+
+	cond := conditionOf(t, c, v, vkov1.ConditionTypeReconcileBlocked)
+	require.NotNil(t, cond)
+	assert.Equal(t, vkov1.ReasonWriteFailed, cond.Reason)
+	assert.Equal(t, "validate.kyverno.svc-fail", cond.Message)
+}
+
+// TestSetSidecarUpdatePendingCondition_NoWritePerPass covers the live NA34.2 call
+// site: handleStandaloneRollingUpdate calls this on every pass of every
+// standalone cluster, drift or no drift.
+func TestSetSidecarUpdatePendingCondition_NoWritePerPass(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Generation = 1 })
+	counter := &statusWriteCounter{}
+	r, c := newInterceptedReconciler(counter.intercept(), v)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		r.setSidecarUpdatePendingCondition(ctx, v, false)
+	}
+	assert.Equal(t, 1, counter.writes,
+		"a standalone cluster without sidecar drift must not write its status on every pass")
+
+	// A real transition must still be reported.
+	r.setSidecarUpdatePendingCondition(ctx, v, true)
+	assert.Equal(t, 2, counter.writes)
+	cond := conditionOf(t, c, v, vkov1.ConditionTypeSidecarUpdatePending)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 }

@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -76,14 +77,6 @@ func reconcileFor(t *testing.T, r *ValkeyReconciler, v *vkov1.Valkey) error {
 	return err
 }
 
-func storedValkey(t *testing.T, c client.Client, v *vkov1.Valkey) *vkov1.Valkey {
-	t.Helper()
-	stored := &vkov1.Valkey{}
-	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
-		Name: v.Name, Namespace: v.Namespace}, stored))
-	return stored
-}
-
 // TestReconcile_BlockedPassDoesNotFlapPhase is the unit-level form of NA3: a
 // healthy data plane behind a rejected managed write must not produce an OK write
 // followed by an Error write on every pass.
@@ -98,7 +91,7 @@ func TestReconcile_BlockedPassDoesNotFlapPhase(t *testing.T) {
 	require.Error(t, reconcileFor(t, r, v))
 	markStatefulSetReady(t, c, v)
 
-	before := storedValkey(t, c, v)
+	before := crGet(t, c, v.Name)
 	require.Equal(t, vkov1.ValkeyPhaseError, before.Status.Phase,
 		"precondition: the blocked first pass leaves the CR in Error")
 
@@ -112,7 +105,7 @@ func TestReconcile_BlockedPassDoesNotFlapPhase(t *testing.T) {
 	assert.Zero(t, rec.transitions(before.Status.Phase),
 		"a blocked pass must not change the phase it already reported")
 
-	after := storedValkey(t, c, v)
+	after := crGet(t, c, v.Name)
 	assert.Equal(t, vkov1.ValkeyPhaseError, after.Status.Phase)
 	assert.Contains(t, after.Status.Message, "NetworkPolicies:",
 		"the phase message must keep naming the failing step")
@@ -148,7 +141,7 @@ func TestReconcile_BlockedPassRecoversToHealthPhase(t *testing.T) {
 
 	assert.Contains(t, rec.phases, vkov1.ValkeyPhaseOK,
 		"an unblocked pass must report the health phase again")
-	assert.Equal(t, vkov1.ValkeyPhaseOK, storedValkey(t, c, v).Status.Phase)
+	assert.Equal(t, vkov1.ValkeyPhaseOK, crGet(t, c, v.Name).Status.Phase)
 }
 
 // TestReconcile_BlockedPassWritesPhaseEvenWhenWorkloadFails settles the open datum
@@ -171,7 +164,7 @@ func TestReconcile_BlockedPassWritesPhaseEvenWhenWorkloadFails(t *testing.T) {
 
 	require.Error(t, reconcileFor(t, r, v))
 
-	stored := storedValkey(t, c, v)
+	stored := crGet(t, c, v.Name)
 	assert.Equal(t, vkov1.ValkeyPhaseError, stored.Status.Phase,
 		"the blocked pass owns the phase even when the workload pass returned early")
 	assert.Contains(t, stored.Status.Message, "Failed to reconcile resources:")
@@ -187,11 +180,11 @@ func TestUpdatePhase_SuppressedWhileBlocked(t *testing.T) {
 	ctx := withBlockedPass(context.Background())
 
 	require.NoError(t, r.updatePhase(ctx, v, vkov1.ValkeyPhaseOK, "All replicas are ready"))
-	assert.Equal(t, vkov1.ValkeyPhaseError, storedValkey(t, c, v).Status.Phase,
+	assert.Equal(t, vkov1.ValkeyPhaseError, crGet(t, c, v.Name).Status.Phase,
 		"intermediate phase writes must be dropped while the pass is blocked")
 
 	require.NoError(t, r.writePhase(ctx, v, vkov1.ValkeyPhaseError, "Failed to reconcile resources: later"))
-	stored := storedValkey(t, c, v)
+	stored := crGet(t, c, v.Name)
 	assert.Equal(t, "Failed to reconcile resources: later", stored.Status.Message,
 		"writePhase is the one write a blocked pass is allowed to make")
 }
@@ -202,7 +195,7 @@ func TestUpdatePhase_WritesWhenPassIsNotBlocked(t *testing.T) {
 	r, c := newTestReconciler(v)
 
 	require.NoError(t, r.updatePhase(context.Background(), v, vkov1.ValkeyPhaseOK, "All replicas are ready"))
-	assert.Equal(t, vkov1.ValkeyPhaseOK, storedValkey(t, c, v).Status.Phase)
+	assert.Equal(t, vkov1.ValkeyPhaseOK, crGet(t, c, v.Name).Status.Phase)
 }
 
 // TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked pins the middle ground NA3
@@ -216,18 +209,85 @@ func TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked(t *testing.T) {
 	require.NoError(t, reconcileFor(t, r, v))
 	markStatefulSetReady(t, c, v)
 
-	stored := storedValkey(t, c, v)
+	stored := crGet(t, c, v.Name)
 	stored.Status.Phase = vkov1.ValkeyPhaseError
 	stored.Status.Message = "Failed to reconcile resources: NetworkPolicies: rejected"
 	require.NoError(t, c.Status().Update(context.Background(), stored))
 
 	require.NoError(t, r.updateStatus(withBlockedPass(context.Background()), stored))
 
-	after := storedValkey(t, c, v)
+	after := crGet(t, c, v.Name)
 	assert.Equal(t, vkov1.ValkeyPhaseError, after.Status.Phase)
 	assert.Equal(t, "Failed to reconcile resources: NetworkPolicies: rejected", after.Status.Message)
 	assert.Equal(t, v.Spec.Replicas, after.Status.ReadyReplicas,
 		"readyReplicas must keep tracking the data plane while blocked")
 	assert.Equal(t, "test-0", after.Status.MasterPod,
 		"masterPod must keep tracking the data plane while blocked")
+}
+
+// --- NA33: a rejected initial phase write must not own the pass ---
+
+// rejectFirstValkeyStatusWrite fails the first status subresource write of a
+// Valkey CR and lets every later one through, keeping whatever else funcs
+// already does. It reproduces the NA33 trigger: a webhook guarding the CR status
+// subresource, or a momentarily lost valkeys/status RBAC, catching the initial
+// Provisioning write of a brand-new CR.
+func rejectFirstValkeyStatusWrite(funcs interceptor.Funcs, rejected *int) interceptor.Funcs {
+	funcs.SubResourceUpdate = func(ctx context.Context, c client.Client, subResource string,
+		obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if _, ok := obj.(*vkov1.Valkey); ok && subResource == "status" && *rejected == 0 {
+			*rejected++
+			return webhookUnreachableError()
+		}
+		return c.SubResource(subResource).Update(ctx, obj, opts...)
+	}
+	return funcs
+}
+
+// TestReconcile_InitialPhaseWriteFailureDoesNotAbortPass pins NA33: the initial
+// Provisioning write used to return the pass, so a rejected status write meant
+// reconcileResources never ran and the CR got neither its managed resources nor
+// a phase.
+func TestReconcile_InitialPhaseWriteFailureDoesNotAbortPass(t *testing.T) {
+	v := newTestValkey("test", "default")
+	rejected := 0
+	r, c := newInterceptedReconciler(rejectFirstValkeyStatusWrite(interceptor.Funcs{}, &rejected), v)
+
+	require.NoError(t, reconcileFor(t, r, v),
+		"a rejected initial phase write must not fail the pass; the phase is written again later in it")
+	require.Equal(t, 1, rejected, "precondition: the initial phase write is the rejected one")
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name:      common.StatefulSetName(v, common.ComponentValkey),
+		Namespace: v.Namespace,
+	}, sts), "reconcileResources must run even when the first status write was rejected")
+
+	assert.Equal(t, vkov1.ValkeyPhaseProvisioning, crGet(t, c, v.Name).Status.Phase,
+		"the later status write of the same pass must fill the phase in")
+}
+
+// TestReconcile_InitialPhaseWriteFailureStillReportsReconcileBlocked is the half
+// of NA33 that matters for observability: with the early return, a CR whose first
+// status write was rejected carried no ReconcileBlocked condition either, so the
+// exact failure class that condition exists to surface stayed invisible.
+func TestReconcile_InitialPhaseWriteFailureStillReportsReconcileBlocked(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+	})
+	rejected := 0
+	r, c := newInterceptedReconciler(
+		rejectFirstValkeyStatusWrite(rejectCreateOf(&networkingv1.NetworkPolicy{}), &rejected), v)
+
+	require.Error(t, reconcileFor(t, r, v), "the rejected managed write must still surface as an error")
+	require.Equal(t, 1, rejected, "precondition: the initial phase write is the rejected one")
+
+	cond := blockedCondition(t, c, v)
+	require.NotNil(t, cond,
+		"a CR whose initial phase write was rejected must still report why its resources are blocked")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonAdmissionWebhookDenied, cond.Reason)
+
+	assert.Equal(t, vkov1.ValkeyPhaseError, crGet(t, c, v.Name).Status.Phase,
+		"the single phase write of the blocked pass must still land")
 }

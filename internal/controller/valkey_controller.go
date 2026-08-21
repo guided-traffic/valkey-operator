@@ -208,9 +208,20 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Set initial provisioning status if phase is empty.
+	//
+	// A failure here does not end the pass. Returning made a rejected status write
+	// — a webhook guarding the CR status subresource, or lost valkeys/status RBAC —
+	// skip reconcileResources entirely, so a brand-new CR kept an empty phase and
+	// never got a ReconcileBlocked condition: invisible for exactly the failure
+	// class that condition exists to surface.
+	//
+	// Nothing is lost by proceeding. The phase is recomputed and written later in
+	// the same pass (persistStatus, or the single writePhase of a blocked pass),
+	// and where an earlier return skips that write, this branch is idempotent —
+	// the next pass still finds an empty phase and retries it.
 	if valkey.Status.Phase == "" {
 		if err := r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseProvisioning, "Setting up Valkey resources"); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "Failed to write the initial Provisioning phase; continuing the pass")
 		}
 	}
 
@@ -281,8 +292,14 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
-	if result, done, err := r.handlePostRollingUpdateChecks(ctx, valkey); done {
-		return result, err
+	//
+	// A non-terminal result (done == false) is not discarded: it is a recheck
+	// cadence the check needs but cannot take, because ending the pass here would
+	// skip the status write. It is applied at the very end, where every other
+	// requeue reason has already had its say.
+	pending, done, err := r.handlePostRollingUpdateChecks(ctx, valkey)
+	if done {
+		return pending, err
 	}
 
 	// Update status based on StatefulSet readiness.
@@ -308,12 +325,16 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 		return ctrl.Result{RequeueAfter: nudgeRequeueInterval}, nil
 	}
 
-	return ctrl.Result{}, nil
+	// The recheck a post-update check asked for without ending the pass. Zero
+	// unless one of them set it, so the healthy path still returns no requeue.
+	return pending, nil
 }
 
 // handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery
 // after the main Valkey rolling update is done. Returns (result, true, err) if the
-// caller should return immediately, or (_, false, nil) if processing should continue.
+// caller should return immediately, or (result, false, nil) if processing should
+// continue — where a non-zero result is a requeue the pass wants applied only
+// after updateStatus has run.
 func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool, error) {
 	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
 	// while verifying sentinel quorum before each deletion.
@@ -347,7 +368,14 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 		}
 	}
 
-	return ctrl.Result{}, false, nil
+	// Outside a rolling update nothing else re-detects a split brain (NA26).
+	// The function self-gates on topology and rolling-update state.
+	//
+	// Its result is returned even when the pass continues: a split brain it could
+	// confirm but not resolve asks for a recheck without ending the pass, because
+	// ending it would skip the status write. Dropping the result here would make
+	// that recheck unreachable just as surely as dropping it in reconcileWorkload.
+	return r.checkSteadyStateSplitBrain(ctx, v)
 }
 
 // reconcileStep is one unit of work inside a reconcile pass: a display name, an
@@ -1390,8 +1418,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Phase = vkov1.ValkeyPhaseOK
 			v.Status.Message = "All replicas are ready"
 
-			// Pod-0 is the master (standalone single pod or ordinal-based multi-replica).
-			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+			v.Status.MasterPod = r.currentMasterPod(ctx, v)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
 				Type:               conditionTypeReady,
@@ -1426,6 +1453,53 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 	}
 
 	return r.persistStatus(ctx, v, prevStatus)
+}
+
+// currentMasterPod reports the pod the non-Sentinel cluster currently serves writes
+// from. The HA path has its own answer (clusterState.MasterPod, from Sentinel).
+//
+// It used to be pod-0 unconditionally, which is a claim the rest of the operator
+// contradicts by design: after an abandoned topology restoration the promoted replica
+// stays master and TopologyRestored=False says so, and every drain adoption
+// (checkSteadyStateSplitBrain) leaves a non-pod-0 master behind. A non-pod-0 master
+// is a supported end state -- the -rw/-r Services select on the instanceRole label,
+// not on the ordinal -- so the status field was lying exactly where the condition
+// next to it was trying to tell the truth (NA39).
+//
+// The order of the three answers is the order of their authority:
+//
+//  1. The instanceRole=master label, when exactly one pod carries it. This is the
+//     literal selector of the -rw Service, so it is not merely a good guess at the
+//     master: it IS the pod that receives writes. Zero or several labeled pods answer
+//     nothing -- that is a no-master or split-brain state that checkAndRecoverNoMaster
+//     and checkSteadyStateSplitBrain own, and status must not pick a winner there.
+//  2. The known-master annotation, the operator's own record of the last promotion it
+//     performed or adopted. It is what the replica ConfigMap is built from, so it is
+//     the right answer while the labels are in flux (a sidecar that has not repatched
+//     yet, or a pod that is restarting).
+//  3. Pod-0, which is correct for a single-pod cluster and for any cluster that has
+//     never failed over -- and is the honest default when nothing else answers.
+//
+// Cost: a single cache-served List, and only for multi-replica clusters. A single-pod
+// cluster returns without reading anything, because its only pod is pod-0.
+func (r *ValkeyReconciler) currentMasterPod(ctx context.Context, v *vkov1.Valkey) string {
+	pod0 := fmt.Sprintf("%s-0", common.StatefulSetName(v, common.ComponentValkey))
+	if v.Spec.Replicas <= 1 {
+		return pod0
+	}
+
+	labeled, err := r.listMasterLabeledPods(ctx, v)
+	if err != nil {
+		log.FromContext(ctx).Info("Cannot list master-labeled pods for the status; falling back to the record",
+			"cluster", v.Name, "error", err)
+	} else if len(labeled) == 1 {
+		return labeled[0].Name
+	}
+
+	if recorded := knownMasterPodName(v); recorded != "" {
+		return recorded
+	}
+	return pod0
 }
 
 // updateHAStatus updates the status for HA (Sentinel) mode.
@@ -1610,11 +1684,24 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 // It refreshes the object from the API server before writing to avoid conflicts.
 //
 // ObservedGeneration is taken from the refreshed object, not from the caller's
-// copy, so it names the spec generation the condition was actually computed
-// against. Every Ready condition already carries it; without it here, tooling
-// that judges staleness by observedGeneration (kstatus and everything modelled
-// on it) reads ReconcileBlocked and SidecarUpdatePending as generation 0 and
-// therefore as permanently stale.
+// copy. It therefore names the generation the CR carried at the moment of the
+// write — which is normally, but not necessarily, the generation the condition
+// was computed against: a spec edit landing between the caller's evaluation and
+// this refresh makes the condition claim a generation it did not evaluate. That
+// over-claim lasts one pass, because the next reconcile recomputes the condition
+// from the new spec and overwrites it. The field is stamped at all because tooling
+// that judges staleness by observedGeneration (kstatus and everything modelled on
+// it) reads a condition without one as generation 0 and therefore as permanently
+// stale; every Ready condition already carries it.
+//
+// The status write is skipped when meta.SetStatusCondition reports no change.
+// That helper counts a differing Status, Reason, Message or ObservedGeneration as
+// a change (LastTransitionTime alone never is — it only moves on a status flip),
+// and v was just refreshed from the API server, so "no change" means the stored
+// condition already matches in every field this write would set. Without the skip
+// every caller that reports a steady state — setSidecarUpdatePendingCondition on
+// each standalone pass being the live one — issued a status update per reconcile,
+// which is what the skip guards in setReconcileBlockedCondition exist to avoid.
 //
 // Both failures are logged and swallowed rather than returned: a condition is a
 // report about the pass, never a reason to fail it, and every caller is a void
@@ -1631,14 +1718,16 @@ func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valk
 		}
 		return
 	}
-	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+	if !meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		ObservedGeneration: v.Generation,
 		Reason:             reason,
 		Message:            message,
 		LastTransitionTime: metav1.Now(),
-	})
+	}) {
+		return
+	}
 	if err := r.Status().Update(ctx, v); err != nil {
 		logger.Error(err, "Failed to write status condition; it will be retried on the next reconcile",
 			"condition", condType, "reason", reason)
@@ -1662,6 +1751,32 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 		metav1.ConditionFalse,
 		"SidecarUpToDate",
 		"All sidecar containers are running the desired image")
+}
+
+// clearSidecarUpdatePending flips SidecarUpdatePending to False, but only for a CR
+// that actually carries the condition.
+//
+// The False branch of setSidecarUpdatePendingCondition had exactly one caller,
+// handleStandaloneRollingUpdate, and it was unreachable on the transition that
+// matters (NA48). That function is only entered while a rolling update is needed or a
+// state annotation is set; the moment the deferred sidecar update actually applies --
+// an admin deletes the pod, it comes back on the current template -- neither holds,
+// checkAndHandleRollingUpdate returns before dispatching, and the condition stays
+// True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable
+// from a cluster that never applied it, and permanent drift for anything keyed on the
+// condition.
+//
+// The presence check is what keeps this from being a new condition on every CR in the
+// fleet: meta.SetStatusCondition adds an absent condition and reports a change, so
+// calling it unconditionally would write SidecarUpdatePending=False onto clusters that
+// never had a sidecar drift -- an upgrade that changes the status of every existing
+// cluster. Only a pending-to-resolved transition writes; everything else is one map
+// lookup on the healthy path.
+func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSidecarUpdatePending) == nil {
+		return
+	}
+	r.setSidecarUpdatePendingCondition(ctx, v, false)
 }
 
 // checkAndRecoverNoMaster detects a no-master state in multi-replica non-Sentinel
@@ -1724,6 +1839,22 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
 	portStr := fmt.Sprintf("%d", port)
+
+	// Record the promotion before performing it. The known-master annotation is
+	// what checkSteadyStateSplitBrain demotes toward and what the init script
+	// self-claims on, so promoting without recording leaves a stale name pointing
+	// at some other pod — and this function never gets a second chance to fix it,
+	// because the next pass finds a master and short-circuits on hasMaster.
+	//
+	// Ordering the record before the REPLICAOF is what makes its failure
+	// recoverable: nothing is promoted yet, so the returned error simply retries
+	// the whole recovery on the next pass (the caller's error path requeues).
+	// Naming a pod that is still a replica is harmless meanwhile —
+	// confirmedMasterAuthority demotes nothing until the named pod itself reports
+	// role:master.
+	if err := r.recordPromotedMaster(ctx, v, masterHost); err != nil {
+		return false, fmt.Errorf("recording %s as known master: %w", masterPodName, err)
+	}
 
 	// Promote pod-0 to master.
 	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
