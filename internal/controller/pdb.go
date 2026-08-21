@@ -9,6 +9,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -44,10 +45,13 @@ func (r *ValkeyReconciler) reconcileDataPodDisruptionBudget(ctx context.Context,
 		return r.cleanupPodDisruptionBudget(ctx, v, builder.PodDisruptionBudgetName(v))
 	}
 
-	if err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v)); err != nil {
+	applied, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v))
+	if err != nil {
 		return err
 	}
-	r.warnIfDataBudgetProtectsNothing(ctx, v)
+	if applied {
+		r.warnIfDataBudgetProtectsNothing(ctx, v)
+	}
 	return nil
 }
 
@@ -64,6 +68,10 @@ const reasonPodDisruptionBudgetTooPermissive = "PodDisruptionBudgetTooPermissive
 // stayed silent for exactly the change that created the hazard. The repetition
 // that costs is the Event, and the recorder aggregates a repeated Event into one
 // series instead of new objects.
+//
+// It is called only when the budget is actually in effect: against a foreign budget
+// under the same name nothing was written, and reporting maxUnavailable of an object
+// that does not exist contradicts the PodDisruptionBudgetNotOwned warning (NA32).
 func (r *ValkeyReconciler) warnIfDataBudgetProtectsNothing(ctx context.Context, v *vkov1.Valkey) {
 	maxUnavailable := v.PodDisruptionBudgetMaxUnavailable()
 	if maxUnavailable < v.Spec.Replicas {
@@ -92,10 +100,13 @@ func (r *ValkeyReconciler) reconcileSentinelPodDisruptionBudget(ctx context.Cont
 		return r.cleanupPodDisruptionBudget(ctx, v, builder.SentinelPodDisruptionBudgetName(v))
 	}
 
-	if err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v)); err != nil {
+	applied, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
+	if err != nil {
 		return err
 	}
-	r.warnIfSentinelBudgetBlocksEveryDrain(ctx, v)
+	if applied {
+		r.warnIfSentinelBudgetBlocksEveryDrain(ctx, v)
+	}
 	return nil
 }
 
@@ -117,6 +128,10 @@ const reasonSentinelPodDisruptionBudgetBlocksDrains = "SentinelPodDisruptionBudg
 // rather than on writes. Scaling spec.sentinel.replicas 3 -> 2 leaves the quorum
 // at 2, so the PDB object is byte-identical and a write-gated warning would stay
 // silent for exactly the change that turned the budget into a drain blocker.
+//
+// Like the data-side warning it is called only when the budget is in effect; a
+// foreign budget under the same name has a minAvailable of its own and the operator
+// must not describe it with values it never wrote (NA32).
 func (r *ValkeyReconciler) warnIfSentinelBudgetBlocksEveryDrain(ctx context.Context, v *vkov1.Valkey) {
 	replicas := v.Spec.Sentinel.Replicas
 	minAvailable := builder.SentinelQuorumFor(replicas)
@@ -146,29 +161,38 @@ func logPodDisruptionBudgetSkip(ctx context.Context, name string, replicas int32
 }
 
 // reconcilePodDisruptionBudget ensures a single PDB matches the desired state.
+//
+// It reports whether the desired budget is in effect. False means a
+// PodDisruptionBudget under that name exists but is controlled by something else:
+// nothing was written, so every value in spec.podDisruptionBudget describes no live
+// object. Callers use the verdict to suppress the content warnings, which would
+// otherwise report on a budget that was never created (NA32).
 func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *vkov1.Valkey,
-	desired *policyv1.PodDisruptionBudget) error {
+	desired *policyv1.PodDisruptionBudget) (bool, error) {
 	logger := log.FromContext(ctx)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
+		return false, fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
 	}
 
 	current := &policyv1.PodDisruptionBudget{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating PodDisruptionBudget", "name", desired.Name)
-		return r.Create(ctx, desired)
+		if createErr := r.Create(ctx, desired); createErr != nil {
+			return false, createErr
+		}
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if !metav1.IsControlledBy(current, v) {
 		r.warnPodDisruptionBudgetNotOwned(ctx, v, desired.Name,
 			"spec.podDisruptionBudget cannot take effect until that budget is deleted or renamed")
-		return nil
+		return false, nil
 	}
 
 	if builder.PodDisruptionBudgetHasChanged(desired, current) ||
@@ -184,14 +208,27 @@ func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *
 		// Changing it is a convention-wide change, deliberately out of scope here.
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return true, r.Update(ctx, current)
 	}
 
-	return nil
+	return true, nil
 }
 
 // cleanupPodDisruptionBudget deletes the named PDB if it exists and this Valkey
 // owns it.
+//
+// The foreign-budget warning is gated on the feature being switched on (NA32).
+// The cleanup path runs on every pass of every CR that never opted in, so an
+// ungated warning turned the documented pre-feature workaround — a hand-written PDB
+// under the StatefulSet name — into a permanent Warning stream for users who changed
+// nothing when they upgraded the operator. With the feature off, the operator has no
+// intention towards that budget and therefore nothing to report.
+//
+// The warning does fire while the feature is enabled but not applicable (fewer than
+// MinPDBReplicas replicas, or Sentinel disabled): the CR asked for operator-managed
+// budgets, the name is taken, and scaling back up would silently produce no budget at
+// all — the reconcile path would hit the same foreign object and refuse. That is worth
+// one aggregated Event series per opted-in CR.
 func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey, name string) error {
 	logger := log.FromContext(ctx)
 	pdb := &policyv1.PodDisruptionBudget{}
@@ -203,16 +240,44 @@ func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vk
 	}
 
 	if !metav1.IsControlledBy(pdb, v) {
-		r.warnPodDisruptionBudgetNotOwned(ctx, v, name,
-			"the operator only deletes budgets it created")
+		if v.IsPodDisruptionBudgetEnabled() {
+			r.warnPodDisruptionBudgetNotOwned(ctx, v, name,
+				"the operator only deletes budgets it created")
+		}
 		return nil
 	}
 
 	logger.Info("Deleting PodDisruptionBudget", "name", name)
-	if err := r.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
+	// The ownership decision above was made on a cache-backed read, so the object
+	// under this name can have been replaced between the Get and the Delete: the
+	// operator budget is gone and the user recreated their own under the same name
+	// before the cache caught up. Deleting by name alone would then destroy the
+	// user's object — precisely what the ownership guard promises not to do (NA31).
+	// The UID precondition makes the Delete apply to the object that was inspected
+	// or to none at all.
+	//
+	// UID only, no ResourceVersion: the disruption controller rewrites PDB .status
+	// (disruptionsAllowed, currentHealthy) continuously, so a cached read is
+	// routinely a few revisions behind and a ResourceVersion precondition would
+	// reject nearly every cleanup forever. A changed ResourceVersion is still the
+	// same object; only a changed UID means a different one, and identity is all
+	// this guard is about.
+	err := r.Delete(ctx, pdb, client.Preconditions{UID: &pdb.UID})
+	switch {
+	case err == nil || apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		// The precondition failed: the name now holds a different object, which by
+		// definition is not the budget this pass decided to delete. Nothing is left
+		// to do and nothing went wrong — the guard did its job — so the pass is not
+		// failed over it. The next pass re-reads the name and, if the new object is
+		// foreign, takes the ownership branch above.
+		logger.Info("Skipping PodDisruptionBudget deletion: the object was replaced under its name",
+			"name", name, "uid", pdb.UID)
+		return nil
+	default:
 		return fmt.Errorf("deleting poddisruptionbudget: %w", err)
 	}
-	return nil
 }
 
 // reasonPodDisruptionBudgetNotOwned is the Event reason for a PodDisruptionBudget
@@ -232,6 +297,8 @@ const reasonPodDisruptionBudgetNotOwned = "PodDisruptionBudgetNotOwned"
 // Like the NA6/NA7 budget warnings this fires on every applicable pass rather than
 // on writes: the condition is a property of the cluster, not of a transition, and
 // the recorder aggregates a repeated Event into one series instead of new objects.
+// "Applicable" excludes the cleanup path of a CR that never enabled the feature —
+// see cleanupPodDisruptionBudget for why (NA32).
 func (r *ValkeyReconciler) warnPodDisruptionBudgetNotOwned(ctx context.Context, v *vkov1.Valkey,
 	name, consequence string) {
 	log.FromContext(ctx).Info("PodDisruptionBudget exists but is not owned by this Valkey; "+
