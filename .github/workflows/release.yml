@@ -25,9 +25,55 @@ env:
 
 jobs:
   e2e-tests:
-    name: E2E Tests
+    name: E2E Tests (${{ matrix.topology }})
     runs-on: self-hosted
     timeout-minutes: 60
+    strategy:
+      # The legs run in parallel: each lands on its own ephemeral ARC runner pod,
+      # and the distinct cluster names keep them collision-free even if two pods
+      # are ever scheduled onto the same node.
+      fail-fast: false
+      matrix:
+        include:
+          # Valkey 9 leg: the full suite on a single-node cluster, against the
+          # line that is also the default. The selector is spelled out rather
+          # than left empty, because a leg whose name claims a line must not
+          # follow the default when the default moves - that is how a leg goes
+          # green while testing something other than what it says.
+          # The cluster keeps the Makefile default name, so reproducing this leg
+          # locally is `make e2e-local` with nothing overridden.
+          - topology: single-node-valkey9
+            workers: 0
+            cluster: valkey-operator-test
+            run_filter: ""
+            require_multi_node: "false"
+            valkey_line: "9"
+          # Multi-node leg: re-runs only the scenarios whose outcome depends on the
+          # node count - eviction serialization and anti-affinity spread.
+          # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
+          # multi-node clusters, so spreading three replicas needs three workers.
+          # The line it runs is irrelevant to what it tests, but it is named and
+          # passed like every other leg: no leg leaves the reader to resolve an
+          # empty selector against the current default.
+          - topology: multi-node-valkey9
+            workers: 3
+            cluster: valkey-operator-test-multinode
+            run_filter: TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget
+            require_multi_node: "true"
+            valkey_line: "9"
+          # Valkey 8 leg: the same suite on the same topology against the other
+          # supported Valkey line. It carries a selector, not an image - the pins
+          # live in test/testimages/images.go and a copy here would have to be
+          # bumped in lockstep with them.
+          - topology: single-node-valkey8
+            workers: 0
+            cluster: valkey-operator-test-valkey8
+            run_filter: ""
+            require_multi_node: "false"
+            valkey_line: "8"
+    env:
+      KIND_CLUSTER: ${{ matrix.cluster }}
+      KIND_WORKERS: ${{ matrix.workers }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,14 +116,24 @@ jobs:
 
       - name: Create Kind config for DinD
         run: |
-          cat << EOF > kind-config.yaml
+          set -euo pipefail
+          {
+            cat << EOF
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
-          name: valkey-operator-test
+          name: ${KIND_CLUSTER}
           networking:
             kubeProxyMode: "iptables"
           nodes:
           - role: control-plane
+          EOF
+            # One worker line per matrix worker; the single-node legs emit none.
+            worker=0
+            while [ "${worker}" -lt "${KIND_WORKERS}" ]; do
+              echo "- role: worker"
+              worker=$((worker + 1))
+            done
+            cat << EOF
           # Use native snapshotter to avoid nested overlay issues in DinD
           containerdConfigPatches:
           - |-
@@ -85,6 +141,9 @@ jobs:
               snapshotter = "native"
               disable_snapshot_annotations = false
           EOF
+          } > kind-config.yaml
+          echo "=== kind-config.yaml ==="
+          cat kind-config.yaml
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v5
@@ -97,7 +156,7 @@ jobs:
         with:
           version: v0.30.0
           node_image: kindest/node:v${{ env.KUBERNETES_VERSION }}
-          cluster_name: valkey-operator-test
+          cluster_name: ${{ matrix.cluster }}
           wait: 300s
           ignore_failed_clean: true
           config: kind-config.yaml
@@ -108,14 +167,27 @@ jobs:
           kubectl cluster-info
           kubectl wait --for=condition=Ready nodes --all --timeout=180s
           kubectl get nodes
+          # The multi-node leg is only worth running with the nodes it asked for:
+          # a cluster that silently came up smaller would turn its assertions into
+          # skips, which is exactly the blind spot this leg exists to close.
+          expected=$(( KIND_WORKERS + 1 ))
+          actual=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+          if [ "$actual" -ne "$expected" ]; then
+            echo "ERROR: the ${{ matrix.topology }} leg expects ${expected} nodes, cluster has ${actual}"
+            exit 1
+          fi
 
-      - name: Fix inotify limits inside Kind node
+      - name: Fix inotify limits inside Kind nodes
         run: |
+          set -euo pipefail
           # Since Linux 5.13, inotify limits are user-namespace-aware.
           # Host sysctl settings are NOT inherited by containers.
           # kube-proxy crashes with "too many open files" without this.
-          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_watches=1048576
-          docker exec valkey-operator-test-control-plane sysctl -w fs.inotify.max_user_instances=8192
+          # Applied per node: every worker of the multi-node leg runs its own kube-proxy.
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            docker exec "$node" sysctl -w fs.inotify.max_user_watches=1048576
+            docker exec "$node" sysctl -w fs.inotify.max_user_instances=8192
+          done
 
       - name: Wait for kube-system pods
         run: |
@@ -124,7 +196,7 @@ jobs:
           kubectl -n kube-system get pods -o wide
           echo ""
           echo "=== containerd info inside Kind node ==="
-          docker exec valkey-operator-test-control-plane ctr version || true
+          docker exec "${KIND_CLUSTER}-control-plane" ctr version || true
           echo ""
 
           # ---------- helper: resilient daemonset wait ----------
@@ -211,20 +283,32 @@ jobs:
 
       - name: Build and load operator image
         run: |
+          set -euo pipefail
           make docker-build IMG=valkey-operator:test
           # Manual ctr import without --all-platforms/--snapshotter flags
-          # to avoid "no unpack platforms defined" error with native snapshotter in DinD
-          docker save valkey-operator:test | docker exec -i valkey-operator-test-control-plane ctr --namespace=k8s.io images import -
+          # to avoid "no unpack platforms defined" error with native snapshotter in DinD.
+          # Imported into every node: the operator Deployment runs with
+          # pullPolicy: Never (test/e2e/helm-values.yaml) and may land on any worker.
+          mkdir -p tmp
+          docker save valkey-operator:test -o tmp/valkey-operator-test.tar
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            echo "Importing operator image into ${node}..."
+            docker exec -i "$node" ctr --namespace=k8s.io images import - < tmp/valkey-operator-test.tar
+          done
+          rm -f tmp/valkey-operator-test.tar
 
       - name: Verify image in cluster
         run: |
-          echo "=== Verifying image is available in Kind cluster ==="
-          docker exec valkey-operator-test-control-plane crictl images | grep -E 'valkey-operator\s+test|valkey-operator:test' || {
-            echo "ERROR: Image not found in cluster!"
-            echo "Available images:"
-            docker exec valkey-operator-test-control-plane crictl images
-            exit 1
-          }
+          set -euo pipefail
+          echo "=== Verifying image is available on every Kind node ==="
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            docker exec "$node" crictl images | grep -E 'valkey-operator\s+test|valkey-operator:test' || {
+              echo "ERROR: Image not found on ${node}!"
+              echo "Available images:"
+              docker exec "$node" crictl images
+              exit 1
+            }
+          done
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -325,23 +409,92 @@ jobs:
         run: kubectl -n valkey-operator-system wait --for=condition=available --timeout=120s deployment/valkey-operator
 
       - name: Run E2E tests
-        run: make test-e2e
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          make test-e2e E2E_RUN="${E2E_RUN}" 2>&1 | tee "tmp/e2e-${{ matrix.topology }}.log"
+          # A -run filter that stopped matching (renamed test, moved file) would leave
+          # this leg green without executing anything, so the filtered leg proves its
+          # two scenarios ran.
+          if [ -n "${E2E_RUN}" ]; then
+            for guard in TestE2E_AntiAffinity_HardSpreadsAcrossNodes \
+                         TestE2E_PodDisruptionBudget_SerializesEvictions; do
+              grep -q -- "--- PASS: ${guard}" "tmp/e2e-${{ matrix.topology }}.log" || {
+                echo "ERROR: ${guard} did not run - E2E_RUN='${E2E_RUN}' no longer matches it"
+                exit 1
+              }
+            done
+          fi
         env:
           E2E_TESTS: "true"
+          E2E_RUN: ${{ matrix.run_filter }}
+          # Turns "not enough nodes" from a skip into a failure on the multi-node leg.
+          E2E_REQUIRE_MULTI_NODE: ${{ matrix.require_multi_node }}
+          # Empty means the pinned Valkey 9 release; the Valkey 8 leg sets "8".
+          # An unrecognised value panics rather than falling back, so a typo here
+          # cannot turn this leg into a second Valkey 9 run reported as a pass.
+          E2E_VALKEY_LINE: ${{ matrix.valkey_line }}
 
       - name: Collect logs on failure
         if: failure()
         run: |
+          # 100 lines covered about four minutes of a busy suite, which put the
+          # message of the failing reconcile out of reach and left only its stack
+          # trace -- the whole reason the TopologyRestored defect took a second
+          # run to diagnose. The operator logs one line per pass and per CR.
           echo "=== Operator logs ==="
-          kubectl -n valkey-operator-system logs -l app.kubernetes.io/name=valkey-operator --tail=100 || true
+          kubectl -n valkey-operator-system logs -l app.kubernetes.io/name=valkey-operator --tail=2000 || true
           echo "=== Describe pods ==="
           kubectl -n valkey-operator-system describe pods || true
           echo "=== Events ==="
           kubectl -n valkey-operator-system get events --sort-by='.lastTimestamp' || true
+          # Pod logs of the test namespaces. Only the operator was ever collected,
+          # so a defect that lives in the sidecar -- the drain handler failing over
+          # a dying master is the one that matters -- left no artifact at all. The
+          # drain runs while the pod terminates, so --previous is the half that
+          # carries it once the replacement is up.
+          # Node conditions first: a pod that lost its process to an eviction or to a
+          # failing probe leaves its reason here and nowhere else, and the failure
+          # that motivated this collection could not be told apart from an operator
+          # decision without it.
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide || true
+          kubectl describe nodes | grep -E '^(Name:|  Ready|  MemoryPressure|  DiskPressure|  PIDPressure)' || true
+          echo "=== Test namespace pod logs ==="
+          for ns in $(kubectl get ns -o name | sed 's|namespace/||' | grep '^e2e-'); do
+            echo "--- $ns pods ---"
+            kubectl -n "$ns" get pods -o wide || true
+            # Events outlive the pods they describe, so they answer "was it killed,
+            # evicted or unhealthy" even for a pod the test already tore down.
+            echo "--- $ns events ---"
+            kubectl -n "$ns" get events --sort-by='.lastTimestamp' || true
+            for pod in $(kubectl -n "$ns" get pods -o name | sed 's|pod/||'); do
+              echo "--- $ns/$pod (current) ---"
+              kubectl -n "$ns" logs "$pod" --all-containers --prefix --tail=300 2>&1 || true
+              echo "--- $ns/$pod (previous) ---"
+              kubectl -n "$ns" logs "$pod" --all-containers --prefix --previous --tail=300 2>&1 || true
+            done
+          done
 
       - name: Cleanup Kind cluster
         if: always()
-        run: kind delete cluster --name valkey-operator-test || true
+        run: kind delete cluster --name "${KIND_CLUSTER}" || true
+
+  # Branch protection requires the status context "E2E Tests". The matrix legs
+  # report as "E2E Tests (<topology>)" - one context per leg, renamed whenever a
+  # leg is - so this gate job carries the stable context and fails unless every
+  # leg succeeded. Keeps the required check independent of matrix reshaping.
+  e2e-gate:
+    name: E2E Tests
+    runs-on: self-hosted
+    needs: [e2e-tests]
+    if: always()
+    steps:
+      - name: Require all matrix legs to succeed
+        run: |
+          result="${{ needs.e2e-tests.result }}"
+          echo "E2E matrix result: ${result}"
+          [ "${result}" = "success" ]
 
   linter:
     name: Code Linting
@@ -463,6 +616,47 @@ jobs:
           path: coverage/unit.out
           retention-days: 7
 
+  # The operator does not build the Valkey image, it runs shell in it: two init
+  # container scripts, the auth-wrapped container command, the probes and the drain
+  # preStop hook. This job asks the pinned images whether they still contain what
+  # those execute. It needs docker and no cluster, so it answers in seconds and
+  # names the missing binary - instead of surfacing in the E2E job minutes later as
+  # a cluster that will not converge.
+  valkey-image-tools:
+    name: Valkey Image Tools
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      # The self-hosted runner image ships no make, so every job that enters the
+      # Makefile installs it. Leaving it out fails at the first target with
+      # "make: command not found", not at a missing tool inside the target.
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # Docker Hub rate-limits anonymous pulls, and this job pulls two images on
+      # every run.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Check the pinned Valkey images
+        run: make test-image-tools
+
   govulncheck:
     name: Vulnerability Check
     runs-on: self-hosted
@@ -517,6 +711,48 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Threshold: 15 (functions above this are flagged)" >> $GITHUB_STEP_SUMMARY
+
+  generated-manifests:
+    name: Generated Manifests Up To Date
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # Runs the generator itself, so the kubebuilder markers in the Go sources
+      # are compared against the checked-in manifests. The RBAC drift test
+      # (internal/controller/rbac_drift_test.go, docs/adr/0006-delete-only-what-the-operator-owns.md,
+      # D12, D13) only compares the generated role against the Helm ClusterRole -
+      # manifest against manifest - so a stale config/rbac/role.yaml passes it while
+      # the operator ships without a verb its markers grant. build.yml runs the same
+      # check, but only on `release: published`; this job moves it to every push and
+      # PR (docs/adr/0014-rbac-lives-in-three-places.md, D5).
+      - name: Regenerate CRDs, RBAC and DeepCopy
+        run: make generate-all
+
+      - name: Verify generated artifacts are committed
+        run: |
+          if ! git diff --quiet || [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+            echo "::error::Generated CRDs / RBAC role / DeepCopy / Helm chart CRD are out of sync with the Go sources."
+            echo "Run 'make generate-all' locally and commit the result."
+            git --no-pager diff --stat
+            git --no-pager diff
+            git status --porcelain
+            exit 1
+          fi
 
   integration-tests:
     name: Integration Tests (envtest)
@@ -843,7 +1079,7 @@ jobs:
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, unit-tests, integration-tests, e2e-tests, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, valkey-image-tools, coverage-report]
     name: Semantic Release
     runs-on: self-hosted
     permissions:

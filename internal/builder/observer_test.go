@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/common"
@@ -95,8 +97,72 @@ func TestBuildObserverDeployment_Standalone(t *testing.T) {
 	assert.Empty(t, c.VolumeMounts)
 	assert.Empty(t, deploy.Spec.Template.Spec.Volumes)
 
-	// ServiceAccount.
-	assert.Equal(t, "test-sidecar", deploy.Spec.Template.Spec.ServiceAccountName)
+	// ServiceAccount: the observer's own, not the sidecar's, and no token mounted.
+	assert.Equal(t, "test-observer", deploy.Spec.Template.Spec.ServiceAccountName,
+		"the observer must not run under the sidecar ServiceAccount, which grants pods patch")
+	require.NotNil(t, deploy.Spec.Template.Spec.AutomountServiceAccountToken)
+	assert.False(t, *deploy.Spec.Template.Spec.AutomountServiceAccountToken,
+		"the observer calls no Kubernetes API, so it mounts no token (ADR 0012 D8 step 2)")
+}
+
+// --- ObserverServiceAccountName / BuildObserverServiceAccount ---
+
+func TestObserverServiceAccountName(t *testing.T) {
+	assert.Equal(t, "my-valkey-observer", ObserverServiceAccountName(newTestValkey("my-valkey")))
+}
+
+func TestBuildObserverServiceAccount(t *testing.T) {
+	v := newTestValkey("my-valkey", func(v *vkov1.Valkey) { v.Namespace = "production" })
+
+	sa := BuildObserverServiceAccount(v)
+
+	require.NotNil(t, sa)
+	assert.Equal(t, "my-valkey-observer", sa.Name)
+	assert.Equal(t, "production", sa.Namespace)
+	assert.Equal(t, ComponentObserver, sa.Labels[common.LabelComponent])
+	assert.Equal(t, "my-valkey", sa.Labels[common.LabelInstance])
+	assert.NotEqual(t, SidecarServiceAccountName(v), sa.Name,
+		"sharing the sidecar name would share its Role")
+}
+
+// --- ObserverDeploymentHasChanged: pod identity ---
+
+func TestObserverDeploymentHasChanged_ServiceAccountName(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+
+	// An observer created before ADR 0012 D8 step 2 ran under the sidecar SA and
+	// mounted its token. Nothing else about the pod changed, so without this
+	// comparison the narrowing would never reach an existing cluster.
+	legacy := desired.DeepCopy()
+	legacy.Spec.Template.Spec.ServiceAccountName = SidecarServiceAccountName(v)
+	legacy.Spec.Template.Spec.AutomountServiceAccountToken = nil
+
+	assert.True(t, ObserverDeploymentHasChanged(desired, legacy))
+	assert.False(t, ObserverDeploymentHasChanged(desired, desired.DeepCopy()),
+		"an already-migrated observer must not be rewritten on every pass")
+}
+
+func TestObserverDeploymentHasChanged_AutomountToken(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+
+	unset := desired.DeepCopy()
+	unset.Spec.Template.Spec.AutomountServiceAccountToken = nil
+	assert.True(t, ObserverDeploymentHasChanged(desired, unset),
+		"an unset field means the token is mounted, which is what the change removes")
+
+	explicitTrue := desired.DeepCopy()
+	explicitTrue.Spec.Template.Spec.AutomountServiceAccountToken = ptr.To(true)
+	assert.True(t, ObserverDeploymentHasChanged(desired, explicitTrue))
+
+	// nil and an explicit true are the same state and must not churn against each other.
+	bothMount := unset.DeepCopy()
+	assert.False(t, ObserverDeploymentHasChanged(explicitTrue, bothMount))
 }
 
 func TestBuildObserverDeployment_Args_Standalone(t *testing.T) {
@@ -534,4 +600,70 @@ func TestBuildObserverDeployment_UnreadyWhen_PartialFalse(t *testing.T) {
 	assert.Contains(t, args, "--unready-when-replica-sync-failure=false")
 	assert.Contains(t, args, "--unready-when-sentinel-unreachable=false")
 	assert.Contains(t, args, "--unready-when-sentinel-replica-hostnames-invalid=false")
+}
+
+// The observer connects to Sentinel itself. Under TLS the plaintext Sentinel port
+// is closed (spec.sentinel.allowUnencrypted defaults to false), so an address list
+// still naming 26379 makes every Sentinel check fail for a cluster that is
+// otherwise healthy.
+func TestBuildObserverDeployment_SentinelAddrsUseTheTLSPortUnderTLS(t *testing.T) {
+	newCR := func(tlsEnabled bool) *vkov1.Valkey {
+		return newTestValkey("test", func(v *vkov1.Valkey) {
+			v.Spec.Replicas = 3
+			v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+			if tlsEnabled {
+				v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+			}
+		})
+	}
+	addrsArg := func(v *vkov1.Valkey) string {
+		t.Helper()
+		for _, arg := range BuildObserverDeployment(v, testOperatorImage).Spec.Template.Spec.Containers[0].Args {
+			if rest, ok := strings.CutPrefix(arg, "--sentinel-addrs="); ok {
+				return rest
+			}
+		}
+		t.Fatal("the observer must be told where Sentinel is")
+		return ""
+	}
+
+	plain := addrsArg(newCR(false))
+	assert.Equal(t, 3, strings.Count(plain, fmt.Sprintf(":%d", SentinelPort)),
+		"one plaintext address per Sentinel replica")
+
+	secured := addrsArg(newCR(true))
+	assert.Equal(t, 3, strings.Count(secured, fmt.Sprintf(":%d", SentinelTLSPort)),
+		"under TLS every Sentinel address must name the TLS port")
+	assert.NotContains(t, secured, fmt.Sprintf(":%d", SentinelPort),
+		"the plaintext Sentinel port is closed under TLS")
+}
+
+// A Deployment somebody scaled by hand must be scaled back: the observer is the
+// readiness signal for the whole cluster, and at zero replicas it reports nothing
+// while the CR still claims it is enabled.
+func TestObserverDeploymentHasChanged_ScaledByHand(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+	current := desired.DeepCopy()
+	current.Spec.Replicas = ptr.To(int32(0))
+
+	assert.True(t, ObserverDeploymentHasChanged(desired, current))
+}
+
+// A container appended to the live pod template (an injected sidecar, a leftover
+// from an older operator version) changes what runs next to the observer, so it
+// counts as drift rather than as something to adopt silently.
+func TestObserverDeploymentHasChanged_ExtraContainer(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	desired := BuildObserverDeployment(v, testOperatorImage)
+	current := desired.DeepCopy()
+	current.Spec.Template.Spec.Containers = append(current.Spec.Template.Spec.Containers,
+		corev1.Container{Name: "injected", Image: "proxy:v1"})
+
+	assert.True(t, ObserverDeploymentHasChanged(desired, current))
 }

@@ -32,11 +32,15 @@ type RoleDetector interface {
 	DetectRole() (string, error)
 }
 
-// PodPatcher patches labels on a pod.
+// PodPatcher patches metadata on a pod.
 // This interface allows mocking in tests.
 type PodPatcher interface {
 	// PatchLabel patches the given label key to the given value on the pod.
 	PatchLabel(ctx context.Context, namespace, name, labelKey, labelValue string) error
+	// PatchAnnotation patches the given annotation key to the given value on the pod.
+	// The pod may be a peer, not the local one - the drain handler stamps the pod
+	// it promoted.
+	PatchAnnotation(ctx context.Context, namespace, name, key, value string) error
 }
 
 // SentinelMasterQuerier queries Sentinel for the current master address.
@@ -61,38 +65,11 @@ type Labeler struct {
 	myFQDN          string
 }
 
-// NewLabeler creates a new Labeler from the sidecar config.
-func NewLabeler(cfg Config) (*Labeler, error) {
-	detector, err := newValkeyRoleDetector(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	patcher, err := newKubernetesPodPatcher()
-	if err != nil {
-		return nil, err
-	}
-
-	l := &Labeler{
-		detector:     detector,
-		patcher:      patcher,
-		podName:      cfg.PodName,
-		podNamespace: cfg.PodNamespace,
-		pollInterval: cfg.PollInterval,
-	}
-
-	if cfg.SentinelEnabled && cfg.SentinelAddrs != "" {
-		querier, err := newSentinelMasterQuerier(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("creating sentinel master querier: %w", err)
-		}
-		l.SetSentinelCrossCheck(querier, cfg.SentinelMonitor, cfg.PodName+"."+cfg.HeadlessSvc)
-	}
-
-	return l, nil
-}
-
-// NewLabelerWithDeps creates a Labeler with injected dependencies (for testing).
+// NewLabelerWithDeps creates a Labeler with injected dependencies. The live
+// wiring is runSidecar (run.go), which builds the detector and patcher once and
+// shares them with the drain handler — which is why there is no constructor here
+// that builds its own: a second wiring path with its own detector/patcher pair
+// was dead code that could drift from the reachable one unnoticed.
 func NewLabelerWithDeps(detector RoleDetector, patcher PodPatcher, podName, podNamespace string, pollInterval time.Duration) *Labeler {
 	return &Labeler{
 		detector:     detector,
@@ -247,12 +224,26 @@ func newKubernetesPodPatcher() (*kubernetesPodPatcher, error) {
 	return &kubernetesPodPatcher{clientset: clientset}, nil
 }
 
-// PatchLabel performs a strategic merge patch on the pod to update a label.
+// PatchLabel performs a merge patch on the pod to update a label.
 func (p *kubernetesPodPatcher) PatchLabel(ctx context.Context, namespace, name, labelKey, labelValue string) error {
+	return p.patchMetadata(ctx, namespace, name, "labels", labelKey, labelValue)
+}
+
+// PatchAnnotation performs a merge patch on the pod to update an annotation.
+func (p *kubernetesPodPatcher) PatchAnnotation(ctx context.Context, namespace, name, key, value string) error {
+	return p.patchMetadata(ctx, namespace, name, "annotations", key, value)
+}
+
+// patchMetadata merge-patches a single key inside metadata.labels or
+// metadata.annotations. A merge patch on that map is additive for every other
+// key, so it cannot clobber the operator-owned hash annotations on the target
+// pod - which a whole-map replace would, making the pod look out of date to the
+// rolling update.
+func (p *kubernetesPodPatcher) patchMetadata(ctx context.Context, namespace, name, field, key, value string) error {
 	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"labels": map[string]string{
-				labelKey: labelValue,
+			field: map[string]string{
+				key: value,
 			},
 		},
 	}

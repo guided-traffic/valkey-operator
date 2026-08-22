@@ -1519,6 +1519,40 @@ func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnounceIP(t 
 		"Non-Sentinel init container must announce plain port")
 }
 
+// The init script is one indexed fmt.Sprintf, so a wrong verb index surfaces as a
+// literal "%!" in the rendered text rather than as a compile error. This renders
+// both flag combinations (plain, and TLS plus auth, which populate the optional
+// valkey-cli flag verbs) and pins the self-claim branch that ADR 0008 D8, D9 added.
+func TestBuildStatefulSet_MultiReplica_InitScript_RendersSelfClaimBranch(t *testing.T) {
+	plain := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+	})
+	tlsAuth := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		v.Spec.Auth = &vkov1.AuthSpec{SecretName: "my-secret", SecretPasswordKey: "password"}
+	})
+
+	for name, v := range map[string]*vkov1.Valkey{"plain": plain, "tls-auth": tlsAuth} {
+		t.Run(name, func(t *testing.T) {
+			sts := BuildStatefulSet(v, testOperatorImage)
+			require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
+			script := sts.Spec.Template.Spec.InitContainers[0].Command[2]
+
+			assert.NotContains(t, script, "%!",
+				"every fmt verb of the init script must be substituted")
+			assert.Contains(t, script, `if [ "$KNOWN_MASTER" = "$MY_HOST" ]; then`,
+				"the recorded master must recognise itself in the replica config")
+			assert.Contains(t, script, `elif [ "$SELF_IS_KNOWN_MASTER" = "1" ]; then`,
+				"the self-claim must sit below the discovery branch, above the ordinal fallback")
+			// The self-claim copies from the same mount the ordinal-0 branch uses,
+			// so a pod-0 that was named produces a byte-identical config.
+			assert.Contains(t, script,
+				"cp "+ConfigMountPath+"/"+ValkeyConfigKey+" "+WritableConfigMountPath+"/"+ValkeyConfigKey)
+		})
+	}
+}
+
 func TestBuildStatefulSet_MultiReplica_InitContainer_InjectsReplicaAnnouncePort_TLS(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3

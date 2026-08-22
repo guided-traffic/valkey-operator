@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"testing"
 	"time"
@@ -10,9 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -676,6 +680,33 @@ func TestRollingUpdateResult_Defaults(t *testing.T) {
 // --- Integration Tests with Fake Client ---
 
 // createPodForSts creates a pod that looks like it belongs to the given StatefulSet.
+// readyStatefulSetFor returns a data StatefulSet that already reports `replicas`
+// created and ready pods.
+//
+// The fake client runs no statefulset-controller, so a StatefulSet the reconcile
+// creates itself stays at status.replicas = 0 no matter how many pods the test
+// seeded. That state means "short of pods" to the reconciler and makes it requeue
+// for the nudge, which drowns out assertions about rolling-update requeues. Seeding
+// the status to match the pods a test creates keeps the fixture honest.
+func readyStatefulSetFor(v *vkov1.Valkey, replicas int32) *appsv1.StatefulSet {
+	desired := replicas
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.StatefulSetName(v, common.ComponentValkey),
+			Namespace: v.Namespace,
+			UID:       testStsUID(v, common.ComponentValkey),
+		},
+		Spec: appsv1.StatefulSetSpec{Replicas: &desired},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:      replicas,
+			ReadyReplicas: replicas,
+		},
+	}
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	controllerRefTo(v, sts)
+	return sts
+}
+
 func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *corev1.Pod {
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	podName := fmt.Sprintf("%s-%d", stsName, ordinal)
@@ -688,7 +719,7 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 		})
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: v.Namespace,
@@ -710,6 +741,8 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 			Conditions: conditions,
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod)
+	return pod
 }
 
 func TestCheckAndHandleRollingUpdate_NoUpdateNeeded(t *testing.T) {
@@ -984,7 +1017,7 @@ func TestReconcile_RollingUpdate_StandaloneNoRequeueWhenNoChange(t *testing.T) {
 	v := newTestValkey("test", "default")
 	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
 
-	r, _ := newTestReconciler(v, pod0)
+	r, _ := newTestReconciler(v, pod0, readyStatefulSetFor(v, 1))
 	result := reconcileOnce(t, r, "test", "default")
 
 	// No requeue needed — no image change.
@@ -1235,6 +1268,7 @@ func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ha-post",
 			Namespace: "default",
+			UID:       stsUIDFor("ha-post"),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -1253,6 +1287,7 @@ func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 			},
 		},
 	}
+	controllerRefTo(v, sts)
 
 	r, _ := newTestReconciler(v, pod0, pod1, pod2, sts)
 
@@ -1864,6 +1899,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 
 	r, c := newTestReconciler(v, pod0)
 	reconcileOnce(t, r, "test", "default")
@@ -1913,6 +1949,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 	pod1 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "default"},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{
@@ -1926,6 +1963,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod1)
 	pod2 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-2", Namespace: "default"},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{
@@ -1939,6 +1977,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod2)
 
 	r, c := newTestReconciler(v, pod0, pod1, pod2)
 	reconcileOnce(t, r, "test", "default")
@@ -1981,6 +2020,7 @@ func TestHandleStandaloneRollingUpdate_ValkeyImageChange_StillDeletesPod(t *test
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 
 	r, c := newTestReconciler(v, pod0)
 	reconcileOnce(t, r, "test", "default")
@@ -2144,7 +2184,7 @@ func createSentinelPod(v *vkov1.Valkey, ordinal int, image string, ready bool) *
 			Status: corev1.ConditionTrue,
 		})
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", stsName, ordinal),
 			Namespace: v.Namespace,
@@ -2154,6 +2194,8 @@ func createSentinelPod(v *vkov1.Valkey, ordinal int, image string, ready bool) *
 		}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: conditions},
 	}
+	ownedByTestSts(v, common.ComponentSentinel, pod)
+	return pod
 }
 
 // buildTestSentinelSts creates a minimal sentinel StatefulSet whose desired container
@@ -2163,7 +2205,7 @@ const sentinelTestNewImage = "valkey/valkey:9.0"
 func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	replicas := v.Spec.Sentinel.Replicas
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: v.Namespace},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -2174,6 +2216,11 @@ func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 			},
 		},
 	}
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent, and the pod
+	// guards compare against this UID.
+	sts.UID = testStsUID(v, common.ComponentSentinel)
+	controllerRefTo(v, sts)
+	return sts
 }
 
 func TestCheckAndHandleSentinelRollingUpdate_AllUpToDate(t *testing.T) {
@@ -2354,6 +2401,38 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 	}, pod2))
 }
 
+// --- ADR 0001 D7: a Sentinel rolling-update error must lead to a retry ---
+
+// TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError pins the ADR 0001 D7 fix.
+// The Sentinel rolling-update error path used to return (ctrl.Result{}, true) with
+// no error and no RequeueAfter, so the pass ended without any retry — and since a
+// status write does not re-trigger the CR watch (GenerationChangedPredicate),
+// reconciliation stalled until some unrelated owned-object event arrived.
+func TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError(t *testing.T) {
+	v, objs := sentinelQuorumWaitFixture(3)
+	failingPod := fmt.Sprintf("%s-0", common.StatefulSetName(v, common.ComponentSentinel))
+	failSentinelPodGet := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok && key.Name == failingPod {
+				return apierrors.NewInternalError(fmt.Errorf("etcd unavailable"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	r, _ := newInterceptedReconciler(failSentinelPodGet, objs...)
+
+	result, err := r.reconcileWorkload(context.Background(), v)
+
+	require.Error(t, err,
+		"a Sentinel rolling-update error must reach the caller so the rate limiter retries the pass")
+	assert.Contains(t, err.Error(), failingPod)
+	assert.Equal(t, vkov1.ValkeyPhaseError, v.Status.Phase,
+		"the error must also be visible on the CR, not only in the retry")
+	assert.Zero(t, result.RequeueAfter,
+		"the retry comes from the returned error; an extra RequeueAfter would bypass the rate limiter")
+}
+
 // --- persistKnownMaster ---
 
 // TestPersistKnownMaster_SetsAnnotation verifies that persistKnownMaster writes the
@@ -2524,9 +2603,6 @@ func (m *perPodMockChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Valke
 // after SENTINEL REMOVE+MONITOR sentinel cannot discover or fix it. Without
 // forceReplicaConnections the cluster is permanently stuck in "Syncing: 1/2".
 func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
 	v := newTestValkey("ha-cascaded", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:9.0"
@@ -2579,9 +2655,6 @@ func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testin
 // syncSentinelWithMaster uses the identified master pod's address (not an empty
 // string that would fall back to pod-0, which may not be the master).
 func TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMasterAddr(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent sentinel pods")
-	}
 	v := newTestValkey("ha-errstall", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:9.0"
@@ -3592,8 +3665,11 @@ func TestVerifyReplacedReplicasSynced_TimeoutPausesUpdate(t *testing.T) {
 
 func TestSyncWaitTimestamp_SetAndCheck(t *testing.T) {
 	v := newTestValkey("ts-test", "default")
-	r, _ := newTestReconciler(v)
+	r, c := newTestReconciler(v)
 	reconcileOnce(t, r, "ts-test", "default")
+	// The stored copy, so the arming write below actually lands — ensureWaitBound
+	// takes a rejected annotation back off the object (ADR 0010 D7/D8).
+	v = crGet(t, c, "ts-test")
 
 	// Initially not timed out.
 	assert.False(t, r.isSyncWaitTimedOut(v))
@@ -4094,27 +4170,39 @@ func TestCountMasters_SingleMaster(t *testing.T) {
 // when two pods report "master" in a non-sentinel cluster, the split-brain is detected
 // and the rogue master is demoted before the rolling update proceeds. This covers the
 // bug where detectAndResolveSplitBrain was only called in the Sentinel path.
+//
+// Every pod in the fixture is up to date on purpose: detectAndResolveSplitBrain runs at
+// the top of handleMultiReplicaRollingUpdate, ahead of the "all pods updated" branch
+// that finalizes the update. Moving the call behind that branch would leave the rogue
+// master in place, and that regression is what this test pins.
 func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	// Non-sentinel, 3-replica cluster with split-brain:
 	// pod-0 reports master (rogue, 0 slaves), pod-1 reports master (real, 1 slave), pod-2 replica.
-	// All pods have the current image so the rolling update was already complete — but
-	// a rogue master was left behind by a failed topology restoration.
+	// The pods are built from the persisted StatefulSet template, so the rolling update
+	// itself is already complete — the rogue master was left behind by a failed
+	// topology restoration.
 	v := newTestValkey("mr-split", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
 	})
+	sts := stsForValkey(v)
 
-	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	pod0 := podFromStsTemplate(v, sts, 0)
 	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
-	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	pod1 := podFromStsTemplate(v, sts, 1)
 	pod1.Labels[common.LabelInstanceRole] = common.RoleMaster
-	pod2 := createPodForSts(v, 2, "valkey/valkey:8.0", true)
+	pod2 := podFromStsTemplate(v, sts, 2)
 
-	r, _ := newTestReconciler(v, pod0, pod1, pod2)
+	r, _ := newTestReconciler(v, sts, pod0, pod1, pod2)
+
+	// A server that answers REPLICAOF, so the demotion is exercised for real instead
+	// of dying on a refused connection.
+	addr := fakeValkeyServer(t)
+	var demoted []string
+	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
+		demoted = append(demoted, target)
+		return valkeyclient.New(addr)
+	}
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4130,15 +4218,15 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 		},
 	}
 
-	sts := &appsv1.StatefulSet{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "mr-split", Namespace: "default"}, sts))
-
 	result := r.handleMultiReplicaRollingUpdate(context.Background(), v, sts)
 
-	// Should requeue (split-brain demoted, but REPLICAOF to rogue master will fail
-	// since no real Valkey pods exist — the demote is best-effort).
-	assert.True(t, result.NeedsRequeue, "Should requeue after split-brain detection")
-	assert.Nil(t, result.Error, "Should not return an error")
+	require.Nil(t, result.Error, "Should not return an error")
+	assert.True(t, result.Completed, "every pod is up to date, so the update finalizes")
+
+	// The master without connected slaves is the rogue one and the only pod that may
+	// be demoted — demoting pod-1 would point the data it serves at an empty master.
+	require.Len(t, demoted, 1, "exactly one pod must be demoted")
+	assert.Contains(t, demoted[0], "mr-split-0.", "the rogue master must be the demoted pod")
 }
 
 // --- Two-phase handleTopologyRestoration ---
@@ -4147,10 +4235,6 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 // promotes pod-0, sends REPLICAOF to all other pods, sets the
 // annotationTopologyRestoreStarted annotation, and requeues without completing.
 func TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-p1", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4169,6 +4253,14 @@ func TestHandleTopologyRestoration_Phase1SetsAnnotationAndRequeues(t *testing.T)
 		annotationPromotedPod:        "topo-p1-1",
 	}
 	require.NoError(t, c.Update(context.Background(), v))
+
+	// Phase 1 only reaches stateVerifyingTopology once REPLICAOF NO ONE on pod-0
+	// succeeded; a refused connection correctly keeps the state at
+	// stateRestoringTopology, so the fixture needs a server that answers.
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
 
 	// pod-0 is fully synced as replica of pod-1 and ready for promotion.
 	r.InstanceChecker = &mockInstanceChecker{
@@ -4254,10 +4346,6 @@ func TestVerifyTopologyRestored_CleanTopologyCompletes(t *testing.T) {
 // (via detectAndResolveSplitBrain) and requeues — until finalizationStallTimeout,
 // after which it clears state and completes to prevent an indefinite stall.
 func TestVerifyTopologyRestored_RogueMasterRetriedThenStall(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-stall", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4315,10 +4403,6 @@ func TestVerifyTopologyRestored_RogueMasterRetriedThenStall(t *testing.T) {
 // stall timeout, verifyTopologyRestored requeues rather than completing when a rogue
 // master is still present after a REPLICAOF attempt.
 func TestVerifyTopologyRestored_RequeuesWhenRogueMasterPresent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("topo-retry", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4421,10 +4505,6 @@ func TestFindPromotionCandidate_Pod0IsOnlyCandidate_ReturnsNegative(t *testing.T
 // stateVerifyingTopology. Without this guard the operator waits forever for
 // master_link_status=up on a self-referencing REPLICAOF.
 func TestHandleTopologyRestoration_SelfLoopRecovery(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode: makes network connection attempts to non-existent pods")
-	}
-
 	v := newTestValkey("selfloop", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Image = "valkey/valkey:8.0"
@@ -4444,6 +4524,14 @@ func TestHandleTopologyRestoration_SelfLoopRecovery(t *testing.T) {
 		annotationPromotedPod:        "selfloop-0", // self-loop: pod-0 was promoted
 	}
 	require.NoError(t, c.Update(context.Background(), v))
+
+	// Phase 1 only reaches stateVerifyingTopology once REPLICAOF NO ONE on pod-0
+	// succeeded; a refused connection correctly keeps the state at
+	// stateRestoringTopology, so the fixture needs a server that answers.
+	addr := fakeValkeyServer(t)
+	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
+		return valkeyclient.New(addr)
+	}
 
 	// GetReplicationInfo returns role=slave, link=down (the stuck self-loop state).
 	r.InstanceChecker = &mockInstanceChecker{

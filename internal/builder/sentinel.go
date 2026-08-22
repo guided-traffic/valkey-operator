@@ -54,6 +54,17 @@ const (
 	SentinelParallelSyncs = 1
 )
 
+// SentinelQuorumFor returns the number of Sentinels that must agree for a
+// failover: floor(replicas/2)+1, i.e. the majority. It is also the minAvailable
+// of the Sentinel PodDisruptionBudget — a voluntary disruption may never take the
+// majority, because that would leave the cluster without automatic failover.
+func SentinelQuorumFor(replicas int32) int32 {
+	if replicas <= 0 {
+		return SentinelQuorum
+	}
+	return replicas/2 + 1
+}
+
 // SentinelConfigMapName returns the name for the Sentinel ConfigMap.
 func SentinelConfigMapName(v *vkov1.Valkey) string {
 	return fmt.Sprintf("%s-sentinel-config", v.Name)
@@ -99,8 +110,8 @@ func generateSentinelConf(v *vkov1.Valkey, useKnownMaster bool) string {
 
 	// Calculate quorum: majority of sentinel replicas.
 	quorum := SentinelQuorum
-	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
-		quorum = int(v.Spec.Sentinel.Replicas/2) + 1
+	if v.Spec.Sentinel != nil {
+		quorum = int(SentinelQuorumFor(v.Spec.Sentinel.Replicas))
 	}
 
 	// Use TLS port for monitoring when TLS is enabled.
@@ -353,8 +364,9 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		})
 	}
 
-	return corev1.PodSpec{
+	spec := corev1.PodSpec{
 		ServiceAccountName: DefaultServiceAccountName,
+		Affinity:           BuildPodAntiAffinity(v, common.ComponentSentinel),
 		// Init container copies the sentinel config to a writable volume.
 		// Sentinel needs to rewrite its config file at runtime.
 		InitContainers: []corev1.Container{
@@ -365,6 +377,15 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 		},
 		Volumes: volumes,
 	}
+
+	// Set terminationGracePeriodSeconds explicitly to the Kubernetes default (30s).
+	// A nil value never matches the API-server-defaulted stored object, so drift
+	// detection would rewrite the StatefulSet on every reconcile. Sentinel has no
+	// failover to wait out on shutdown, so the default is sufficient.
+	sentinelTerminationGrace := int64(30)
+	spec.TerminationGracePeriodSeconds = &sentinelTerminationGrace
+
+	return spec
 }
 
 // SentinelProbeCommand returns the exec probe command for a Sentinel container,

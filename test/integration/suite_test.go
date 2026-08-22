@@ -15,9 +15,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
+	"github.com/guided-traffic/valkey-operator/internal/health"
+	"github.com/guided-traffic/valkey-operator/internal/metrics"
+)
+
+// Metrics endpoint of the shared manager. Loopback and a non-default port so the
+// suite never competes with anything else on :8080, and TestMetricsEndpoint has a
+// fixed address to scrape.
+const (
+	metricsBindAddress  = "127.0.0.1:18080"
+	metricsURL          = "http://" + metricsBindAddress + "/metrics"
+	testOperatorVersion = "integration-version"
+	testOperatorCommit  = "integration-commit"
 )
 
 // Package-level shared test infrastructure.
@@ -30,6 +43,11 @@ var (
 	testCancel context.CancelFunc
 	k8sClient  client.Client
 	testEnv    *envtest.Environment
+
+	// slowProbes is the InstanceChecker of the shared reconciler. It delegates to
+	// the real Checker unless a test arms it, so only the CR of
+	// TestReconcileConcurrency_StuckClusterDoesNotBlockOthers is ever delayed.
+	slowProbes *slowProbeChecker
 )
 
 // TestMain sets up a shared envtest environment, registers schemes, starts
@@ -58,20 +76,34 @@ func TestMain(m *testing.M) {
 	}
 
 	// Create manager and register the Valkey controller once.
+	//
+	// The metrics endpoint is bound explicitly to loopback on a non-default port:
+	// controller-runtime would otherwise take :8080 on every interface, and the
+	// metrics test needs a known address to scrape.
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: metricsBindAddress},
 	})
 	if err != nil {
 		panic("failed to create manager: " + err.Error())
 	}
 
+	slowProbes = &slowProbeChecker{delegate: health.NewChecker(mgr.GetClient())}
+
 	reconciler := &controller.ValkeyReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		OperatorImage: "valkey-operator:test",
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		OperatorImage:   "valkey-operator:test",
+		InstanceChecker: slowProbes,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic("failed to setup controller: " + err.Error())
+	}
+
+	// Registered the same way cmd/main.go does it, so the metrics test exercises
+	// the real wiring rather than a collector built by hand.
+	if err := metrics.Register(mgr.GetCache(), testOperatorVersion, testOperatorCommit); err != nil {
+		panic("failed to register the metrics collector: " + err.Error())
 	}
 
 	testCtx, testCancel = context.WithCancel(context.Background())

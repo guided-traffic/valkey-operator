@@ -15,6 +15,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // ---------------------------------------------------------------------------
@@ -129,7 +132,7 @@ func TestE2E_SidecarRoleLabelingAndRouting(t *testing.T) {
 	name := "sc-route"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -244,7 +247,7 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 	name := "sc-drain"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -370,12 +373,25 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 
 	// Verify the -rw service now routes to the new master.
 	t.Run("rw service points to new master after failover", func(t *testing.T) {
-		newMaster := tc.findMasterPod(t, ns, name, 3)
-		tc.waitForEndpointPodCount(t, ns, fmt.Sprintf("%s-rw", name), 1)
-		pods := tc.getEndpointPodNames(t, ns, fmt.Sprintf("%s-rw", name))
-		require.Len(t, pods, 1, "-rw should have 1 endpoint after failover")
-		assert.Equal(t, newMaster, pods[0],
-			"-rw endpoint should point to new master %s", newMaster)
+		// Two independent sources have to agree here: INFO replication answers the
+		// moment the role changes, while the -rw selector follows the instanceRole
+		// label the sidecar writes on a 1 s poll. Sampling them once caught the
+		// window in between and read the old master out of the endpoints, so the
+		// whole sequence retries rather than only the endpoint count.
+		var lastMaster string
+		var lastEndpoints []string
+		err := wait.PollUntilContextTimeout(context.Background(), pollInterval, testTimeout, true,
+			func(_ context.Context) (bool, error) {
+				lastMaster = tc.findMasterPod(t, ns, name, 3)
+				lastEndpoints = tc.getEndpointPodNames(t, ns, fmt.Sprintf("%s-rw", name))
+				return len(lastEndpoints) == 1 && lastEndpoints[0] == lastMaster, nil
+			})
+		// Reported after the poll, so the values are the last ones observed rather
+		// than the empty ones a message argument would have captured up front.
+		require.NoError(t, err,
+			"-rw must select exactly the new master (last master %q, last endpoints %v)",
+			lastMaster, lastEndpoints)
+		t.Logf("-rw selects the new master %s", lastMaster)
 	})
 
 	// Verify pod labels are correct after failover.
@@ -438,7 +454,7 @@ func TestE2E_SidecarDrainReplica(t *testing.T) {
 	name := "sc-repdr"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -556,7 +572,7 @@ func TestE2E_LegacyServiceCleanup(t *testing.T) {
 	name := "sc-legacy"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -695,7 +711,7 @@ func TestE2E_StandaloneServicesOnly(t *testing.T) {
 	name := "sc-sa"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR for service verification")

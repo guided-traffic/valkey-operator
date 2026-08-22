@@ -2,6 +2,7 @@ package v1
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -1107,4 +1108,230 @@ func TestGetObserverUnreadyWhen_PartialOverride(t *testing.T) {
 	uw := v.GetObserverUnreadyWhen()
 	assert.True(t, UnreadyWhenDefault(uw.MasterUnreachable), "unset field defaults to true")
 	assert.False(t, UnreadyWhenDefault(uw.ReplicaSyncFailure), "explicitly false field is false")
+}
+
+// --- PodDisruptionBudget helpers ---
+
+func TestIsPodDisruptionBudgetEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		pdb      *PodDisruptionBudgetSpec
+		expected bool
+	}{
+		{name: "nil spec", pdb: nil, expected: false},
+		{name: "disabled", pdb: &PodDisruptionBudgetSpec{Enabled: false}, expected: false},
+		{name: "enabled", pdb: &PodDisruptionBudgetSpec{Enabled: true}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.PodDisruptionBudget = tt.pdb })
+			assert.Equal(t, tt.expected, v.IsPodDisruptionBudgetEnabled())
+		})
+	}
+}
+
+func TestPodDisruptionBudgetMaxUnavailable(t *testing.T) {
+	v := newValkey("test")
+	assert.Equal(t, DefaultPDBMaxUnavailable, v.PodDisruptionBudgetMaxUnavailable(), "no spec falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+	})
+	assert.Equal(t, DefaultPDBMaxUnavailable, v.PodDisruptionBudgetMaxUnavailable(), "unset field falls back to the default")
+
+	custom := int32(2)
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true, MaxUnavailable: &custom}
+	})
+	assert.Equal(t, int32(2), v.PodDisruptionBudgetMaxUnavailable())
+}
+
+// TestNeedsDataPodDisruptionBudget guards the single-replica skip rule: a PDB is
+// only created for a StatefulSet that has a peer to fall back on.
+func TestNeedsDataPodDisruptionBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		replicas int32
+		expected bool
+	}{
+		{name: "disabled with three replicas", enabled: false, replicas: 3, expected: false},
+		{name: "enabled with one replica", enabled: true, replicas: 1, expected: false},
+		{name: "enabled with two replicas", enabled: true, replicas: 2, expected: true},
+		{name: "enabled with three replicas", enabled: true, replicas: 3, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				if tt.enabled {
+					v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+				}
+			})
+			assert.Equal(t, tt.expected, v.NeedsDataPodDisruptionBudget())
+		})
+	}
+}
+
+func TestNeedsSentinelPodDisruptionBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		sentinel *SentinelSpec
+		expected bool
+	}{
+		{name: "pdb disabled", enabled: false, sentinel: &SentinelSpec{Enabled: true, Replicas: 3}, expected: false},
+		{name: "sentinel disabled", enabled: true, sentinel: nil, expected: false},
+		{name: "sentinel spec present but off", enabled: true, sentinel: &SentinelSpec{Enabled: false, Replicas: 3}, expected: false},
+		{name: "single sentinel", enabled: true, sentinel: &SentinelSpec{Enabled: true, Replicas: 1}, expected: false},
+		{name: "three sentinels", enabled: true, sentinel: &SentinelSpec{Enabled: true, Replicas: 3}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Sentinel = tt.sentinel
+				if tt.enabled {
+					v.Spec.PodDisruptionBudget = &PodDisruptionBudgetSpec{Enabled: true}
+				}
+			})
+			assert.Equal(t, tt.expected, v.NeedsSentinelPodDisruptionBudget())
+		})
+	}
+}
+
+// --- anti-affinity ---
+
+func TestAntiAffinityMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		spec     *AntiAffinitySpec
+		expected string
+	}{
+		{name: "nil spec defaults to off", spec: nil, expected: AntiAffinityModeOff},
+		{name: "empty mode defaults to off", spec: &AntiAffinitySpec{}, expected: AntiAffinityModeOff},
+		{name: "explicit off", spec: &AntiAffinitySpec{Mode: AntiAffinityModeOff}, expected: AntiAffinityModeOff},
+		{name: "explicit soft", spec: &AntiAffinitySpec{Mode: AntiAffinityModeSoft}, expected: AntiAffinityModeSoft},
+		{name: "explicit hard", spec: &AntiAffinitySpec{Mode: AntiAffinityModeHard}, expected: AntiAffinityModeHard},
+		{name: "unknown value falls back to off", spec: &AntiAffinitySpec{Mode: "bogus"}, expected: AntiAffinityModeOff},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) { v.Spec.AntiAffinity = tt.spec })
+			assert.Equal(t, tt.expected, v.AntiAffinityMode())
+		})
+	}
+}
+
+func TestAntiAffinityTopologyKey(t *testing.T) {
+	v := newValkey("test")
+	assert.Equal(t, DefaultAntiAffinityTopologyKey, v.AntiAffinityTopologyKey(), "no spec falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) { v.Spec.AntiAffinity = &AntiAffinitySpec{} })
+	assert.Equal(t, DefaultAntiAffinityTopologyKey, v.AntiAffinityTopologyKey(), "empty key falls back to the default")
+
+	v = newValkey("test", func(v *Valkey) {
+		v.Spec.AntiAffinity = &AntiAffinitySpec{TopologyKey: "topology.kubernetes.io/zone"}
+	})
+	assert.Equal(t, "topology.kubernetes.io/zone", v.AntiAffinityTopologyKey())
+}
+
+// TestNeedsAntiAffinity guards two skip rules: the off default (no block, or
+// mode off, renders nothing regardless of replica count) and the single-replica
+// skip (a singleton has no peer to repel, so it must not get a term and
+// therefore no pod-spec hash churn).
+func TestNeedsAntiAffinity(t *testing.T) {
+	tests := []struct {
+		name             string
+		replicas         int32
+		sentinel         *SentinelSpec
+		antiAffinity     *AntiAffinitySpec
+		expectedData     bool
+		expectedSentinel bool
+	}{
+		{name: "default off: no block", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			expectedData: false, expectedSentinel: false},
+		{name: "explicit off", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeOff},
+			expectedData: false, expectedSentinel: false},
+		{name: "soft, standalone", replicas: 1,
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: false, expectedSentinel: false},
+		{name: "soft, two data replicas, no sentinel", replicas: 2,
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false},
+		{
+			name: "soft, sentinel disabled", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: false, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "soft, single sentinel", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 1},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeSoft},
+			expectedData: true, expectedSentinel: false,
+		},
+		{
+			name: "hard, ha", replicas: 3,
+			sentinel:     &SentinelSpec{Enabled: true, Replicas: 3},
+			antiAffinity: &AntiAffinitySpec{Mode: AntiAffinityModeHard},
+			expectedData: true, expectedSentinel: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.Replicas = tt.replicas
+				v.Spec.Sentinel = tt.sentinel
+				v.Spec.AntiAffinity = tt.antiAffinity
+			})
+			assert.Equal(t, tt.expectedData, v.NeedsDataAntiAffinity())
+			assert.Equal(t, tt.expectedSentinel, v.NeedsSentinelAntiAffinity())
+		})
+	}
+}
+
+func TestGetSyncTimeout(t *testing.T) {
+	tests := []struct {
+		name          string
+		rollingUpdate *RollingUpdateSpec
+		expected      time.Duration
+	}{
+		{
+			name:          "no rollingUpdate block falls back to 5m",
+			rollingUpdate: nil,
+			expected:      5 * time.Minute,
+		},
+		{
+			name:          "rollingUpdate without syncTimeout falls back to 5m",
+			rollingUpdate: &RollingUpdateSpec{},
+			expected:      5 * time.Minute,
+		},
+		{
+			name:          "explicit syncTimeout wins",
+			rollingUpdate: &RollingUpdateSpec{SyncTimeout: &metav1.Duration{Duration: 90 * time.Second}},
+			expected:      90 * time.Second,
+		},
+		{
+			name:          "zero syncTimeout is honoured, not treated as unset",
+			rollingUpdate: &RollingUpdateSpec{SyncTimeout: &metav1.Duration{Duration: 0}},
+			expected:      0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newValkey("test", func(v *Valkey) {
+				v.Spec.RollingUpdate = tt.rollingUpdate
+			})
+			assert.Equal(t, tt.expected, v.GetSyncTimeout())
+		})
+	}
 }

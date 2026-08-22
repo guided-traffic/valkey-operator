@@ -17,8 +17,23 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
+- **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
+- **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread); off by default so upgrades change nothing
 - **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - **Helm deployment** — install the operator with a single `helm install`
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md) | Trust boundaries, every RBAC rule the operator and the per-instance sidecar hold and what each one permits, where the password and the TLS material live, what the isolation does **not** cover, and the hardening checklist |
+| [docs/adr/](docs/adr/README.md) | Architecture Decision Records — what was decided, why, what was rejected and what it costs, for the reconcile model, the rolling update, the master authority and split-brain resolution, the privilege model, and the test/CI policy |
+| [CRD Reference](#crd-reference) (below) | Every `spec` field, its default and its effect |
+| [Valkey documentation](https://valkey.io/topics/) | Upstream server, replication and Sentinel behaviour |
+| [cert-manager](https://cert-manager.io/docs/) | Issuers referenced by `spec.tls.certManager` |
+
+Read the security document before granting anyone `create valkeys`: the operator
+holds a cluster-wide grant that includes reading every Secret and writing RBAC.
 
 ## Quick Start
 
@@ -35,6 +50,111 @@ helm install valkey-operator deploy/helm/valkey-operator \
   --namespace valkey-operator-system \
   --create-namespace
 ```
+
+### Upgrade the Operator
+
+`helm upgrade` with the chart is the supported path. The CRD, the operator
+ClusterRole and the Deployment all live in the chart's `templates/`, so one
+command carries schema, permissions and image forward together:
+
+```bash
+helm upgrade valkey-operator deploy/helm/valkey-operator \
+  --namespace valkey-operator-system
+```
+
+Updating the operator image on its own — `kubectl set image`, or a bumped tag
+applied against an older chart — leaves the CRD and the ClusterRole behind and is
+not a supported upgrade path.
+
+<details>
+<summary>What the upgrade does, how to verify it, rollback and uninstall</summary>
+
+**Before the new operator starts.** The chart runs a `pre-upgrade` hook Job
+(`valkey-operator-pre-upgrade`) that executes `manager migrate` and writes the
+current field defaults into existing `Valkey` CRs, so the new operator never
+reconciles a CR that predates its defaults. It is enabled by default; skip it
+with `--set preUpgradeHook.enabled=false`.
+
+**What it does to running clusters.** The sidecar that runs in every Valkey pod
+uses the operator image (`--operator-image`, set by the chart from
+`image.repository:tag`), so an upgrade that changes the operator tag changes the
+managed pod spec. Every multi-replica cluster is then migrated once through the
+failover-aware rolling update — replicas first, then a controlled failover, then
+the former master — without data loss.
+
+**A single-replica cluster without Sentinel is not restarted for this.** A
+sidecar-only delta on the only pod has no failover target, so the operator
+deliberately does not apply it: it sets the `SidecarUpdatePending` condition on the
+`Valkey` CR and leaves the pod running the **old** sidecar image. There is no
+downtime and nothing to schedule — but there is also no automatic convergence: the
+pod keeps the old sidecar until something restarts it, which means a manual
+`kubectl delete pod`, an eviction, or a spec change that alters the pod template
+(a new `spec.image`, for example). Force it when you want it — but the restart is
+not free on the only pod of the cluster: it has no failover target, so an instance
+without `persistence.enabled` comes back empty (with persistence it reloads its
+RDB/AOF). This is the same exception as the metrics note further down.
+
+```bash
+kubectl get valkey <name> -o jsonpath='{range .status.conditions[?(@.type=="SidecarUpdatePending")]}{.status}{"\n"}{end}'
+kubectl delete pod <name>-0        # the deferred sidecar update applies on recreation
+```
+
+The condition clears itself once the deferred update has applied: the operator clears it
+in the one place that provably knows every pod matches the live template — the pass where
+no pod needs an update and no rolling-update state is recorded
+([ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10). To confirm the
+running sidecar directly rather than through the condition:
+
+```bash
+kubectl get pod <name>-0 -o jsonpath='{range .spec.containers[*]}{.name}={.image}{"\n"}{end}'
+```
+
+**Verify.**
+
+```bash
+kubectl -n valkey-operator-system rollout status deployment/valkey-operator
+kubectl get valkey -A
+```
+
+Every instance returns to `PHASE=OK` with `READY` equal to `REPLICAS`. `Rolling
+Update` means the migration above is still running; `kubectl describe valkey
+<name>` shows the current step and any `ReconcileBlocked` condition.
+
+**Upgrading from the released chart repository** instead of a checked-out tree:
+
+```bash
+helm repo add valkey-operator https://guided-traffic.github.io/valkey-operator/
+helm repo update
+helm upgrade valkey-operator valkey-operator/valkey-operator \
+  --namespace valkey-operator-system
+```
+
+**Rollback.**
+
+```bash
+helm rollback valkey-operator --namespace valkey-operator-system
+```
+
+The CRD is part of the release, so a rollback restores the previous CRD schema as
+well. Spec fields that only the newer schema knows are pruned from existing CRs by
+the API server, so roll back before adopting new fields, or re-apply them after
+upgrading again.
+
+**Uninstall.**
+
+```bash
+kubectl delete valkey --all --all-namespaces   # do this knowingly, see below
+helm uninstall valkey-operator --namespace valkey-operator-system
+```
+
+The CRD is a normal chart template with no `helm.sh/resource-policy: keep`, so
+`helm uninstall` deletes it — and deleting a CRD removes every `Valkey` CR with
+it, which garbage-collects the StatefulSets, Services and ConfigMaps those CRs
+own. PersistentVolumeClaims created for `spec.persistence` are **not** removed
+(the StatefulSets set no PVC retention policy): the data stays on disk and is
+reattached when a cluster of the same name is created again.
+
+</details>
 
 ### Deploy a Standalone Valkey Instance
 
@@ -417,6 +537,9 @@ spec:
 | `networkPolicy` | `NetworkPolicySpec` | — | NetworkPolicy configuration |
 | `persistence` | `PersistenceSpec` | — | Data persistence configuration |
 | `observer` | `ObserverSpec` | — | Cluster observer configuration |
+| `podDisruptionBudget` | `PodDisruptionBudgetSpec` | — | PodDisruptionBudgets for the data and Sentinel StatefulSets |
+| `antiAffinity` | `AntiAffinitySpec` | *(off)* | Opt-in pod anti-affinity for the data and Sentinel StatefulSets |
+| `rollingUpdate` | `RollingUpdateSpec` | — | Rolling update timing |
 | `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
 | `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
@@ -539,6 +662,149 @@ When `spec.tls.enabled: true`, the observer always verifies the server's certifi
 
 > **Note:** The TLS secret is only mounted into the observer pod when at least one of `mtls.valkey` or `mtls.sentinel` is `true`. If both are `false` (the default), the observer connects using TLS without a client certificate and no volume mount is created.
 
+### `spec.podDisruptionBudget`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Create a PDB for the data StatefulSet and, with Sentinel enabled, a quorum-preserving PDB for the Sentinel StatefulSet |
+| `maxUnavailable` | `int32` | `1` | Data pods that may be disrupted voluntarily at the same time. Applies to the data StatefulSet only |
+
+The budgets are named after the StatefulSets they cover — `<name>` for the data
+pods and `<name>-sentinel` for Sentinel — live in the CR's namespace and are owned
+by the CR, so deleting the CR removes them.
+
+The ownerReference is also what the operator goes by: **a PodDisruptionBudget it
+does not own is never deleted and never adopted**, even under exactly those names.
+A hand-written budget for the same pods therefore survives every reconcile — the
+operator leaves it untouched and records a `PodDisruptionBudgetNotOwned` Warning
+Event on the CR instead. That Event is only recorded while
+`spec.podDisruptionBudget.enabled` is `true`: a CR that never opted in leaves a
+foreign budget alone silently, without a permanent warning stream. It **is**
+recorded while the feature is on but not applicable to that StatefulSet (fewer
+than two replicas, or Sentinel disabled): the name is taken, so scaling back up
+would silently produce no budget at all. While such a budget exists,
+`spec.podDisruptionBudget` has no effect for that StatefulSet — and
+the operator suppresses the two content warnings below for it, because they would
+describe values that never reached an object. Delete or rename the foreign budget
+to hand the name over to the operator.
+
+Both budgets are **opt-in**. The operator creates none unless the block is present
+and `enabled: true` — a budget created next to a user-managed one would cover the
+same pods twice, and the Eviction API refuses every eviction in that case.
+
+What the budgets do and do not cover:
+
+- The **data PDB** uses `maxUnavailable` (default `1`), so a node drain takes one
+  data pod at a time instead of the whole StatefulSet. Setting `maxUnavailable`
+  to `spec.replicas` or higher removes the protection; the operator honours it and
+  warns rather than rejecting a later scale-down. The warning is a log line plus a
+  `PodDisruptionBudgetTooPermissive` Event on the CR, emitted on every reconcile
+  while the condition holds — so scaling `spec.replicas` down into it (`5` -> `2`
+  with `maxUnavailable: 2`) is reported too, even though the PDB object itself
+  never changes.
+- The **Sentinel PDB** uses `minAvailable = floor(spec.sentinel.replicas / 2) + 1`
+  — the failover quorum. It is **computed, never configurable**: a settable value
+  could silently break the guarantee that a drain cannot take the Sentinel majority.
+  With `spec.sentinel.replicas: 2` the quorum equals the replica count, so **no
+  voluntary disruption is permitted at all** — `kubectl drain` on a node hosting a
+  Sentinel pod never finishes until the CR is scaled or the PDB removed. The formula
+  stays (a smaller `minAvailable` would let a drain take automatic failover), and the
+  operator makes the consequence visible: a log line plus a
+  `SentinelPodDisruptionBudgetBlocksDrains` Event on the CR, emitted on every reconcile
+  while the condition holds — including after scaling `spec.sentinel.replicas` `3` ->
+  `2`, where the quorum stays `2` and the PDB object itself never changes. Use an odd
+  Sentinel count of 3 or more; an even count is not HA in the first place.
+- **StatefulSets with fewer than 2 replicas get no PDB**, even with `enabled: true`
+  (data at `spec.replicas: 1`, Sentinel at `spec.sentinel.replicas: 1`). With one pod
+  `maxUnavailable: 1` would permit evicting the only pod and `minAvailable: 1` would
+  block `kubectl drain` forever — fake safety for an instance that is not HA either
+  way. Scaling below 2 deletes an existing PDB; scaling back up recreates it.
+- Budgets gate **voluntary** disruptions only (drain, cluster autoscaler, eviction
+  API). Node failures, `kubectl delete pod` and the operator's own failover-aware
+  rolling update are unaffected — the operator deletes pods directly.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: ha-valkey
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  podDisruptionBudget:
+    enabled: true          # default: false
+    maxUnavailable: 1      # default: 1 (data StatefulSet only)
+```
+
+The operator needs `policy/poddisruptionbudgets` RBAC for this; the Helm chart
+ships it unconditionally, so no permission change is needed to turn the feature on.
+
+### `spec.antiAffinity`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `string` | `off` | `off` (no term), `soft` (scheduler preference) or `hard` (guaranteed spread) |
+| `topologyKey` | `string` | `kubernetes.io/hostname` | Node label whose values define the spread domains |
+
+Anti-affinity is **opt-in**: omitting the block (or `mode: off`, the default)
+renders no term at all, so upgrading the operator never changes how existing
+clusters are scheduled. The flip side is that without an opt-in all pods of a
+cluster may land on one node — a single drain then takes the whole data plane
+down at once. **Multi-replica clusters should set `mode: soft` (or `hard`)**;
+enabling it on a running cluster triggers one failover-aware rolling update
+(lossless for multi-replica clusters).
+
+- **`off`** (default) renders nothing. Scheduling is exactly what it was before
+  the operator supported anti-affinity.
+- **`soft`** renders `preferredDuringSchedulingIgnoredDuringExecution`
+  with weight `100`, the strongest preference the scheduler weighs against its other
+  priorities. Under node pressure pods may still be co-located, so the spread is a
+  best effort, not a guarantee.
+- **`hard`** renders `requiredDuringSchedulingIgnoredDuringExecution`. The spread is
+  guaranteed, with two consequences worth knowing before enabling it: with fewer
+  schedulable spread domains than replicas the surplus pods stay `Pending` (which
+  also wedges the next rolling update), and during a node drain an evicted pod stays
+  `Pending` until a domain without a pod of the same StatefulSet becomes schedulable.
+  That is degraded but correct — the alternative is silently re-co-locating the pods.
+- Each StatefulSet **repels only its own kind**, selected by
+  `app.kubernetes.io/instance` + `app.kubernetes.io/managed-by` +
+  `app.kubernetes.io/component`. Data and Sentinel pods may therefore share a node,
+  and a second Valkey CR in the same namespace is unaffected.
+- **StatefulSets with fewer than 2 replicas get no term** (data at
+  `spec.replicas: 1`, Sentinel at `spec.sentinel.replicas: 1`): a singleton has no
+  peer to repel, and injecting an empty term would change the pod-spec hash and
+  restart the pod for nothing.
+- Changing `mode` or `topologyKey` changes the pod-spec hash and therefore triggers
+  the operator's failover-aware rolling update — lossless for a multi-replica
+  cluster.
+
+```yaml
+apiVersion: vko.gtrfc.com/v1
+kind: Valkey
+metadata:
+  name: ha-valkey
+spec:
+  replicas: 3
+  image: valkey/valkey:8.0
+  sentinel:
+    enabled: true
+    replicas: 3
+  antiAffinity:
+    mode: soft                            # default: off (no term; opt in with soft or hard)
+    topologyKey: kubernetes.io/hostname   # default: kubernetes.io/hostname
+```
+
+Spreading across availability zones instead of nodes is a `topologyKey` change:
+
+```yaml
+  antiAffinity:
+    mode: hard
+    topologyKey: topology.kubernetes.io/zone
+```
+
 ### `spec.persistence`
 
 | Field | Type | Default | Description |
@@ -547,6 +813,27 @@ When `spec.tls.enabled: true`, the observer always verifies the server's certifi
 | `mode` | `string` | `rdb` | Persistence mode: `rdb`, `aof`, or `both` |
 | `storageClass` | `string` | `""` | StorageClass name (empty = default) |
 | `size` | `Quantity` | `1Gi` | Requested storage size |
+
+### `spec.rollingUpdate`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting |
+
+`syncTimeout` bounds the two points in a rolling update where the operator waits
+for a full dataset transfer, and it does something different at each:
+
+| Wait | On timeout |
+|------|------------|
+| A replaced replica syncing from the master, before the next pod is replaced | The rolling update is **paused** (`RollingUpdatePaused` condition, phase `Error`). It resumes on the next spec change. |
+| The former master (pod-0) syncing back after the failover, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
+
+The second case never force-promotes pod-0. An unsynced pod-0 would come up as an
+empty master and discard every write the promoted replica accepted since the
+failover, so the operator gives up the canonical topology rather than the data.
+The cluster stays fully usable — the `-rw`/`-r` Services select the master by
+label, not by ordinal. Raise `syncTimeout` for large datasets whose initial sync
+does not fit in five minutes.
 
 ### `spec.auth`
 
@@ -565,6 +852,15 @@ When `spec.tls.enabled: true`, the observer always verifies the server's certifi
 | `phase` | `string` | Current lifecycle phase |
 | `message` | `string` | Human-readable status description |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions |
+
+#### Condition Types
+
+| Type | Meaning when `True` |
+|------|---------------------|
+| `RollingUpdatePaused` | A rolling update stopped because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. It resumes on the next spec change. |
+| `TopologyRestored` | The last multi-replica rolling update handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. |
+| `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. A clearing branch exists but is not reached when the drift resolves (a pass with nothing to update returns before dispatching), so a `True` can outlive it — confirm the running image rather than this field. |
+| `ReconcileBlocked` | A managed resource could not be written. The reason distinguishes an admission-webhook rejection from any other write failure. |
 
 #### Phase Values
 
@@ -752,7 +1048,8 @@ make test-unit               # Unit tests
 make test-unit-coverage      # Unit tests with coverage
 make test-integration        # Integration tests (envtest)
 make test-e2e                # E2E tests (requires running cluster)
-make e2e-local               # Full E2E: create Kind cluster → deploy → test → cleanup
+make test-e2e E2E_RUN='TestE2E_PodDisruptionBudget'  # E2E tests filtered by name
+make e2e-local               # Full E2E: create Kind cluster (control-plane + 3 workers) → deploy → test → cleanup
 make lint                    # Linting (golangci-lint + go vet)
 make gosec                   # Security scan
 make vuln                    # Vulnerability check
@@ -789,7 +1086,79 @@ resources:
 
 leaderElection:
   enabled: true      # required for HA operator deployment
+
+maxConcurrentReconciles: 4   # default; how many Valkey resources are reconciled at once
+
+metrics:                       # the OPERATOR's own endpoint, not spec.metrics on a CR
+  service:
+    enabled: false             # default; ClusterIP Service in front of :8080
+    port: 8080                 # default
+    labels: {}                 # default; extra labels on the Service
+  serviceMonitor:
+    enabled: false             # default; needs the Prometheus-Operator CRDs
+    interval: 30s              # default
+    scrapeTimeout: ""          # default; left to Prometheus when empty
+    labels: {}                 # default; must match your serviceMonitorSelector
+  prometheusRule:
+    enabled: false             # default; ships the alert rules below
+    labels: {}                 # default; must match your ruleSelector
 ```
+
+`maxConcurrentReconciles` bounds how far one unhealthy cluster can slow down the rest:
+a reconcile pass dials the pods of its cluster with a 5 s timeout each, so with a single
+worker a cluster whose pods stopped answering delays every other Valkey resource in the
+fleet. Passes for the *same* resource stay serialised at any value. Raise it for large
+fleets, lower it to reduce concurrent API-server load
+([ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)).
+
+### Operator metrics and alerting
+
+`metrics.*` above configures the **operator's own** endpoint. It is unrelated to
+`spec.metrics` on a `Valkey` resource, which adds a Prometheus exporter sidecar to that
+resource's pods.
+
+The operator always serves `:8080/metrics`. Besides controller-runtime's counters it
+publishes one set of `vko_valkey_*` series per `Valkey` resource, labelled with namespace
+and name — so an alert can say *which* resource is not converging.
+`controller_runtime_reconcile_errors_total` only carries the controller name and cannot
+([ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)).
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `vko_valkey_status_phase` | `namespace`, `name`, `phase` | Always `1`; one series per resource carrying its current phase |
+| `vko_valkey_status_condition` | `namespace`, `name`, `condition`, `status`, `reason` | Always `1`; one series per status condition |
+| `vko_valkey_status_ready_replicas` | `namespace`, `name` | Ready data pods the operator last observed |
+| `vko_valkey_spec_replicas` | `namespace`, `name` | Data pods requested by `spec.replicas` |
+| `vko_valkey_metadata_generation` | `namespace`, `name` | The spec version the API server holds |
+| `vko_valkey_status_observed_generation` | `namespace`, `name` | Newest generation any condition reports as observed |
+| `vko_valkey_operator_version_info` | `namespace`, `name`, `version` | Always `1`; the operator that last wrote status |
+| `vko_operator_build_info` | `version`, `commit` | Always `1`; the operator that is running |
+| `vko_valkey_collector_success` | — | `1` when the last scrape could list the resources, `0` when it could not |
+
+The pair to watch is `vko_valkey_metadata_generation` against
+`vko_valkey_status_observed_generation`: a gap means a spec change was accepted by the API
+server and never converged — for example a field that is immutable on an already created
+object. That is the shape of failure that can sit unnoticed for months, because the pods stay
+up and only the spec change is stuck.
+
+`prometheusRule.enabled: true` ships seven alerts over these series — `ValkeySpecNotObserved`,
+`ValkeyReconcileBlocked`, `ValkeyPhaseNotOK`, `ValkeyReplicasMissing`,
+`ValkeyOperatorVersionStale`, `ValkeyMetricsCollectorFailing` and `ValkeyMetricsAbsent`. Every
+rule is guarded on `vko_valkey_collector_success`, so a collector that cannot read reports
+"unknown" instead of "healthy". Thresholds are not exposed as values; replace the rule if they
+do not fit.
+
+Turning `serviceMonitor.enabled` on renders the Service as well — a ServiceMonitor selects
+Services, and one without the other scrapes nothing.
+
+> **Security note:** the endpoint is plain HTTP with no authentication filter wherever it
+> binds, and the per-resource series make it an inventory of every `Valkey` resource in the
+> cluster and its health. It carries no Secret material and no spec contents. Adding the
+> Service does **not** change reachability — the container port is declared either way, so
+> anything that can route to the operator pod already reads `:8080`. Restrict it with a
+> NetworkPolicy in the operator namespace, move it with `--metrics-bind-address`, or switch it
+> off with `--metrics-bind-address=0`
+> ([SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md)).
 
 ---
 

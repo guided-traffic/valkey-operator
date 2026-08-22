@@ -5,7 +5,9 @@
     ":semanticCommits",
     ":automergeDigest"
   ],
-  "schedule": ["at any time"],
+  "schedule": [
+    "at any time"
+  ],
   "timezone": "Europe/Berlin",
   "labels": [
     "dependencies"
@@ -199,6 +201,28 @@
       ]
     },
     {
+      "description": "Valkey test images: keep the Valkey 8 pin on the Valkey 8 line. The second E2E leg exists to test that line; letting the pin advance a major would silently turn it into a second run of the other leg.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "valkey/valkey"
+      ],
+      "matchCurrentValue": "/^8\\./",
+      "allowedVersions": "<9"
+    },
+    {
+      "description": "Valkey test images: keep the default pin on the Valkey 9 line. Moving to a future major is a decision, not a dependency update - the upgrade tests, the e2e legs and the image tool check all assume which line is which.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "valkey/valkey"
+      ],
+      "matchCurrentValue": "/^9\\./",
+      "allowedVersions": "<10"
+    },
+    {
       "description": "Makefile-pinned Go tools (custom regex manager): automerge minor and patch updates",
       "matchManagers": [
         "custom.regex"
@@ -258,7 +282,9 @@
     {
       "description": "Update Go tool versions pinned in Makefile via renovate comments",
       "customType": "regex",
-      "managerFilePatterns": ["/^Makefile$/"],
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\n.+\\?=\\s*(?<currentValue>v[\\d.]+)"
       ],
@@ -317,6 +343,17 @@
       "depNameTemplate": "golang",
       "datasourceTemplate": "golang-version",
       "versioningTemplate": "semver"
+    },
+    {
+      "description": "Update the Valkey test images pinned in test/testimages/images.go via renovate comments",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^test/testimages/images\\.go$/"
+      ],
+      "matchStrings": [
+        "//\\s*renovate:\\s*datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)\\s*\\n\\s*\\w+\\s*=\\s*\"[^\":]+:(?<currentValue>[^\"]+)\""
+      ],
+      "versioningTemplate": "docker"
     }
   ],
   "gomod": {

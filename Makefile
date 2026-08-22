@@ -70,16 +70,20 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 test: fmt vet envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out
 
+# No -short: it used to gate eight tests in internal/controller behind
+# testing.Short(), and since CI runs test-unit-coverage they were skipped
+# everywhere automated - three of them had been failing unnoticed. Without the
+# flag a testing.Short() gate can never silently remove a test from CI again.
 .PHONY: test-unit
 test-unit: envtest ## Run unit tests only.
 	@echo "Running unit tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -short ./...
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v ./...
 
 .PHONY: test-unit-coverage
 test-unit-coverage: envtest ## Run unit tests with coverage.
 	@echo "Running unit tests with coverage..."
 	@mkdir -p $(COVERAGE_DIR)
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -short -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic ./...
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -coverprofile=$(COVERAGE_DIR)/unit.out -covermode=atomic ./...
 
 .PHONY: test-integration
 test-integration: envtest ## Run integration tests only.
@@ -92,10 +96,43 @@ test-integration-coverage: envtest ## Run integration tests with coverage.
 	@mkdir -p $(COVERAGE_DIR)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTEST) -v -tags=integration -count=1 -timeout=60m -coverprofile=$(COVERAGE_DIR)/integration.out -covermode=atomic -coverpkg=./... ./test/integration/...
 
+# E2E_RUN optionally narrows the E2E run to matching test names, e.g.
+#   make test-e2e E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'
+# CI uses it for the multi-node leg, which re-runs only the node-shape-sensitive
+# scenarios on a control-plane + 3 workers cluster.
+E2E_RUN ?=
+
+# E2E_VALKEY_LINE picks the pinned Valkey line the E2E suite runs against: empty
+# or 9 for the current Valkey 9 release, 8 for the current Valkey 8 one.
+# E2E_VALKEY_IMAGE names an image directly and wins over the line.
+#
+# Both pins live in test/testimages/images.go and are kept current by Renovate.
+# Neither this file nor the workflow carries a copy of them, deliberately: a second
+# copy that lags turns a leg green while it tests the wrong line.
+E2E_VALKEY_LINE ?=
+E2E_VALKEY_IMAGE ?=
+
+.PHONY: test-image-tools
+test-image-tools: ## Verify the pinned Valkey images contain every tool the generated scripts execute (needs docker, no cluster).
+	@echo "Checking the pinned Valkey images for the tools the operator executes in them..."
+	$(GOTEST) -v -tags=imagetools -count=1 -timeout=15m ./test/imagetools/...
+
 .PHONY: test-e2e
-test-e2e: ## Run E2E tests against a running Kind cluster.
+test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by test name).
 	@echo "Running E2E tests..."
-	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m ./test/e2e/...
+	E2E_VALKEY_LINE=$(E2E_VALKEY_LINE) E2E_VALKEY_IMAGE=$(E2E_VALKEY_IMAGE) \
+		$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
+
+# E2E_UPGRADE_FROM is the released chart version the fleet-upgrade E2E provisions
+# its clusters on before upgrading to the local chart. Keep it at the version the
+# production fleet actually runs, so the test measures the upgrade that is due.
+E2E_UPGRADE_FROM ?= 1.10.48
+
+.PHONY: test-e2e-fleet-upgrade
+test-e2e-fleet-upgrade: ## Run the fleet-upgrade E2E (installs $(E2E_UPGRADE_FROM), then upgrades to the local chart).
+	@echo "Running fleet-upgrade E2E (from chart $(E2E_UPGRADE_FROM))..."
+	E2E_UPGRADE_FROM=$(E2E_UPGRADE_FROM) E2E_UPGRADE_TO_IMAGE=$(E2E_IMG) \
+		$(GOTEST) -v -tags=e2e,fleetupgrade -count=1 -timeout=45m -run TestE2E_FleetUpgrade ./test/e2e/...
 
 .PHONY: test-e2e-helm
 test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind cluster with operator).
@@ -103,10 +140,11 @@ test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind clust
 	MANAGER_BINARY=./bin/manager $(GOTEST) -v -tags=e2e,e2e_helm -count=1 -timeout=10m -run TestE2E_Migrate ./test/e2e/...
 
 .PHONY: kind-create
-kind-create: ## Create a Kind cluster for local testing.
+kind-create: ## Create a Kind cluster for local testing (control-plane + 3 workers).
 	@echo "Creating Kind cluster..."
-	@echo 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: valkey-operator-test\nnodes:\n- role: control-plane' | sed 's/\\n/\n/g' > /tmp/kind-config.yaml
-	kind create cluster --config /tmp/kind-config.yaml --wait 120s
+	@mkdir -p tmp
+	@printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nname: valkey-operator-test\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n- role: worker\n' > tmp/kind-config.yaml
+	kind create cluster --config tmp/kind-config.yaml --wait 300s
 
 .PHONY: kind-delete
 kind-delete: ## Delete the Kind test cluster.
@@ -147,6 +185,19 @@ e2e-local: kind-create cert-manager-install ## Run full E2E test locally with Ki
 		--timeout 120s
 	@echo "Running E2E tests..."
 	$(MAKE) test-e2e
+	@echo "Cleaning up..."
+	$(MAKE) kind-delete
+
+.PHONY: e2e-fleet-upgrade-local
+e2e-fleet-upgrade-local: kind-create cert-manager-install ## Run the fleet-upgrade E2E locally with Kind.
+	@echo "Building E2E image..."
+	docker build -f Containerfile -t $(E2E_IMG) .
+	@echo "Loading E2E image into Kind cluster..."
+	kind load docker-image $(E2E_IMG) --name valkey-operator-test
+	@echo "Running fleet-upgrade E2E..."
+	@# No Helm install here on purpose: the test installs the previous release
+	@# itself and then performs the upgrade, so it owns both ends of the change.
+	$(MAKE) test-e2e-fleet-upgrade
 	@echo "Cleaning up..."
 	$(MAKE) kind-delete
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -13,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +49,16 @@ const (
 	certManagerKindCertificate = "Certificate"
 	// conditionTypeReady is the standard "Ready" condition type.
 	conditionTypeReady = "Ready"
+	// certManagerCertificateNameAnnotation is the annotation cert-manager stamps
+	// on every Secret it issues, naming the Certificate that produced it. Verified
+	// against cert-manager v1.21.1: present on all 119 issued Secrets of the
+	// reference cluster, and the value is the Certificate name — not the Secret
+	// name, which can differ (spec.secretName).
+	certManagerCertificateNameAnnotation = "cert-manager.io/certificate-name"
+	// reasonLegacySentinelTLSNotOwned is the Event reason for legacy Sentinel TLS material that the
+	// operator refused to delete for lack of provenance
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11).
+	reasonLegacySentinelTLSNotOwned = "LegacySentinelTLSNotOwned"
 )
 
 // InstanceChecker verifies connectivity and health of Valkey instances.
@@ -70,6 +83,17 @@ type ValkeyReconciler struct {
 	// NewValkeyClientFn overrides the default Valkey client factory.
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
+
+	// MaxConcurrentReconciles is how many Valkey CRs are reconciled at the same
+	// time. Zero means DefaultMaxConcurrentReconciles; see
+	// reconcileControllerOptions.
+	MaxConcurrentReconciles int
+
+	// nudges tracks first-seen timestamps for two disjoint key sets: how long
+	// each StatefulSet has been short of pods (nudgeShortStatefulSets), and the
+	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
+	// a bound suffix (waitBoundKey). See the nudgeTracker type doc.
+	nudges nudgeTracker
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -168,8 +192,10 @@ func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;escalate;bind
@@ -184,6 +210,7 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, req.NamespacedName, valkey); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Valkey resource not found, probably deleted")
+			r.forgetNudges(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -194,20 +221,99 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// This prevents a reboot loop on partially provisioned clusters that are being deleted.
 	if !valkey.DeletionTimestamp.IsZero() {
 		logger.Info("Valkey resource is being deleted, skipping reconciliation")
+		r.forgetNudges(valkey.Namespace, valkey.Name)
 		return ctrl.Result{}, nil
 	}
 
 	// Set initial provisioning status if phase is empty.
+	//
+	// A failure here does not end the pass. Returning made a rejected status write
+	// — a webhook guarding the CR status subresource, or lost valkeys/status RBAC —
+	// skip reconcileResources entirely, so a brand-new CR kept an empty phase and
+	// never got a ReconcileBlocked condition: invisible for exactly the failure
+	// class that condition exists to surface.
+	//
+	// Nothing is lost by proceeding. The phase is recomputed and written later in
+	// the same pass (persistStatus, or the single writePhase of a blocked pass),
+	// and where an earlier return skips that write, this branch is idempotent —
+	// the next pass still finds an empty phase and retries it.
 	if valkey.Status.Phase == "" {
 		if err := r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseProvisioning, "Setting up Valkey resources"); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "Failed to write the initial Provisioning phase; continuing the pass")
 		}
 	}
 
-	// Reconcile all managed resources.
-	if err := r.reconcileResources(ctx, valkey); err != nil {
-		return ctrl.Result{}, err
+	// Reconcile all managed resources. The outcome is mirrored into the
+	// ReconcileBlocked condition so an admission rejection is distinguishable
+	// from any other write failure without reading operator logs.
+	//
+	// A failure no longer aborts the pass: the data plane (rolling update,
+	// nudge, status) is handled either way, so a rejected write on one
+	// sub-resource cannot leave the CR status stale about everything else.
+	// Per-pass state a step can widen but only the pass can act on. Today that is
+	// the recheck a refused-but-not-failed write asks for; it rides on the context
+	// so it stays per-CR at MaxConcurrentReconciles > 1 (ADR 0019 D3).
+	state := &passState{}
+	ctx = withPassState(ctx, state)
+
+	resourceErr := r.reconcileResources(ctx, valkey)
+	r.setReconcileBlockedCondition(ctx, valkey, resourceErr)
+
+	if resourceErr != nil {
+		// Silence every intermediate phase write for the rest of this pass; the
+		// single write below is the phase authority while blocked.
+		ctx = withBlockedPass(ctx)
 	}
+
+	result, workloadErr := r.reconcileWorkload(ctx, valkey)
+
+	if resourceErr != nil {
+		// The one phase write of a blocked pass. It runs even when the workload
+		// pass failed, so an early return in there can never leave the phase on
+		// whatever the previous pass wrote. writePhase bypasses the suppression
+		// that withBlockedPass installed.
+		//
+		// The error is returned so the controller-runtime rate limiter backs the
+		// retry off instead of spinning on the 10 s requeue; a workload failure
+		// is joined in rather than dropped.
+		_ = r.writePhase(ctx, valkey, vkov1.ValkeyPhaseError,
+			fmt.Sprintf("Failed to reconcile resources: %s", compactErrorMessage(resourceErr)))
+		return ctrl.Result{}, errors.Join(resourceErr, workloadErr)
+	}
+
+	if workloadErr != nil {
+		return result, workloadErr
+	}
+
+	// A pass that refused a write without failing has no other way back: the
+	// colliding object carries no ownerReference to this CR, so no Owns() watch
+	// fires when an administrator removes it, and GenerationChangedPredicate drops
+	// the operator's own status writes (ADR 0020 D6). The requeue is folded in only
+	// here, on the error-free path — controller-runtime drives the retry from the
+	// error otherwise.
+	return applyRecheck(result, state.interval()), nil
+}
+
+// reconcileWorkload handles everything that depends on the running data plane
+// rather than on the managed objects themselves: rolling updates, the
+// StatefulSet nudge and the status update.
+func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.Valkey) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Nudge StatefulSets that are short of pods so the statefulset-controller
+	// resyncs immediately instead of waiting out its exponential backoff.
+	//
+	// This runs before the rolling-update checks, not after. Both of them return
+	// early while they wait, and both wait for a deleted pod that is being
+	// recreated — so when that recreation is blocked, reaching the nudge only
+	// afterwards made it unreachable in exactly the situation it exists for.
+	// Both StatefulSets are nudged unconditionally; this call's position only
+	// guarantees the nudge is reached, it does not decide who gets one.
+	//
+	// The rolling update keeps requeue authority: shortOfPods is read at the very
+	// end of this function, after every rolling-update return, so the 5 s nudge
+	// clock never preempts a rolling-update wait.
+	shortOfPods := r.nudgeShortStatefulSets(ctx, valkey)
 
 	// Check for rolling update (image change on running pods).
 	rollingResult := r.checkAndHandleRollingUpdate(ctx, valkey)
@@ -220,8 +326,14 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
-	if result, done := r.handlePostRollingUpdateChecks(ctx, valkey); done {
-		return result, nil
+	//
+	// A non-terminal result (done == false) is not discarded: it is a recheck
+	// cadence the check needs but cannot take, because ending the pass here would
+	// skip the status write. It is applied at the very end, where every other
+	// requeue reason has already had its say.
+	pending, done, err := r.handlePostRollingUpdateChecks(ctx, valkey)
+	if done {
+		return pending, err
 	}
 
 	// Update status based on StatefulSet readiness.
@@ -238,23 +350,41 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	return ctrl.Result{}, nil
+	// A StatefulSet short of pods needs its own requeue. Rejected pod creates leave
+	// the CR in Provisioning, which the branch above does not cover — and with no
+	// pods, no spec drift and GenerationChangedPredicate on the CR watch, nothing
+	// else re-enters Reconcile. The nudge would then never get the second pass its
+	// grace period requires, which is exactly the stall it exists to break.
+	if shortOfPods {
+		return ctrl.Result{RequeueAfter: nudgeRequeueInterval}, nil
+	}
+
+	// The recheck a post-update check asked for without ending the pass. Zero
+	// unless one of them set it, so the healthy path still returns no requeue.
+	return pending, nil
 }
 
 // handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery
-// after the main Valkey rolling update is done. Returns (result, true) if the caller
-// should return immediately, or (_, false) if processing should continue.
-func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool) {
+// after the main Valkey rolling update is done. Returns (result, true, err) if the
+// caller should return immediately, or (result, false, nil) if processing should
+// continue — where a non-zero result is a requeue the pass wants applied only
+// after updateStatus has run.
+func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool, error) {
 	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
 	// while verifying sentinel quorum before each deletion.
 	if v.IsSentinelEnabled() {
 		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, v)
 		if sentinelResult.Error != nil {
 			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
-			return ctrl.Result{}, true
+			// The error is returned, not swallowed: without it the pass ends with
+			// no requeue and no error, and because status writes do not re-trigger
+			// (GenerationChangedPredicate) reconciliation stalls until an unrelated
+			// owned-object event arrives. Returning it hands the retry to the
+			// rate limiter, mirroring the data rolling-update error path.
+			return ctrl.Result{}, true, sentinelResult.Error
 		}
 		if sentinelResult.NeedsRequeue {
-			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true
+			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
 		}
 	}
 
@@ -263,92 +393,102 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 	// (e.g. after staggered restarts where the master pod was the last to restart).
 	if v.IsMultiReplicaWithoutSentinel() {
 		if recovered, err := r.checkAndRecoverNoMaster(ctx, v); err != nil {
+			// Kept as an explicit requeue rather than a returned error: this path
+			// already carries its own retry clock.
 			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("No-master recovery failed: %v", err))
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 		} else if recovered {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 		}
 	}
 
-	return ctrl.Result{}, false
+	// Outside a rolling update nothing else re-detects a split brain
+	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D1). The function
+	// self-gates on topology and rolling-update state.
+	//
+	// Its result is returned even when the pass continues: a split brain it could
+	// confirm but not resolve asks for a recheck without ending the pass, because
+	// ending it would skip the status write. Dropping the result here would make
+	// that recheck unreachable just as surely as dropping it in reconcileWorkload.
+	return r.checkSteadyStateSplitBrain(ctx, v)
+}
+
+// reconcileStep is one unit of work inside a reconcile pass: a display name, an
+// optional applicability predicate and the function that performs the write.
+type reconcileStep struct {
+	name string
+	// when reports whether the step applies to this CR. A nil predicate means
+	// the step always runs.
+	when func(*vkov1.Valkey) bool
+	run  func(context.Context, *vkov1.Valkey) error
+}
+
+// runReconcileSteps executes every applicable step and returns the joined error
+// of all failures.
+//
+// A failing step does not stop the pass. Steps only reference the objects of
+// earlier steps by name (a StatefulSet names its ConfigMap, a Service its
+// selector labels), so a rejected write never invalidates the later ones — while
+// aborting the pass would leave NetworkPolicies, monitoring and the status
+// unreconciled for as long as a single write keeps failing. That is the
+// 2026-08-19 infra-d failure mode: one webhook rejection on the Sentinel
+// StatefulSet silenced the rest of the reconcile.
+func (r *ValkeyReconciler) runReconcileSteps(ctx context.Context, v *vkov1.Valkey, steps []reconcileStep) error {
+	var errs []error
+	for _, step := range steps {
+		if step.when != nil && !step.when(v) {
+			continue
+		}
+		if err := step.run(ctx, v); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", step.name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// needsReplicaConfigMap reports whether the replica ConfigMap applies: it is used
+// by every multi-replica topology, with or without Sentinel.
+func needsReplicaConfigMap(v *vkov1.Valkey) bool {
+	return v.IsSentinelEnabled() || v.IsMultiReplicaWithoutSentinel()
 }
 
 // reconcileResources reconciles all Kubernetes resources managed by the operator.
+// The returned error joins every step that failed; the caller mirrors it into the
+// ReconcileBlocked condition and the CR phase.
 func (r *ValkeyReconciler) reconcileResources(ctx context.Context, valkey *vkov1.Valkey) error {
-	// Reconcile ConfigMap.
-	if err := r.reconcileConfigMap(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ConfigMap: %v", err))
-		return err
-	}
+	return r.runReconcileSteps(ctx, valkey, r.resourceReconcileSteps())
+}
 
-	// Reconcile replica ConfigMap in multi-replica mode (Sentinel or non-Sentinel replication).
-	if valkey.IsSentinelEnabled() || valkey.IsMultiReplicaWithoutSentinel() {
-		if err := r.reconcileReplicaConfigMap(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile replica ConfigMap: %v", err))
-			return err
-		}
+// resourceReconcileSteps returns the steps of a resource pass, in the order they run.
+//
+// The order carries one guarantee: **"sidecar RBAC" runs before "StatefulSet"**. The
+// sidecar Role grants patch on named pods (ADR 0012 D8 step 3), so on a scale-up the
+// Role has to name pod N before the StatefulSet write creates it — otherwise the new
+// pod's sidecar 403s on its own role label until the next pass. Moving the StatefulSet
+// step ahead of the RBAC step reopens that window; TestResourceReconcileSteps_RBACBeforeStatefulSet
+// exists to catch that.
+func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
+	return []reconcileStep{
+		{name: "ConfigMap", run: r.reconcileConfigMap},
+		{name: "replica ConfigMap", when: needsReplicaConfigMap, run: r.reconcileReplicaConfigMap},
+		{name: "TLS Certificates", when: (*vkov1.Valkey).IsCertManagerEnabled, run: r.reconcileTLSCertificates},
+		{name: "Services", run: r.reconcileServices},
+		{name: "sidecar RBAC", run: r.reconcileSidecarRBAC},
+		{name: "StatefulSet", run: r.reconcileStatefulSet},
+		{name: "Sentinel resources", when: (*vkov1.Valkey).IsSentinelEnabled, run: r.reconcileSentinelResources},
+		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
+		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
+		{name: "monitoring", run: r.reconcileMonitoringResources},
 	}
-
-	// Reconcile TLS Certificates (cert-manager) if enabled.
-	if valkey.IsCertManagerEnabled() {
-		if err := r.reconcileTLSCertificates(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile TLS Certificates: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile all Services (headless, -rw, -all, -r, legacy cleanup).
-	if err := r.reconcileServices(ctx, valkey); err != nil {
-		return err
-	}
-
-	// Reconcile sidecar RBAC (ServiceAccount, Role, RoleBinding).
-	if err := r.reconcileSidecarRBAC(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile sidecar RBAC: %v", err))
-		return err
-	}
-
-	// Reconcile StatefulSet.
-	if err := r.reconcileStatefulSet(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile StatefulSet: %v", err))
-		return err
-	}
-
-	// Reconcile Sentinel resources if enabled.
-	if valkey.IsSentinelEnabled() {
-		if err := r.reconcileSentinelResources(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Sentinel resources: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile NetworkPolicies if enabled.
-	if valkey.IsNetworkPolicyEnabled() {
-		if err := r.reconcileNetworkPolicies(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile NetworkPolicies: %v", err))
-			return err
-		}
-	}
-
-	// Reconcile monitoring resources (Observer Deployment + metrics exporter
-	// Service/ServiceMonitor), each created or cleaned up based on its toggle.
-	if err := r.reconcileMonitoringResources(ctx, valkey); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // reconcileMonitoringResources reconciles the Observer deployment and the metrics
 // exporter Service + ServiceMonitor.
 func (r *ValkeyReconciler) reconcileMonitoringResources(ctx context.Context, valkey *vkov1.Valkey) error {
-	if err := r.reconcileObserver(ctx, valkey); err != nil {
-		return err
-	}
-	if err := r.reconcileMetrics(ctx, valkey); err != nil {
-		return err
-	}
-	return nil
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "Observer", run: r.reconcileObserver},
+		{name: "metrics", run: r.reconcileMetrics},
+	})
 }
 
 // reconcileMetrics reconciles the metrics exporter Service and ServiceMonitor,
@@ -357,34 +497,44 @@ func (r *ValkeyReconciler) reconcileMonitoringResources(ctx context.Context, val
 // builder.BuildStatefulSet); enabling/disabling it changes the pod-spec hash and
 // is therefore rolled out through the normal failover-aware rolling update.
 func (r *ValkeyReconciler) reconcileMetrics(ctx context.Context, valkey *vkov1.Valkey) error {
-	// Metrics Service.
-	if valkey.IsMetricsServiceEnabled() {
-		if err := r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey)); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile metrics Service: %v", err))
-			return err
-		}
-	} else if err := r.cleanupMetricsService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup metrics Service: %v", err))
-		return err
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "metrics Service", run: r.reconcileMetricsService},
+		{name: "ServiceMonitor", run: r.reconcileMetricsServiceMonitor},
+	})
+}
+
+// reconcileMetricsService creates the metrics Service when metrics are enabled
+// and removes it otherwise.
+func (r *ValkeyReconciler) reconcileMetricsService(ctx context.Context, valkey *vkov1.Valkey) error {
+	if !valkey.IsMetricsServiceEnabled() {
+		return r.cleanupMetricsService(ctx, valkey)
 	}
 
-	// Prometheus-Operator ServiceMonitor.
+	err := r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey))
+	if errors.Is(err, errForeignObject) {
+		// The metrics Service is the one Service whose refusal does not fail the
+		// pass, and it takes the same direction as the ServiceMonitor next to it:
+		// a name collision in the monitoring surface costs scraping, not the data
+		// plane, and converting it into a CR outage is the trade ADR 0020 D2
+		// rejects for the observer. reconcileService already logged it and emitted
+		// the Event, so only the recheck is added here (D6).
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+	return err
+}
+
+// reconcileMetricsServiceMonitor creates the Prometheus-Operator ServiceMonitor
+// when enabled and removes it otherwise.
+func (r *ValkeyReconciler) reconcileMetricsServiceMonitor(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsServiceMonitorEnabled() {
-		if err := r.reconcileServiceMonitor(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile ServiceMonitor: %v", err))
-			return err
-		}
-	} else if err := r.cleanupServiceMonitor(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup ServiceMonitor: %v", err))
-		return err
+		return r.reconcileServiceMonitor(ctx, valkey)
 	}
-
-	return nil
+	return r.cleanupServiceMonitor(ctx, valkey)
 }
 
 // cleanupMetricsService deletes the metrics Service if it exists.
 func (r *ValkeyReconciler) cleanupMetricsService(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
 	svc := &corev1.Service{}
 	name := types.NamespacedName{Name: builder.MetricsServiceName(v), Namespace: v.Namespace}
 	if err := r.Get(ctx, name, svc); err != nil {
@@ -393,11 +543,11 @@ func (r *ValkeyReconciler) cleanupMetricsService(ctx context.Context, v *vkov1.V
 		}
 		return err
 	}
-	logger.Info("Deleting metrics Service", "name", svc.Name)
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting metrics service: %w", err)
-	}
-	return nil
+	// Reachable by flipping spec.metrics.enabled off, which is why the ownership
+	// proof belongs here and not only on the write path: without it, switching a
+	// feature off deletes whatever holds <cr>-metrics
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2).
+	return r.deleteIfOwned(ctx, v, svc, "metrics Service")
 }
 
 // reconcileServiceMonitor ensures a Prometheus-Operator ServiceMonitor matches the
@@ -433,6 +583,23 @@ func (r *ValkeyReconciler) reconcileServiceMonitor(ctx context.Context, v *vkov1
 		return err
 	}
 
+	// One of the two paths that used to stamp this CR's ownerReference — with
+	// Controller and BlockOwnerDeletion set — onto whatever object held the name,
+	// which would have made the garbage collector delete a foreign object when the
+	// CR goes. The spec write is the nearer half of the same harm: it repoints
+	// someone else's scrape config at this cluster's endpoints.
+	//
+	// The refusal does not fail the pass. Scraping is observability, the data plane
+	// is untouched, and the recheck brings the operator back on its own once the
+	// collision is gone (ADR 0020 D2, D6).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonServiceMonitorNotOwned, "ServiceMonitor", desired.GetName(),
+			"metrics are not scraped through this Valkey: the operator will not write the object "+
+				"and will not stamp its owner reference onto it")
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
 	if !equality.Semantic.DeepEqual(desired.Object["spec"], current.Object["spec"]) ||
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating ServiceMonitor", "name", desired.GetName())
@@ -449,7 +616,6 @@ func (r *ValkeyReconciler) reconcileServiceMonitor(ctx context.Context, v *vkov1
 // cleanupServiceMonitor deletes the ServiceMonitor if it exists. It tolerates the
 // monitoring.coreos.com CRDs being absent.
 func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
 	sm := &unstructured.Unstructured{}
 	sm.SetGroupVersionKind(builder.ServiceMonitorGVK())
 	name := types.NamespacedName{Name: builder.ServiceMonitorName(v), Namespace: v.Namespace}
@@ -459,59 +625,102 @@ func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.V
 		}
 		return err
 	}
-	logger.Info("Deleting ServiceMonitor", "name", sm.GetName())
-	if err := r.Delete(ctx, sm); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting servicemonitor: %w", err)
-	}
-	return nil
+	// The cheapest door in this family: flipping spec.metrics.serviceMonitor.enabled
+	// off used to delete whatever object held the derived name
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2).
+	return r.deleteIfOwned(ctx, v, sm, "ServiceMonitor")
 }
 
-// reconcileObserver creates the observer deployment when enabled, or cleans it up when disabled.
+// reconcileObserver creates the observer ServiceAccount and Deployment when enabled,
+// or cleans both up when disabled. The ServiceAccount is written first: the Deployment
+// names it, and a pod whose ServiceAccount does not exist yet is rejected by the
+// ServiceAccount admission plugin.
 func (r *ValkeyReconciler) reconcileObserver(ctx context.Context, valkey *vkov1.Valkey) error {
 	if valkey.IsObserverEnabled() {
-		if err := r.reconcileObserverDeployment(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile Observer: %v", err))
+		if err := r.reconcileObserverServiceAccount(ctx, valkey); err != nil {
 			return err
 		}
-	} else {
-		if err := r.cleanupObserverDeployment(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to cleanup Observer: %v", err))
-			return err
+		return r.reconcileObserverDeployment(ctx, valkey)
+	}
+	return r.cleanupObserverDeployment(ctx, valkey)
+}
+
+// reconcileObserverServiceAccount creates or updates the observer ServiceAccount.
+// No Role and no RoleBinding accompany it — that is the point of it (ADR 0012 D8 step 2).
+//
+// A pre-existing ServiceAccount under the derived name is left alone and reported,
+// and the pass still writes the Deployment. That is the opposite of what the
+// PodDisruptionBudget path does with a foreign object, and deliberately so: an
+// unwritten budget silently protects nothing, whereas the observer under a
+// ServiceAccount the operator did not create does exactly what it would have done
+// anyway — the pod mounts no token (builder.BuildObserverDeployment), no RoleBinding
+// names that ServiceAccount, and the observer makes no Kubernetes API call at all.
+// Refusing the Deployment too would turn a name collision into an outage of the
+// diagnostic component and buy nothing
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D2).
+func (r *ValkeyReconciler) reconcileObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	logger := log.FromContext(ctx)
+	desired := builder.BuildObserverServiceAccount(v)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on Observer ServiceAccount: %w", err)
+	}
+	current := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating Observer ServiceAccount", "name", desired.Name)
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("creating Observer ServiceAccount: %w", err)
 		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonObserverServiceAccountNotOwned, "ServiceAccount", desired.Name,
+			"the observer Deployment still runs, under that ServiceAccount; it mounts no token and no Role "+
+				"is bound to it, so it gains no permission from it")
+		// The pass ends without an error, so nothing else would bring it back:
+		// the colliding object carries no ownerReference to this CR, so the
+		// ServiceAccount watch never fires for it, and the operator's own status
+		// writes are filtered by GenerationChangedPredicate.
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
+	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		return nil
+	}
+	logger.Info("Updating Observer ServiceAccount", "name", desired.Name)
+	current.Labels = desired.Labels
+	// Labels are assigned and annotations are merged, which is what every other
+	// reconciler in this package does. Assigning the whole annotation map — as this
+	// function used to — erases every key the operator does not set, and the desired
+	// object carries at most the operator-version one. On an owned ServiceAccount
+	// that silently drops what an IRSA or Workload-Identity injector wrote, which no
+	// ownership guard can prevent (ADR 0020 D4).
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
+	if err := r.Update(ctx, current); err != nil {
+		return fmt.Errorf("updating Observer ServiceAccount: %w", err)
 	}
 	return nil
 }
 
 // reconcileServices reconciles all Service resources: headless, -rw, and (for multi-replica)
 // -all and -r. It also removes legacy services that no longer exist in the new naming scheme.
+// A failing Service does not stop the others — see runReconcileSteps.
 func (r *ValkeyReconciler) reconcileServices(ctx context.Context, valkey *vkov1.Valkey) error {
-	if err := r.reconcileHeadlessService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile headless Service: %v", err))
-		return err
-	}
-
-	if err := r.reconcileRWService(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -rw Service: %v", err))
-		return err
-	}
-
-	if valkey.Spec.Replicas > 1 {
-		if err := r.reconcileAllService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -all Service: %v", err))
-			return err
-		}
-		if err := r.reconcileReadOnlyService(ctx, valkey); err != nil {
-			_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to reconcile -r Service: %v", err))
-			return err
-		}
-	}
-
-	if err := r.deleteLegacyServices(ctx, valkey); err != nil {
-		_ = r.updatePhase(ctx, valkey, vkov1.ValkeyPhaseError, fmt.Sprintf("Failed to delete legacy Services: %v", err))
-		return err
-	}
-
-	return nil
+	isMultiReplica := func(v *vkov1.Valkey) bool { return v.Spec.Replicas > 1 }
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "headless Service", run: r.reconcileHeadlessService},
+		{name: "-rw Service", run: r.reconcileRWService},
+		{name: "-all Service", when: isMultiReplica, run: r.reconcileAllService},
+		{name: "-r Service", when: isMultiReplica, run: r.reconcileReadOnlyService},
+		{name: "legacy Service cleanup", run: r.deleteLegacyServices},
+	})
 }
 
 // reconcileConfigMap ensures the Valkey ConfigMap matches the desired state.
@@ -532,6 +741,19 @@ func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valk
 	}
 	if err != nil {
 		return err
+	}
+
+	// The pods mount this ConfigMap by name, so a foreign object under it is
+	// already the configuration Valkey starts with; the refusal cannot undo that.
+	// What it stops is the other direction — the operator overwriting someone
+	// else's config data with this cluster's. The step fails because nothing about
+	// the data plane is what the CR asked for while that name belongs to another
+	// object (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the Valkey configuration is not managed by this Valkey: the operator will not write "+
+				"its data")
+		return foreignObjectError("ConfigMap", desired.Name)
 	}
 
 	// Update if config content or operator version annotation has changed.
@@ -565,6 +787,21 @@ func (r *ValkeyReconciler) reconcileReplicaConfigMap(ctx context.Context, v *vko
 	}
 	if err != nil {
 		return err
+	}
+
+	// The replica ConfigMap carries the replicaof directive derived from the
+	// known-master annotation (ADR 0008), and replicaConfigMaster reads the LIVE
+	// object back as the published master for the steady-state resolver (ADR 0011).
+	// Both directions matter: writing ours onto a foreign object publishes this
+	// cluster's master into someone else's config, and reading a foreign one feeds
+	// a stranger's value into this cluster's master authority. This refusal closes
+	// the write and is the one reporter; replicaConfigMaster closes the read by
+	// reporting the published master as unknown (ADR 0020 D8).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the replica configuration is not managed by this Valkey: the operator will not write "+
+				"its data and will not read a published master from it")
+		return foreignObjectError("ConfigMap", desired.Name)
 	}
 
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
@@ -635,80 +872,187 @@ func (r *ValkeyReconciler) deleteLegacyServices(ctx context.Context, v *vkov1.Va
 }
 
 // reconcileSidecarRBAC ensures the sidecar ServiceAccount, Role, and RoleBinding exist.
+//
+// The three objects share the derived name <cr-name>-sidecar, and the grant follows
+// that **name** rather than any particular object: BuildSidecarRoleBinding names the
+// ServiceAccount as its subject without a UID, and this function never reads the
+// ServiceAccount back. Writing the binding while a foreign ServiceAccount holds the
+// name would therefore hand `pods: patch` on this cluster's data pods to whatever
+// identity that is — which is the label the -rw Service selects on and the drain
+// stamp the split-brain resolver consumes as evidence.
+//
+// So a refusal on the ServiceAccount or on the Role stops the binding too, and the
+// step fails rather than returning quietly: the resulting cluster has no sidecar
+// able to set instanceRole, so the -rw Service selects no pod at all and the CR is
+// not writable. The failure carries that into the ReconcileBlocked condition and the
+// Error phase, and the rate limiter re-enters the pass at most
+// reconcileRetryMaxDelay later, so removing the colliding object is enough to finish
+// the provisioning — no operator restart
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D1, D3, D6).
 func (r *ValkeyReconciler) reconcileSidecarRBAC(ctx context.Context, v *vkov1.Valkey) error {
-	if err := r.reconcileSidecarServiceAccount(ctx, v); err != nil {
+	saOwned, err := r.reconcileSidecarServiceAccount(ctx, v)
+	if err != nil {
 		return err
 	}
-	if err := r.reconcileSidecarRole(ctx, v); err != nil {
+	if !saOwned {
+		return foreignObjectError("sidecar ServiceAccount", builder.SidecarServiceAccountName(v))
+	}
+
+	roleOwned, err := r.reconcileSidecarRole(ctx, v)
+	if err != nil {
 		return err
 	}
+	if !roleOwned {
+		// The other direction of the same hazard: RoleRef names the Role, so
+		// binding our ServiceAccount to a Role the operator did not write would
+		// grant the sidecar whatever that Role happens to carry.
+		return foreignObjectError("sidecar Role", builder.SidecarServiceAccountName(v))
+	}
+
 	return r.reconcileSidecarRoleBinding(ctx, v)
 }
 
 // reconcileSidecarServiceAccount creates or updates the sidecar ServiceAccount.
-func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+//
+// It reports whether the name is held by an object this Valkey controls. False means
+// nothing was written and the caller must not write the Role or the RoleBinding
+// either; see reconcileSidecarRBAC for why the binding is the part that matters.
+func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSidecarServiceAccount(v)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
+		return false, fmt.Errorf("setting owner reference on sidecar ServiceAccount: %w", err)
 	}
 	current := &corev1.ServiceAccount{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating sidecar ServiceAccount", "name", desired.Name)
 		if err := r.Create(ctx, desired); err != nil {
-			return fmt.Errorf("creating sidecar ServiceAccount: %w", err)
+			return false, fmt.Errorf("creating sidecar ServiceAccount: %w", err)
 		}
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSidecarServiceAccountNotOwned, "ServiceAccount", desired.Name,
+			"no Role and no RoleBinding are written for it, so it is granted nothing; this Valkey stays "+
+				"unwritable until that ServiceAccount is deleted or the Valkey is renamed")
+		return false, nil
+	}
+
 	if equality.Semantic.DeepEqual(current.Labels, desired.Labels) &&
-		equality.Semantic.DeepEqual(current.Annotations, desired.Annotations) {
-		return nil
+		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		return true, nil
 	}
 	logger.Info("Updating sidecar ServiceAccount", "name", desired.Name)
 	current.Labels = desired.Labels
-	current.Annotations = desired.Annotations
+	// Merge, do not assign — see reconcileObserverServiceAccount for why (ADR 0020 D4).
+	builder.ApplyOperatorVersion(current, r.OperatorVersion)
 	if err := r.Update(ctx, current); err != nil {
-		return fmt.Errorf("updating sidecar ServiceAccount: %w", err)
+		return false, fmt.Errorf("updating sidecar ServiceAccount: %w", err)
 	}
-	return nil
+	return true, nil
+}
+
+// listDataPodNames returns the names of the pods that currently carry this cluster's
+// data-pod selector labels, including pods that are terminating — a pod on its way out
+// is exactly the one whose sidecar still needs to patch.
+// A pod that merely carries the selector labels is not one of ours, and this list
+// is not only read: it becomes the resourceNames of the sidecar Role, so an
+// unfiltered entry hands this cluster's sidecar `patch` on somebody else's pod. That
+// is ADR 0020 D3 mirrored — there the grant followed the name of the subject, here it
+// would follow the name of the object. The refused names are returned rather than
+// logged, because this function's one caller is the family's single reporter (D9).
+func (r *ValkeyReconciler) listDataPodNames(
+	ctx context.Context, v *vkov1.Valkey,
+) (names []string, refused []string, err error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(v.Namespace),
+		client.MatchingLabels(common.SelectorLabels(v, common.ComponentValkey)),
+	); err != nil {
+		return nil, nil, err
+	}
+
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	owned, refused := filterOwnedPods(podList.Items, sts)
+	names = make([]string, 0, len(owned))
+	for i := range owned {
+		names = append(names, owned[i].Name)
+	}
+	return names, refused, nil
 }
 
 // reconcileSidecarRole creates or updates the sidecar Role.
-func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) error {
+//
+// The grant is scoped to named pods, so the pass has to know which pods exist: a
+// scale-down keeps a departing pod in the list until it is actually gone, or its
+// drain handler could not set its own draining label (builder.SidecarRolePodNames).
+// A failed List fails the step rather than narrowing the Role on incomplete
+// information — the Role already in the cluster is the wider one, and leaving it
+// is the safe direction.
+// It reports whether the name is held by an object this Valkey controls, the same
+// way reconcileSidecarServiceAccount does. Overwriting a foreign Role would destroy
+// whatever it grants; binding to one would grant the sidecar whatever it carries.
+func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
-	desired := builder.BuildSidecarRole(v)
+	livePodNames, refusedPods, err := r.listDataPodNames(ctx, v)
+	if err != nil {
+		return false, fmt.Errorf("listing data pods for the sidecar Role: %w", err)
+	}
+	// The one reporter for the pod family (ADR 0020 D9). This step is wired
+	// unconditionally and lists the data pods anyway, so the Event costs no extra
+	// read, and every other filtering path stays quiet — one Event series per pass,
+	// the same rule D8 sets for the StatefulSet.
+	for _, name := range refusedPods {
+		r.warnForeignObject(ctx, v, reasonPodNotOwned, "Pod", name,
+			"it carries this cluster's labels but was not created by its StatefulSet: the operator "+
+				"will not grant the sidecar patch on it, command it, or count it")
+	}
+	desired := builder.BuildSidecarRole(v, livePodNames)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on sidecar Role: %w", err)
+		return false, fmt.Errorf("setting owner reference on sidecar Role: %w", err)
 	}
 	current := &rbacv1.Role{}
-	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	err = r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
 		logger.Info("Creating sidecar Role", "name", desired.Name)
 		if err := r.Create(ctx, desired); err != nil {
-			return fmt.Errorf("creating sidecar Role: %w", err)
+			return false, fmt.Errorf("creating sidecar Role: %w", err)
 		}
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSidecarRoleNotOwned, "Role", desired.Name,
+			"its rules are left as they are and no RoleBinding is written, so the sidecar is granted "+
+				"nothing; this Valkey stays unwritable until that Role is deleted or the Valkey is renamed")
+		return false, nil
+	}
+
 	if equality.Semantic.DeepEqual(current.Rules, desired.Rules) &&
 		!builder.OperatorVersionChanged(current, r.OperatorVersion) {
-		return nil
+		return true, nil
 	}
 	logger.Info("Updating sidecar Role", "name", desired.Name)
 	current.Rules = desired.Rules
 	builder.ApplyOperatorVersion(current, r.OperatorVersion)
 	if err := r.Update(ctx, current); err != nil {
-		return fmt.Errorf("updating sidecar Role: %w", err)
+		return false, fmt.Errorf("updating sidecar Role: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // reconcileSidecarRoleBinding creates or updates the sidecar RoleBinding.
@@ -732,11 +1076,39 @@ func (r *ValkeyReconciler) reconcileSidecarRoleBinding(ctx context.Context, v *v
 	if err != nil {
 		return err
 	}
+
+	if !metav1.IsControlledBy(current, v) {
+		// Before this guard the branch below deleted and recreated whatever held
+		// the name, and RoleRef being immutable made that trigger *certain* for a
+		// foreign binding: a hand-written one points at a different Role by
+		// construction. ADR 0006 named it as an open residual; this closes it.
+		r.warnForeignObject(ctx, v, reasonSidecarRoleBindingNotOwned, "RoleBinding", desired.Name,
+			"it is neither rewritten nor recreated, so the sidecar is granted nothing; this Valkey stays "+
+				"unwritable until that RoleBinding is deleted or the Valkey is renamed")
+		return foreignObjectError("sidecar RoleBinding", desired.Name)
+	}
+
 	if !equality.Semantic.DeepEqual(current.RoleRef, desired.RoleRef) {
-		// RoleRef is immutable — delete and recreate.
+		// RoleRef is immutable — delete and recreate. The UID precondition keeps
+		// the delete on the object this pass inspected: the ownership decision
+		// above was made on a cache-backed read, so the name can hold a different
+		// object by the time the Delete lands (ADR 0006 D8, D9).
 		logger.Info("Recreating sidecar RoleBinding (RoleRef changed)", "name", desired.Name)
-		if err := r.Delete(ctx, current); err != nil {
-			return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+		if err := r.Delete(ctx, current, client.Preconditions{UID: &current.UID}); err != nil {
+			switch {
+			case apierrors.IsNotFound(err):
+				// Already gone; the Create below puts ours in its place.
+			case apierrors.IsConflict(err):
+				// The name holds a different object than the one this pass
+				// inspected, so there is nothing of ours to replace. The next
+				// pass re-Gets the name and takes the ownership branch above
+				// (ADR 0006 D10).
+				logger.Info("Skipping sidecar RoleBinding recreation: the object was replaced under its name",
+					"name", desired.Name)
+				return nil
+			default:
+				return fmt.Errorf("deleting sidecar RoleBinding for recreation: %w", err)
+			}
 		}
 		if err := r.Create(ctx, desired); err != nil {
 			return fmt.Errorf("recreating sidecar RoleBinding: %w", err)
@@ -777,6 +1149,23 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 		return err
 	}
 
+	// Every Service the operator manages runs through here: the headless one, -rw,
+	// -r, -all, -metrics and the Sentinel headless one. A spec.selector is mutable,
+	// so unlike the StatefulSet there is no immutability backstop behind a takeover
+	// — the Update succeeds and points a foreign Service's traffic at this
+	// cluster's pods.
+	//
+	// The refusal fails the step, because -rw is how clients reach the master and a
+	// cluster whose write endpoint the operator will not maintain cannot do its job
+	// (ADR 0020 D2). The one exception is the metrics Service, whose caller
+	// downgrades this error: see reconcileMetricsService.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonServiceNotOwned, "Service", desired.Name,
+			"traffic under this name is not routed by this Valkey: the operator will not write "+
+				"its ports, selector or labels")
+		return foreignObjectError("Service", desired.Name)
+	}
+
 	// Update ports, selector, labels, or operator version annotation if they changed.
 	if !equality.Semantic.DeepEqual(current.Spec.Ports, desired.Spec.Ports) ||
 		!equality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) ||
@@ -810,6 +1199,21 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	}
 	if err != nil {
 		return err
+	}
+
+	// The data StatefulSet carries the bare CR name, so this is the name an
+	// arbitrary pre-existing StatefulSet is most likely to hold. Writing the pod
+	// template onto a foreign one replaces its workload — and its own
+	// updateStrategy (which the operator does not write) rolls that template out
+	// immediately, without the OnDelete pacing. Without the data StatefulSet the
+	// CR cannot do its job, so the refusal fails the step, unlike the observer
+	// ones (ADR 0020 D2). Every other consumer treats the foreign object as
+	// absent; this function is the one reporter.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonStatefulSetNotOwned, "StatefulSet", desired.Name,
+			"the data plane is not provisioned: the operator will not write the object, nudge it, "+
+				"run rolling updates against it, or count its pods in status")
+		return foreignObjectError("StatefulSet", desired.Name)
 	}
 
 	// Detect drift and update.
@@ -865,6 +1269,16 @@ func (r *ValkeyReconciler) reconcileSentinelConfigMap(ctx context.Context, v *vk
 		return err
 	}
 
+	// Same rule and same fail direction as the data ConfigMap: the Sentinel pods
+	// mount this name, and an HA cluster whose Sentinel configuration the operator
+	// does not control has no dependable failover authority (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the Sentinel configuration is not managed by this Valkey: the operator will not write "+
+				"its data")
+		return foreignObjectError("ConfigMap", desired.Name)
+	}
+
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Sentinel ConfigMap", "name", desired.Name)
@@ -901,6 +1315,17 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	}
 	if err != nil {
 		return err
+	}
+
+	// Same rule and same fail direction as the data StatefulSet: without its
+	// Sentinels an HA cluster has no failover authority, so the CR cannot do its
+	// job and the refusal fails the step (ADR 0020 D2). This function is the one
+	// reporter; every other consumer treats the foreign object as absent.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSentinelStatefulSetNotOwned, "StatefulSet", desired.Name,
+			"Sentinel is not provisioned: the operator will not write the object, nudge it, "+
+				"run rolling updates against it, or count its pods in status")
+		return foreignObjectError("StatefulSet", desired.Name)
 	}
 
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -952,6 +1377,12 @@ func (r *ValkeyReconciler) reconcileTLSCertificates(ctx context.Context, v *vkov
 // unified Secret via its kubelet binding, and is Ready. This prevents pulling
 // the legacy volume out from under any pod that is still bound to it.
 // Idempotent: NotFound is OK.
+//
+// Neither object is deleted on its name alone. <cr>-sentinel-tls is a name a user
+// object can legitimately carry, and a principal who may create Valkey CRs in a
+// namespace picks the CR name — so the name is attacker-chosen input, not evidence
+// of ownership (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11). The two helpers below
+// each establish provenance first.
 func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context.Context, v *vkov1.Valkey) error {
 	if !v.IsCertManagerEnabled() || !v.IsUnifiedCertificateEnabled() {
 		return nil
@@ -974,42 +1405,178 @@ func (r *ValkeyReconciler) reconcileLegacySentinelCertificateCleanup(ctx context
 		return nil
 	}
 
+	ourCertificate, err := r.deleteLegacySentinelCertificate(ctx, v, legacyName)
+	if err != nil {
+		return err
+	}
+
+	return r.deleteLegacySentinelSecret(ctx, v, legacyName, ourCertificate)
+}
+
+// deleteLegacySentinelCertificate removes the legacy per-Sentinel Certificate and
+// reports whether the object under that name was one this Valkey owned and whose
+// spec.secretName pointed at the legacy Secret name. That verdict is the in-pass
+// provenance proof the Secret deletion below consumes; it is returned rather than
+// re-read so the Secret decision costs no second API call.
+//
+// A Certificate that is NOT controlled by this Valkey is left untouched
+// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11). The operator sets the
+// ownerReference itself on every Certificate it creates (see reconcileCertificate), so ownership is
+// a self-issued fact here and needs no external convention. A foreign Certificate under this name
+// belongs to someone else; deleting it stops their issuance and renewal.
+//
+// We GET first so a missing resource costs zero delete-permission attempts: the
+// apiserver evaluates authz before existence, so a Delete against a non-existent
+// resource on a cluster without `delete` RBAC returns 403 (Forbidden) rather than
+// 404 (NotFound) and would loop the reconciler.
+func (r *ValkeyReconciler) deleteLegacySentinelCertificate(
+	ctx context.Context, v *vkov1.Valkey, legacyName string,
+) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	// Delete the legacy Certificate only if it actually exists. We GET first
-	// so a missing resource costs zero delete-permission attempts: the
-	// apiserver evaluates authz before existence, so a Delete against a
-	// non-existent resource on a cluster without `delete` RBAC returns 403
-	// (Forbidden) rather than 404 (NotFound) and would loop the reconciler.
 	cert := &unstructured.Unstructured{}
 	cert.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   certManagerGroup,
 		Version: "v1",
 		Kind:    certManagerKindCertificate,
 	})
-	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert); err == nil {
-		if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete certificate %s: %w", legacyName, err)
-		}
-		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get legacy certificate %s: %w", legacyName, err)
+	err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, cert)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get legacy certificate %s: %w", legacyName, err)
 	}
 
-	// cert-manager does not garbage-collect the Secret it produced; drop it
-	// explicitly so no stale TLS material lingers and the name is free for
-	// future use. Same GET-first guard as above.
+	if !metav1.IsControlledBy(cert, v) {
+		r.warnLegacySentinelTLSNotOwned(ctx, v, certManagerKindCertificate, legacyName,
+			"it is not controlled by this Valkey")
+		return false, nil
+	}
+
+	// The Secret this Certificate issues into. Under the operator's own naming
+	// these coincide with legacyName (SentinelCertificateName and
+	// SentinelTLSSecretName both derive <cr>-sentinel-tls in split-cert mode),
+	// but the check is explicit so a future split of those two derivations
+	// fails loudly instead of silently authorising the wrong Secret.
+	secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
+
+	// UID precondition, same reasoning as cleanupPodDisruptionBudget
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D8, D9): the ownership decision above was
+	// made on a cache-backed read, so the name can hold a different object by the time the Delete
+	// lands.
+	uid := cert.GetUID()
+	switch err := r.Delete(ctx, cert, client.Preconditions{UID: &uid}); {
+	case err == nil || apierrors.IsNotFound(err):
+		logger.Info("Deleted legacy Sentinel Certificate (unified mode)", "name", legacyName)
+	case apierrors.IsConflict(err):
+		// The name now holds a different object, which by definition is not the
+		// Certificate this pass inspected. Nothing went wrong and nothing is left
+		// to do, but the provenance proof no longer applies to whatever is there.
+		logger.Info("Skipping legacy Sentinel Certificate deletion: the object was replaced under its name",
+			"name", legacyName, "uid", uid)
+		return false, nil
+	default:
+		return false, fmt.Errorf("delete certificate %s: %w", legacyName, err)
+	}
+
+	return secretName == legacyName, nil
+}
+
+// deleteLegacySentinelSecret removes the Secret the legacy Sentinel Certificate
+// produced. cert-manager does not garbage-collect it — the Secrets it issues carry
+// no ownerReference unless the controller runs with --enable-certificate-owner-ref
+// (verified absent on the reference cluster) — so without this delete the stale TLS
+// material lingers and the name stays occupied.
+//
+// The delete is never taken on the name alone (docs/adr/0006-delete-only-what-the-operator-owns.md,
+// D4-D11). One of two provenance proofs must hold, and the Secret must additionally be a TLS
+// Secret:
+//
+//   - ourCertificate: this same pass found a Certificate under legacyName that this
+//     Valkey controls and that issues into legacyName. Fully self-issued evidence,
+//     but only available while that Certificate still exists.
+//   - the cert-manager provenance annotation names legacyName. Retroactive: it sits
+//     on Secrets issued long before this guard existed, which is the population the
+//     migration actually has to clean up. Verified against cert-manager v1.21.1 on
+//     the reference cluster: present on 119 of 119 issued Secrets, and its value is
+//     the CERTIFICATE name, not the Secret name.
+//
+// A Secret that satisfies neither is left alone and reported as an Event. Failing
+// this way round leaves stale TLS material, which is recoverable by hand; the other
+// direction destroys a Secret the operator never created.
+func (r *ValkeyReconciler) deleteLegacySentinelSecret(
+	ctx context.Context, v *vkov1.Valkey, legacyName string, ourCertificate bool,
+) error {
+	logger := log.FromContext(ctx)
+
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, secret); err == nil {
-		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete secret %s: %w", legacyName, err)
-		}
-		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
-	} else if !apierrors.IsNotFound(err) {
+	err := r.Get(ctx, types.NamespacedName{Name: legacyName, Namespace: v.Namespace}, secret)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("get legacy secret %s: %w", legacyName, err)
 	}
 
-	return nil
+	if reason, ok := legacySentinelSecretIsOurs(secret, legacyName, ourCertificate); !ok {
+		r.warnLegacySentinelTLSNotOwned(ctx, v, "Secret", legacyName, reason)
+		return nil
+	}
+
+	uid := secret.GetUID()
+	switch err := r.Delete(ctx, secret, client.Preconditions{UID: &uid}); {
+	case err == nil || apierrors.IsNotFound(err):
+		logger.Info("Deleted legacy Sentinel TLS Secret (unified mode)", "name", legacyName)
+		return nil
+	case apierrors.IsConflict(err):
+		logger.Info("Skipping legacy Sentinel TLS Secret deletion: the object was replaced under its name",
+			"name", legacyName, "uid", uid)
+		return nil
+	default:
+		return fmt.Errorf("delete secret %s: %w", legacyName, err)
+	}
+}
+
+// legacySentinelSecretIsOurs decides whether the Secret under the legacy name is
+// the one the legacy Sentinel Certificate produced. It returns the reason for a
+// refusal so the Event can state what was missing rather than only that something
+// was. See deleteLegacySentinelSecret for why each proof is admissible.
+func legacySentinelSecretIsOurs(secret *corev1.Secret, legacyName string, ourCertificate bool) (string, bool) {
+	// A cert-manager-issued TLS Secret is always kubernetes.io/tls. This does not
+	// establish provenance on its own — an attacker can point the name at a real
+	// TLS Secret — but it removes the entire class of accidental collateral
+	// (token, config and registry Secrets) before either proof is consulted.
+	if secret.Type != corev1.SecretTypeTLS {
+		return fmt.Sprintf("its type is %q, not %q", secret.Type, corev1.SecretTypeTLS), false
+	}
+
+	if ourCertificate {
+		return "", true
+	}
+
+	if secret.Annotations[certManagerCertificateNameAnnotation] == legacyName {
+		return "", true
+	}
+
+	return fmt.Sprintf("neither a Certificate owned by this Valkey nor the %s annotation identifies it "+
+		"as the legacy Sentinel certificate material", certManagerCertificateNameAnnotation), false
+}
+
+// warnLegacySentinelTLSNotOwned reports legacy TLS material that carries the name
+// the operator would clean up but could not be proven to belong to this Valkey.
+//
+// It fires on every applicable pass rather than on a transition: the condition is a
+// property of the cluster, not of an event, and the recorder aggregates a repeated
+// Event into one series. Same shape and rationale as warnPodDisruptionBudgetNotOwned.
+func (r *ValkeyReconciler) warnLegacySentinelTLSNotOwned(
+	ctx context.Context, v *vkov1.Valkey, kind, name, reason string,
+) {
+	log.FromContext(ctx).Info("Legacy Sentinel TLS object exists but was not proven to belong to this Valkey; "+
+		"leaving it untouched", "kind", kind, "name", name, "reason", reason)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonLegacySentinelTLSNotOwned,
+		"%s %s carries the legacy Sentinel TLS name but %s; leaving it untouched. "+
+			"Remove it by hand once you have confirmed it is unused.", kind, name, reason)
 }
 
 // sentinelRolloutComplete reports whether every Sentinel pod has been recreated
@@ -1033,6 +1600,12 @@ func (r *ValkeyReconciler) sentinelRolloutComplete(ctx context.Context, v *vkov1
 	}
 	if err != nil {
 		return false, fmt.Errorf("get sentinel statefulset: %w", err)
+	}
+	// A foreign StatefulSet is treated as absent, which here means "trivially
+	// complete": no pod of ours is bound to the legacy Secret. The downstream
+	// legacy-cleanup deletes are ownership-guarded themselves.
+	if !metav1.IsControlledBy(sts, v) {
+		return true, nil
 	}
 
 	// Wait until the StatefulSet controller has observed our latest spec
@@ -1060,6 +1633,14 @@ func (r *ValkeyReconciler) sentinelRolloutComplete(ctx context.Context, v *vkov1
 				return false, nil
 			}
 			return false, fmt.Errorf("get sentinel pod %s: %w", podName, err)
+		}
+		// A pod this StatefulSet did not create proves nothing about the rollout, and
+		// this verdict gates deleting the legacy Sentinel Secret. Reporting "not
+		// complete" is the same direction the missing-pod branch above takes, and it
+		// keeps the deletion deferred rather than justified by a stranger's revision
+		// label (ADR 0020 D9).
+		if !podIsOurs(pod, sts) {
+			return false, nil
 		}
 		if pod.Labels[appsv1.StatefulSetRevisionLabel] != sts.Status.UpdateRevision {
 			return false, nil
@@ -1121,6 +1702,28 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 		return err
 	}
 
+	// The sharper of the two ownerReference stamps this ADR removes. With
+	// Controller and BlockOwnerDeletion set on a foreign Certificate, deleting the
+	// CR would garbage-collect it and the Secret it manages, ending someone else's
+	// issuance and renewal — the exact harm ADR 0006 D1 forbids, arriving through a
+	// door D1 does not watch because the operator issues no Delete. The spec write
+	// does not even wait for the CR delete: it rewrites issuerRef, dnsNames and
+	// above all secretName, after which cert-manager maintains this cluster's
+	// Secret and abandons theirs.
+	//
+	// The refusal fails the step. The data StatefulSet mounts the TLS Secret by
+	// name, so a foreign Certificate under this name means either no Secret at all
+	// (pods never start) or one with foreign SANs (clients fail the verify); the CR
+	// cannot do its job and must not report OK (ADR 0020 D2). The delete side of
+	// this same object was already guarded in deleteLegacySentinelCertificate —
+	// this closes an asymmetry that was accidental rather than considered.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonCertificateNotOwned, "Certificate", name,
+			"TLS is not provisioned: the operator will not write the object and will not stamp "+
+				"its owner reference onto it, so deleting this Valkey cannot garbage-collect it")
+		return foreignObjectError("Certificate", name)
+	}
+
 	// Compare spec content to determine if update is needed.
 	// Remove fields that cert-manager's webhook adds/manages to avoid
 	// infinite update loops (e.g., privateKey.rotationPolicy added in v1.18.0).
@@ -1174,7 +1777,14 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 	// Observer NetworkPolicy (only if observer is enabled).
 	if v.IsObserverEnabled() {
 		desiredObserver := builder.BuildObserverNetworkPolicy(v)
-		if err := r.reconcileNetworkPolicy(ctx, v, desiredObserver); err != nil {
+		// The observer's own policy takes the observer's fail direction, not the
+		// NetworkPolicy one: the component is diagnostic, it mounts no token, and
+		// no RoleBinding names it, so a collision on its policy name costs the CR
+		// nothing (ADR 0020 D2). reconcileNetworkPolicy already reported it.
+		switch err := r.reconcileNetworkPolicy(ctx, v, desiredObserver); {
+		case errors.Is(err, errForeignObject):
+			requestRecheck(ctx, foreignObjectRecheckInterval)
+		case err != nil:
 			return fmt.Errorf("observer networkpolicy: %w", err)
 		}
 	}
@@ -1199,6 +1809,23 @@ func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.
 	}
 	if err != nil {
 		return err
+	}
+
+	// A NetworkPolicy under a managed name is the isolation the user asked for with
+	// spec.networkPolicy.enabled, and its spec is freely mutable — the write would
+	// replace a foreign policy's rules with this cluster's, changing what somebody
+	// else's pods may reach.
+	//
+	// The refusal fails the step, which is the one place this ADR reads D2 wider
+	// than "does the data plane still serve": a CR reporting OK while the policy it
+	// names belongs to another object is a security statement that is not true. The
+	// observer's policy is the exception its caller makes, matching the rest of the
+	// observer (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonNetworkPolicyNotOwned, "NetworkPolicy", desired.Name,
+			"the isolation this Valkey defines under that name is not enforced: the operator will "+
+				"not write the policy spec")
+		return foreignObjectError("NetworkPolicy", desired.Name)
 	}
 
 	if builder.NetworkPolicyHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -1232,6 +1859,18 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 		return err
 	}
 
+	// The observer is a diagnostic component: the CR still does its job without
+	// it, so the refusal does not fail the step (ADR 0020 D2), mirroring the
+	// observer ServiceAccount. The recheck is what brings the operator back once
+	// an administrator removes the collision — the foreign object carries no
+	// ownerReference to this CR, so no Owns() watch fires for it.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonObserverDeploymentNotOwned, "Deployment", desired.Name,
+			"the observer is not deployed and status.observerReady stays false")
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
 	if builder.ObserverDeploymentHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Observer Deployment", "name", desired.Name)
 		current.Spec = desired.Spec
@@ -1247,29 +1886,76 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 
-	// Delete Observer Deployment.
+	// Delete Observer Deployment — but only the one this CR owns, with the UID
+	// precondition keeping the delete on the object that was inspected (ADR 0006
+	// D8, D9). Refusing to *write* a foreign Deployment while still deleting it
+	// on disable would have been the write guard's absurd mirror image.
 	deploy := &appsv1.Deployment{}
 	deployName := types.NamespacedName{Name: builder.ObserverDeploymentName(v), Namespace: v.Namespace}
 	if err := r.Get(ctx, deployName, deploy); err == nil {
-		logger.Info("Deleting Observer Deployment", "name", deploy.Name)
-		if err := r.Delete(ctx, deploy); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("deleting observer deployment: %w", err)
+		switch {
+		case !metav1.IsControlledBy(deploy, v):
+			logger.Info("Skipping Observer Deployment deletion: not owned by this Valkey", "name", deploy.Name)
+		default:
+			logger.Info("Deleting Observer Deployment", "name", deploy.Name)
+			err := r.Delete(ctx, deploy, client.Preconditions{UID: &deploy.UID})
+			switch {
+			case err == nil || apierrors.IsNotFound(err):
+			case apierrors.IsConflict(err):
+				// The name holds a different object than the one this pass
+				// inspected; nothing of ours is left to delete.
+				logger.Info("Skipping Observer Deployment deletion: the object was replaced under its name",
+					"name", deploy.Name)
+			default:
+				return fmt.Errorf("deleting observer deployment: %w", err)
+			}
 		}
 	}
 
-	// Delete Observer NetworkPolicy if NP is enabled.
+	// Delete the Observer ServiceAccount. A deleted CR garbage-collects it through the
+	// owner reference; this covers the observer being switched off instead.
+	//
+	// Ownership-checked and UID-preconditioned, unlike the two name-only cleanups above:
+	// <cr-name>-observer is a name a CR author can aim at a pre-existing ServiceAccount,
+	// and deleting a foreign one takes every Role bound to it out of service
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md).
+	if err := r.cleanupObserverServiceAccount(ctx, v); err != nil {
+		return err
+	}
+
+	// Delete Observer NetworkPolicy if NP is enabled. Ownership-checked and
+	// UID-preconditioned like the ServiceAccount above: this was the last name-only
+	// delete left on the observer path
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2, D8).
 	if v.IsNetworkPolicyEnabled() {
 		np := &networkingv1.NetworkPolicy{}
 		npName := types.NamespacedName{Name: builder.ObserverNetworkPolicyName(v), Namespace: v.Namespace}
 		if err := r.Get(ctx, npName, np); err == nil {
-			logger.Info("Deleting Observer NetworkPolicy", "name", np.Name)
-			if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("deleting observer network policy: %w", err)
+			if err := r.deleteIfOwned(ctx, v, np, "observer NetworkPolicy"); err != nil {
+				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// cleanupObserverServiceAccount deletes the observer ServiceAccount, but only the one
+// this CR owns. A foreign ServiceAccount that merely shares the derived name is left
+// alone, and the UID precondition keeps the delete on the object that was inspected:
+// the ownership decision is made on a cache-backed read, so the name can hold a
+// different object by the time the Delete lands (ADR 0006 D8, D9).
+func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
+	sa := &corev1.ServiceAccount{}
+	name := types.NamespacedName{Name: builder.ObserverServiceAccountName(v), Namespace: v.Namespace}
+	if err := r.Get(ctx, name, sa); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	return r.deleteIfOwned(ctx, v, sa, "Observer ServiceAccount")
 }
 
 // isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.
@@ -1298,6 +1984,14 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 			return r.updatePhase(ctx, v, vkov1.ValkeyPhaseProvisioning, "Waiting for StatefulSet creation")
 		}
 		return err
+	}
+
+	// A foreign StatefulSet is treated as absent: its replica counts and pod
+	// roles describe someone else's workload. reconcileStatefulSet reports the
+	// collision and fails its step, so the blocked pass writes the authoritative
+	// Error phase over the Provisioning written here.
+	if !metav1.IsControlledBy(sts, v) {
+		return r.updatePhase(ctx, v, vkov1.ValkeyPhaseProvisioning, "Waiting for StatefulSet creation")
 	}
 
 	// Refresh the Valkey object to avoid conflicts.
@@ -1352,8 +2046,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Phase = vkov1.ValkeyPhaseOK
 			v.Status.Message = "All replicas are ready"
 
-			// Pod-0 is the master (standalone single pod or ordinal-based multi-replica).
-			v.Status.MasterPod = fmt.Sprintf("%s-0", v.Name)
+			v.Status.MasterPod = r.currentMasterPod(ctx, v)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
 				Type:               conditionTypeReady,
@@ -1387,14 +2080,55 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		})
 	}
 
-	// Only update if status actually changed to prevent infinite reconcile loops.
-	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
-	v.Status.OperatorVersion = r.OperatorVersion
-	if statusUnchanged(prevStatus, &v.Status) {
-		return nil
+	return r.persistStatus(ctx, v, prevStatus)
+}
+
+// currentMasterPod reports the pod the non-Sentinel cluster currently serves writes
+// from. The HA path has its own answer (clusterState.MasterPod, from Sentinel).
+//
+// It used to be pod-0 unconditionally, which is a claim the rest of the operator
+// contradicts by design: after an abandoned topology restoration the promoted replica
+// stays master and TopologyRestored=False says so, and every drain adoption
+// (checkSteadyStateSplitBrain) leaves a non-pod-0 master behind. A non-pod-0 master
+// is a supported end state -- the -rw/-r Services select on the instanceRole label,
+// not on the ordinal -- so the status field was lying exactly where the condition
+// next to it was trying to tell the truth (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md,
+// D11).
+//
+// The order of the three answers is the order of their authority:
+//
+//  1. The instanceRole=master label, when exactly one pod carries it. This is the
+//     literal selector of the -rw Service, so it is not merely a good guess at the
+//     master: it IS the pod that receives writes. Zero or several labeled pods answer
+//     nothing -- that is a no-master or split-brain state that checkAndRecoverNoMaster
+//     and checkSteadyStateSplitBrain own, and status must not pick a winner there.
+//  2. The known-master annotation, the operator's own record of the last promotion it
+//     performed or adopted. It is what the replica ConfigMap is built from, so it is
+//     the right answer while the labels are in flux (a sidecar that has not repatched
+//     yet, or a pod that is restarting).
+//  3. Pod-0, which is correct for a single-pod cluster and for any cluster that has
+//     never failed over -- and is the honest default when nothing else answers.
+//
+// Cost: a single cache-served List, and only for multi-replica clusters. A single-pod
+// cluster returns without reading anything, because its only pod is pod-0.
+func (r *ValkeyReconciler) currentMasterPod(ctx context.Context, v *vkov1.Valkey) string {
+	pod0 := fmt.Sprintf("%s-0", common.StatefulSetName(v, common.ComponentValkey))
+	if v.Spec.Replicas <= 1 {
+		return pod0
 	}
 
-	return r.Status().Update(ctx, v)
+	labeled, err := r.listMasterLabeledPods(ctx, v)
+	if err != nil {
+		log.FromContext(ctx).Info("Cannot list master-labeled pods for the status; falling back to the record",
+			"cluster", v.Name, "error", err)
+	} else if len(labeled) == 1 {
+		return labeled[0].Name
+	}
+
+	if recorded := knownMasterPodName(v); recorded != "" {
+		return recorded
+	}
+	return pod0
 }
 
 // updateHAStatus updates the status for HA (Sentinel) mode.
@@ -1407,7 +2141,9 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		Name:      fmt.Sprintf("%s-sentinel", v.Name),
 		Namespace: v.Namespace,
 	}
-	if err := r.Get(ctx, sentinelName, sentinelSts); err == nil {
+	// A foreign Sentinel StatefulSet is treated as absent — its ready count
+	// describes someone else's pods (reconcileSentinelStatefulSet reports it).
+	if err := r.Get(ctx, sentinelName, sentinelSts); err == nil && metav1.IsControlledBy(sentinelSts, v) {
 		sentinelReady = sentinelSts.Status.ReadyReplicas
 	}
 
@@ -1492,7 +2228,22 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		})
 	}
 
-	// Only update if status actually changed to prevent infinite reconcile loops.
+	return r.persistStatus(ctx, v, prevStatus)
+}
+
+// persistStatus writes the status computed by updateStandaloneStatus/updateHAStatus,
+// skipping the write when nothing changed to prevent infinite reconcile loops.
+//
+// While the pass is blocked the computed phase and message are dropped and the
+// previous ones kept, so the pass keeps its single Error phase write. Everything
+// else — readyReplicas, masterPod, observerReady, conditions — keeps updating:
+// a rejected managed write says nothing about the running data plane.
+func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, prevStatus *vkov1.ValkeyStatus) error {
+	if passIsBlocked(ctx) {
+		v.Status.Phase = prevStatus.Phase
+		v.Status.Message = prevStatus.Message
+	}
+
 	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
 	v.Status.OperatorVersion = r.OperatorVersion
 	if statusUnchanged(prevStatus, &v.Status) {
@@ -1531,7 +2282,20 @@ func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 }
 
 // updatePhase is a convenience function to update only the phase and message.
+//
+// While the pass is blocked the write is dropped: reconcileResources failed, and
+// Reconcile ends the pass with a single Error phase write. Without this the health
+// phase and the Error phase alternate on every pass and watchers see the CR flap.
 func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, phase vkov1.ValkeyPhase, message string) error {
+	if passIsBlocked(ctx) {
+		return nil
+	}
+	return r.writePhase(ctx, v, phase, message)
+}
+
+// writePhase updates phase and message unconditionally. Only the final write of a
+// blocked pass may use it directly; everything else goes through updatePhase.
+func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phase vkov1.ValkeyPhase, message string) error {
 	// Refresh the object first to avoid update conflicts.
 	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
 		return err
@@ -1548,19 +2312,80 @@ func (r *ValkeyReconciler) updatePhase(ctx context.Context, v *vkov1.Valkey, pha
 }
 
 // setStatusCondition sets a named status condition on the Valkey CR.
-// It refreshes the object from the API server before writing to avoid conflicts.
+// It refreshes the object before writing to avoid conflicts.
+//
+// ObservedGeneration is taken from the refreshed object, not from the caller's
+// copy. It therefore names the generation the CR carried at the moment of the
+// write — which is normally, but not necessarily, the generation the condition
+// was computed against: a spec edit landing between the caller's evaluation and
+// this refresh makes the condition claim a generation it did not evaluate. That
+// over-claim lasts one pass, because the next reconcile recomputes the condition
+// from the new spec and overwrites it. The field is stamped at all because tooling
+// that judges staleness by observedGeneration (kstatus and everything modelled on
+// it) reads a condition without one as generation 0 and therefore as permanently
+// stale; every Ready condition already carries it.
+//
+// The status write is skipped when meta.SetStatusCondition reports no change.
+// That helper counts a differing Status, Reason, Message or ObservedGeneration as
+// a change (LastTransitionTime alone never is — it only moves on a status flip),
+// and v was just refreshed from the API server, so "no change" means the stored
+// condition already matches in every field this write would set. Without the skip
+// every caller that reports a steady state — setSidecarUpdatePendingCondition on
+// each standalone pass being the live one — issued a status update per reconcile,
+// which is what the skip guards in setReconcileBlockedCondition exist to avoid.
+//
+// setStatusCondition logs and swallows the outcome: for the callers that report a
+// steady state — ReconcileBlocked, SidecarUpdatePending, RollingUpdatePaused — a
+// condition is a report about the pass, never a reason to fail it, and losing one
+// write is self-healing because the next pass recomputes the condition from live
+// state and rewrites it. It is not silent either: a persistent conflict or a lost
+// permission shows up in the operator log instead of leaving the condition stale
+// with no trace.
+//
+// A caller whose condition is the one-shot record of something that happens
+// exactly once has no next pass to be healed by. It calls writeStatusCondition
+// and decides for itself what a failed write means
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
 func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
-	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
-		return
+	if err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to write status condition; it will be recomputed on the next reconcile",
+			"condition", condType, "reason", reason)
 	}
-	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
+}
+
+// writeStatusCondition is the write setStatusCondition documents, reporting
+// whether it landed.
+//
+// Every attempt reads the CR again, because the read goes through the manager
+// cache and a caller that updated the CR itself moments earlier reads back the
+// version from before its own write — the status update is then rejected with a
+// 409 that has nothing to do with a competing writer. Retrying is what turns that
+// into a landed condition; a conflict that survives the retry is handed to the
+// caller, which is the only place that knows whether the record is worth another
+// pass.
+//
+// A CR that disappeared under the pass is not a failure: there is nothing left to
+// record on, and every caller would swallow the NotFound anyway.
+func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if !meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			ObservedGeneration: v.Generation,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		}) {
+			return nil
+		}
+		return r.Status().Update(ctx, v)
 	})
-	_ = r.Status().Update(ctx, v)
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
@@ -1582,6 +2407,31 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 		"All sidecar containers are running the desired image")
 }
 
+// clearSidecarUpdatePending flips SidecarUpdatePending to False, but only for a CR
+// that actually carries the condition.
+//
+// The False branch of setSidecarUpdatePendingCondition had exactly one caller,
+// handleStandaloneRollingUpdate, and it was unreachable on the transition that matters
+// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D10). That function is only entered
+// while a rolling update is needed or a state annotation is set; the moment the deferred sidecar
+// update actually applies -- an admin deletes the pod, it comes back on the current template --
+// neither holds, checkAndHandleRollingUpdate returns before dispatching, and the condition stays
+// True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable from a
+// cluster that never applied it, and permanent drift for anything keyed on the condition.
+//
+// The presence check is what keeps this from being a new condition on every CR in the
+// fleet: meta.SetStatusCondition adds an absent condition and reports a change, so
+// calling it unconditionally would write SidecarUpdatePending=False onto clusters that
+// never had a sidecar drift -- an upgrade that changes the status of every existing
+// cluster. Only a pending-to-resolved transition writes; everything else is one map
+// lookup on the healthy path.
+func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSidecarUpdatePending) == nil {
+		return
+	}
+	r.setSidecarUpdatePendingCondition(ctx, v, false)
+}
+
 // checkAndRecoverNoMaster detects a no-master state in multi-replica non-Sentinel
 // clusters and recovers by promoting pod-0 to master. This can happen when pods
 // restart in a staggered fashion and the master pod is the last to restart — all
@@ -1589,6 +2439,36 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 //
 // Returns (true, nil) if recovery was performed, (false, nil) if no recovery needed,
 // or (false, err) if an error occurred during detection or recovery.
+// probeForAnyMaster asks every pod of the cluster whether it is the master and
+// reports the two facts the recovery decision needs: whether one said yes, and how
+// many could not be asked.
+//
+// A pod sts did not create counts as unreachable rather than as an answer: that is
+// the branch the caller already fails closed on, and it keeps an unproven pod from
+// ever contributing to the unanimous no-master verdict that promotes pod-0
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D9).
+func (r *ValkeyReconciler) probeForAnyMaster(
+	ctx context.Context, v *vkov1.Valkey, sts *appsv1.StatefulSet, stsName string,
+	checker InstanceChecker,
+) (hasMaster bool, unreachable int) {
+	for i := int32(0); i < v.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		if !r.podUnderNameIsOurs(ctx, v, podName, sts) {
+			unreachable++
+			continue
+		}
+		info, err := checker.GetReplicationInfo(ctx, v, podName)
+		if err != nil {
+			unreachable++
+			continue
+		}
+		if info.Role == common.RoleMaster {
+			return true, unreachable
+		}
+	}
+	return false, unreachable
+}
+
 func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
 
@@ -1601,24 +2481,19 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 	checker := r.getInstanceChecker()
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 
-	// Check that all pods are reachable before drawing conclusions.
-	// If any pod is unreachable, we cannot reliably determine cluster topology.
-	hasMaster := false
-	unreachable := 0
-	for i := int32(0); i < v.Spec.Replicas; i++ {
-		podName := fmt.Sprintf("%s-%d", stsName, i)
-		info, err := checker.GetReplicationInfo(ctx, v, podName)
-		if err != nil {
-			unreachable++
-			continue
-		}
-		if info.Role == common.RoleMaster {
-			hasMaster = true
-			break
-		}
+	// The promotion this function can reach is REPLICAOF NO ONE on pod-0, so every
+	// pod it draws a conclusion from has to be proven ours first (ADR 0020 D9). A
+	// StatefulSet this Valkey does not own leaves nothing to recover — the data plane
+	// is not provisioned and reconcileStatefulSet is already reporting that.
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		return false, fmt.Errorf("reading the data StatefulSet: %w", err)
+	}
+	if sts == nil {
+		return false, nil
 	}
 
-	if hasMaster || unreachable > 0 {
+	if hasMaster, unreachable := r.probeForAnyMaster(ctx, v, sts, stsName, checker); hasMaster || unreachable > 0 {
 		return false, nil
 	}
 
@@ -1642,6 +2517,22 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 	headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 	masterHost := fmt.Sprintf("%s.%s.%s.svc.cluster.local", masterPodName, headlessName, v.Namespace)
 	portStr := fmt.Sprintf("%d", port)
+
+	// Record the promotion before performing it. The known-master annotation is
+	// what checkSteadyStateSplitBrain demotes toward and what the init script
+	// self-claims on, so promoting without recording leaves a stale name pointing
+	// at some other pod — and this function never gets a second chance to fix it,
+	// because the next pass finds a master and short-circuits on hasMaster.
+	//
+	// Ordering the record before the REPLICAOF is what makes its failure
+	// recoverable: nothing is promoted yet, so the returned error simply retries
+	// the whole recovery on the next pass (the caller's error path requeues).
+	// Naming a pod that is still a replica is harmless meanwhile —
+	// confirmedMasterAuthority demotes nothing until the named pod itself reports
+	// role:master.
+	if err := r.recordPromotedMaster(ctx, v, masterHost); err != nil {
+		return false, fmt.Errorf("recording %s as known master: %w", masterPodName, err)
+	}
 
 	// Promote pod-0 to master.
 	masterAddr := health.PodAddressForComponent(v, masterPodName, common.ComponentValkey, port)
@@ -1683,6 +2574,7 @@ func (r *ValkeyReconciler) verifyValkeyConnectivity(ctx context.Context, v *vkov
 // SetupWithManager sets up the controller with the Manager.
 func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(reconcileControllerOptions(r.MaxConcurrentReconciles)).
 		For(&vkov1.Valkey{}, ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
@@ -1692,6 +2584,7 @@ func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findValkeyForSecret),

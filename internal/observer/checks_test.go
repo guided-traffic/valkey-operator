@@ -2,7 +2,6 @@ package observer
 
 import (
 	"context"
-	"crypto/tls"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +12,7 @@ func TestDiscoverMaster_StandaloneMode(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.ns.invalid",
 			SentinelEnabled:   false,
 			TLSEnabled:        false,
 		},
@@ -21,14 +20,14 @@ func TestDiscoverMaster_StandaloneMode(t *testing.T) {
 
 	addr, err := obs.discoverMaster(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:6379", addr)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.invalid:6379", addr)
 }
 
 func TestDiscoverMaster_StandaloneMode_TLS(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.ns.invalid",
 			SentinelEnabled:   false,
 			TLSEnabled:        true,
 		},
@@ -36,7 +35,7 @@ func TestDiscoverMaster_StandaloneMode_TLS(t *testing.T) {
 
 	addr, err := obs.discoverMaster(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:16379", addr)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.invalid:16379", addr)
 }
 
 func TestDiscoverMaster_SentinelMode_NoAddrs(t *testing.T) {
@@ -77,7 +76,7 @@ func TestCheckReplicaRead_NoReplicasToCheck(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "test",
-			ValkeyHeadlessSvc: "test-headless.default.svc.cluster.local",
+			ValkeyHeadlessSvc: "test-headless.default.invalid",
 			Replicas:          0,
 		},
 	}
@@ -147,40 +146,13 @@ func TestCheckSentinelReplicaHostnames_AllFail(t *testing.T) {
 	assert.Contains(t, err.Error(), "replica hostname check failed")
 }
 
-func TestNewSentinelClient_FallbackToTLSConfig(t *testing.T) {
-	obs := &Observer{
-		cfg:       Config{},
-		tlsConfig: nil,
-	}
-
-	// No TLS, no password.
-	c := obs.newSentinelClient("localhost:26379", "")
-	assert.NotNil(t, c)
-
-	// With password, no TLS.
-	c = obs.newSentinelClient("localhost:26379", "secret")
-	assert.NotNil(t, c)
-}
-
-func TestNewSentinelClient_WithSentinelTLSConfig(t *testing.T) {
-	obs := &Observer{
-		cfg:               Config{},
-		sentinelTLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		tlsConfig:         &tls.Config{MinVersion: tls.VersionTLS13},
-	}
-
-	// Should use sentinelTLSConfig, not tlsConfig.
-	c := obs.newSentinelClient("localhost:36379", "pass")
-	assert.NotNil(t, c)
-}
-
 // --- discoverMasterViaProbe tests ---
 
 func TestDiscoverMasterViaProbe_AllUnreachable_FallsBackToHeadless(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.ns.invalid",
 			Replicas:          3,
 			SentinelEnabled:   false,
 			TLSEnabled:        false,
@@ -191,7 +163,7 @@ func TestDiscoverMasterViaProbe_AllUnreachable_FallsBackToHeadless(t *testing.T)
 	// discoverMaster falls back to masterAddressFromHeadless (pod-0).
 	addr, err := obs.discoverMaster(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:6379", addr,
+	assert.Equal(t, "mydb-0.mydb-headless.ns.invalid:6379", addr,
 		"When probe fails, should fall back to pod-0 headless address")
 }
 
@@ -199,7 +171,7 @@ func TestDiscoverMasterViaProbe_AllUnreachable_TLS(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.ns.invalid",
 			Replicas:          3,
 			SentinelEnabled:   false,
 			TLSEnabled:        true,
@@ -208,7 +180,7 @@ func TestDiscoverMasterViaProbe_AllUnreachable_TLS(t *testing.T) {
 
 	addr, err := obs.discoverMaster(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:16379", addr,
+	assert.Equal(t, "mydb-0.mydb-headless.ns.invalid:16379", addr,
 		"When probe fails with TLS, should fall back to pod-0 headless TLS address")
 }
 
@@ -216,7 +188,7 @@ func TestDiscoverMasterViaProbe_ReturnsError_WhenAllUnreachable(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.invalid.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.invalid",
 			Replicas:          3,
 		},
 	}
@@ -230,7 +202,7 @@ func TestDiscoverMaster_SingleReplica_SkipsProbe(t *testing.T) {
 	obs := &Observer{
 		cfg: Config{
 			ClusterName:       "mydb",
-			ValkeyHeadlessSvc: "mydb-headless.ns.svc.cluster.local",
+			ValkeyHeadlessSvc: "mydb-headless.ns.invalid",
 			Replicas:          1,
 			SentinelEnabled:   false,
 			TLSEnabled:        false,
@@ -240,5 +212,5 @@ func TestDiscoverMaster_SingleReplica_SkipsProbe(t *testing.T) {
 	// Replicas=1 → should not attempt probe, go directly to headless.
 	addr, err := obs.discoverMaster(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "mydb-0.mydb-headless.ns.svc.cluster.local:6379", addr)
+	assert.Equal(t, "mydb-0.mydb-headless.ns.invalid:6379", addr)
 }

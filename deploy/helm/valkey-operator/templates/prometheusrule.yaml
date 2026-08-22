@@ -1,0 +1,142 @@
+{{- if .Values.metrics.prometheusRule.enabled -}}
+{{/*
+A starting set of alerts over the vko_valkey_* series, not a fixed contract.
+Every rule here answers a failure the operator was previously silent about: a
+resource whose spec the operator never finished evaluating, a write it keeps
+refusing, a phase it cannot leave, and a resource it stopped writing status for
+altogether. Thresholds are deliberately not exposed as values - replace this
+rule with your own if the durations do not fit your fleet.
+
+Every rule is guarded on the collector having succeeded, so a scrape that could
+not list the resources reads as "unknown", never as "the fleet is healthy".
+
+Every rule aggregates away the scrape-target labels with max by (...). With
+replicaCount > 1 both operator pods serve the same per-resource series - the
+non-leader keeps its cache warm - and without the aggregation each alert would
+fire once per pod.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "valkey-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: valkey-operator
+      rules:
+        - alert: ValkeySpecNotObserved
+          expr: |
+            (
+              max by (namespace, name) (vko_valkey_metadata_generation)
+              - max by (namespace, name) (vko_valkey_status_observed_generation)
+            ) > 0
+            and on () max(vko_valkey_collector_success) == 1
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: The operator has not evaluated the current spec of {{ "{{ $labels.namespace }}/{{ $labels.name }}" }}
+            description: >-
+              metadata.generation is ahead of the newest generation any status condition
+              reports as observed, so a spec change was accepted by the API server and
+              never converged. This is the shape of a write the operator cannot complete,
+              for example a field that is immutable on an already created object.
+              Check the ReconcileBlocked condition and status.message on the resource.
+
+        - alert: ValkeyReconcileBlocked
+          expr: |
+            max by (namespace, name, reason) (
+              vko_valkey_status_condition{condition="ReconcileBlocked",status="True"}
+            ) == 1
+            and on () max(vko_valkey_collector_success) == 1
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: The operator cannot write a managed resource of {{ "{{ $labels.namespace }}/{{ $labels.name }}" }}
+            description: >-
+              ReconcileBlocked has been True for 15 minutes with reason
+              {{ "{{ $labels.reason }}" }}. WriteFailed and ForeignObject clear only when a
+              human acts; AdmissionWebhookDenied usually clears on its own once the
+              admission gate reopens.
+
+        - alert: ValkeyPhaseNotOK
+          expr: |
+            max by (namespace, name, phase) (vko_valkey_status_phase{phase!="OK"}) == 1
+            and on () max(vko_valkey_collector_success) == 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: '{{ "{{ $labels.namespace }}/{{ $labels.name }}" }} has been in phase {{ "{{ $labels.phase }}" }} for 30 minutes'
+            description: >-
+              Provisioning, Syncing, Rolling Update and Failover in progress are all
+              transient by design. Half an hour in any of them, or any time in Error,
+              means the cluster is not converging on its own.
+
+        - alert: ValkeyReplicasMissing
+          expr: |
+            (
+              max by (namespace, name) (vko_valkey_spec_replicas)
+              - max by (namespace, name) (vko_valkey_status_ready_replicas)
+            ) > 0
+            and on () max(vko_valkey_collector_success) == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: '{{ "{{ $labels.namespace }}/{{ $labels.name }}" }} is short of ready data pods'
+            description: >-
+              Fewer data pods are ready than spec.replicas asks for. During a rolling
+              update this is expected and brief; sustained, it means pods are not being
+              replaced or not becoming ready.
+
+        - alert: ValkeyOperatorVersionStale
+          expr: |
+            (
+              max by (namespace, name, version) (vko_valkey_operator_version_info)
+              unless on (version) max by (version) (vko_operator_build_info)
+            )
+            and on () max(vko_valkey_collector_success) == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: '{{ "{{ $labels.namespace }}/{{ $labels.name }}" }} was last reconciled by operator {{ "{{ $labels.version }}" }}'
+            description: >-
+              status.operatorVersion does not match the version the running operator
+              reports in vko_operator_build_info. The operator writes it on every
+              successful status update, so a resource left behind is one the current
+              operator has not converged since it started. This fires even when the
+              resource otherwise looks healthy - it is the only rule here that catches a
+              resource the operator quietly stopped touching.
+
+        - alert: ValkeyMetricsCollectorFailing
+          expr: max(vko_valkey_collector_success) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The Valkey operator cannot list its own resources
+            description: >-
+              The metrics collector could not read the Valkey resources from the
+              manager cache. Every other alert in this group is guarded on this one and
+              is therefore not evaluating while it fires.
+
+        - alert: ValkeyMetricsAbsent
+          expr: absent(vko_valkey_collector_success)
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: No Valkey operator metrics are being scraped
+            description: >-
+              The series the other alerts depend on is missing entirely: the operator is
+              down, the Service or ServiceMonitor is gone, or the scrape is failing.
+              While this fires, a broken Valkey resource would not be reported.
+{{- end }}

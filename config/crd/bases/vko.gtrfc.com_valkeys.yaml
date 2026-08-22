@@ -71,6 +71,44 @@ spec:
           spec:
             description: ValkeySpec defines the desired state of Valkey.
             properties:
+              antiAffinity:
+                description: |-
+                  AntiAffinity configures pod anti-affinity for the data and Sentinel
+                  StatefulSets. Omitted means off: no term is rendered and scheduling is
+                  unchanged. Set mode: soft or hard to spread StatefulSets with at least
+                  two replicas across nodes.
+                properties:
+                  mode:
+                    default: "off"
+                    description: |-
+                      Mode selects off (no term, the default), soft
+                      (preferredDuringSchedulingIgnoredDuringExecution) or hard
+                      (requiredDuringSchedulingIgnoredDuringExecution).
+
+                      Soft is a scheduler preference: under node pressure pods may still be
+                      co-located, so the spread is not guaranteed.
+
+                      Hard guarantees the spread and has two consequences worth knowing before
+                      enabling it: with fewer schedulable nodes than replicas the surplus pods
+                      stay Pending (which also wedges the next rolling update), and during a node
+                      drain an evicted pod stays Pending until a node without a pod of the same
+                      StatefulSet becomes schedulable.
+
+                      Switching between the modes changes the pod-spec hash and therefore
+                      triggers one failover-aware rolling update.
+                    enum:
+                    - "off"
+                    - soft
+                    - hard
+                    type: string
+                  topologyKey:
+                    default: kubernetes.io/hostname
+                    description: |-
+                      TopologyKey is the node label whose values define the spread domains.
+                      Defaults to kubernetes.io/hostname (one pod per node); set e.g.
+                      topology.kubernetes.io/zone to spread across availability zones instead.
+                    type: string
+                type: object
               auth:
                 description: Auth configures authentication.
                 properties:
@@ -432,6 +470,46 @@ spec:
                 description: PodAnnotations are additional annotations applied to
                   Valkey pods.
                 type: object
+              podDisruptionBudget:
+                description: |-
+                  PodDisruptionBudget configures PodDisruptionBudgets for the data and
+                  Sentinel StatefulSets. Omitted means no PDBs are managed by the operator.
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
+                      and, when Sentinel is enabled, a quorum-preserving PDB
+                      (minAvailable = floor(replicas/2)+1) for the Sentinel StatefulSet.
+                      StatefulSets with fewer than 2 replicas never get a PDB: it would either be
+                      useless (maxUnavailable 1) or block node drains (minAvailable 1).
+                      With exactly 2 Sentinels the quorum equals the replica count, so the Sentinel
+                      budget permits no voluntary disruption at all and a node drain hosting a
+                      Sentinel pod stalls until it is resolved manually; the operator keeps the
+                      quorum formula (a smaller minAvailable would let a drain take automatic
+                      failover) and warns about it on every reconcile.
+                      A PodDisruptionBudget under one of those names that the operator does not own
+                      is never deleted and never adopted: it stays untouched, this field has no
+                      effect for that StatefulSet, and the operator records a
+                      PodDisruptionBudgetNotOwned Event on every reconcile while that holds and
+                      spec.podDisruptionBudget.enabled is true.
+                    type: boolean
+                  maxUnavailable:
+                    default: 1
+                    description: |-
+                      MaxUnavailable is the maximum number of data pods that may be disrupted
+                      voluntarily at the same time. It applies to the data StatefulSet only — the
+                      Sentinel budget is always derived from the quorum and is not configurable,
+                      because a settable value could silently break the quorum guarantee.
+                      A value greater than or equal to spec.replicas disables the protection
+                      (every pod may be evicted at once); the operator logs a warning and records a
+                      PodDisruptionBudgetTooPermissive Event on every reconcile but honours it
+                      rather than rejecting a later scale-down. Scaling spec.replicas down into
+                      that condition is warned about as well, not only a change of this field.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
               podLabels:
                 additionalProperties:
                   type: string
@@ -549,7 +627,14 @@ spec:
                     type: object
                   replicas:
                     default: 3
-                    description: Replicas is the number of Sentinel instances to run.
+                    description: |-
+                      Replicas is the number of Sentinel instances to run. Use an odd count of 3
+                      or more: a failover needs floor(replicas/2)+1 Sentinels to agree, so 2
+                      Sentinels tolerate no outage at all. With spec.podDisruptionBudget.enabled
+                      that even count also blocks node drains, because the quorum then equals the
+                      replica count and the Eviction API refuses every eviction; the operator
+                      warns and records a SentinelPodDisruptionBudgetBlocksDrains Event on every
+                      reconcile while that holds.
                     format: int32
                     minimum: 1
                     type: integer

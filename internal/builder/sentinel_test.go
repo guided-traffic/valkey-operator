@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
 // --- SentinelConfigMapName ---
@@ -605,6 +606,45 @@ func TestSentinelStatefulSetHasChanged_NoChange(t *testing.T) {
 	current := desired.DeepCopy()
 
 	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestSentinelStatefulSetHasChanged_NoDriftAfterAPIServerDefaulting(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	desired := BuildSentinelStatefulSet(v)
+	current := desired.DeepCopy()
+
+	// Simulate API-server defaulting of the stored object: a nil
+	// terminationGracePeriodSeconds is persisted as 30. A desired spec that
+	// leaves the field nil would report drift on every reconcile.
+	if current.Spec.Template.Spec.TerminationGracePeriodSeconds == nil {
+		defaulted := int64(30)
+		current.Spec.Template.Spec.TerminationGracePeriodSeconds = &defaulted
+	}
+
+	assert.False(t, SentinelStatefulSetHasChanged(desired, current))
+}
+
+func TestBuildSentinelPodSpec_ExplicitTerminationGracePeriod(t *testing.T) {
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{
+			Enabled:  true,
+			Replicas: 3,
+		}
+	})
+
+	spec := buildSentinelPodSpec(v)
+
+	// Pinned to the Kubernetes default so the fix changes no runtime behavior;
+	// only the permanent nil-vs-30 drift disappears.
+	if assert.NotNil(t, spec.TerminationGracePeriodSeconds) {
+		assert.Equal(t, int64(30), *spec.TerminationGracePeriodSeconds)
+	}
 }
 
 func TestSentinelStatefulSetHasChanged_ReplicaChange(t *testing.T) {
@@ -1524,4 +1564,21 @@ func TestSentinelInitContainer_NoTLSVolumeMount_WhenNoTLS(t *testing.T) {
 		assert.NotEqual(t, TLSVolumeName, vm.Name,
 			"init container must NOT mount TLS volume when TLS is disabled")
 	}
+}
+
+// BuildSentinelStatefulSet dereferences spec.sentinel for the user-supplied pod
+// labels. Every production caller is gated on spec.sentinel.enabled, so the nil
+// branch is a guard rather than a code path -- but it is the guard that keeps a CR
+// without a sentinel block from panicking the whole reconcile loop, and it must
+// still produce the base labels the Services and the operator select on.
+func TestBuildSentinelStatefulSet_NoSentinelBlock(t *testing.T) {
+	v := newTestValkey("test")
+	require.Nil(t, v.Spec.Sentinel, "the fixture must carry no sentinel block for this to pin anything")
+
+	sts := BuildSentinelStatefulSet(v)
+
+	assert.Equal(t, common.BaseLabels(v, common.ComponentSentinel), sts.Spec.Template.Labels,
+		"without user labels the pod template carries exactly the base labels")
+	assert.Equal(t, common.ComponentSentinel,
+		sts.Spec.Template.Labels["app.kubernetes.io/component"])
 }

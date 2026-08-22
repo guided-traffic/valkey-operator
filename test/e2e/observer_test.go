@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // TestE2E_Observer tests the observer deployment lifecycle.
@@ -25,7 +27,7 @@ func TestE2E_Observer(t *testing.T) {
 		name := "obs-ha"
 		valkey := buildValkeyObject(name, ns, map[string]interface{}{
 			"replicas": int64(3),
-			"image":    "valkey/valkey:8.0",
+			"image":    testimages.Default(),
 			"sentinel": map[string]interface{}{
 				"enabled":  true,
 				"replicas": int64(3),
@@ -101,7 +103,7 @@ func TestE2E_Observer(t *testing.T) {
 		name := "obs-standalone"
 		valkey := buildValkeyObject(name, ns, map[string]interface{}{
 			"replicas": int64(1),
-			"image":    "valkey/valkey:8.0",
+			"image":    testimages.Default(),
 		})
 
 		tc.createValkey(t, ns, valkey)

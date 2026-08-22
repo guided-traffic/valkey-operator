@@ -1,0 +1,309 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
+	"github.com/guided-traffic/valkey-operator/internal/builder"
+)
+
+// reconcilePodDisruptionBudgets reconciles the data and Sentinel PodDisruptionBudgets.
+//
+// Why the operator manages them at all: a node drain evicts every pod on the node
+// at once. Without a budget that can be all data pods (the 2026-08-19 infra-d
+// incident) or the Sentinel majority, which removes automatic failover exactly
+// when it is needed. The Eviction API is the only thing that serializes voluntary
+// disruptions, and it needs a PDB to do so.
+//
+// Both budgets are opt-in (spec.podDisruptionBudget.enabled) because a PDB the
+// operator creates alongside a user-managed one would make eviction fail outright:
+// the Eviction API refuses a pod covered by more than one budget.
+func (r *ValkeyReconciler) reconcilePodDisruptionBudgets(ctx context.Context, valkey *vkov1.Valkey) error {
+	return r.runReconcileSteps(ctx, valkey, []reconcileStep{
+		{name: "data PodDisruptionBudget", run: r.reconcileDataPodDisruptionBudget},
+		{name: "Sentinel PodDisruptionBudget", run: r.reconcileSentinelPodDisruptionBudget},
+	})
+}
+
+// reconcileDataPodDisruptionBudget creates the data PDB when it applies and removes
+// it otherwise (disabled, or the StatefulSet scaled below the minimum replica count).
+func (r *ValkeyReconciler) reconcileDataPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.NeedsDataPodDisruptionBudget() {
+		if v.IsPodDisruptionBudgetEnabled() && v.Spec.Replicas < vkov1.MinPDBReplicas {
+			logPodDisruptionBudgetSkip(ctx, builder.PodDisruptionBudgetName(v), v.Spec.Replicas)
+		}
+		return r.cleanupPodDisruptionBudget(ctx, v, builder.PodDisruptionBudgetName(v))
+	}
+
+	applied, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildValkeyPodDisruptionBudget(v))
+	if err != nil {
+		return err
+	}
+	if applied {
+		r.warnIfDataBudgetProtectsNothing(ctx, v)
+	}
+	return nil
+}
+
+// reasonPodDisruptionBudgetTooPermissive is the Event reason for a data budget
+// that permits evicting every data pod at once.
+const reasonPodDisruptionBudgetTooPermissive = "PodDisruptionBudgetTooPermissive"
+
+// warnIfDataBudgetProtectsNothing warns while maxUnavailable is not smaller than
+// spec.replicas — the budget then permits a single drain to take every data pod.
+//
+// It runs on every pass in which the budget applies, not only when the PDB was
+// written. Scaling spec.replicas down into the condition (5 -> 2 with
+// maxUnavailable 2) leaves the PDB object byte-identical, so a write-gated warning
+// stayed silent for exactly the change that created the hazard. The repetition
+// that costs is the Event, and the recorder aggregates a repeated Event into one
+// series instead of new objects.
+//
+// It is called only when the budget is actually in effect: against a foreign budget under the same
+// name nothing was written, and reporting maxUnavailable of an object that does not exist
+// contradicts the PodDisruptionBudgetNotOwned warning
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
+func (r *ValkeyReconciler) warnIfDataBudgetProtectsNothing(ctx context.Context, v *vkov1.Valkey) {
+	maxUnavailable := v.PodDisruptionBudgetMaxUnavailable()
+	if maxUnavailable < v.Spec.Replicas {
+		return
+	}
+
+	name := builder.PodDisruptionBudgetName(v)
+	log.FromContext(ctx).Info("PodDisruptionBudget allows every data pod to be evicted at once; "+
+		"spec.podDisruptionBudget.maxUnavailable is not smaller than spec.replicas",
+		"name", name, "maxUnavailable", maxUnavailable, "replicas", v.Spec.Replicas)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonPodDisruptionBudgetTooPermissive,
+		"PodDisruptionBudget %s allows every data pod to be evicted at once "+
+			"(maxUnavailable %d is not smaller than replicas %d)",
+		name, maxUnavailable, v.Spec.Replicas)
+}
+
+// reconcileSentinelPodDisruptionBudget creates the quorum-preserving Sentinel PDB
+// when it applies and removes it otherwise (PDBs or Sentinel disabled, or fewer
+// than two Sentinel replicas).
+func (r *ValkeyReconciler) reconcileSentinelPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.NeedsSentinelPodDisruptionBudget() {
+		if v.IsPodDisruptionBudgetEnabled() && v.IsSentinelEnabled() &&
+			v.Spec.Sentinel.Replicas < vkov1.MinPDBReplicas {
+			logPodDisruptionBudgetSkip(ctx, builder.SentinelPodDisruptionBudgetName(v), v.Spec.Sentinel.Replicas)
+		}
+		return r.cleanupPodDisruptionBudget(ctx, v, builder.SentinelPodDisruptionBudgetName(v))
+	}
+
+	applied, err := r.reconcilePodDisruptionBudget(ctx, v, builder.BuildSentinelPodDisruptionBudget(v))
+	if err != nil {
+		return err
+	}
+	if applied {
+		r.warnIfSentinelBudgetBlocksEveryDrain(ctx, v)
+	}
+	return nil
+}
+
+// reasonSentinelPodDisruptionBudgetBlocksDrains is the Event reason for a Sentinel
+// budget whose quorum equals the replica count, so no voluntary disruption is
+// permitted at all.
+const reasonSentinelPodDisruptionBudgetBlocksDrains = "SentinelPodDisruptionBudgetBlocksDrains"
+
+// warnIfSentinelBudgetBlocksEveryDrain warns while the Sentinel quorum equals
+// spec.sentinel.replicas — with an even Sentinel count of 2 that is the case, and
+// the Eviction API then refuses every eviction indefinitely: a node drain hosting
+// a Sentinel pod never completes without manual intervention.
+//
+// The formula stays: minAvailable below the quorum would let a drain take the
+// Sentinel majority and thereby automatic failover. The gap ADR 0004 D7 closes is that the
+// consequence was documented in a builder comment only and invisible at runtime.
+//
+// Like the data-side warning, it runs on every pass in which the budget applies
+// rather than on writes. Scaling spec.sentinel.replicas 3 -> 2 leaves the quorum
+// at 2, so the PDB object is byte-identical and a write-gated warning would stay
+// silent for exactly the change that turned the budget into a drain blocker.
+//
+// Like the data-side warning it is called only when the budget is in effect; a foreign budget under
+// the same name has a minAvailable of its own and the operator must not describe it with values it
+// never wrote (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
+func (r *ValkeyReconciler) warnIfSentinelBudgetBlocksEveryDrain(ctx context.Context, v *vkov1.Valkey) {
+	replicas := v.Spec.Sentinel.Replicas
+	minAvailable := builder.SentinelQuorumFor(replicas)
+	if minAvailable < replicas {
+		return
+	}
+
+	name := builder.SentinelPodDisruptionBudgetName(v)
+	log.FromContext(ctx).Info("Sentinel PodDisruptionBudget blocks every voluntary disruption; "+
+		"the quorum equals spec.sentinel.replicas, so node drains hosting a Sentinel pod stall. "+
+		"Use an odd Sentinel count of 3 or more",
+		"name", name, "minAvailable", minAvailable, "replicas", replicas)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonSentinelPodDisruptionBudgetBlocksDrains,
+		"PodDisruptionBudget %s blocks every voluntary disruption "+
+			"(minAvailable %d equals spec.sentinel.replicas %d); node drains hosting a Sentinel pod "+
+			"will not complete. Use an odd Sentinel count of 3 or more",
+		name, minAvailable, replicas)
+}
+
+// logPodDisruptionBudgetSkip records why an enabled PDB was not created. A
+// StatefulSet with a single pod is deliberately left uncovered: maxUnavailable=1
+// would permit evicting the only pod and minAvailable=1 would block node drains
+// forever, neither of which makes a non-HA instance safer.
+func logPodDisruptionBudgetSkip(ctx context.Context, name string, replicas int32) {
+	log.FromContext(ctx).V(1).Info("Skipping PodDisruptionBudget: fewer replicas than the minimum",
+		"name", name, "replicas", replicas, "minimum", vkov1.MinPDBReplicas)
+}
+
+// reconcilePodDisruptionBudget ensures a single PDB matches the desired state.
+//
+// It reports whether the desired budget is in effect. False means a PodDisruptionBudget under that
+// name exists but is controlled by something else: nothing was written, so every value in
+// spec.podDisruptionBudget describes no live object. Callers use the verdict to suppress the
+// content warnings, which would otherwise report on a budget that was never created
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D10).
+func (r *ValkeyReconciler) reconcilePodDisruptionBudget(ctx context.Context, v *vkov1.Valkey,
+	desired *policyv1.PodDisruptionBudget) (bool, error) {
+	logger := log.FromContext(ctx)
+	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+
+	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
+		return false, fmt.Errorf("setting owner reference on PodDisruptionBudget %s: %w", desired.Name, err)
+	}
+
+	current := &policyv1.PodDisruptionBudget{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating PodDisruptionBudget", "name", desired.Name)
+		if createErr := r.Create(ctx, desired); createErr != nil {
+			return false, createErr
+		}
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if !metav1.IsControlledBy(current, v) {
+		r.warnPodDisruptionBudgetNotOwned(ctx, v, desired.Name,
+			"spec.podDisruptionBudget cannot take effect until that budget is deleted or renamed")
+		return false, nil
+	}
+
+	if builder.PodDisruptionBudgetHasChanged(desired, current) ||
+		builder.OperatorVersionChanged(current, r.OperatorVersion) {
+		logger.Info("Updating PodDisruptionBudget", "name", desired.Name)
+		builder.ApplyPodDisruptionBudgetSpec(desired, current)
+		// Accepted tradeoff: assignment, not a merge, so labels added to the PDB by
+		// anything other than the operator are dropped on the next update. This is
+		// the repo-wide convention for every managed object (StatefulSet, Service,
+		// ConfigMap, NetworkPolicy — see valkey_controller.go), and the PDB must not
+		// deviate from it in isolation: a PDB whose labels survive while its
+		// StatefulSet's do not is worse than either rule applied consistently.
+		// Changing it is a convention-wide change, deliberately out of scope here.
+		current.Labels = desired.Labels
+		builder.ApplyOperatorVersion(current, r.OperatorVersion)
+		return true, r.Update(ctx, current)
+	}
+
+	return true, nil
+}
+
+// cleanupPodDisruptionBudget deletes the named PDB if it exists and this Valkey
+// owns it.
+//
+// The foreign-budget warning is gated on the feature being switched on
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D11). The cleanup path runs on every pass of every
+// CR that never opted in, so an ungated warning turned the documented pre-feature workaround — a
+// hand-written PDB under the StatefulSet name — into a permanent Warning stream for users who
+// changed nothing when they upgraded the operator. With the feature off, the operator has no
+// intention towards that budget and therefore nothing to report.
+//
+// The warning does fire while the feature is enabled but not applicable (fewer than
+// MinPDBReplicas replicas, or Sentinel disabled): the CR asked for operator-managed
+// budgets, the name is taken, and scaling back up would silently produce no budget at
+// all — the reconcile path would hit the same foreign object and refuse. That is worth
+// one aggregated Event series per opted-in CR.
+func (r *ValkeyReconciler) cleanupPodDisruptionBudget(ctx context.Context, v *vkov1.Valkey, name string) error {
+	logger := log.FromContext(ctx)
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: v.Namespace}, pdb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if !metav1.IsControlledBy(pdb, v) {
+		if v.IsPodDisruptionBudgetEnabled() {
+			r.warnPodDisruptionBudgetNotOwned(ctx, v, name,
+				"the operator only deletes budgets it created")
+		}
+		return nil
+	}
+
+	logger.Info("Deleting PodDisruptionBudget", "name", name)
+	// The ownership decision above was made on a cache-backed read, so the object under this name can
+	// have been replaced between the Get and the Delete: the operator budget is gone and the user
+	// recreated their own under the same name before the cache caught up. Deleting by name alone would
+	// then destroy the user's object — precisely what the ownership guard promises not to do
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D8, D9). The UID precondition makes the
+	// Delete apply to the object that was inspected or to none at all.
+	//
+	// UID only, no ResourceVersion: the disruption controller rewrites PDB .status
+	// (disruptionsAllowed, currentHealthy) continuously, so a cached read is
+	// routinely a few revisions behind and a ResourceVersion precondition would
+	// reject nearly every cleanup forever. A changed ResourceVersion is still the
+	// same object; only a changed UID means a different one, and identity is all
+	// this guard is about.
+	err := r.Delete(ctx, pdb, client.Preconditions{UID: &pdb.UID})
+	switch {
+	case err == nil || apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		// The precondition failed: the name now holds a different object, which by
+		// definition is not the budget this pass decided to delete. Nothing is left
+		// to do and nothing went wrong — the guard did its job — so the pass is not
+		// failed over it. The next pass re-reads the name and, if the new object is
+		// foreign, takes the ownership branch above.
+		logger.Info("Skipping PodDisruptionBudget deletion: the object was replaced under its name",
+			"name", name, "uid", pdb.UID)
+		return nil
+	default:
+		return fmt.Errorf("deleting poddisruptionbudget: %w", err)
+	}
+}
+
+// reasonPodDisruptionBudgetNotOwned is the Event reason for a PodDisruptionBudget
+// that carries a name the operator manages but is not controlled by this Valkey.
+const reasonPodDisruptionBudgetNotOwned = "PodDisruptionBudgetNotOwned"
+
+// warnPodDisruptionBudgetNotOwned reports a foreign PDB under one of the operator's
+// budget names and states what the operator did not do to it.
+//
+// Why ownership is checked by ownerReference and not by name: both budget names are
+// the StatefulSet names (`<name>`, `<name>-sentinel`), which is exactly what a
+// hand-written PDB covering the same pods is called — and hand-writing that PDB was
+// the documented workaround before the operator managed budgets at all. Deleting or
+// overwriting it by name would remove a protection the user built, silently and on
+// every pass.
+//
+// Like the ADR 0004 D7, D8 budget warnings this fires on every applicable pass rather than on
+// writes: the condition is a property of the cluster, not of a transition, and the recorder
+// aggregates a repeated Event into one series instead of new objects. "Applicable" excludes the
+// cleanup path of a CR that never enabled the feature — see cleanupPodDisruptionBudget for why
+// (docs/adr/0004-opt-in-poddisruptionbudgets.md, D11).
+func (r *ValkeyReconciler) warnPodDisruptionBudgetNotOwned(ctx context.Context, v *vkov1.Valkey,
+	name, consequence string) {
+	log.FromContext(ctx).Info("PodDisruptionBudget exists but is not owned by this Valkey; "+
+		"leaving it untouched", "name", name, "consequence", consequence)
+	r.recordEvent(v, corev1.EventTypeWarning, reasonPodDisruptionBudgetNotOwned,
+		"PodDisruptionBudget %s exists but is not owned by this Valkey; leaving it untouched. %s",
+		name, consequence)
+}

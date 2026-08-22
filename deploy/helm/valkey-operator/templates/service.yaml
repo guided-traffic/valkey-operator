@@ -1,0 +1,29 @@
+{{- if or .Values.metrics.service.enabled .Values.metrics.serviceMonitor.enabled -}}
+{{/*
+Rendered when the Service is asked for directly, or when a ServiceMonitor is
+asked for: a ServiceMonitor selects Services, so requesting one without the
+other would silently scrape nothing. This mirrors IsMetricsServiceEnabled in
+api/v1/valkey_types.go, where a CR-level ServiceMonitor forces its Service on
+the same way.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "valkey-operator.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    vko.gtrfc.com/metrics: "true"
+    {{- with .Values.metrics.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "valkey-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.service.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

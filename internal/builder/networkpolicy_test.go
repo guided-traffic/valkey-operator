@@ -484,3 +484,58 @@ func TestNetworkPolicyHasChanged_OperatorNamespaceDiffers(t *testing.T) {
 	assert.True(t, NetworkPolicyHasChanged(withNS, withoutNS))
 	assert.True(t, NetworkPolicyHasChanged(withoutNS, withNS))
 }
+
+// --- BuildValkeyNetworkPolicy: metrics exporter port ---
+
+// With a NetworkPolicy in place the exporter port is closed unless the policy opens
+// it, so enabling spec.metrics without this rule produces a Prometheus target that
+// times out on every scrape. Like the health port the rule carries no From
+// restriction: the operator does not know where Prometheus runs.
+func TestBuildValkeyNetworkPolicy_MetricsPort(t *testing.T) {
+	const customPort int32 = 9999
+	v := newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true, Port: customPort}
+	})
+
+	np := BuildValkeyNetworkPolicy(v, "")
+
+	var opened *networkingv1.NetworkPolicyIngressRule
+	for i, rule := range np.Spec.Ingress {
+		if len(rule.Ports) == 1 && *rule.Ports[0].Port == intstr.FromInt32(customPort) {
+			opened = &np.Spec.Ingress[i]
+		}
+	}
+	require.NotNil(t, opened, "the configured exporter port must be opened for ingress")
+	assert.Equal(t, corev1.ProtocolTCP, *opened.Ports[0].Protocol)
+	assert.Empty(t, opened.From, "Prometheus runs where the operator cannot know, so no From restriction")
+}
+
+// The rule is gated on spec.metrics.enabled: a cluster without an exporter must not
+// have an extra port opened in its NetworkPolicy.
+func TestBuildValkeyNetworkPolicy_NoMetricsPortWhenDisabled(t *testing.T) {
+	withMetrics := BuildValkeyNetworkPolicy(newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+	}), "")
+	without := BuildValkeyNetworkPolicy(newTestValkey("test"), "")
+
+	assert.Len(t, without.Spec.Ingress, len(withMetrics.Spec.Ingress)-1,
+		"enabling metrics adds exactly one ingress rule")
+	for _, rule := range without.Spec.Ingress {
+		for _, p := range rule.Ports {
+			assert.NotEqual(t, intstr.FromInt32(vkov1.DefaultMetricsExporterPort), *p.Port,
+				"the exporter port must stay closed while metrics are disabled")
+		}
+	}
+}
+
+// NetworkPolicyHasChanged decides whether the live policy is rewritten. The pod
+// selector is the half that says WHICH pods are firewalled: a policy that kept an
+// outdated selector would leave the real pods unprotected while looking correct.
+func TestNetworkPolicyHasChanged_DifferentPodSelector(t *testing.T) {
+	v := newTestValkey("test")
+	desired := BuildValkeyNetworkPolicy(v, "")
+	current := desired.DeepCopy()
+	current.Spec.PodSelector.MatchLabels["app.kubernetes.io/instance"] = "some-other-cluster"
+
+	assert.True(t, NetworkPolicyHasChanged(desired, current))
+}

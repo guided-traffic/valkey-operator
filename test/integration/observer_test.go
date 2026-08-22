@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,6 +66,32 @@ func TestObserver_Integration(t *testing.T) {
 		// Verify owner reference (garbage collection).
 		require.Len(t, deploy.OwnerReferences, 1)
 		assert.Equal(t, "obs-test", deploy.OwnerReferences[0].Name)
+
+		// The observer runs under its own ServiceAccount and mounts no token
+		// (ADR 0012 D8 step 2). Sharing the sidecar ServiceAccount gave a process
+		// that makes no Kubernetes API call a mounted token for pods patch.
+		assert.Equal(t, "obs-test-observer", deploy.Spec.Template.Spec.ServiceAccountName)
+		require.NotNil(t, deploy.Spec.Template.Spec.AutomountServiceAccountToken)
+		assert.False(t, *deploy.Spec.Template.Spec.AutomountServiceAccountToken)
+
+		sa := &corev1.ServiceAccount{}
+		require.Eventually(t, func() bool {
+			return k8sClient.Get(ctx, types.NamespacedName{
+				Name: "obs-test-observer", Namespace: "default",
+			}, sa) == nil
+		}, 10*time.Second, 250*time.Millisecond, "Observer ServiceAccount should be created")
+		require.Len(t, sa.OwnerReferences, 1)
+		assert.Equal(t, "obs-test", sa.OwnerReferences[0].Name)
+
+		// Role-less by construction: nothing in the namespace may bind a Role to it.
+		bindings := &rbacv1.RoleBindingList{}
+		require.NoError(t, k8sClient.List(ctx, bindings, client.InNamespace("default")))
+		for i := range bindings.Items {
+			for _, subject := range bindings.Items[i].Subjects {
+				assert.False(t, subject.Kind == "ServiceAccount" && subject.Name == "obs-test-observer",
+					"the observer ServiceAccount must be bound to no Role at all")
+			}
+		}
 
 		// Cleanup.
 		require.NoError(t, k8sClient.Delete(ctx, v, client.GracePeriodSeconds(0)))
@@ -143,6 +171,16 @@ func TestObserver_Integration(t *testing.T) {
 			}, deploy)
 			return err != nil
 		}, 10*time.Second, 250*time.Millisecond, "Observer Deployment should be deleted after disabling")
+
+		// The ServiceAccount goes with it: the operator owns it, so the ownership
+		// guard in cleanupObserverServiceAccount lets this delete through.
+		require.Eventually(t, func() bool {
+			sa := &corev1.ServiceAccount{}
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "obs-cleanup-test-observer", Namespace: "default",
+			}, sa)
+			return err != nil
+		}, 10*time.Second, 250*time.Millisecond, "Observer ServiceAccount should be deleted after disabling")
 
 		// Cleanup.
 		require.NoError(t, k8sClient.Delete(ctx, v, client.GracePeriodSeconds(0)))

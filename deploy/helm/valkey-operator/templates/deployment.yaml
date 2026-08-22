@@ -40,6 +40,7 @@ spec:
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
             - --operator-image={{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+            - --max-concurrent-reconciles={{ .Values.maxConcurrentReconciles }}
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             {{- end }}

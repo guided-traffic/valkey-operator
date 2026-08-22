@@ -24,6 +24,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // annotationOperatorVersion is the annotation set by the operator on every
@@ -45,7 +47,7 @@ func TestE2E_Upgrade_OperatorVersionAnnotation(t *testing.T) {
 	name := "ann-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR")
@@ -138,7 +140,7 @@ func TestE2E_Upgrade_RBACDrift(t *testing.T) {
 	name := "rbac-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR")
@@ -156,6 +158,15 @@ func TestE2E_Upgrade_RBACDrift(t *testing.T) {
 		require.NoError(t, err, "Role %s should exist", roleName)
 		assert.NotEmpty(t, role.Rules, "Role should have at least one rule")
 		t.Logf("Role %s has %d rules", roleName, len(role.Rules))
+
+		// The grant is patch on this cluster's own data pods, nothing wider
+		// (ADR 0012 D8 step 3). That the sidecar still does its job under it is
+		// proven by the labeling assertions in sidecar_test.go, which run against
+		// this same Role on a real cluster.
+		require.Len(t, role.Rules, 1)
+		assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+		assert.Equal(t, []string{fmt.Sprintf("%s-0", name)}, role.Rules[0].ResourceNames,
+			"a single-replica cluster grants patch on pod 0 and no other pod")
 	})
 
 	t.Run("RoleBinding references sidecar ServiceAccount", func(t *testing.T) {
@@ -217,8 +228,8 @@ func TestE2E_Upgrade_SentinelQuorumDuringRollingUpdate(t *testing.T) {
 	defer cleanup()
 
 	name := "quorum-test"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),

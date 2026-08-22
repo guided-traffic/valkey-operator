@@ -44,6 +44,19 @@ const (
 	// DataVolumeName is the name of the volume for persistent data.
 	DataVolumeName = "data"
 
+	// DrainSignalVolumeName is the emptyDir over which the sidecar tells the Valkey
+	// container that the drain is finished (internal/common/drain.go).
+	DrainSignalVolumeName = "drain-signal"
+
+	// drainPreStopTimeoutSeconds bounds the preStop wait for the drain signal. It is
+	// a bound, not an expectation: a promotion is one REPLICAOF NO ONE against a pod
+	// that is already up, so the file normally appears within a second. The value
+	// matters only when the sidecar cannot write it at all -- a crashed sidecar, an
+	// unmounted volume -- and then it decides how long a pod deletion hangs. 60 s
+	// leaves 15 s of the 75 s terminationGracePeriodSeconds for Valkey to shut down,
+	// so the hook always expires before the kubelet stops waiting.
+	drainPreStopTimeoutSeconds = 60
+
 	// ConfigMountPath is the mount path for the master Valkey configuration (readonly).
 	ConfigMountPath = "/etc/valkey"
 
@@ -157,6 +170,8 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			},
 		},
 	}
+
+	volumes = append(volumes, drainSignalVolumes(v)...)
 
 	var initContainers []corev1.Container
 
@@ -392,6 +407,7 @@ ORDINAL=$(echo $HOSTNAME | rev | cut -d'-' -f1 | rev)
 REPLICAS=%[9]d
 PORT=%[7]d
 MASTER_ADDR=""
+SELF_IS_KNOWN_MASTER=0
 
 # Phase 1: Discover existing master by querying peer pods.
 # Uses a retry loop to handle the case where peers are still starting.
@@ -431,13 +447,47 @@ while [ "$WAITED" -lt "$MAX_WAIT" ] && [ -z "$MASTER_ADDR" ]; do
   [ "$SLEEP" -gt 4 ] && SLEEP=4
 done
 
-# Phase 2: Apply discovery result or fall back to ordinal-based config.
+# Phase 2: No master with connected replicas was found. Consult the known-master
+# address that the operator writes into the replica config before it deletes the
+# old master during a manual failover. At that moment the promoted pod is the only
+# master and has no replicas attached yet, so Phase 1 rejects it — without this
+# step the returning pod-0 would take the ordinal fallback and boot as a second,
+# independent master. The address is only trusted when that peer is reachable and
+# actually reports role:master, so a stale entry degrades to the ordinal fallback.
+#
+# When the address names THIS pod, the pod is the master the operator recorded and
+# re-claims the role instead of taking the ordinal fallback (ADR 0008 D8, D9).
+# Falling back would make the recorded master a replica of the ordinal-0 pod, and
+# the full sync would overwrite the only copy of the post-failover writes. The
+# two-master state this can produce is transient: the operator's steady-state check
+# consolidates it, with this same address as its authority.
+if [ -z "$MASTER_ADDR" ]; then
+  KNOWN_MASTER=$(grep '^replicaof ' %[4]s/%[3]s 2>/dev/null | awk '{print $2}')
+  if [ "$KNOWN_MASTER" = "$MY_HOST" ]; then
+    SELF_IS_KNOWN_MASTER=1
+    echo "Replica config names this pod as master, booting as master"
+  elif [ -n "$KNOWN_MASTER" ]; then
+    KNOWN_INFO=$(timeout 2 valkey-cli %[10]s %[11]s -h "$KNOWN_MASTER" -p $PORT INFO replication 2>/dev/null)
+    KNOWN_ROLE=$(echo "$KNOWN_INFO" | grep "^role:" | tr -d '\r' | cut -d: -f2)
+    if [ "$KNOWN_ROLE" = "master" ]; then
+      MASTER_ADDR="$KNOWN_MASTER"
+      echo "Using known master from replica config: $MASTER_ADDR"
+    else
+      echo "Known master $KNOWN_MASTER reports role=${KNOWN_ROLE:-unreachable}, ignoring"
+    fi
+  fi
+fi
+
+# Phase 3: Apply discovery result, the self-claim, or fall back to ordinal-based config.
 if [ -n "$MASTER_ADDR" ]; then
   echo "This pod is a replica, discovered master=$MASTER_ADDR"
   cp %[1]s/%[3]s %[2]s/%[3]s
   echo "" >> %[2]s/%[3]s
   echo "# Replication (configured by init container via master discovery)" >> %[2]s/%[3]s
   echo "replicaof $MASTER_ADDR %[7]d" >> %[2]s/%[3]s
+elif [ "$SELF_IS_KNOWN_MASTER" = "1" ]; then
+  echo "This pod is the known master, using master config (ordinal=$ORDINAL)"
+  cp %[1]s/%[3]s %[2]s/%[3]s
 else
   echo "No existing master discovered, using ordinal-based config (ordinal=$ORDINAL)"
   if [ "$ORDINAL" = "0" ]; then
@@ -512,6 +562,7 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 		ServiceAccountName: SidecarServiceAccountName(v),
 		Containers:         buildPodContainers(v, operatorImage),
 		Volumes:            volumes,
+		Affinity:           BuildPodAntiAffinity(v, common.ComponentValkey),
 	}
 
 	// Set terminationGracePeriodSeconds to allow time for graceful failover.
@@ -561,6 +612,64 @@ func configVolumeNameForContainer(v *vkov1.Valkey) string {
 	return ConfigVolumeName
 }
 
+// drainSignalVolumes returns the volume the drain handshake needs, or nothing.
+//
+// The handshake exists only where the drain handler performs the failover itself
+// (docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md, D10). A Sentinel
+// cluster loses at most failover latency when the drain bails, because Sentinel's own
+// down-after-milliseconds timer takes over, and a standalone pod has nothing to fail
+// over to -- neither should pay a preStop on every pod deletion.
+//
+// It returns a slice rather than a pointer so the caller appends unconditionally: the
+// same condition is asked three times (volume, two mounts, hook) and buildPodSpec has no
+// complexity budget left for a fourth branch.
+func drainSignalVolumes(v *vkov1.Valkey) []corev1.Volume {
+	if !v.IsMultiReplicaWithoutSentinel() {
+		return nil
+	}
+	return []corev1.Volume{{
+		Name: DrainSignalVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	}}
+}
+
+// drainPreStop holds the Valkey process open until the sidecar drain handler has
+// finished, or until the bound expires.
+//
+// It is the only ordering primitive Kubernetes offers here. The kubelet SIGTERMs
+// every container at once, and the drain handler needs the local Valkey alive to
+// read its own role and needs the peers to still see their master to qualify as
+// promotion targets. Without the hook the drain loses that race often enough to
+// show up in CI, and the loss is a discarded dataset, not a slow failover.
+//
+// Native sidecar containers (initContainers with restartPolicy Always) do not
+// solve this and must not be mistaken for a simpler version of it: they terminate
+// AFTER the regular containers, so Valkey would be guaranteed to be gone before
+// the drain starts. That makes the race deterministic rather than absent.
+//
+// The shell is safe to rely on: the master-discovery init container already runs
+// `sh -c` with `sleep` in this same image.
+func drainPreStop(v *vkov1.Valkey) *corev1.Lifecycle {
+	if !v.IsMultiReplicaWithoutSentinel() {
+		return nil
+	}
+	marker := common.DrainSignalMountPath + "/" + common.DrainCompleteFile
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"sh", "-c",
+					fmt.Sprintf(
+						"i=0; while [ \"$i\" -lt %d ]; do [ -f %s ] && exit 0; sleep 1; i=$((i+1)); done",
+						drainPreStopTimeoutSeconds, marker),
+				},
+			},
+		},
+	}
+}
+
 // buildValkeyContainer builds the main Valkey container spec.
 func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	cfgMount := configMountForContainer(v)
@@ -584,6 +693,13 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 			Name:      TLSVolumeName,
 			MountPath: TLSMountPath,
 			ReadOnly:  true,
+		})
+	}
+
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      DrainSignalVolumeName,
+			MountPath: common.DrainSignalMountPath,
 		})
 	}
 
@@ -628,6 +744,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		Name:         ValkeyContainerName,
 		Image:        v.Spec.Image,
 		Command:      cmd,
+		Lifecycle:    drainPreStop(v),
 		Ports:        valkeyContainerPorts,
 		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
@@ -752,6 +869,15 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 			Name:      TLSVolumeName,
 			MountPath: TLSMountPath,
 			ReadOnly:  true,
+		})
+	}
+
+	// The writing half of the drain handshake. The sidecar treats a missing mount
+	// as "not this cluster", so this mount is what switches the handshake on.
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      DrainSignalVolumeName,
+			MountPath: common.DrainSignalMountPath,
 		})
 	}
 

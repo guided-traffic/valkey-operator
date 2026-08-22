@@ -35,6 +35,46 @@ const (
 	// because a replaced pod failed to sync within the configured timeout.
 	// The operator will not resume until the user applies a new spec change.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
+
+	// ConditionTypeTopologyRestored reports whether the multi-replica rolling
+	// update managed to hand the master role back to pod-0. It is set to True
+	// once pod-0 has been promoted again, and to False when the operator gave up
+	// waiting for pod-0 to sync and left the promoted replica as master. The
+	// cluster is healthy in both cases -- the Services select the master by label,
+	// not by ordinal -- so the condition is the only durable record that the
+	// topology differs from the canonical one.
+	ConditionTypeTopologyRestored ConditionType = "TopologyRestored"
+
+	// ConditionTypeReconcileBlocked is set when the operator could not write one
+	// of the managed resources. Its reason distinguishes an admission-webhook
+	// rejection (a cluster-side gate, e.g. a fail-closed policy webhook whose
+	// backend is down) from any other write failure, so users do not have to read
+	// operator logs to tell the two apart.
+	ConditionTypeReconcileBlocked ConditionType = "ReconcileBlocked"
+)
+
+const (
+	// ReasonAdmissionWebhookDenied is the ReconcileBlocked reason for a write
+	// rejected by the admission chain — either an explicit webhook denial or a
+	// fail-closed webhook that could not be called. The condition message carries
+	// the API server error including the webhook name.
+	ReasonAdmissionWebhookDenied = "AdmissionWebhookDenied"
+
+	// ReasonWriteFailed is the ReconcileBlocked reason for any other failure to
+	// write a managed resource (RBAC, quota, conflict, API server unreachable).
+	ReasonWriteFailed = "WriteFailed"
+
+	// ReasonForeignObject is the ReconcileBlocked reason for a write the operator
+	// refused to take because one of its generated names is held by an object this
+	// Valkey does not control. It is deliberately distinct from ReasonWriteFailed:
+	// nothing failed, the operator could have written and chose not to, and the
+	// condition clears only when a human deletes or renames the colliding object
+	// (docs/adr/0020-write-only-what-the-operator-owns.md).
+	ReasonForeignObject = "ForeignObject"
+
+	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
+	// reconcile pass over all managed resources.
+	ReasonReconcileSucceeded = "ReconcileSucceeded"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -61,7 +101,13 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Replicas is the number of Sentinel instances to run.
+	// Replicas is the number of Sentinel instances to run. Use an odd count of 3
+	// or more: a failover needs floor(replicas/2)+1 Sentinels to agree, so 2
+	// Sentinels tolerate no outage at all. With spec.podDisruptionBudget.enabled
+	// that even count also blocks node drains, because the quorum then equals the
+	// replica count and the Eviction API refuses every eviction; the operator
+	// warns and records a SentinelPodDisruptionBudgetBlocksDrains Event on every
+	// reconcile while that holds.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas,omitempty"`
@@ -249,6 +295,132 @@ type ServiceMonitorSpec struct {
 	// match a Prometheus instance's serviceMonitorSelector (e.g. release: prometheus).
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
+}
+
+const (
+	// DefaultPDBMaxUnavailable is the maxUnavailable used for the data
+	// PodDisruptionBudget when spec.podDisruptionBudget.maxUnavailable is unset.
+	DefaultPDBMaxUnavailable int32 = 1
+
+	// MinPDBReplicas is the smallest replica count that gets a PodDisruptionBudget.
+	// A StatefulSet with a single pod is never covered: maxUnavailable=1 would
+	// permit evicting the only pod (a useless object) and minAvailable=1 would
+	// block node drains forever (fake safety — a singleton is not HA either way).
+	MinPDBReplicas int32 = 2
+)
+
+// PodDisruptionBudgetSpec configures PodDisruptionBudgets for the Valkey data
+// and Sentinel StatefulSets. Omit the whole block to keep the operator out of
+// PDBs entirely — users who manage their own PDB for these pods would otherwise
+// end up with two budgets matching the same pods, which makes the Eviction API
+// refuse every eviction.
+//
+// The operator only ever touches budgets it created, recognised by the
+// ownerReference on them. A PodDisruptionBudget carrying one of the generated
+// names (the StatefulSet names) that the operator does not own is neither deleted
+// when the feature is off nor overwritten when it is on: it is left untouched and,
+// while spec.podDisruptionBudget.enabled is true, reported as a
+// PodDisruptionBudgetNotOwned Warning Event on the CR, and this spec has no
+// effect for that StatefulSet until the foreign budget is removed.
+type PodDisruptionBudgetSpec struct {
+	// Enabled creates a PDB for the data StatefulSet (maxUnavailable, default 1)
+	// and, when Sentinel is enabled, a quorum-preserving PDB
+	// (minAvailable = floor(replicas/2)+1) for the Sentinel StatefulSet.
+	// StatefulSets with fewer than 2 replicas never get a PDB: it would either be
+	// useless (maxUnavailable 1) or block node drains (minAvailable 1).
+	// With exactly 2 Sentinels the quorum equals the replica count, so the Sentinel
+	// budget permits no voluntary disruption at all and a node drain hosting a
+	// Sentinel pod stalls until it is resolved manually; the operator keeps the
+	// quorum formula (a smaller minAvailable would let a drain take automatic
+	// failover) and warns about it on every reconcile.
+	// A PodDisruptionBudget under one of those names that the operator does not own
+	// is never deleted and never adopted: it stays untouched, this field has no
+	// effect for that StatefulSet, and the operator records a
+	// PodDisruptionBudgetNotOwned Event on every reconcile while that holds and
+	// spec.podDisruptionBudget.enabled is true.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MaxUnavailable is the maximum number of data pods that may be disrupted
+	// voluntarily at the same time. It applies to the data StatefulSet only — the
+	// Sentinel budget is always derived from the quorum and is not configurable,
+	// because a settable value could silently break the quorum guarantee.
+	// A value greater than or equal to spec.replicas disables the protection
+	// (every pod may be evicted at once); the operator logs a warning and records a
+	// PodDisruptionBudgetTooPermissive Event on every reconcile but honours it
+	// rather than rejecting a later scale-down. Scaling spec.replicas down into
+	// that condition is warned about as well, not only a change of this field.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
+}
+
+const (
+	// AntiAffinityModeOff renders no anti-affinity term at all. It is the
+	// default: an operator upgrade must not change the scheduling behavior of
+	// existing clusters, so spreading is strictly opt-in.
+	AntiAffinityModeOff = "off"
+
+	// AntiAffinityModeSoft renders preferredDuringSchedulingIgnoredDuringExecution:
+	// the scheduler tries to spread pods but never leaves one Pending.
+	AntiAffinityModeSoft = "soft"
+
+	// AntiAffinityModeHard renders requiredDuringSchedulingIgnoredDuringExecution:
+	// the spread is guaranteed, surplus pods stay Pending.
+	AntiAffinityModeHard = "hard"
+
+	// DefaultAntiAffinityTopologyKey is the spread domain used when
+	// spec.antiAffinity.topologyKey is unset: one pod per node.
+	DefaultAntiAffinityTopologyKey = "kubernetes.io/hostname"
+
+	// MinAntiAffinityReplicas is the smallest replica count that gets an
+	// anti-affinity term. A singleton has no peer to repel, so injecting one
+	// would only change the pod-spec hash and restart the pod for nothing.
+	MinAntiAffinityReplicas int32 = 2
+
+	// AntiAffinityWeight is the weight of the preferred (soft) anti-affinity term.
+	// 100 is the maximum, making the spread the strongest preference the
+	// scheduler weighs against its other priorities.
+	AntiAffinityWeight int32 = 100
+)
+
+// AntiAffinitySpec configures pod anti-affinity for the data and Sentinel
+// StatefulSets. Each StatefulSet repels only its own kind, so data and Sentinel
+// pods may still share a node. A term is rendered only when mode is soft or
+// hard AND the StatefulSet has at least MinAntiAffinityReplicas replicas;
+// omitting the block (or mode: off, the default) renders nothing, so an
+// operator upgrade never changes the scheduling of existing clusters. Without
+// a term all pods of a cluster may land on one node — the enabling condition
+// of the 2026-08-19 infra-d incident — so multi-replica clusters should opt
+// into soft or hard.
+type AntiAffinitySpec struct {
+	// Mode selects off (no term, the default), soft
+	// (preferredDuringSchedulingIgnoredDuringExecution) or hard
+	// (requiredDuringSchedulingIgnoredDuringExecution).
+	//
+	// Soft is a scheduler preference: under node pressure pods may still be
+	// co-located, so the spread is not guaranteed.
+	//
+	// Hard guarantees the spread and has two consequences worth knowing before
+	// enabling it: with fewer schedulable nodes than replicas the surplus pods
+	// stay Pending (which also wedges the next rolling update), and during a node
+	// drain an evicted pod stays Pending until a node without a pod of the same
+	// StatefulSet becomes schedulable.
+	//
+	// Switching between the modes changes the pod-spec hash and therefore
+	// triggers one failover-aware rolling update.
+	// +kubebuilder:validation:Enum=off;soft;hard
+	// +kubebuilder:default=off
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// TopologyKey is the node label whose values define the spread domains.
+	// Defaults to kubernetes.io/hostname (one pod per node); set e.g.
+	// topology.kubernetes.io/zone to spread across availability zones instead.
+	// +kubebuilder:default="kubernetes.io/hostname"
+	// +optional
+	TopologyKey string `json:"topologyKey,omitempty"`
 }
 
 // NetworkPolicySpec defines network policy configuration.
@@ -474,6 +646,18 @@ type ValkeySpec struct {
 	// RollingUpdate configures rolling update behaviour.
 	// +optional
 	RollingUpdate *RollingUpdateSpec `json:"rollingUpdate,omitempty"`
+
+	// PodDisruptionBudget configures PodDisruptionBudgets for the data and
+	// Sentinel StatefulSets. Omitted means no PDBs are managed by the operator.
+	// +optional
+	PodDisruptionBudget *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
+
+	// AntiAffinity configures pod anti-affinity for the data and Sentinel
+	// StatefulSets. Omitted means off: no term is rendered and scheduling is
+	// unchanged. Set mode: soft or hard to spread StatefulSets with at least
+	// two replicas across nodes.
+	// +optional
+	AntiAffinity *AntiAffinitySpec `json:"antiAffinity,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -566,8 +750,15 @@ func (v *Valkey) IsCertManagerEnabled() bool {
 // IsUnifiedCertificateEnabled returns true if Valkey and Sentinel should share
 // a single TLS certificate / Secret. With cert-manager this changes the issued
 // Certificate to cover both hostname sets; with a user-provided Secret the flag
-// is informational (both StatefulSets already mount the same Secret). When
-// Sentinel is disabled, the flag has no observable effect.
+// is informational (both StatefulSets already mount the same Secret).
+//
+// With Sentinel disabled the flag still has one observable effect: it admits
+// reconcileLegacySentinelCertificateCleanup, which garbage-collects the legacy <name>-sentinel-tls
+// Certificate and Secret left behind by an instance that used to run Sentinel.
+// sentinelRolloutComplete short-circuits to "complete" in that case (no pods are bound to the
+// legacy Secret), so the cleanup runs on the first pass with no rollout to wait for. It only ever
+// removes material it can prove is the operator's own — see deleteLegacySentinelSecret
+// (docs/adr/0006-delete-only-what-the-operator-owns.md, D4-D11).
 func (v *Valkey) IsUnifiedCertificateEnabled() bool {
 	return v.IsTLSEnabled() && v.Spec.TLS.UnifiedCertificate
 }
@@ -631,6 +822,80 @@ func (v *Valkey) MetricsScrapeInterval() string {
 // IsNetworkPolicyEnabled returns true if network policies are enabled.
 func (v *Valkey) IsNetworkPolicyEnabled() bool {
 	return v.Spec.NetworkPolicy != nil && v.Spec.NetworkPolicy.Enabled
+}
+
+// IsPodDisruptionBudgetEnabled returns true if the operator should manage
+// PodDisruptionBudgets for this instance.
+func (v *Valkey) IsPodDisruptionBudgetEnabled() bool {
+	return v.Spec.PodDisruptionBudget != nil && v.Spec.PodDisruptionBudget.Enabled
+}
+
+// PodDisruptionBudgetMaxUnavailable returns the maxUnavailable for the data PDB,
+// falling back to the default.
+func (v *Valkey) PodDisruptionBudgetMaxUnavailable() int32 {
+	if v.Spec.PodDisruptionBudget != nil && v.Spec.PodDisruptionBudget.MaxUnavailable != nil {
+		return *v.Spec.PodDisruptionBudget.MaxUnavailable
+	}
+	return DefaultPDBMaxUnavailable
+}
+
+// NeedsDataPodDisruptionBudget reports whether a PDB applies to the data
+// StatefulSet: PDBs enabled and at least MinPDBReplicas pods.
+func (v *Valkey) NeedsDataPodDisruptionBudget() bool {
+	return v.IsPodDisruptionBudgetEnabled() && v.Spec.Replicas >= MinPDBReplicas
+}
+
+// NeedsSentinelPodDisruptionBudget reports whether a PDB applies to the Sentinel
+// StatefulSet: PDBs enabled, Sentinel enabled and at least MinPDBReplicas pods.
+func (v *Valkey) NeedsSentinelPodDisruptionBudget() bool {
+	return v.IsPodDisruptionBudgetEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.Replicas >= MinPDBReplicas
+}
+
+// AntiAffinityMode returns the configured anti-affinity mode, falling back to
+// the default (off). An unknown value is treated as off: the weakest setting —
+// no constraint at all — is the safe fallback if validation is ever bypassed.
+func (v *Valkey) AntiAffinityMode() string {
+	if v.Spec.AntiAffinity == nil {
+		return AntiAffinityModeOff
+	}
+	switch v.Spec.AntiAffinity.Mode {
+	case AntiAffinityModeSoft:
+		return AntiAffinityModeSoft
+	case AntiAffinityModeHard:
+		return AntiAffinityModeHard
+	default:
+		return AntiAffinityModeOff
+	}
+}
+
+// IsAntiAffinityEnabled reports whether an anti-affinity term is requested at
+// all (mode soft or hard).
+func (v *Valkey) IsAntiAffinityEnabled() bool {
+	return v.AntiAffinityMode() != AntiAffinityModeOff
+}
+
+// AntiAffinityTopologyKey returns the configured topology key, falling back to
+// the default (kubernetes.io/hostname).
+func (v *Valkey) AntiAffinityTopologyKey() string {
+	if v.Spec.AntiAffinity != nil && v.Spec.AntiAffinity.TopologyKey != "" {
+		return v.Spec.AntiAffinity.TopologyKey
+	}
+	return DefaultAntiAffinityTopologyKey
+}
+
+// NeedsDataAntiAffinity reports whether an anti-affinity term applies to the data
+// StatefulSet: mode soft or hard, and at least MinAntiAffinityReplicas pods.
+func (v *Valkey) NeedsDataAntiAffinity() bool {
+	return v.IsAntiAffinityEnabled() && v.Spec.Replicas >= MinAntiAffinityReplicas
+}
+
+// NeedsSentinelAntiAffinity reports whether an anti-affinity term applies to the
+// Sentinel StatefulSet: mode soft or hard, Sentinel enabled and at least
+// MinAntiAffinityReplicas pods.
+func (v *Valkey) NeedsSentinelAntiAffinity() bool {
+	return v.IsAntiAffinityEnabled() && v.IsSentinelEnabled() &&
+		v.Spec.Sentinel.Replicas >= MinAntiAffinityReplicas
 }
 
 // IsPersistenceEnabled returns true if persistence is configured and enabled.

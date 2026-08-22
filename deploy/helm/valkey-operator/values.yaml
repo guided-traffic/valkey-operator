@@ -36,9 +36,73 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# maxConcurrentReconciles is how many Valkey resources the operator reconciles at
+# the same time. A reconcile pass dials the pods of its cluster with a 5 s timeout
+# each, so with a single worker one cluster whose pods stopped answering delays
+# every other Valkey resource in the fleet. Passes for the same resource stay
+# serialised at any value.
+maxConcurrentReconciles: 4
+
 # Leader election ensures only one operator instance is active at a time.
 leaderElection:
   enabled: true
+
+# metrics configures how the operator's OWN metrics endpoint is exposed and
+# alerted on. It is unrelated to spec.metrics on a Valkey CR, which adds a
+# Prometheus exporter sidecar to that CR's pods.
+#
+# The operator always serves :8080/metrics (--metrics-bind-address, set on the
+# Deployment; =0 switches it off). Besides controller-runtime's own counters it
+# publishes one set of vko_valkey_* series per Valkey resource, labelled with
+# namespace and name, so an alert can say WHICH resource is not converging -
+# controller_runtime_reconcile_errors_total only carries the controller name and
+# cannot.
+#
+# Everything below defaults to false, so a chart upgrade creates no object the
+# administrator did not ask for. Turning serviceMonitor on renders the Service
+# too, because a ServiceMonitor selects Services and one without the other
+# scrapes nothing.
+#
+# Security note: the endpoint is plain HTTP with no authentication filter
+# wherever it binds, and the per-resource series make it an inventory of every
+# Valkey resource in the cluster and its health. Anything that can route to the
+# operator pod already reads it, with or without the Service - the Service adds
+# a stable name, not new reach. Restrict it with a NetworkPolicy in the operator
+# namespace, or bind the endpoint elsewhere.
+metrics:
+  service:
+    # enabled renders a ClusterIP Service in front of the metrics port. Forced on
+    # when serviceMonitor.enabled is true.
+    enabled: false
+    # port is the Service port; the target is always the operator's metrics
+    # container port.
+    port: 8080
+    # labels are extra labels on the Service. The marker label
+    # vko.gtrfc.com/metrics=true is always set and is what the ServiceMonitor
+    # selects on.
+    labels: {}
+  serviceMonitor:
+    # enabled renders a Prometheus-Operator ServiceMonitor. Requires the
+    # monitoring.coreos.com CRDs to be installed - unlike the per-CR
+    # ServiceMonitor the operator writes at runtime, this one is rendered by
+    # Helm, so a missing CRD fails the install instead of being skipped.
+    enabled: false
+    # interval is the scrape interval.
+    interval: 30s
+    # scrapeTimeout is the per-scrape timeout; empty leaves it to Prometheus.
+    scrapeTimeout: ""
+    # labels must match your Prometheus serviceMonitorSelector, or the
+    # ServiceMonitor is created and never used.
+    labels: {}
+  prometheusRule:
+    # enabled renders a PrometheusRule with a starting set of alerts over the
+    # vko_valkey_* series: a spec the operator never evaluated, a blocked write,
+    # a phase that will not clear, missing data pods, a resource the operator
+    # stopped writing status for, and the collector itself failing. Thresholds
+    # are not exposed as values; replace the rule if they do not fit.
+    enabled: false
+    # labels must match your Prometheus ruleSelector.
+    labels: {}
 
 # preUpgradeHook configures the Helm pre-upgrade hook Job that migrates existing
 # Valkey CRs to the field defaults of the current operator version.
@@ -58,3 +122,20 @@ preUpgradeHook:
     limits:
       cpu: 200m
       memory: 128Mi
+
+# Valkey CRs support spec.podDisruptionBudget (opt-in). PDBs are only
+# created for StatefulSets with >= 2 replicas; singletons are skipped.
+# The Sentinel budget is the failover quorum (floor(replicas/2)+1), so with
+# spec.sentinel.replicas: 2 it equals the replica count and blocks every
+# voluntary disruption - node drains hosting a Sentinel pod then stall. Use an
+# odd Sentinel count of 3 or more; the operator warns and records a
+# SentinelPodDisruptionBudgetBlocksDrains Event while the condition holds.
+# Budgets the operator does not own (no ownerReference to the CR) are never
+# deleted and never adopted, even under the generated names - a hand-written PDB
+# for these pods survives, and the operator records a PodDisruptionBudgetNotOwned
+# Event instead while spec.podDisruptionBudget.enabled is true.
+
+# Valkey CRs support spec.antiAffinity (opt-in, default mode: off - upgrades
+# change nothing). mode: soft spreads StatefulSets with >= 2 replicas across
+# kubernetes.io/hostname as a scheduler preference; mode: hard guarantees the
+# spread (surplus pods stay Pending). Multi-replica clusters should opt in.

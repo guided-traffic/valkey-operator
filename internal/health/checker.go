@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"sort"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +48,12 @@ type ClusterState struct {
 // Checker performs health checks on Valkey and Sentinel instances.
 type Checker struct {
 	client client.Client
+
+	// NewValkeyClientFn builds the client used for every probe this Checker
+	// sends. It is nil in production, where newValkeyClient builds the client
+	// itself; tests set it to point the probes at a local responder. Mirrors
+	// ValkeyReconciler.NewValkeyClientFn.
+	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
 }
 
 // NewChecker creates a new health checker.
@@ -159,43 +166,68 @@ type masterCandidate struct {
 	connectedSlaves int
 }
 
-// findMaster iterates over all Valkey pods and finds the one reporting role=master.
+// probeMasterRole asks one pod whether it is the master and returns a candidate
+// when it says yes. A pod the API server does not report as Running is not
+// dialled at all, and a pod that does not answer is not a candidate.
+func (h *Checker) probeMasterRole(
+	ctx context.Context, v *vkov1.Valkey, podName, addr string, password string, tlsConfig *tls.Config,
+) *masterCandidate {
+	pod := &corev1.Pod{}
+	err := h.client.Get(ctx, types.NamespacedName{
+		Name:      podName,
+		Namespace: v.Namespace,
+	}, pod)
+	if err != nil || pod.Status.Phase != corev1.PodRunning {
+		return nil
+	}
+
+	c := h.newValkeyClient(addr, password, tlsConfig)
+	info, err := c.InfoReplication()
+	if err != nil || info.Role != "master" {
+		return nil
+	}
+
+	return &masterCandidate{podName: podName, addr: addr, connectedSlaves: info.ConnectedSlaves}
+}
+
+// findMaster probes all Valkey pods and returns the one reporting role=master.
 // When multiple pods report as master (split-brain), a warning is logged and the
 // one with the most connected slaves is preferred (it is the active master serving
-// real data).
+// real data); ties are broken by the lowest ordinal.
+//
+// The probes run concurrently. Sequentially they cost up to one client timeout
+// (5 s, internal/valkeyclient) per pod, so a cluster whose pods stopped answering
+// held the reconcile worker for replicas x 5 s — latency that every other Valkey CR
+// inherited through the shared work queue
+// (docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md).
+//
+// Concurrency must not make the answer depend on which pod replies first: the
+// results are collected into a slice indexed by ordinal, never appended in
+// completion order, and the sort below is stable with an explicit ordinal
+// tie-break. Before this the tie-break was sort.Slice, which is not stable — with
+// two masters reporting the same slave count the winner was already unspecified.
 func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string, tlsConfig *tls.Config) (string, string, error) {
 	logger := log.FromContext(ctx)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 	port := int(builder.ServicePort(v))
 
-	var candidates []masterCandidate
+	found := make([]*masterCandidate, v.Spec.Replicas)
+	var wg sync.WaitGroup
 
 	for i := int32(0); i < v.Spec.Replicas; i++ {
-		podName := fmt.Sprintf("%s-%d", stsName, i)
-		addr := podAddress(v, podName, port)
+		wg.Add(1)
+		go func(idx int32) {
+			defer wg.Done()
+			podName := fmt.Sprintf("%s-%d", stsName, idx)
+			found[idx] = h.probeMasterRole(ctx, v, podName, podAddress(v, podName, port), password, tlsConfig)
+		}(i)
+	}
+	wg.Wait()
 
-		// Check if pod is running first.
-		pod := &corev1.Pod{}
-		err := h.client.Get(ctx, types.NamespacedName{
-			Name:      podName,
-			Namespace: v.Namespace,
-		}, pod)
-		if err != nil || pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-
-		c := h.newValkeyClient(addr, password, tlsConfig)
-		info, err := c.InfoReplication()
-		if err != nil {
-			continue
-		}
-
-		if info.Role == "master" {
-			candidates = append(candidates, masterCandidate{
-				podName:         podName,
-				addr:            addr,
-				connectedSlaves: info.ConnectedSlaves,
-			})
+	candidates := make([]masterCandidate, 0, len(found))
+	for _, c := range found {
+		if c != nil {
+			candidates = append(candidates, *c)
 		}
 	}
 
@@ -207,8 +239,9 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		logger.Info("WARNING: Multiple masters detected (split-brain)",
 			"count", len(candidates), "candidates", masterCandidateNames(candidates))
 		// Return the one with the most connected slaves — it is the active master
-		// serving real replicas and preserving client data.
-		sort.Slice(candidates, func(i, j int) bool {
+		// serving real replicas and preserving client data. Stable, so equal slave
+		// counts keep the ordinal order the slice was built in.
+		sort.SliceStable(candidates, func(i, j int) bool {
 			return candidates[i].connectedSlaves > candidates[j].connectedSlaves
 		})
 	}
@@ -314,6 +347,9 @@ func (h *Checker) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretNam
 
 // newValkeyClient creates a valkeyclient.Client with the given TLS and auth settings.
 func (h *Checker) newValkeyClient(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client {
+	if h.NewValkeyClientFn != nil {
+		return h.NewValkeyClientFn(addr, password, tlsConfig)
+	}
 	if tlsConfig != nil && password != "" {
 		return valkeyclient.NewTLSWithPassword(addr, tlsConfig, password)
 	}

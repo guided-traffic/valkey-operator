@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +52,11 @@ type DrainHandler struct {
 	headlessSvc           string
 	replicas              int
 	valkeyPort            string
+
+	// signalDir is where the drain-complete marker is written. Empty means the
+	// mount path the operator uses (common.DrainSignalMountPath); tests point it at
+	// a temporary directory.
+	signalDir string
 }
 
 // NewDrainHandlerWithDeps creates a DrainHandler with injected dependencies (for testing).
@@ -89,6 +96,11 @@ func NewDrainHandlerWithDeps(
 // a graceful failover if the pod is the master. Returns nil when safe to exit.
 func (d *DrainHandler) Handle(ctx context.Context) error {
 	log := ctrl.Log.WithName("sidecar").WithName("drain")
+
+	// The Valkey container waits on this marker before it exits, so every way out
+	// of this function has to release it -- including the panic path, which is why
+	// it is deferred here rather than called at each return.
+	defer d.signalDrainComplete(log)
 
 	role, err := d.detector.DetectRole()
 	if err != nil {
@@ -137,10 +149,18 @@ func (d *DrainHandler) sentinelFailover(ctx context.Context, log drainLog) error
 // manualFailover promotes a synced replica to master without Sentinel.
 // It discovers replicas via headless DNS, picks a synced one, promotes it,
 // and reconfigures the remaining replicas.
+//
+// A peer that already answers role:master ends the failover before it starts:
+// the topology has a master, so this drain has nothing to promote and nothing to
+// stamp. See findSyncedReplica for why that case is not hypothetical.
 func (d *DrainHandler) manualFailover(ctx context.Context, log drainLog) error {
-	replicaAddr, err := d.findSyncedReplica(log)
+	replicaAddr, masterPresent, err := d.findSyncedReplica(log)
 	if err != nil {
 		return fmt.Errorf("finding synced replica: %w", err)
+	}
+	if masterPresent {
+		log.Info("a peer already answers role:master, skipping promotion")
+		return d.waitForRoleChange(ctx, log)
 	}
 
 	replicaHost, _ := splitHostPort(replicaAddr)
@@ -152,16 +172,94 @@ func (d *DrainHandler) manualFailover(ctx context.Context, log drainLog) error {
 		return fmt.Errorf("promoting replica %s: %w", replicaAddr, err)
 	}
 
+	// Record the promotion before anything else. Everything below is
+	// best-effort, the promotion above is not, and the operator needs the
+	// record as early as possible.
+	d.stampPromotion(ctx, replicaHost, log)
+
 	// Reconfigure remaining replicas to follow the new master.
 	d.reconfigureReplicas(replicaHost, replicaAddr, log)
 
 	return d.waitForRoleChange(ctx, log)
 }
 
-// findSyncedReplica discovers replica pods via headless DNS and returns the
-// address of the first replica that is fully synced with the master.
-func (d *DrainHandler) findSyncedReplica(log drainLog) (string, error) {
+// stampPromotion records on the promoted pod that a drain handler - not the
+// operator - performed this promotion. The sidecar has no access to the Valkey
+// CR, so this pod annotation is the only trace the operator can later find of a
+// promotion it did not perform itself.
+//
+// Non-Sentinel path only, on purpose. With Sentinel, Sentinel is the promotion
+// authority and the operator's steady-state split-brain check never runs for
+// Sentinel clusters, so a stamp written there would be evidence nobody reads.
+//
+// Best-effort by construction: the promotion has already happened and cannot be
+// undone, and this pod is terminating, so a failed patch must never abort the
+// drain. Losing the stamp is a degradation, never a corruption - the operator
+// then falls back to the structural rule (a labeled master with ordinal > 0 that
+// the replica ConfigMap does not name cannot have elected itself), or refuses to
+// resolve and records a Warning Event.
+//
+// The stamp lives on the Pod object, so it survives a container restart but not a
+// delete-recreate: a promoted pod that loses its node before the operator adopts
+// the promotion comes back without the annotation. That residual is inherent to
+// where the record is kept, and it degrades the same way a failed patch does -
+// the operator falls back to the structural rule, or refuses to resolve.
+func (d *DrainHandler) stampPromotion(ctx context.Context, promotedHost string, log drainLog) {
+	podName, ok := d.podNameFromHost(promotedHost)
+	if !ok {
+		log.Error(fmt.Errorf("host %q does not belong to headless service %q", promotedHost, d.headlessSvc),
+			"cannot derive the promoted pod name, skipping the promotion stamp")
+		return
+	}
+
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	if err := d.patcher.PatchAnnotation(ctx, d.podNamespace, podName,
+		common.AnnotationDrainPromotedAt, stamp); err != nil {
+		log.Error(err, "failed to stamp the promoted pod, the operator will have to infer this promotion",
+			"promoted", podName)
+		return
+	}
+	log.Info("stamped the promoted pod", "promoted", podName, "at", stamp)
+}
+
+// podNameFromHost extracts the pod name from a headless-service host of the form
+// "<pod>.<headlessSvc>" - the exact shape buildReplicaAddrs produces, where
+// headlessSvc is the "<name>-headless.<namespace>.svc.cluster.local" FQDN the
+// operator renders from common.HeadlessServiceName. The suffix is matched against
+// the configured headless Service instead of just cutting at the first dot, so an
+// address that does not come from this StatefulSet yields no pod name at all.
+// Reports false when the name cannot be derived.
+func (d *DrainHandler) podNameFromHost(host string) (string, bool) {
+	if d.headlessSvc == "" {
+		return "", false
+	}
+	name, found := strings.CutSuffix(host, "."+d.headlessSvc)
+	if !found || name == "" || strings.Contains(name, ".") {
+		return "", false
+	}
+	return name, true
+}
+
+// findSyncedReplica queries the peers discovered via headless DNS and reports
+// two things: the address of the first fully synced replica, and whether any
+// peer already answers role:master.
+//
+// The master report is what keeps this handler from fighting the operator. On a
+// rolling update the operator promotes a replica itself and then deletes the old
+// master without ever demoting it, so this code runs on a pod that is still
+// master while the topology already has a new one. Promoting again would pick a
+// third pod - the operator's fresh master is a master, not a synced replica, so
+// it is skipped here - point REPLICAOF at the operator's master, and stamp a pod
+// nobody promoted. That stamp is read by the operator's steady-state master
+// resolution, so a promotion the operator did not perform must not leave one. A
+// genuine node drain has no master among its peers and is unaffected.
+//
+// Every reachable peer is therefore queried before "no master" may be concluded:
+// returning at the first synced replica could hand back a promotion target while
+// a master sits further down the list.
+func (d *DrainHandler) findSyncedReplica(log drainLog) (string, bool, error) {
 	addrs := d.buildReplicaAddrs()
+	synced := ""
 	for _, addr := range addrs {
 		client := d.clientFactory.NewClient(addr)
 		info, err := client.InfoReplication()
@@ -169,11 +267,49 @@ func (d *DrainHandler) findSyncedReplica(log drainLog) (string, error) {
 			log.Error(err, "failed to query replica", "addr", addr)
 			continue
 		}
-		if isSyncedReplica(info) {
-			return addr, nil
+		if info.Role == common.RoleMaster {
+			log.Info("peer already reports role:master", "addr", addr)
+			return "", true, nil
+		}
+		if synced == "" && isSyncedReplica(info) {
+			synced = addr
 		}
 	}
-	return "", fmt.Errorf("no synced replica found among %d candidates", len(addrs))
+	if synced == "" {
+		return "", false, fmt.Errorf("no synced replica found among %d candidates", len(addrs))
+	}
+	return synced, false, nil
+}
+
+// signalDrainComplete tells the Valkey container that it may exit
+// (internal/common/drain.go).
+//
+// A missing directory is the normal case, not a failure: the operator mounts the
+// shared volume only where the drain performs a manual failover, so a Sentinel or
+// standalone pod has no directory and no preStop hook waiting on it. Checking the
+// mount rather than re-deriving the condition keeps the two sides from drifting
+// apart -- the mount IS the switch.
+//
+// A failed write is logged and nothing more. The preStop bound then expires on its
+// own, which is slower but not wrong, and there is nothing better to do from a
+// process that is itself terminating.
+func (d *DrainHandler) signalDrainComplete(log drainLog) {
+	dir := d.signalDir
+	if dir == "" {
+		dir = common.DrainSignalMountPath
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+
+	path := filepath.Join(dir, common.DrainCompleteFile)
+	content := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		log.Error(err, "could not signal drain completion; the Valkey container will wait out its preStop bound",
+			"path", path)
+		return
+	}
+	log.Info("drain complete, released the Valkey container", "path", path)
 }
 
 // isSyncedReplica returns true if the replication info indicates a fully synced replica.
