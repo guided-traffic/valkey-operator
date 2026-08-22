@@ -102,7 +102,9 @@ func replicaConfigMapNaming(v *vkov1.Valkey, masterOrdinal int) *corev1.ConfigMa
 	published.Annotations = map[string]string{
 		builder.AnnotationKnownMaster: podHost(v.Name, masterOrdinal),
 	}
-	return builder.BuildReplicaConfigMap(published)
+	cm := builder.BuildReplicaConfigMap(published)
+	controllerRefTo(v, cm)
+	return cm
 }
 
 // splitBrainFixture builds the post-failover shape: a 2-replica non-Sentinel CR
@@ -1623,6 +1625,7 @@ func TestReplicaConfigMaster_ParseOutcomes(t *testing.T) {
 				},
 				Data: map[string]string{builder.ValkeyConfigKey: tt.data},
 			}
+			controllerRefTo(v, cm)
 			r, _ := newTestReconciler(v, cm)
 
 			name, known := r.replicaConfigMaster(context.Background(), v)

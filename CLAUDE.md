@@ -317,6 +317,20 @@ sentences are repeated here so nothing is changed without them.
    master label during a drain.
    → [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
 
+## Provenance before every write and every delete
+
+Every object the operator manages is named from the CR name, and whoever may `create valkeys`
+in a namespace picks that name. **No write and no delete onto a generated name without
+`metav1.IsControlledBy(obj, v)` first** — a label is not a proof, and an ownerReference is a
+write like any other, the one that decides whether the garbage collector takes the object
+with the CR. Since 2026-08-22 the rule binds *every* managed kind, so **a new managed object
+inherits it, not an exemption**: guard the write, decide the fail direction by "can the CR do
+the job it was asked to do", give the kind its own Event reason, and guard the delete with the
+UID precondition (`deleteIfOwned`). If a second code path reads or acts on the object, that
+path treats a foreign one as absent and stays quiet — the reconciler is the one reporter.
+→ [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes and grants),
+[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
+
 ## Metrics / Exporter
 
 `spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on

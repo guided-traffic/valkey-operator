@@ -84,7 +84,9 @@ func twoReplicaFailoverFixture(t *testing.T) (*vkov1.Valkey, []podState, *corev1
 		{name: pod1.Name, pod: pod1, needsUpdate: false, isMaster: false, ready: true, exists: true},
 	}
 
-	return v, pods, builder.BuildReplicaConfigMap(v)
+	replicaCM := builder.BuildReplicaConfigMap(v)
+	controllerRefTo(v, replicaCM)
+	return v, pods, replicaCM
 }
 
 func replicaConfigMapContent(t *testing.T, c client.Client, v *vkov1.Valkey) string {
@@ -152,6 +154,7 @@ func TestPromotePod0AndRedirect_ResetsKnownMasterToPod0(t *testing.T) {
 		annotationPromotedPod:         "test-1",
 	}
 	replicaCM := builder.BuildReplicaConfigMap(v)
+	controllerRefTo(v, replicaCM)
 	require.Contains(t, replicaCM.Data[builder.ValkeyConfigKey], "replicaof "+promotedHost,
 		"the fixture must start from a ConfigMap that points at the promoted pod")
 

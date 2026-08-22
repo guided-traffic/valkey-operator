@@ -259,3 +259,141 @@ func TestForeignDataStatefulSet_Integration(t *testing.T) {
 		}, 30*time.Second, 250*time.Millisecond, "the condition must clear once the collision is gone")
 	})
 }
+
+// TestForeignMetricsService_Integration is the half of ADR 0020 D2 that a unit test
+// cannot make stick: a refusal that must NOT fail the pass. The metrics Service and
+// the ServiceMonitor take the observer's direction, so a name collision in the
+// monitoring surface has to leave the CR outside ReconcileBlocked and outside the
+// Error phase.
+//
+// Why this tier: the phase is not written by the refusing step. updateStatus runs
+// after reconcileResources in the same pass and recomputes it from the data plane,
+// and setReconcileBlockedCondition writes the condition from the joined pass error.
+// Only a real manager driving a real pass shows what those two authorities agree on
+// after a downgraded refusal.
+func TestForeignMetricsService_Integration(t *testing.T) {
+	ctx := testCtx
+	crName := "foreign-metrics-test"
+	key := types.NamespacedName{Name: crName, Namespace: "default"}
+	svcKey := types.NamespacedName{Name: crName + "-metrics", Namespace: "default"}
+
+	foreign := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svcKey.Name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "theirs"},
+			Ports:    []corev1.ServicePort{{Name: "http", Port: 8080}},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, foreign))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, foreign) })
+
+	v := &vkov1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: "default"},
+		Spec: vkov1.ValkeySpec{
+			Replicas: 1,
+			Image:    "valkey/valkey:8.0",
+			Metrics:  &vkov1.MetricsSpec{Enabled: true},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, v))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, v) })
+
+	// Wait for the pass to have run at all, which the operator's own StatefulSet
+	// proves; the assertions below are about what it did NOT do.
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, key, &appsv1.StatefulSet{}) == nil
+	}, 60*time.Second, 250*time.Millisecond, "the pass must complete despite the collision")
+
+	current := &vkov1.Valkey{}
+	require.NoError(t, k8sClient.Get(ctx, key, current))
+	blocked := meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
+	if blocked != nil {
+		assert.NotEqual(t, vkov1.ReasonForeignObject, blocked.Reason,
+			"a monitoring name collision must not block the CR")
+	}
+	assert.NotEqual(t, vkov1.ValkeyPhaseError, current.Status.Phase,
+		"scraping is observability: the data plane is untouched and the CR must not read Error")
+
+	got := &corev1.Service{}
+	require.NoError(t, k8sClient.Get(ctx, svcKey, got))
+	assert.Equal(t, map[string]string{"app": "theirs"}, got.Spec.Selector,
+		"a Service selector is mutable, so only the guard stops the traffic takeover")
+	assert.Empty(t, got.OwnerReferences,
+		"leaving it unowned is what keeps it out of this CR's garbage collection")
+}
+
+// TestForeignConfigMap_Integration is the opposite direction on the same rule: the
+// Valkey ConfigMap is the data plane, so its refusal fails the pass, names itself on
+// the CR, and clears by itself once the collision is removed
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D2, D6).
+func TestForeignConfigMap_Integration(t *testing.T) {
+	ctx := testCtx
+	crName := "foreign-cm-test"
+	key := types.NamespacedName{Name: crName, Namespace: "default"}
+	cmKey := types.NamespacedName{Name: crName + "-config", Namespace: "default"}
+
+	foreign := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmKey.Name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Data: map[string]string{"theirs.conf": "# not ours\n"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, foreign))
+
+	v := &vkov1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: "default"},
+		Spec:       vkov1.ValkeySpec{Replicas: 1, Image: "valkey/valkey:8.0"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, v))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, v) })
+
+	t.Run("the write is refused and reported", func(t *testing.T) {
+		require.Eventually(t, func() bool {
+			current := &vkov1.Valkey{}
+			if err := k8sClient.Get(ctx, key, current); err != nil {
+				return false
+			}
+			blocked := meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
+			return blocked != nil &&
+				blocked.Status == metav1.ConditionTrue &&
+				blocked.Reason == vkov1.ReasonForeignObject
+		}, 30*time.Second, 250*time.Millisecond,
+			"the collision is only actionable if the CR names it: ReconcileBlocked/ForeignObject")
+
+		got := &corev1.ConfigMap{}
+		require.NoError(t, k8sClient.Get(ctx, cmKey, got))
+		assert.Equal(t, "# not ours\n", got.Data["theirs.conf"],
+			"a foreign ConfigMap keeps the data another workload reads")
+		assert.NotContains(t, got.Data, builder.ValkeyConfigKey,
+			"and must not gain this cluster's configuration")
+		assert.Empty(t, got.OwnerReferences, "the operator must not adopt it either")
+	})
+
+	t.Run("removing the collision provisions the operator's own ConfigMap", func(t *testing.T) {
+		require.NoError(t, k8sClient.Delete(ctx, foreign))
+
+		require.Eventually(t, func() bool {
+			got := &corev1.ConfigMap{}
+			if err := k8sClient.Get(ctx, cmKey, got); err != nil {
+				return false
+			}
+			return metav1.IsControlledBy(got, v)
+		}, 90*time.Second, 500*time.Millisecond,
+			"the operator has to pick itself back up and create its own ConfigMap")
+
+		require.Eventually(t, func() bool {
+			current := &vkov1.Valkey{}
+			if err := k8sClient.Get(ctx, key, current); err != nil {
+				return false
+			}
+			blocked := meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
+			return blocked != nil && blocked.Status == metav1.ConditionFalse
+		}, 30*time.Second, 250*time.Millisecond, "the condition must clear once the collision is gone")
+	})
+}

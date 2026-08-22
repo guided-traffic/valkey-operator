@@ -15,10 +15,17 @@ verifiable from this repository. The legacy Sentinel TLS half landed as commit `
 Amended 2026-08-21: the `reconcileSidecarRoleBinding` residual is **closed** by
 [ADR 0020](0020-write-only-what-the-operator-owns.md), which added the ownership check
 that keeps the delete-and-recreate off a foreign binding and the UID precondition on
-the operator's own. Two items stay **open**: the name-only cleanups
-(`cleanupMetricsService`, `cleanupObserverDeployment`, `cleanupServiceMonitor`) and
-`deleteLegacyServices`, which scans ownerReferences but takes its Delete without a UID
-precondition — see Residual risks.
+the operator's own.
+
+Amended 2026-08-22: the **name-only cleanups are closed too**. The observer Deployment half
+of `cleanupObserverDeployment` went with the NA61 amendment of ADR 0020; `cleanupMetricsService`,
+`cleanupServiceMonitor` and the NetworkPolicy half of `cleanupObserverDeployment` went with
+the NA62 one. All four now prove ownership with `IsControlledBy` and send
+`client.Preconditions{UID: …}`, through the shared `deleteIfOwned` in
+[`internal/controller/foreign_object.go`](../../internal/controller/foreign_object.go).
+**One item stays open**: `deleteLegacyServices`, which scans ownerReferences but takes its
+Delete without a UID precondition and accepts any ownerReference rather than the controller
+one — see Residual risks.
 
 This ADR is the **deletion** half. The write half — no write onto a generated name the
 operator cannot prove it owns, and no grant to a subject it does not own — is
@@ -286,15 +293,16 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
 
 ## Residual risks
 
-* **`cleanupMetricsService`, `cleanupServiceMonitor` and the NetworkPolicy half of
-  `cleanupObserverDeployment` still delete by name.** Their names are operator-suffixed
-  (`-metrics`, `-observer`) and are not names a hand-written object would plausibly carry,
-  so this is a consistency follow-up rather than a severity-driven fix. A hand-written
-  object under one of those names is still deleted on every pass. *(Amended 2026-08-22:
-  the `-observer` **Deployment** half is closed — [ADR 0020](0020-write-only-what-the-operator-owns.md)
-  put the write guard on `reconcileObserverDeployment`, and refusing to write a foreign
-  Deployment while still deleting it on disable would have been absurd, so the delete now
-  checks `IsControlledBy` and carries the D8 UID precondition.)*
+* **(Closed 2026-08-22) `cleanupMetricsService`, `cleanupServiceMonitor` and the
+  NetworkPolicy half of `cleanupObserverDeployment` deleted by name.** Filed as a
+  consistency follow-up on the argument that `-metrics` and `-observer` are not names a
+  hand-written object would plausibly carry. That argument was weaker than it read: the
+  trigger is not an accident but a feature flag — `spec.metrics.enabled`,
+  `spec.metrics.serviceMonitor.enabled` and `spec.observer.enabled` each turn a name
+  collision into a `Delete`, and the CR author owns all three. All three are closed by the
+  NA62 amendment of [ADR 0020](0020-write-only-what-the-operator-owns.md); the observer
+  **Deployment** half went with its NA61 amendment. Each now checks `IsControlledBy` and
+  carries the D8 UID precondition, via the shared `deleteIfOwned`.
 * **(Closed 2026-08-21) `reconcileSidecarRoleBinding` deleted and recreated by name.**
   `RoleRef` is immutable, so a live RoleBinding under `<cr>-sidecar` whose `RoleRef`
   differs from the desired one was deleted and rebuilt — with neither `IsControlledBy`

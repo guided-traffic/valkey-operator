@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -724,6 +725,19 @@ func (r *ValkeyReconciler) replicaConfigMaster(ctx context.Context, v *vkov1.Val
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: v.Namespace}, cm); err != nil {
 		log.FromContext(ctx).Info("Cannot read the replica ConfigMap; treating the published master as unknown",
 			"configMap", name, "error", err)
+		return "", false
+	}
+
+	// A ConfigMap this Valkey does not control is treated as absent, exactly like
+	// the foreign StatefulSet (docs/adr/0020-write-only-what-the-operator-owns.md,
+	// D8). Without this the replicaof directive of a stranger's ConfigMap would
+	// become this cluster's published master and feed the steady-state resolver,
+	// which is the input that decides who gets demoted with REPLICAOF
+	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md).
+	// reconcileReplicaConfigMap is the one reporter; this path stays quiet.
+	if !metav1.IsControlledBy(cm, v) {
+		log.FromContext(ctx).Info("Replica ConfigMap is held by an object this Valkey does not control; "+
+			"treating the published master as unknown", "configMap", name)
 		return "", false
 	}
 

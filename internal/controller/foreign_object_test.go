@@ -11,9 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -525,4 +528,383 @@ func TestReconcileResources_ForeignDataStatefulSetFailsThePass(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errForeignObject)
 	assert.Equal(t, vkov1.ReasonForeignObject, reconcileBlockedReason(err))
+}
+
+// --- Services, ConfigMaps, NetworkPolicies, ServiceMonitor and Certificate ---
+//
+// The kinds D7 used to leave out. The two unstructured ones are the sharpest: they
+// wrote this CR's ownerReference onto whatever object held the name, with Controller
+// and BlockOwnerDeletion set, so deleting the CR handed a foreign object to the
+// garbage collector. Every assertion below that reads OwnerReferences on a refused
+// object is that half of the rule.
+
+// foreignService returns a Service under name that no Valkey controls, selecting
+// its own pods — the selector is the field a takeover would rewrite, and it is
+// mutable, so unlike the StatefulSet nothing upstream would have rejected the write.
+func foreignService(name string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "theirs"},
+			Ports:    []corev1.ServicePort{{Name: "http", Port: 8080}},
+		},
+	}
+}
+
+// foreignConfigMap returns a ConfigMap under name that no Valkey controls.
+func foreignConfigMap(name string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Data: map[string]string{"theirs.conf": "# not ours\n"},
+	}
+}
+
+// foreignCertificate returns a cert-manager Certificate under name that no Valkey
+// controls. spec.secretName is the field that matters: writing ours onto it makes
+// cert-manager maintain this cluster's Secret and abandon theirs, without waiting
+// for any CR deletion.
+func foreignCertificate(name string) *unstructured.Unstructured {
+	c := newEmptyCert()
+	c.SetName(name)
+	c.SetNamespace("default")
+	c.SetLabels(map[string]string{"owner": "someone-else"})
+	c.Object["spec"] = map[string]interface{}{
+		"secretName": "their-tls",
+		"dnsNames":   []interface{}{"theirs.example.com"},
+		"issuerRef": map[string]interface{}{
+			"kind": "Issuer",
+			"name": "their-issuer",
+		},
+	}
+	return c
+}
+
+// foreignServiceMonitor returns a ServiceMonitor under name that no Valkey controls.
+func foreignServiceMonitor(name string) *unstructured.Unstructured {
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(builder.ServiceMonitorGVK())
+	sm.SetName(name)
+	sm.SetNamespace("default")
+	sm.SetLabels(map[string]string{"owner": "someone-else"})
+	sm.Object["spec"] = map[string]interface{}{
+		"selector":  map[string]interface{}{"matchLabels": map[string]interface{}{"app": "theirs"}},
+		"endpoints": []interface{}{map[string]interface{}{"port": "theirs"}},
+	}
+	return sm
+}
+
+func TestReconcileService_RefusesAForeignService(t *testing.T) {
+	v := newTestValkey("test", "default")
+	desired := builder.BuildHeadlessService(v)
+	foreign := foreignService(desired.Name)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileService(context.Background(), v, builder.BuildHeadlessService(v))
+
+	require.Error(t, err, "the -rw Service is how clients reach the master (ADR 0020 D2)")
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, map[string]string{"app": "theirs"}, got.Spec.Selector,
+		"a Service selector is mutable, so only the guard stops the traffic takeover")
+	assert.Equal(t, foreign.Labels, got.Labels)
+	require.Len(t, rec.withReason(reasonServiceNotOwned), 1)
+}
+
+func TestReconcileMetricsService_ForeignServiceDoesNotFailThePass(t *testing.T) {
+	// The one Service whose refusal is downgraded: a collision in the monitoring
+	// surface costs scraping, not the data plane (ADR 0020 D2).
+	v := serviceMonitorValkey()
+	foreign := foreignService(builder.MetricsServiceName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	ctx, state := passCtx()
+	require.NoError(t, r.reconcileMetricsService(ctx, v))
+
+	got := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, map[string]string{"app": "theirs"}, got.Spec.Selector)
+	require.Len(t, rec.withReason(reasonServiceNotOwned), 1,
+		"the Event is still emitted; only the error is downgraded")
+	assert.Equal(t, foreignObjectRecheckInterval, state.interval())
+}
+
+func TestReconcileConfigMap_RefusesAForeignConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default")
+	foreign := foreignConfigMap(builder.ConfigMapName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileConfigMap(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Data, got.Data, "a foreign ConfigMap keeps its data")
+	require.Len(t, rec.withReason(reasonConfigMapNotOwned), 1)
+}
+
+func TestReconcileReplicaConfigMap_RefusesAForeignConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	foreign := foreignConfigMap(builder.ReplicaConfigMapName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileReplicaConfigMap(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Data, got.Data,
+		"publishing this cluster's master into a stranger's config is the write half of ADR 0020 D8")
+	require.Len(t, rec.withReason(reasonConfigMapNotOwned), 1)
+}
+
+func TestReplicaConfigMaster_TreatsAForeignConfigMapAsUnknown(t *testing.T) {
+	// The read half: a stranger's replicaof directive must never become this
+	// cluster's published master, because that value feeds the resolver that
+	// issues REPLICAOF (ADR 0020 D8, ADR 0011).
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	foreign := foreignConfigMap(builder.ReplicaConfigMapName(v))
+	foreign.Data = map[string]string{
+		builder.ValkeyConfigKey: "replicaof test-2.test-headless.default.svc.cluster.local 6379\n",
+	}
+	r, _ := newTestReconciler(v, foreign)
+
+	name, known := r.replicaConfigMaster(context.Background(), v)
+
+	assert.False(t, known, "a ConfigMap this Valkey does not control is treated as absent")
+	assert.Empty(t, name)
+}
+
+func TestReconcileSentinelConfigMap_RefusesAForeignConfigMap(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	foreign := foreignConfigMap(builder.SentinelConfigMapName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileSentinelConfigMap(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Data, got.Data)
+	require.Len(t, rec.withReason(reasonConfigMapNotOwned), 1)
+}
+
+func TestReconcileNetworkPolicy_RefusesAForeignNetworkPolicy(t *testing.T) {
+	// The one path where D2 is read wider than "does the data plane still serve":
+	// a CR reporting OK while the policy it names belongs to somebody else is a
+	// security statement that is not true.
+	v := networkPolicyValkey()
+	desired := builder.BuildValkeyNetworkPolicy(v, "valkey-system")
+	foreign := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      desired.Name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "theirs"}},
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileNetworkPolicy(context.Background(), v,
+		builder.BuildValkeyNetworkPolicy(v, "valkey-system"))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &networkingv1.NetworkPolicy{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, map[string]string{"app": "theirs"}, got.Spec.PodSelector.MatchLabels,
+		"a foreign policy keeps the pods it selects")
+	assert.Empty(t, got.Spec.Ingress, "and keeps its own rules")
+	require.Len(t, rec.withReason(reasonNetworkPolicyNotOwned), 1)
+}
+
+func TestReconcileNetworkPolicies_ForeignObserverPolicyDoesNotFailThePass(t *testing.T) {
+	// The observer's own policy takes the observer's fail direction, not the
+	// NetworkPolicy one (ADR 0020 D2).
+	v := networkPolicyValkey()
+	observerEnabled(v)
+	foreign := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      builder.ObserverNetworkPolicyName(v),
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	ctx, state := passCtx()
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, v))
+
+	got := &networkingv1.NetworkPolicy{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Labels, got.Labels)
+	require.Len(t, rec.withReason(reasonNetworkPolicyNotOwned), 1)
+	assert.Equal(t, foreignObjectRecheckInterval, state.interval())
+}
+
+func TestReconcileServiceMonitor_RefusesAForeignServiceMonitor(t *testing.T) {
+	v := serviceMonitorValkey()
+	foreign := foreignServiceMonitor(builder.ServiceMonitorName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	ctx, state := passCtx()
+	require.NoError(t, r.reconcileServiceMonitor(ctx, v),
+		"scraping is observability; the refusal must not fail the pass (ADR 0020 D2)")
+
+	got := getSM(t, c, foreign.GetName())
+	assert.Empty(t, got.GetOwnerReferences(),
+		"the CR must not become the controller owner: the garbage collector would delete it")
+	endpoints, _, err := unstructured.NestedSlice(got.Object, "spec", "endpoints")
+	require.NoError(t, err)
+	assert.Equal(t, "theirs", endpoints[0].(map[string]interface{})["port"],
+		"a foreign scrape config keeps its endpoints")
+	assert.Equal(t, map[string]string{"owner": "someone-else"}, got.GetLabels())
+	require.Len(t, rec.withReason(reasonServiceMonitorNotOwned), 1)
+	assert.Equal(t, foreignObjectRecheckInterval, state.interval())
+}
+
+func TestReconcileCertificate_RefusesAForeignCertificate(t *testing.T) {
+	v := newCertManagerValkey()
+	foreign := foreignCertificate(builder.ValkeyCertificateName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileCertificate(context.Background(), v, builder.BuildValkeyCertificate(v))
+
+	require.Error(t, err, "the pods mount the TLS Secret by name, so the CR cannot do its job")
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := getCert(t, c, foreign.GetName())
+	assert.Empty(t, got.GetOwnerReferences(),
+		"deleting the CR must not garbage-collect a foreign Certificate and its Secret")
+	secretName, _, _ := unstructured.NestedString(got.Object, "spec", "secretName")
+	assert.Equal(t, "their-tls", secretName,
+		"rewriting secretName would make cert-manager abandon their Secret for ours")
+	assert.Equal(t, []string{"theirs.example.com"}, certDNSNames(t, got))
+	require.Len(t, rec.withReason(reasonCertificateNotOwned), 1)
+}
+
+func TestReconcileResources_ForeignCertificateFailsThePass(t *testing.T) {
+	// End to end through the step runner, so the ReconcileBlocked reason comes out
+	// as ForeignObject rather than WriteFailed.
+	v := newCertManagerValkey()
+	foreign := foreignCertificate(builder.ValkeyCertificateName(v))
+	r, _ := newTestReconciler(v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileResources(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+	assert.Equal(t, vkov1.ReasonForeignObject, reconcileBlockedReason(err))
+}
+
+// --- the delete half: a feature flag must not delete somebody else's object ---
+
+func TestCleanupServiceMonitor_LeavesAForeignServiceMonitorAlone(t *testing.T) {
+	// Reachable by flipping spec.metrics.serviceMonitor.enabled off
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2).
+	v := serviceMonitorValkey()
+	foreign := foreignServiceMonitor(builder.ServiceMonitorName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+
+	require.NoError(t, r.cleanupServiceMonitor(context.Background(), v))
+
+	getSM(t, c, foreign.GetName())
+}
+
+func TestCleanupMetricsService_LeavesAForeignServiceAlone(t *testing.T) {
+	v := serviceMonitorValkey()
+	foreign := foreignService(builder.MetricsServiceName(v))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+
+	require.NoError(t, r.cleanupMetricsService(context.Background(), v))
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, &corev1.Service{}))
+}
+
+func TestCleanupObserverDeployment_LeavesAForeignNetworkPolicyAlone(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
+		// Observer left disabled: this is the "turned off" cleanup path.
+	})
+	foreign := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      builder.ObserverNetworkPolicyName(v),
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+	}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+
+	require.NoError(t, r.cleanupObserverDeployment(context.Background(), v))
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, &networkingv1.NetworkPolicy{}),
+		"a foreign policy under the generated name must survive the cleanup")
+}
+
+// TestDeleteIfOwned_ToleratesAReplacementUnderTheName pins the Conflict branch: the
+// UID precondition is what makes the ownership decision and the delete describe the
+// same object, and losing that race is not a pass failure (ADR 0006 D8, D9).
+func TestDeleteIfOwned_ToleratesAReplacementUnderTheName(t *testing.T) {
+	v := newTestValkey("test", "default")
+	owned := builder.BuildMetricsService(v)
+	controllerRefTo(v, owned)
+	funcs := interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+			return apierrors.NewConflict(
+				schema.GroupResource{Resource: "services"}, owned.Name, errors.New("uid mismatch"))
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, owned)
+
+	assert.NoError(t, r.deleteIfOwned(context.Background(), v, owned, "metrics Service"))
 }

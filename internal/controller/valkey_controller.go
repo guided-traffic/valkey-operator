@@ -505,10 +505,22 @@ func (r *ValkeyReconciler) reconcileMetrics(ctx context.Context, valkey *vkov1.V
 // reconcileMetricsService creates the metrics Service when metrics are enabled
 // and removes it otherwise.
 func (r *ValkeyReconciler) reconcileMetricsService(ctx context.Context, valkey *vkov1.Valkey) error {
-	if valkey.IsMetricsServiceEnabled() {
-		return r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey))
+	if !valkey.IsMetricsServiceEnabled() {
+		return r.cleanupMetricsService(ctx, valkey)
 	}
-	return r.cleanupMetricsService(ctx, valkey)
+
+	err := r.reconcileService(ctx, valkey, builder.BuildMetricsService(valkey))
+	if errors.Is(err, errForeignObject) {
+		// The metrics Service is the one Service whose refusal does not fail the
+		// pass, and it takes the same direction as the ServiceMonitor next to it:
+		// a name collision in the monitoring surface costs scraping, not the data
+		// plane, and converting it into a CR outage is the trade ADR 0020 D2
+		// rejects for the observer. reconcileService already logged it and emitted
+		// the Event, so only the recheck is added here (D6).
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+	return err
 }
 
 // reconcileMetricsServiceMonitor creates the Prometheus-Operator ServiceMonitor
@@ -522,7 +534,6 @@ func (r *ValkeyReconciler) reconcileMetricsServiceMonitor(ctx context.Context, v
 
 // cleanupMetricsService deletes the metrics Service if it exists.
 func (r *ValkeyReconciler) cleanupMetricsService(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
 	svc := &corev1.Service{}
 	name := types.NamespacedName{Name: builder.MetricsServiceName(v), Namespace: v.Namespace}
 	if err := r.Get(ctx, name, svc); err != nil {
@@ -531,11 +542,11 @@ func (r *ValkeyReconciler) cleanupMetricsService(ctx context.Context, v *vkov1.V
 		}
 		return err
 	}
-	logger.Info("Deleting metrics Service", "name", svc.Name)
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting metrics service: %w", err)
-	}
-	return nil
+	// Reachable by flipping spec.metrics.enabled off, which is why the ownership
+	// proof belongs here and not only on the write path: without it, switching a
+	// feature off deletes whatever holds <cr>-metrics
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2).
+	return r.deleteIfOwned(ctx, v, svc, "metrics Service")
 }
 
 // reconcileServiceMonitor ensures a Prometheus-Operator ServiceMonitor matches the
@@ -571,6 +582,23 @@ func (r *ValkeyReconciler) reconcileServiceMonitor(ctx context.Context, v *vkov1
 		return err
 	}
 
+	// One of the two paths that used to stamp this CR's ownerReference — with
+	// Controller and BlockOwnerDeletion set — onto whatever object held the name,
+	// which would have made the garbage collector delete a foreign object when the
+	// CR goes. The spec write is the nearer half of the same harm: it repoints
+	// someone else's scrape config at this cluster's endpoints.
+	//
+	// The refusal does not fail the pass. Scraping is observability, the data plane
+	// is untouched, and the recheck brings the operator back on its own once the
+	// collision is gone (ADR 0020 D2, D6).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonServiceMonitorNotOwned, "ServiceMonitor", desired.GetName(),
+			"metrics are not scraped through this Valkey: the operator will not write the object "+
+				"and will not stamp its owner reference onto it")
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
 	if !equality.Semantic.DeepEqual(desired.Object["spec"], current.Object["spec"]) ||
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating ServiceMonitor", "name", desired.GetName())
@@ -587,7 +615,6 @@ func (r *ValkeyReconciler) reconcileServiceMonitor(ctx context.Context, v *vkov1
 // cleanupServiceMonitor deletes the ServiceMonitor if it exists. It tolerates the
 // monitoring.coreos.com CRDs being absent.
 func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
 	sm := &unstructured.Unstructured{}
 	sm.SetGroupVersionKind(builder.ServiceMonitorGVK())
 	name := types.NamespacedName{Name: builder.ServiceMonitorName(v), Namespace: v.Namespace}
@@ -597,11 +624,10 @@ func (r *ValkeyReconciler) cleanupServiceMonitor(ctx context.Context, v *vkov1.V
 		}
 		return err
 	}
-	logger.Info("Deleting ServiceMonitor", "name", sm.GetName())
-	if err := r.Delete(ctx, sm); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting servicemonitor: %w", err)
-	}
-	return nil
+	// The cheapest door in this family: flipping spec.metrics.serviceMonitor.enabled
+	// off used to delete whatever object held the derived name
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2).
+	return r.deleteIfOwned(ctx, v, sm, "ServiceMonitor")
 }
 
 // reconcileObserver creates the observer ServiceAccount and Deployment when enabled,
@@ -716,6 +742,19 @@ func (r *ValkeyReconciler) reconcileConfigMap(ctx context.Context, v *vkov1.Valk
 		return err
 	}
 
+	// The pods mount this ConfigMap by name, so a foreign object under it is
+	// already the configuration Valkey starts with; the refusal cannot undo that.
+	// What it stops is the other direction — the operator overwriting someone
+	// else's config data with this cluster's. The step fails because nothing about
+	// the data plane is what the CR asked for while that name belongs to another
+	// object (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the Valkey configuration is not managed by this Valkey: the operator will not write "+
+				"its data")
+		return foreignObjectError("ConfigMap", desired.Name)
+	}
+
 	// Update if config content or operator version annotation has changed.
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
 		builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -747,6 +786,21 @@ func (r *ValkeyReconciler) reconcileReplicaConfigMap(ctx context.Context, v *vko
 	}
 	if err != nil {
 		return err
+	}
+
+	// The replica ConfigMap carries the replicaof directive derived from the
+	// known-master annotation (ADR 0008), and replicaConfigMaster reads the LIVE
+	// object back as the published master for the steady-state resolver (ADR 0011).
+	// Both directions matter: writing ours onto a foreign object publishes this
+	// cluster's master into someone else's config, and reading a foreign one feeds
+	// a stranger's value into this cluster's master authority. This refusal closes
+	// the write and is the one reporter; replicaConfigMaster closes the read by
+	// reporting the published master as unknown (ADR 0020 D8).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the replica configuration is not managed by this Valkey: the operator will not write "+
+				"its data and will not read a published master from it")
+		return foreignObjectError("ConfigMap", desired.Name)
 	}
 
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
@@ -1070,6 +1124,23 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 		return err
 	}
 
+	// Every Service the operator manages runs through here: the headless one, -rw,
+	// -r, -all, -metrics and the Sentinel headless one. A spec.selector is mutable,
+	// so unlike the StatefulSet there is no immutability backstop behind a takeover
+	// — the Update succeeds and points a foreign Service's traffic at this
+	// cluster's pods.
+	//
+	// The refusal fails the step, because -rw is how clients reach the master and a
+	// cluster whose write endpoint the operator will not maintain cannot do its job
+	// (ADR 0020 D2). The one exception is the metrics Service, whose caller
+	// downgrades this error: see reconcileMetricsService.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonServiceNotOwned, "Service", desired.Name,
+			"traffic under this name is not routed by this Valkey: the operator will not write "+
+				"its ports, selector or labels")
+		return foreignObjectError("Service", desired.Name)
+	}
+
 	// Update ports, selector, labels, or operator version annotation if they changed.
 	if !equality.Semantic.DeepEqual(current.Spec.Ports, desired.Spec.Ports) ||
 		!equality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) ||
@@ -1171,6 +1242,16 @@ func (r *ValkeyReconciler) reconcileSentinelConfigMap(ctx context.Context, v *vk
 	}
 	if err != nil {
 		return err
+	}
+
+	// Same rule and same fail direction as the data ConfigMap: the Sentinel pods
+	// mount this name, and an HA cluster whose Sentinel configuration the operator
+	// does not control has no dependable failover authority (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonConfigMapNotOwned, "ConfigMap", desired.Name,
+			"the Sentinel configuration is not managed by this Valkey: the operator will not write "+
+				"its data")
+		return foreignObjectError("ConfigMap", desired.Name)
 	}
 
 	if !equality.Semantic.DeepEqual(current.Data, desired.Data) ||
@@ -1588,6 +1669,28 @@ func (r *ValkeyReconciler) reconcileCertificate(ctx context.Context, v *vkov1.Va
 		return err
 	}
 
+	// The sharper of the two ownerReference stamps this ADR removes. With
+	// Controller and BlockOwnerDeletion set on a foreign Certificate, deleting the
+	// CR would garbage-collect it and the Secret it manages, ending someone else's
+	// issuance and renewal — the exact harm ADR 0006 D1 forbids, arriving through a
+	// door D1 does not watch because the operator issues no Delete. The spec write
+	// does not even wait for the CR delete: it rewrites issuerRef, dnsNames and
+	// above all secretName, after which cert-manager maintains this cluster's
+	// Secret and abandons theirs.
+	//
+	// The refusal fails the step. The data StatefulSet mounts the TLS Secret by
+	// name, so a foreign Certificate under this name means either no Secret at all
+	// (pods never start) or one with foreign SANs (clients fail the verify); the CR
+	// cannot do its job and must not report OK (ADR 0020 D2). The delete side of
+	// this same object was already guarded in deleteLegacySentinelCertificate —
+	// this closes an asymmetry that was accidental rather than considered.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonCertificateNotOwned, "Certificate", name,
+			"TLS is not provisioned: the operator will not write the object and will not stamp "+
+				"its owner reference onto it, so deleting this Valkey cannot garbage-collect it")
+		return foreignObjectError("Certificate", name)
+	}
+
 	// Compare spec content to determine if update is needed.
 	// Remove fields that cert-manager's webhook adds/manages to avoid
 	// infinite update loops (e.g., privateKey.rotationPolicy added in v1.18.0).
@@ -1641,7 +1744,14 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 	// Observer NetworkPolicy (only if observer is enabled).
 	if v.IsObserverEnabled() {
 		desiredObserver := builder.BuildObserverNetworkPolicy(v)
-		if err := r.reconcileNetworkPolicy(ctx, v, desiredObserver); err != nil {
+		// The observer's own policy takes the observer's fail direction, not the
+		// NetworkPolicy one: the component is diagnostic, it mounts no token, and
+		// no RoleBinding names it, so a collision on its policy name costs the CR
+		// nothing (ADR 0020 D2). reconcileNetworkPolicy already reported it.
+		switch err := r.reconcileNetworkPolicy(ctx, v, desiredObserver); {
+		case errors.Is(err, errForeignObject):
+			requestRecheck(ctx, foreignObjectRecheckInterval)
+		case err != nil:
 			return fmt.Errorf("observer networkpolicy: %w", err)
 		}
 	}
@@ -1666,6 +1776,23 @@ func (r *ValkeyReconciler) reconcileNetworkPolicy(ctx context.Context, v *vkov1.
 	}
 	if err != nil {
 		return err
+	}
+
+	// A NetworkPolicy under a managed name is the isolation the user asked for with
+	// spec.networkPolicy.enabled, and its spec is freely mutable — the write would
+	// replace a foreign policy's rules with this cluster's, changing what somebody
+	// else's pods may reach.
+	//
+	// The refusal fails the step, which is the one place this ADR reads D2 wider
+	// than "does the data plane still serve": a CR reporting OK while the policy it
+	// names belongs to another object is a security statement that is not true. The
+	// observer's policy is the exception its caller makes, matching the rest of the
+	// observer (ADR 0020 D2).
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonNetworkPolicyNotOwned, "NetworkPolicy", desired.Name,
+			"the isolation this Valkey defines under that name is not enforced: the operator will "+
+				"not write the policy spec")
+		return foreignObjectError("NetworkPolicy", desired.Name)
 	}
 
 	if builder.NetworkPolicyHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -1763,14 +1890,16 @@ func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vko
 		return err
 	}
 
-	// Delete Observer NetworkPolicy if NP is enabled.
+	// Delete Observer NetworkPolicy if NP is enabled. Ownership-checked and
+	// UID-preconditioned like the ServiceAccount above: this was the last name-only
+	// delete left on the observer path
+	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2, D8).
 	if v.IsNetworkPolicyEnabled() {
 		np := &networkingv1.NetworkPolicy{}
 		npName := types.NamespacedName{Name: builder.ObserverNetworkPolicyName(v), Namespace: v.Namespace}
 		if err := r.Get(ctx, npName, np); err == nil {
-			logger.Info("Deleting Observer NetworkPolicy", "name", np.Name)
-			if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("deleting observer network policy: %w", err)
+			if err := r.deleteIfOwned(ctx, v, np, "observer NetworkPolicy"); err != nil {
+				return err
 			}
 		}
 	}
@@ -1784,8 +1913,6 @@ func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vko
 // the ownership decision is made on a cache-backed read, so the name can hold a
 // different object by the time the Delete lands (ADR 0006 D8, D9).
 func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v *vkov1.Valkey) error {
-	logger := log.FromContext(ctx)
-
 	sa := &corev1.ServiceAccount{}
 	name := types.NamespacedName{Name: builder.ObserverServiceAccountName(v), Namespace: v.Namespace}
 	if err := r.Get(ctx, name, sa); err != nil {
@@ -1795,26 +1922,7 @@ func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v 
 		return err
 	}
 
-	if !metav1.IsControlledBy(sa, v) {
-		logger.Info("Skipping Observer ServiceAccount deletion: not owned by this Valkey", "name", sa.Name)
-		return nil
-	}
-
-	logger.Info("Deleting Observer ServiceAccount", "name", sa.Name)
-	err := r.Delete(ctx, sa, client.Preconditions{UID: &sa.UID})
-	switch {
-	case err == nil || apierrors.IsNotFound(err):
-		return nil
-	case apierrors.IsConflict(err):
-		// The name holds a different object than the one this pass inspected, so there
-		// is nothing of ours left to delete. The guard did its job; the pass is not
-		// failed over it.
-		logger.Info("Skipping Observer ServiceAccount deletion: the object was replaced under its name",
-			"name", sa.Name)
-		return nil
-	default:
-		return fmt.Errorf("deleting observer service account: %w", err)
-	}
+	return r.deleteIfOwned(ctx, v, sa, "Observer ServiceAccount")
 }
 
 // isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.

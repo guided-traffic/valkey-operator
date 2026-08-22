@@ -173,6 +173,7 @@ func TestReconcileNetworkPolicy_Update_RestoresIngressAndLabels(t *testing.T) {
 	stale := desired.DeepCopy()
 	stale.Spec.Ingress = nil
 	stale.Labels = map[string]string{"hand-edited": "true"}
+	ownedByValkey(t, v, stale)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 
@@ -338,6 +339,7 @@ func TestReconcileSentinelConfigMap_Update_ReplacesDriftedData(t *testing.T) {
 	stale := desired.DeepCopy()
 	stale.Data = map[string]string{"sentinel.conf": "# hand-edited\n"}
 	stale.Labels = map[string]string{"stale": "yes"}
+	ownedByValkey(t, v, stale)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 
@@ -463,7 +465,7 @@ func TestReconcileServiceMonitor_Update_ReplacesDriftedSpec(t *testing.T) {
 		"endpoints": []interface{}{map[string]interface{}{"port": "bogus"}},
 	}
 	stale.SetLabels(map[string]string{"stale": "yes"})
-	stale.SetOwnerReferences(nil)
+	controllerRefTo(v, stale)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 
@@ -476,7 +478,8 @@ func TestReconcileServiceMonitor_Update_ReplacesDriftedSpec(t *testing.T) {
 	assert.Equal(t, builder.ExporterPortName, endpoints[0].(map[string]interface{})["port"],
 		"a drifted scrape port must be corrected")
 	assert.NotContains(t, got.GetLabels(), "stale")
-	require.Len(t, got.GetOwnerReferences(), 1, "a missing owner reference must be restored")
+	require.Len(t, got.GetOwnerReferences(), 1,
+		"the update must not change who controls the object")
 	assert.Equal(t, version, got.GetAnnotations()[builder.AnnotationOperatorVersion])
 }
 
@@ -547,6 +550,7 @@ func TestReconcileServiceMonitor_PropagatesUpdateError(t *testing.T) {
 	v := serviceMonitorValkey()
 	stale := builder.BuildServiceMonitor(v)
 	stale.Object["spec"] = map[string]interface{}{"endpoints": []interface{}{}}
+	controllerRefTo(v, stale)
 
 	funcs := interceptor.Funcs{
 		Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
@@ -593,6 +597,7 @@ func TestCleanupServiceMonitor_PropagatesGetError(t *testing.T) {
 func TestCleanupServiceMonitor_PropagatesDeleteError(t *testing.T) {
 	v := serviceMonitorValkey()
 	sm := builder.BuildServiceMonitor(v)
+	controllerRefTo(v, sm)
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
 			return internalErr("servicemonitor delete forbidden")
@@ -603,7 +608,7 @@ func TestCleanupServiceMonitor_PropagatesDeleteError(t *testing.T) {
 	err := r.cleanupServiceMonitor(context.Background(), v)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deleting servicemonitor")
+	assert.Contains(t, err.Error(), "deleting ServiceMonitor")
 	getSM(t, c, builder.ServiceMonitorName(v))
 }
 
@@ -628,6 +633,7 @@ func TestCleanupMetricsService_PropagatesGetError(t *testing.T) {
 func TestCleanupMetricsService_PropagatesDeleteError(t *testing.T) {
 	v := serviceMonitorValkey()
 	svc := builder.BuildMetricsService(v)
+	controllerRefTo(v, svc)
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
 			return internalErr("service delete forbidden")
@@ -638,7 +644,7 @@ func TestCleanupMetricsService_PropagatesDeleteError(t *testing.T) {
 	err := r.cleanupMetricsService(context.Background(), v)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deleting metrics service")
+	assert.Contains(t, err.Error(), "deleting metrics Service")
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
 		Name: builder.MetricsServiceName(v), Namespace: "default",
 	}, &corev1.Service{}))
@@ -1268,6 +1274,7 @@ func TestCleanupObserverDeployment_RemovesDeploymentAndPolicy(t *testing.T) {
 	deploy := builder.BuildObserverDeployment(v, "img")
 	ownedByValkey(t, v, deploy)
 	np := builder.BuildObserverNetworkPolicy(v)
+	ownedByValkey(t, v, np)
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy, np)
 
 	require.NoError(t, r.cleanupObserverDeployment(context.Background(), v))
@@ -1319,6 +1326,7 @@ func TestCleanupObserverDeployment_PropagatesNetworkPolicyDeleteError(t *testing
 		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
 	})
 	np := builder.BuildObserverNetworkPolicy(v)
+	ownedByValkey(t, v, np)
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
 			if _, ok := obj.(*networkingv1.NetworkPolicy); ok {
@@ -1332,7 +1340,7 @@ func TestCleanupObserverDeployment_PropagatesNetworkPolicyDeleteError(t *testing
 	err := r.cleanupObserverDeployment(context.Background(), v)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deleting observer network policy")
+	assert.Contains(t, err.Error(), "deleting observer NetworkPolicy")
 }
 
 // --- isObserverDeploymentReady ---

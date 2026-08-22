@@ -196,6 +196,7 @@ func TestReconcileCertificate_WebhookDefaultedPrivateKey_IssuesNoUpdate(t *testi
 		"algorithm":      "RSA",
 	}
 	require.NoError(t, unstructured.SetNestedMap(stored.Object, spec, "spec"))
+	controllerRefTo(v, stored)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stored)
 	ctx := context.Background()
@@ -213,7 +214,7 @@ func TestReconcileCertificate_WebhookDefaultedPrivateKey_IssuesNoUpdate(t *testi
 
 // --- reconcileCertificate: update path ---
 
-func TestReconcileCertificate_Update_ReplacesDriftedSpecLabelsAndOwnerRef(t *testing.T) {
+func TestReconcileCertificate_Update_ReplacesDriftedSpecAndLabels(t *testing.T) {
 	const version = "2.0.0"
 	v := newCertManagerValkey()
 
@@ -223,7 +224,7 @@ func TestReconcileCertificate_Update_ReplacesDriftedSpecLabelsAndOwnerRef(t *tes
 	require.NoError(t, unstructured.SetNestedField(
 		stale.Object, "wrong-secret", "spec", "secretName"))
 	stale.SetLabels(map[string]string{"leftover": "yes"})
-	stale.SetOwnerReferences(nil)
+	controllerRefTo(v, stale)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 
@@ -240,8 +241,9 @@ func TestReconcileCertificate_Update_ReplacesDriftedSpecLabelsAndOwnerRef(t *tes
 	assert.NotContains(t, got.GetLabels(), "leftover", "labels must be replaced, not merged")
 	assert.Equal(t, "valkey", got.GetLabels()["app.kubernetes.io/name"])
 	assert.Equal(t, version, got.GetAnnotations()[builder.AnnotationOperatorVersion])
-	require.Len(t, got.GetOwnerReferences(), 1, "a missing owner reference must be restored")
-	assert.Equal(t, v.UID, got.GetOwnerReferences()[0].UID)
+	require.Len(t, got.GetOwnerReferences(), 1)
+	assert.Equal(t, v.UID, got.GetOwnerReferences()[0].UID,
+		"the update must not change who controls the object")
 }
 
 func TestReconcileCertificate_Update_OnOperatorVersionBumpAlone(t *testing.T) {
@@ -250,6 +252,7 @@ func TestReconcileCertificate_Update_OnOperatorVersionBumpAlone(t *testing.T) {
 	// Identical spec, stamped by an older operator version.
 	stored := builder.BuildValkeyCertificate(v)
 	builder.ApplyOperatorVersion(stored, "1.0.0")
+	controllerRefTo(v, stored)
 
 	r, c := newReconcilerWithInterceptor("1.1.0", interceptor.Funcs{}, v, stored)
 
@@ -295,6 +298,7 @@ func TestReconcileCertificate_PropagatesUpdateError(t *testing.T) {
 	stale := builder.BuildValkeyCertificate(v)
 	require.NoError(t, unstructured.SetNestedStringSlice(
 		stale.Object, []string{"stale.example.com"}, "spec", "dnsNames"))
+	controllerRefTo(v, stale)
 
 	funcs := interceptor.Funcs{
 		Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {

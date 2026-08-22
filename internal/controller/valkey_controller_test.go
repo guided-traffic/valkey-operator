@@ -2430,6 +2430,7 @@ func TestReconcile_UpdatesOperatorVersionAnnotation_OnConfigMapDrift(t *testing.
 	// Pre-create the ConfigMap with the old operator version annotation.
 	cm := builder.BuildConfigMap(v)
 	builder.ApplyOperatorVersion(cm, oldVersion)
+	controllerRefTo(v, cm)
 	r, c := newTestReconcilerWithVersion(newVersion, v, cm)
 
 	reconcileOnce(t, r, "test", "default")

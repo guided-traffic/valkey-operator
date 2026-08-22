@@ -8,7 +8,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
@@ -34,6 +37,11 @@ const (
 	reasonStatefulSetNotOwned            = "StatefulSetNotOwned"
 	reasonSentinelStatefulSetNotOwned    = "SentinelStatefulSetNotOwned"
 	reasonObserverDeploymentNotOwned     = "ObserverDeploymentNotOwned"
+	reasonServiceNotOwned                = "ServiceNotOwned"
+	reasonConfigMapNotOwned              = "ConfigMapNotOwned"
+	reasonNetworkPolicyNotOwned          = "NetworkPolicyNotOwned"
+	reasonServiceMonitorNotOwned         = "ServiceMonitorNotOwned"
+	reasonCertificateNotOwned            = "CertificateNotOwned"
 )
 
 // foreignObjectRecheckInterval is how soon a pass that refused a write without
@@ -152,4 +160,40 @@ func (r *ValkeyReconciler) warnForeignObject(ctx context.Context, v *vkov1.Valke
 	r.recordEvent(v, corev1.EventTypeWarning, reason,
 		"%s %s exists but is not owned by this Valkey; leaving it untouched. %s",
 		kind, name, consequence)
+}
+
+// deleteIfOwned deletes obj, but only when this Valkey controls it, and keeps the
+// delete on the object the ownership decision was made on.
+//
+// Both halves are docs/adr/0006-delete-only-what-the-operator-owns.md: the provenance
+// proof (D2), because a generated name is input the CR author chooses and not evidence
+// of ownership, and the UID precondition (D8, D9), because the decision is made on a
+// cache-backed read and the name can hold a different object by the time the Delete
+// lands. A Conflict therefore means the object that decision was about is already
+// gone: the guard did its job and the pass is not failed over it.
+//
+// The caller has already read obj, so the guard costs no extra API call. kind appears
+// in the log lines and in the error because the name alone does not say which of the
+// managed families collided.
+func (r *ValkeyReconciler) deleteIfOwned(ctx context.Context, v *vkov1.Valkey, obj client.Object, kind string) error {
+	logger := log.FromContext(ctx)
+
+	if !metav1.IsControlledBy(obj, v) {
+		logger.Info("Skipping deletion: the name is held by an object this Valkey does not control",
+			"kind", kind, "name", obj.GetName())
+		return nil
+	}
+
+	logger.Info("Deleting object", "kind", kind, "name", obj.GetName())
+	uid := obj.GetUID()
+	switch err := r.Delete(ctx, obj, client.Preconditions{UID: &uid}); {
+	case err == nil || apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		logger.Info("Skipping deletion: the object was replaced under its name",
+			"kind", kind, "name", obj.GetName())
+		return nil
+	default:
+		return fmt.Errorf("deleting %s %s: %w", kind, obj.GetName(), err)
+	}
 }

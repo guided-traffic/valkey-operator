@@ -226,25 +226,28 @@ password.
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
   arbitrary strings with no registry allowlist, and the pods run with the
   namespace's default security posture.
-- **Every managed object name is derived from the CR name, and some writes still
-  do not check who owns the name.** There is no admission webhook constraining CR
-  names ([ADR 0015](docs/adr/0015-one-crd-validated-by-schema-only.md)), so whoever
-  may `create valkeys` in a namespace chooses the names of that CR's derived
-  objects. Guarded today: every delete except the three name-only cleanups in the
-  ADR 0006 residual list
-  ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)), the
-  PodDisruptionBudget write, and the seven writes of
-  [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) — which since the
-  NA61 amendment include the data and Sentinel StatefulSets and the observer
-  Deployment. **Not** guarded: Services, ConfigMaps, NetworkPolicies, the
-  ServiceMonitor and the cert-manager Certificate — each is written by name onto
-  whatever object holds it. The last two go further and stamp this CR's controller
-  ownerReference onto an object they never verified, so deleting the CR
-  garbage-collects a foreign object. Tracked as NA62; ADR 0020 D7 says why each
-  kind is decided on its own. The **pod door** is separate and open: two
-  steady-state paths probe and command pods derived from the CR name or selected
-  by label without verifying their controller, bounded by the CR's own auth
-  credentials — tracked as NA63.
+- **Every managed object name is derived from the CR name, and the pod door is
+  still open.** There is no admission webhook constraining CR names
+  ([ADR 0015](docs/adr/0015-one-crd-validated-by-schema-only.md)), so whoever may
+  `create valkeys` in a namespace chooses the names of that CR's derived objects.
+  Since the NA62 amendment of
+  [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) **every managed
+  object family is guarded on both sides**: fourteen reconcile paths refuse to
+  write an object the CR does not control, and every delete except
+  `deleteLegacyServices` proves ownership and sends a UID precondition
+  ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)). In particular
+  the operator no longer stamps its controller ownerReference onto a ServiceMonitor
+  or a cert-manager Certificate it did not verify, so a CR deletion can no longer
+  garbage-collect a foreign object it adopted by name.
+
+  Two gaps remain. **The guard protects only forward:** an object a *previous*
+  release already stamped passes the ownership check, and nothing in the object
+  distinguishes it from a genuine child — the same Update replaced its labels and
+  wrote the operator-version annotation. Look before upgrading; there is no
+  detection. And the **pod door** is untouched: two steady-state paths probe and
+  command pods derived from the CR name or selected by label without verifying
+  their controller, bounded only by the CR's own auth credentials — tracked as
+  NA63.
 - **Namespace is not a trust boundary for the operator itself.** It watches and
   writes everywhere.
 
@@ -497,6 +500,32 @@ analysis.
       without failing and its cleanup deletes only with provenance plus a UID
       precondition. Operator upgrades are unaffected: every release since the
       first commit stamps the controller reference on create.
+- [x] **Guard the last five write paths and stop stamping an ownerReference onto
+      an unverified object (NA62)**
+      ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D1, D2, D8,
+      done 2026-08-22). `reconcileServiceMonitor` and `reconcileCertificate` wrote
+      this CR's controller ownerReference onto whatever object held the derived
+      name, so the CR deletion garbage-collected it — and the same branch rewrote a
+      foreign Certificate's `secretName` and `issuerRef`, which costs the other
+      party their Secret without waiting for any deletion. Both refuse now, as do
+      `reconcileService`, the three ConfigMap reconcilers and
+      `reconcileNetworkPolicy`. `replicaConfigMaster` treats a foreign replica
+      ConfigMap as absent, so a stranger's `replicaof` directive can no longer feed
+      the master authority.
+- [x] **Stop deleting by name when a feature flag is switched off (NA62)**
+      ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) D2, D8, done
+      2026-08-22). `cleanupMetricsService`, `cleanupServiceMonitor` and the
+      NetworkPolicy half of `cleanupObserverDeployment` deleted whatever held the
+      derived name; the trigger was one boolean in a CR its author controls. All
+      three prove ownership and send the UID precondition now.
+- [ ] **Before upgrading, look for objects an earlier release already adopted.**
+      The NA62 guard is not retroactive. A ServiceMonitor or cert-manager
+      Certificate that collided with a derived name under an earlier release
+      carries this CR's controller ownerReference today, and deleting the CR will
+      garbage-collect it. No field distinguishes such an object from a genuine
+      child, so this cannot be automated: compare the ServiceMonitors and
+      Certificates under `<cr>` names against what you expect the operator to have
+      created, in every namespace that runs a Valkey.
 - [ ] **Verify pod provenance before steady-state Valkey commands (NA63).**
       `checkAndRecoverNoMaster` probes pods `<cr>-0..N-1` by derived name and can
       promote pod-0; `checkSteadyStateSplitBrain` demotes pods selected by the
@@ -538,11 +567,11 @@ analysis.
       collide with existing objects by design.
       [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) closed the
       deletes and [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md)
-      closed four writes, but **most writes are still unguarded** — the
-      StatefulSets, Services, ConfigMaps, NetworkPolicies, the observer Deployment,
-      the ServiceMonitor and the Certificate (section 3, NA61 and NA62). Until
-      those are taken, the CR-name grant is the control that bounds this, and any
-      new write or delete by generated name needs the same provenance discipline.
+      closed every write, so a collision is now refused and reported rather than
+      acted on. What the guards do **not** undo is the image choice, the objects an
+      earlier release already adopted, or the pod door (section 3). The CR-name
+      grant stays the control that bounds all three, and any new write or delete by
+      generated name needs the same provenance discipline.
 - [ ] **Disable the pre-upgrade hook (`preUpgradeHook.enabled: false`) unless a
       migration needs it**, or accept a cluster-wide CRD write grant during every
       upgrade.
