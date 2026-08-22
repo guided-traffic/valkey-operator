@@ -23,6 +23,7 @@
 package imagetools
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -40,10 +41,19 @@ import (
 // imageProbeTimeout covers a cold pull of the image plus the probe itself.
 const imageProbeTimeout = 5 * time.Minute
 
-// runInImage executes a shell snippet inside the image and returns its output.
+// runInImage executes a shell snippet inside the image and returns what the script
+// wrote to stdout.
 //
 // --entrypoint sh is required: the Valkey images start valkey-server by default,
 // which would ignore the script and hang.
+//
+// stdout and stderr are kept apart deliberately, and this is not hygiene. docker
+// writes the progress of a cold pull to stderr, so a combined capture returns the
+// whole layer list with the answer appended -- green on a runner that already holds
+// the image, red on the first run of a fresh one, which is exactly how this check
+// failed in CI while every tool it looks for was present. Only what the script
+// echoed is the answer; stderr is kept for the failure message, where a real docker
+// error has to stay readable.
 func runInImage(t *testing.T, image, script string) string {
 	t.Helper()
 
@@ -51,9 +61,13 @@ func runInImage(t *testing.T, image, script string) string {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--entrypoint", "sh", image, "-c", script)
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "docker run against %s failed:\n%s", image, out)
-	return strings.TrimSpace(string(out))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	require.NoError(t, err, "docker run against %s failed:\nstdout:\n%s\nstderr:\n%s",
+		image, stdout.String(), stderr.String())
+	return strings.TrimSpace(stdout.String())
 }
 
 // pinnedImages are the images the suites create clusters with. Both are checked,
