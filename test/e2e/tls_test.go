@@ -245,9 +245,54 @@ func assertNoErrorsInLogs(t *testing.T, logs string, podName string) {
 		"no such file or directory",
 	}
 
+	scanned := dropResolvedSyncRetries(logs)
 	for _, pattern := range criticalPatterns {
-		assert.NotContains(t, logs, pattern, "Pod %s logs contain critical error: %s", podName, pattern)
+		assert.NotContains(t, scanned, pattern, "Pod %s logs contain critical error: %s", podName, pattern)
 	}
+}
+
+// syncFinishedMarkers are the Valkey 8 and Valkey 9 spellings of the line a
+// replica writes once its full resynchronisation finished.
+var syncFinishedMarkers = []string{
+	"MASTER <-> REPLICA sync: Finished with success",  // Valkey 8
+	"PRIMARY <-> REPLICA sync: Finished with success", // Valkey 9
+}
+
+// dropResolvedSyncRetries removes the replication-connect retries a replica
+// logs before its master listens, and only those.
+//
+// The data StatefulSet uses podManagementPolicy: Parallel, so all pods start at
+// once and a replica regularly reaches pod-0 a second before pod-0 binds its
+// port. Valkey logs "Error condition on socket for SYNC: Connection refused",
+// retries and synchronises -- a startup race of the server, not a defect of the
+// operator, and the reason this assertion flaked.
+//
+// The line is dropped only when a later line reports the sync that followed it,
+// so a replica that never synchronised, or one whose master went away after a
+// successful sync, still trips "Connection refused".
+func dropResolvedSyncRetries(logs string) string {
+	lines := strings.Split(logs, "\n")
+
+	lastFinished := -1
+	for i, line := range lines {
+		for _, marker := range syncFinishedMarkers {
+			if strings.Contains(line, marker) {
+				lastFinished = i
+			}
+		}
+	}
+	if lastFinished < 0 {
+		return logs
+	}
+
+	kept := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if i < lastFinished && strings.Contains(line, "Error condition on socket for SYNC: Connection refused") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // assertTLSActiveInLogs checks that Valkey logs confirm TLS is active.

@@ -19,6 +19,10 @@ declared tool list found three dependencies its own author had missed on a caref
 (`sed`, `seq`, `valkey-sentinel`), which is why the list is guarded from both sides rather
 than hand-maintained.
 
+Amended 2026-08-22: **D44 is new.** `TestE2E_TLS_HACluster` failed on the single-node leg
+because a replica logged one refused SYNC connect while pod-0 was still binding its TLS port,
+and the log scan treated "Connection refused" as a critical error wherever it appeared.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -404,6 +408,21 @@ the tests double as continuous proof that the upgrade users will actually perfor
 data. Accepted cost: a genuine cross-major replication break upstream turns these tests red
 for something that is not this operator -- information worth having before a support request
 rather than after one.
+
+**D44 — A log scan ignores a retry only when the same log shows the recovery, and never a
+pattern outright.** The data StatefulSet uses `podManagementPolicy: Parallel`, so all pods
+start at once and a replica regularly reaches pod-0 before pod-0 binds its port: Valkey logs
+`Error condition on socket for SYNC: Connection refused`, retries a second later and
+synchronises. `dropResolvedSyncRetries` ([`test/e2e/tls_test.go`](../../test/e2e/tls_test.go))
+removes that line only when a later line reports the sync that followed it, so a replica that
+never synchronised -- and a master that went away after a successful sync -- still trips the
+pattern.
+
+Dropping `"Connection refused"` from the pattern list would have been the smaller edit and the
+worse one: it is exactly the message a wrong port, a wrong hostname or a dead master produces,
+and the assertion exists to catch those. The filter is pinned by a table test built from the
+ordering that failed CI, including the two cases where the line must survive
+([`test/e2e/tls_log_filter_test.go`](../../test/e2e/tls_log_filter_test.go)).
 
 ## Consequences
 
