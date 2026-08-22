@@ -347,6 +347,21 @@ verified: `runAsNonRoot: true`, `seccompProfile: RuntimeDefault`,
 `capabilities: drop [ALL]`, `terminationGracePeriodSeconds: 10`. Ports 8080
 (metrics) and 8081 (health), both plain HTTP and unauthenticated.
 
+**What `:8080` discloses.** Besides controller-runtime's own counters it serves one
+set of `vko_valkey_*` series per `Valkey` resource
+([`internal/metrics/collector.go`](internal/metrics/collector.go),
+[ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)):
+namespace, resource name, phase, condition types with their reasons, replica
+counts, and the operator version that last wrote status. That is an inventory of
+the fleet and its health. It carries **no Secret material and no spec contents** —
+no password, no image, no host, no TLS material.
+
+The chart can render an optional `<release>-metrics` Service and ServiceMonitor for
+this endpoint (`metrics.service.enabled`, `metrics.serviceMonitor.enabled`, both
+default `false`). Neither changes reachability: the container port is declared with
+or without them, so anything that can route to the operator pod already reads
+`:8080`. What they add is a stable name and a scrape target.
+
 ---
 
 ## 5. Validation story
@@ -479,12 +494,17 @@ analysis.
       `tls-auth-clients optional` means TLS authenticates the server only.
 - [ ] **Do not leave `spec.sentinel.disableAuth` or either `allowUnencrypted` on
       after the migration that needed them.**
-- [ ] **Treat the operator metrics endpoint as public unless moved or disabled.**
-      By default it binds `:8080` in plain HTTP with no authentication filter.
-      `--metrics-bind-address` is applied since the ADR 0018 D8 fix, so the
-      endpoint can be moved or switched off (`=0`) from the chart; wherever it
-      binds it stays unauthenticated — the filter is a separate trade
-      ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md) D9/D10).
+- [ ] **Treat the operator metrics endpoint as public unless moved or disabled,
+      and know that it now names every Valkey resource.** By default it binds
+      `:8080` in plain HTTP with no authentication filter, and since
+      [ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)
+      the payload is an inventory of the fleet and its health (section 4.4), not
+      only controller-runtime counters. `--metrics-bind-address` is applied since
+      the ADR 0018 D8 fix, so the endpoint can be moved or switched off (`=0`) from
+      the chart; wherever it binds it stays unauthenticated — the filter is a
+      separate trade ([ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
+      D9/D10). A NetworkPolicy for the operator namespace is the only control that
+      works without changing either.
 - [ ] **Restrict who may `create valkeys`.** A CR author chooses the image the
       cluster runs and the name every generated object gets, and generated names
       collide with existing objects by design.

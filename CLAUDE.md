@@ -328,6 +328,18 @@ absent. Enabling metrics changes the pod-spec hash and therefore rides the failo
 rolling update — lossless except for a single standalone pod without persistence.
 → [ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
 
+**The operator's own endpoint is a separate surface.** `:8080/metrics` serves one set of
+`vko_valkey_*` series per Valkey resource, labelled with namespace and name, built by a
+collect-time collector over the manager cache
+([`internal/metrics/collector.go`](internal/metrics/collector.go)) — so a deleted resource
+stops producing series with no deletion bookkeeping. **That is a standing constraint on new
+metrics here: no gauge written from a reconcile pass.** The pair that matters is
+`vko_valkey_metadata_generation` against `vko_valkey_status_observed_generation`; a gap is a
+spec the operator accepted and never converged. The chart's Service, ServiceMonitor and
+PrometheusRule for this endpoint are all **default off**, and the endpoint is unauthenticated
+wherever it binds — the per-resource series make it an inventory of the fleet.
+→ [ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)
+
 # Important Notes
 
 - Remember Cyclomatic Complexity: Keep it under 15 for all functions. Refactor if it exceeds this threshold.

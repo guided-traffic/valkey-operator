@@ -1,0 +1,33 @@
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{/*
+Requires the Prometheus-Operator CRDs. Unlike the per-Valkey ServiceMonitor the
+operator writes at runtime, this one is rendered by Helm, so a missing CRD is an
+install error rather than a skipped reconcile step - which is why it is
+default-off and the values comment says what it needs.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "valkey-operator.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "valkey-operator.selectorLabels" . | nindent 6 }}
+      vko.gtrfc.com/metrics: "true"
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+{{- end }}

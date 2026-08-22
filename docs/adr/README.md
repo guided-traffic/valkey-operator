@@ -78,6 +78,7 @@ A reader must never find the old rule stated as current.
 |---|---|
 | [0017](0017-test-and-ci-policy.md) | Test, verification and CI policy |
 | [0018](0018-metrics-and-the-exporter-sidecar.md) | Metrics — an opt-in exporter sidecar, and the operator's own endpoint |
+| [0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) | Export per-resource state as metrics, because the only alertable signal could not name a resource |
 
 ## Related documents
 

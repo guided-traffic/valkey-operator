@@ -18,6 +18,7 @@ import (
 	observercmd "github.com/guided-traffic/valkey-operator/cmd/observer"
 	"github.com/guided-traffic/valkey-operator/cmd/sidecar"
 	"github.com/guided-traffic/valkey-operator/internal/controller"
+	"github.com/guided-traffic/valkey-operator/internal/metrics"
 )
 
 var (
@@ -149,6 +150,14 @@ func main() {
 
 	if err = newReconciler(mgr, flags, operatorNamespace).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Valkey")
+		os.Exit(1)
+	}
+
+	// Per-resource state on the metrics endpoint. It reads the manager's cache at
+	// scrape time, so it costs no API request and cannot outlive a deleted
+	// resource (internal/metrics/collector.go).
+	if err = metrics.Register(mgr.GetCache(), version, commit); err != nil {
+		setupLog.Error(err, "unable to register the Valkey metrics collector")
 		os.Exit(1)
 	}
 

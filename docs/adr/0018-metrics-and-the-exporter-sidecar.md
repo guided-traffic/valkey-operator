@@ -3,7 +3,11 @@
 ## Status
 
 Accepted. Date: 2026-08-21. Amended 2026-08-21: D8 is implemented — the flag is wired
-through — and D9 is rewritten accordingly.
+through — and D9 is rewritten accordingly. Amended again 2026-08-21: the endpoint no longer
+serves controller-runtime metrics alone. [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md)
+adds per-resource `vko_valkey_*` series to it, which changes what an unauthenticated scrape
+discloses; the residual risk below is rewritten in place, and the chart now ships an optional
+Service, ServiceMonitor and PrometheusRule for this endpoint.
 
 The exporter, the metrics Service and the ServiceMonitor are implemented. The operator's own
 `--metrics-bind-address` is applied since the D8 fix; the authentication filter (D10) remains
@@ -190,10 +194,17 @@ flag alone is the recommended minimum.
 * **Closed 2026-08-21:** `managerOptions` had no `Metrics` field, so the flag reached nothing.
   Fixed per D8 and pinned by two unit tests; verified by `make test-unit`, **not reproduced
   against a cluster** (no scrape of a moved or disabled endpoint was measured).
-* **The operator metrics endpoint is unauthenticated.** Risk named per case rather than as a
-  blanket: the payload is standard controller-runtime and workqueue metrics — **no Secret
-  material and no CR contents** — so this is exposure of operational metadata, not of
-  credentials.
+* **The operator metrics endpoint is unauthenticated, and since
+  [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) its payload names
+  every Valkey resource.** Risk named per case: the series carry namespace, resource name,
+  phase, condition types and reasons, replica counts and the operator version — an inventory
+  of the fleet and its health. They carry **no Secret material and no spec contents**: no
+  password, no image, no host, no TLS material. So this is exposure of operational metadata
+  plus resource identity, not of credentials. Reachability is unchanged by the chart Service —
+  the container port is declared either way and anything that can route to the operator pod
+  already reads `:8080`. What the Service adds is a stable name and a scrape target.
+  *(Superseded wording, kept for the record: before ADR 0021 the payload was "standard
+  controller-runtime and workqueue metrics — no Secret material and no CR contents".)*
 * The health endpoint (`:8081`) is likewise plain HTTP and unauthenticated; it serves
   `healthz.Ping` only.
 

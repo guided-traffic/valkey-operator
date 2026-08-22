@@ -1088,6 +1088,20 @@ leaderElection:
   enabled: true      # required for HA operator deployment
 
 maxConcurrentReconciles: 4   # default; how many Valkey resources are reconciled at once
+
+metrics:                       # the OPERATOR's own endpoint, not spec.metrics on a CR
+  service:
+    enabled: false             # default; ClusterIP Service in front of :8080
+    port: 8080                 # default
+    labels: {}                 # default; extra labels on the Service
+  serviceMonitor:
+    enabled: false             # default; needs the Prometheus-Operator CRDs
+    interval: 30s              # default
+    scrapeTimeout: ""          # default; left to Prometheus when empty
+    labels: {}                 # default; must match your serviceMonitorSelector
+  prometheusRule:
+    enabled: false             # default; ships the alert rules below
+    labels: {}                 # default; must match your ruleSelector
 ```
 
 `maxConcurrentReconciles` bounds how far one unhealthy cluster can slow down the rest:
@@ -1096,6 +1110,55 @@ worker a cluster whose pods stopped answering delays every other Valkey resource
 fleet. Passes for the *same* resource stay serialised at any value. Raise it for large
 fleets, lower it to reduce concurrent API-server load
 ([ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)).
+
+### Operator metrics and alerting
+
+`metrics.*` above configures the **operator's own** endpoint. It is unrelated to
+`spec.metrics` on a `Valkey` resource, which adds a Prometheus exporter sidecar to that
+resource's pods.
+
+The operator always serves `:8080/metrics`. Besides controller-runtime's counters it
+publishes one set of `vko_valkey_*` series per `Valkey` resource, labelled with namespace
+and name — so an alert can say *which* resource is not converging.
+`controller_runtime_reconcile_errors_total` only carries the controller name and cannot
+([ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)).
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `vko_valkey_status_phase` | `namespace`, `name`, `phase` | Always `1`; one series per resource carrying its current phase |
+| `vko_valkey_status_condition` | `namespace`, `name`, `condition`, `status`, `reason` | Always `1`; one series per status condition |
+| `vko_valkey_status_ready_replicas` | `namespace`, `name` | Ready data pods the operator last observed |
+| `vko_valkey_spec_replicas` | `namespace`, `name` | Data pods requested by `spec.replicas` |
+| `vko_valkey_metadata_generation` | `namespace`, `name` | The spec version the API server holds |
+| `vko_valkey_status_observed_generation` | `namespace`, `name` | Newest generation any condition reports as observed |
+| `vko_valkey_operator_version_info` | `namespace`, `name`, `version` | Always `1`; the operator that last wrote status |
+| `vko_operator_build_info` | `version`, `commit` | Always `1`; the operator that is running |
+| `vko_valkey_collector_success` | — | `1` when the last scrape could list the resources, `0` when it could not |
+
+The pair to watch is `vko_valkey_metadata_generation` against
+`vko_valkey_status_observed_generation`: a gap means a spec change was accepted by the API
+server and never converged — for example a field that is immutable on an already created
+object. That is the shape of failure that can sit unnoticed for months, because the pods stay
+up and only the spec change is stuck.
+
+`prometheusRule.enabled: true` ships seven alerts over these series — `ValkeySpecNotObserved`,
+`ValkeyReconcileBlocked`, `ValkeyPhaseNotOK`, `ValkeyReplicasMissing`,
+`ValkeyOperatorVersionStale`, `ValkeyMetricsCollectorFailing` and `ValkeyMetricsAbsent`. Every
+rule is guarded on `vko_valkey_collector_success`, so a collector that cannot read reports
+"unknown" instead of "healthy". Thresholds are not exposed as values; replace the rule if they
+do not fit.
+
+Turning `serviceMonitor.enabled` on renders the Service as well — a ServiceMonitor selects
+Services, and one without the other scrapes nothing.
+
+> **Security note:** the endpoint is plain HTTP with no authentication filter wherever it
+> binds, and the per-resource series make it an inventory of every `Valkey` resource in the
+> cluster and its health. It carries no Secret material and no spec contents. Adding the
+> Service does **not** change reachability — the container port is declared either way, so
+> anything that can route to the operator pod already reads `:8080`. Restrict it with a
+> NetworkPolicy in the operator namespace, move it with `--metrics-bind-address`, or switch it
+> off with `--metrics-bind-address=0`
+> ([SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md)).
 
 ---
 
