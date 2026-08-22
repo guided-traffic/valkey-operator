@@ -34,6 +34,15 @@ the promoted pod lost its process afterwards: the workflow collects pod logs aft
 has finished, and every test namespace deletes itself in a defer, so the collection step had
 printed an empty section for months.
 
+Amended 2026-08-22: **D46 is new.** The npm dependency set behind semantic-release was
+exercised in exactly one place: the release job, on pushes to main, after a Renovate bump had
+merged. Two failures rode that gap. `conventional-changelog-conventionalcommits` v10 ships its
+templates for conventional-changelog-writer@9 as compiled functions; the writer@8 that
+`@semantic-release/release-notes-generator` 14 loads rendered them as an accidentally-valid
+no-op, so every release from v1.10.26 (2026-06-28) to v1.10.48 published header-only notes and
+nobody noticed. Preset 10.4.0 added an upstream guard that turned the same mismatch into a
+hard `Missing helper` failure, and releasing stopped entirely.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -466,6 +475,28 @@ cause is a second defect**, and it is fixed in the same pass as the first. The c
 a failed run leaves one namespace running for the rest of the suite, on a cluster that is
 deleted at the end of the job anyway.
 
+**D46 — The release tooling is exercised where its updates land: in PR CI, against the
+committed lockfile.** Three rules:
+
+* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) drives
+  `analyzeCommits` and `generateNotes` through the plugin configuration read from
+  [`.releaserc.json`](../../.releaserc.json), against a synthetic commit set covering patch,
+  minor and breaking commits, and asserts the rendered notes contain the type sections and
+  the commit subjects. Both observed failure modes stay covered: a render that throws
+  (preset 10.4.0) and a render that silently drops every section (preset 10.0.0–10.3.0) —
+  the second is the one a smoke test that only checks the exit code would bless. The script
+  runs as the `release-tooling` job on every PR and push, via `make test-release-tooling`
+  locally, and the `semantic-release` job lists it in `needs`.
+* `package-lock.json` is committed and both jobs install with `npm ci`, so the release job
+  runs the byte-identical tree the PR tested. Before, `npm install` resolved transitive
+  ranges at run time — the preset's `@conventional-changelog/template ^1.3.0` floated to a
+  version published days after the pin that referenced it.
+* `conventional-changelog-conventionalcommits` stays pinned on the 9.x line, the last one
+  that ships handlebars string templates for writer@8, until
+  `@semantic-release/release-notes-generator` ships conventional-changelog-writer@9. A
+  Renovate PR bumping the preset to 10.x goes red in `release-tooling`; that red is the
+  signal that upstream is still incompatible, not an obstacle to work around.
+
 ## Consequences
 
 * Every fix costs an extra build-and-run cycle for the mutation check, and the result is
@@ -625,6 +656,16 @@ Rejected: it contaminates the pass's own verification.
   tip against `main`.
 * **A documentation pass can only revert-verify the fixes it wrote itself**, so the record has to
   name who verified what.
+* **The release-tooling check drives the two plugins directly, not `npx semantic-release`
+  (D46).** A break confined to semantic-release core — plugin loading, CLI flags, the
+  verifyConditions of the git and github plugins — is outside it; those need repository
+  credentials a PR must not hold, and in both observed incidents they failed loudly, not
+  silently. The synthetic context also freezes the plugin API shape of semantic-release 25:
+  a future major that changes what `generateNotes` receives fails the check, which is the
+  point, but the failure will name this script rather than the incompatibility.
+* **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
+  Nothing regenerates them; the commits they cover are in the git history and the compare
+  links still work.
 
 ## References
 
@@ -634,7 +675,8 @@ Rejected: it contaminates the pass's own verification.
 * [`internal/builder/init_script_exec_test.go`](../../internal/builder/init_script_exec_test.go) — the executing init-script harness
 * [`test/integration/`](../../test/integration/) — envtest suites, including the UID delete-precondition test
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
-* `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`
+* `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
+* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the decision table these tests are written against
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — the CI job that proves the generated manifests are current

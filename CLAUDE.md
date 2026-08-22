@@ -186,6 +186,7 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Integration tests w/ coverage | `make test-integration-coverage` |
 | E2E tests                     | `make test-e2e`                |
 | Valkey image tool check       | `make test-image-tools`        |
+| Release tooling check         | `make test-release-tooling`    |
 | Full E2E local (Kind)         | `make e2e-local`               |
 | All tests with coverage       | `make test`                    |
 | Linting                       | `make lint`                    |
@@ -234,6 +235,21 @@ else** — CI passes `E2E_VALKEY_LINE=8`, a selector, and an unrecognised value 
 falling back. Only e2e is pinned; unit and integration never pull an image, so their image
 strings are fixtures.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D42, D43
+
+### The release tooling is tested in PR CI, against the committed lockfile
+
+The npm dependency set behind semantic-release broke twice without a PR ever going red: the
+conventionalcommits preset v10 rendered header-only release notes for two months silently,
+then 10.4.0 failed every release hard — both only visible on main, because only the release
+job installs npm dependencies. `make test-release-tooling`
+([`hack/verify-release-tooling.mjs`](hack/verify-release-tooling.mjs)) renders release notes
+through the plugin config in `.releaserc.json` and fails on a throw **and** on silently
+missing sections; the `release-tooling` CI job runs it on every PR, and the `semantic-release`
+job depends on it. `package-lock.json` is committed, both jobs use `npm ci`, and the preset
+stays on the 9.x line until `@semantic-release/release-notes-generator` ships
+conventional-changelog-writer@9 — a red Renovate PR for preset 10.x is the signal that
+upstream is still incompatible.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46
 
 ### E2E cluster topology
 

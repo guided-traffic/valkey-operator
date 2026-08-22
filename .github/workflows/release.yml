@@ -1077,9 +1077,35 @@ jobs:
         if: always()
         run: docker rmi valkey-operator:scan-${{ github.sha }} || true
 
+  # Proves on every PR that the semantic-release dependency set can still render
+  # release notes. The release job is the only other place these npm packages are
+  # exercised, and it runs on pushes to main - after a Renovate bump has merged.
+  # A preset/writer mismatch therefore used to surface as a failed (or silently
+  # note-less) release instead of a red check on the bump PR.
+  release-tooling:
+    name: Release Tooling
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify the integrity of provenance attestations and registry signatures for installed dependencies
+        run: npm audit signatures
+
+      - name: Verify release tooling renders release notes
+        run: node hack/verify-release-tooling.mjs
+
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, valkey-image-tools, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, valkey-image-tools, coverage-report, release-tooling]
     name: Semantic Release
     runs-on: self-hosted
     permissions:
@@ -1116,7 +1142,7 @@ jobs:
           node-version: "lts/*"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Verify the integrity of provenance attestations and registry signatures for installed dependencies
         run: npm audit signatures

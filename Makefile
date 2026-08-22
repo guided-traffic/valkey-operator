@@ -117,6 +117,12 @@ test-image-tools: ## Verify the pinned Valkey images contain every tool the gene
 	@echo "Checking the pinned Valkey images for the tools the operator executes in them..."
 	$(GOTEST) -v -tags=imagetools -count=1 -timeout=15m ./test/imagetools/...
 
+.PHONY: test-release-tooling
+test-release-tooling: ## Verify the semantic-release dependency set renders release notes (needs node+npm, no cluster).
+	@echo "Checking the semantic-release dependency set renders release notes..."
+	npm ci --no-audit --no-fund
+	node hack/verify-release-tooling.mjs
+
 .PHONY: test-e2e
 test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by test name).
 	@echo "Running E2E tests..."
