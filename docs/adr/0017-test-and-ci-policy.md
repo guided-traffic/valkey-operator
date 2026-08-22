@@ -28,6 +28,12 @@ the Valkey 8 leg, and every leg is now named for the Valkey line it runs and pas
 explicitly (`single-node-valkey9`, `multi-node-valkey9`, `single-node-valkey8`) instead of
 leaving the default one nameless behind an empty selector.
 
+Amended 2026-08-22: **D45 is new.** An e2e failed on a promoted master that served an empty
+dataset, and nothing in the run could say whether the operator promoted an empty replica or
+the promoted pod lost its process afterwards: the workflow collects pod logs after the suite
+has finished, and every test namespace deletes itself in a defer, so the collection step had
+printed an empty section for months.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -439,6 +445,26 @@ worse one: it is exactly the message a wrong port, a wrong hostname or a dead ma
 and the assertion exists to catch those. The filter is pinned by a table test built from the
 ordering that failed CI, including the two cases where the line must survive
 ([`test/e2e/tls_log_filter_test.go`](../../test/e2e/tls_log_filter_test.go)).
+
+**D45 — A failing e2e leaves behind the evidence that names the cause, and it collects it
+while the objects still exist.** Three parts, because each covers what the others cannot:
+
+* The assertion dumps the pod at the moment it fails --  restart count, last termination
+  state, the previous container log when it restarted, DBSIZE, the replication and
+  persistence sections, and the pod's events (`valkeyPodForensics`,
+  [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go)). This is the only dump taken while
+  the cluster is still in the failed state.
+* A failed test keeps its namespace (`createNamespace`), so the post-run collection has
+  something to read. Events outlive the pods they describe and answer "killed, evicted or
+  unhealthy" even for a pod the test already tore down.
+* The workflow collects node conditions and per-namespace pods and events, not only pod
+  logs -- a pod that lost its process to node pressure leaves its reason there and nowhere
+  else.
+
+The rule this encodes: **a red e2e whose cause cannot be distinguished from a different
+cause is a second defect**, and it is fixed in the same pass as the first. The cost is that
+a failed run leaves one namespace running for the rest of the suite, on a cluster that is
+deleted at the end of the job anyway.
 
 ## Consequences
 

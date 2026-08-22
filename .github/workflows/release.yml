@@ -453,8 +453,21 @@ jobs:
           # a dying master is the one that matters -- left no artifact at all. The
           # drain runs while the pod terminates, so --previous is the half that
           # carries it once the replacement is up.
+          # Node conditions first: a pod that lost its process to an eviction or to a
+          # failing probe leaves its reason here and nowhere else, and the failure
+          # that motivated this collection could not be told apart from an operator
+          # decision without it.
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide || true
+          kubectl describe nodes | grep -E '^(Name:|  Ready|  MemoryPressure|  DiskPressure|  PIDPressure)' || true
           echo "=== Test namespace pod logs ==="
           for ns in $(kubectl get ns -o name | sed 's|namespace/||' | grep '^e2e-'); do
+            echo "--- $ns pods ---"
+            kubectl -n "$ns" get pods -o wide || true
+            # Events outlive the pods they describe, so they answer "was it killed,
+            # evicted or unhealthy" even for a pod the test already tore down.
+            echo "--- $ns events ---"
+            kubectl -n "$ns" get events --sort-by='.lastTimestamp' || true
             for pod in $(kubectl -n "$ns" get pods -o name | sed 's|pod/||'); do
               echo "--- $ns/$pod (current) ---"
               kubectl -n "$ns" logs "$pod" --all-containers --prefix --tail=300 2>&1 || true

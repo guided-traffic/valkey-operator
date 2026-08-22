@@ -119,6 +119,15 @@ func (tc *testClients) createNamespace(t *testing.T, name string) func() {
 	require.NoError(t, err, "Failed to create namespace %s", name)
 
 	return func() {
+		// A failed test keeps its namespace. The workflow collects pod logs and
+		// events after the suite has finished, so deleting here removed exactly the
+		// evidence the collection step exists for -- the Events of the namespace
+		// outlive the pods and are what names a kill, an eviction or a failing
+		// probe. The cluster is thrown away at the end of the job either way.
+		if t.Failed() {
+			t.Logf("Test failed: keeping namespace %s for post-run collection", name)
+			return
+		}
 		_ = tc.kube.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{})
 	}
 }
@@ -602,3 +611,144 @@ func (tc *testClients) waitForNoPods(t *testing.T, namespace, namePrefix string)
 
 // Ensure all types used are available for linting.
 var _ = types.NamespacedName{}
+
+// valkeyPodForensics returns what distinguishes a pod that lost its dataset from
+// one that never received it: the restart count and last termination state of
+// every container, the previous container log when the valkey container did
+// restart, the pod's events, and the live DBSIZE plus the replication and sync
+// counters.
+//
+// It exists because the CI failure that motivated it left no way to tell those
+// two apart. The workflow collects pod logs after the suite has finished, and by
+// then every test namespace is deleted -- pod, events and logs with it. A dump
+// taken at the assertion is the only one that still has them.
+//
+// Every lookup is best-effort and failures are recorded in the dump rather than
+// failing the test: this runs when a test is already failing, and a forensics
+// helper that can itself fail replaces the real error message with its own.
+func (tc *testClients) valkeyPodForensics(t *testing.T, namespace, podName string, port int) string {
+	t.Helper()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "forensics for pod %s/%s\n", namespace, podName)
+
+	pod, err := tc.kube.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		fmt.Fprintf(&b, "  pod lookup failed: %v\n", err)
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "  phase=%s startTime=%v\n", pod.Status.Phase, pod.Status.StartTime)
+	valkeyRestarted := false
+	for _, cs := range pod.Status.ContainerStatuses {
+		fmt.Fprintf(&b, "  container %s: ready=%v restarts=%d state=%s\n",
+			cs.Name, cs.Ready, cs.RestartCount, containerStateSummary(cs.State))
+		if cs.LastTerminationState.Terminated != nil {
+			term := cs.LastTerminationState.Terminated
+			fmt.Fprintf(&b, "    last termination: reason=%s exitCode=%d signal=%d started=%v finished=%v\n",
+				term.Reason, term.ExitCode, term.Signal, term.StartedAt, term.FinishedAt)
+		}
+		if cs.Name == valkeyContainerName && cs.RestartCount > 0 {
+			valkeyRestarted = true
+		}
+	}
+
+	// The previous log is the only place that says why the process went away, and
+	// it exists only while the pod does.
+	if valkeyRestarted {
+		fmt.Fprintf(&b, "  previous %s log (tail):\n%s\n", valkeyContainerName,
+			indentLines(tc.podLogsBestEffort(namespace, podName, valkeyContainerName, "--previous", "--tail=40"), "    "))
+	}
+
+	for _, probe := range []struct {
+		label string
+		args  []string
+		keep  string // substring filter, empty keeps every line
+	}{
+		{label: "DBSIZE", args: []string{"DBSIZE"}},
+		{label: "INFO replication", args: []string{"INFO", "replication"}},
+		{label: "INFO persistence", args: []string{"INFO", "persistence"}},
+		// INFO stats is ~80 lines of which two matter here: sync_full and
+		// sync_partial_ok say whether this pod ever received a dataset at all.
+		{label: "INFO stats (sync)", args: []string{"INFO", "stats"}, keep: "sync_"},
+	} {
+		out := keepLinesContaining(tc.valkeyExecQuick(t, namespace, podName, port, probe.args...), probe.keep)
+		if out == "" {
+			out = "<no answer>"
+		}
+		fmt.Fprintf(&b, "  %s:\n%s\n", probe.label, indentLines(out, "    "))
+	}
+
+	events, err := tc.kube.CoreV1().Events(namespace).List(context.Background(), metav1.ListOptions{
+		FieldSelector: "involvedObject.name=" + podName,
+	})
+	if err != nil {
+		fmt.Fprintf(&b, "  events lookup failed: %v\n", err)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "  events (%d):\n", len(events.Items))
+	for _, ev := range events.Items {
+		fmt.Fprintf(&b, "    %v %s/%s: %s\n", ev.LastTimestamp, ev.Type, ev.Reason, ev.Message)
+	}
+	return b.String()
+}
+
+// valkeyContainerName is the name the builder gives the Valkey container
+// (internal/builder/statefulset.go, ValkeyContainerName).
+const valkeyContainerName = "valkey"
+
+// containerStateSummary renders a container state as one short field.
+func containerStateSummary(state corev1.ContainerState) string {
+	switch {
+	case state.Running != nil:
+		return fmt.Sprintf("running since %v", state.Running.StartedAt)
+	case state.Waiting != nil:
+		return fmt.Sprintf("waiting (%s: %s)", state.Waiting.Reason, state.Waiting.Message)
+	case state.Terminated != nil:
+		return fmt.Sprintf("terminated (%s, exit %d)", state.Terminated.Reason, state.Terminated.ExitCode)
+	default:
+		return "unknown"
+	}
+}
+
+// podLogsBestEffort runs kubectl logs and returns its output or the error text,
+// so a dump never loses the reason it came up empty.
+func (tc *testClients) podLogsBestEffort(namespace, podName, container string, extraArgs ...string) string {
+	cliArgs := append([]string{"logs", podName, "-n", namespace, "-c", container}, extraArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "kubectl", cliArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Sprintf("<kubectl logs failed: %v: %s>", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String()
+}
+
+// keepLinesContaining drops every line that does not contain the substring. An empty
+// substring keeps the input unchanged.
+func keepLinesContaining(s, substr string) string {
+	if substr == "" {
+		return s
+	}
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, substr) {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+// indentLines prefixes every line so a multi-line dump stays readable inside the
+// go test output.
+func indentLines(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
+}

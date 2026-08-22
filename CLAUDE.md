@@ -296,7 +296,16 @@ pod replacement is the operator's job, not the StatefulSet controller's — whic
 PodDisruptionBudget never constrains it. The rolling update compares pods against the
 **persisted StatefulSet template**, never against the CR, so a rejected StatefulSet write
 cannot turn an image change into a pod-delete loop.
-→ [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md)
+
+**"Synced" in step 3 and 4 is the full replication answer** — role, `master_link_status:up`
+and no sync in progress (`replicationNotEstablishedReason`), never the sync flag alone: a
+replica whose link is still connecting reports `master_sync_in_progress:0` while holding
+nothing, and step 4 is followed by the delete of the outgoing master. Zero WAIT
+acknowledgements is not a partial acknowledgement, and a promotion candidate holding no keys
+while the master holds some is refused (`verifyPromotionCandidateHoldsData`). Every one of
+these waits is bounded by `spec.rollingUpdate.syncTimeout` and pauses the update rather than
+promoting.
+→ [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D10
 
 ## Reconcile concurrency
 

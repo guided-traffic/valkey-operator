@@ -1437,8 +1437,8 @@ func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *
 			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		if info.MasterSyncInProgress {
-			logger.Info("Replication sync still in progress on replaced pod, waiting", "pod", ps.name)
+		if reason := replicationNotEstablishedReason(ps.name, info); reason != "" {
+			logger.Info("Replaced pod has not completed replication, waiting", "pod", ps.name, "reason", reason)
 			r.ensureSyncWaitTimestamp(ctx, v)
 
 			totalPods := len(pods)
@@ -1449,7 +1449,8 @@ func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *
 
 			if r.isSyncWaitTimedOut(v) {
 				return r.pauseRollingUpdate(ctx, v,
-					fmt.Sprintf("Pod %s replication sync timed out after %v", ps.name, v.GetSyncTimeout()))
+					fmt.Sprintf("Pod %s replication sync timed out after %v (%s)",
+						ps.name, v.GetSyncTimeout(), reason))
 			}
 			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
@@ -1603,8 +1604,21 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
 }
 
-// waitForReplicasReady verifies all non-master replicas are ready and have completed
-// replication sync. Returns a requeue result if any replica is not ready.
+// waitForReplicasReady verifies all non-master replicas are ready and have actually
+// received the master dataset. Returns a requeue result if any replica has not.
+//
+// This is the last gate in front of the promotion, and the promotion is followed by
+// the delete of the outgoing master -- so a replica that is waved through here and
+// promoted takes the only remaining copy of the data with it. It therefore asks the
+// full question (replicationNotEstablishedReason) rather than only whether a full
+// sync is currently running.
+//
+// The wait is bounded by the same sync-wait budget the replica phase uses
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md): a replica that never
+// establishes replication would otherwise requeue forever, which is the failure mode
+// that bound exists to prevent. On expiry the rolling update pauses rather than
+// promoting anyway -- an update that stops half-done is recoverable, a promotion
+// onto an empty replica is not.
 func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	checker := r.getInstanceChecker()
@@ -1621,14 +1635,94 @@ func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Va
 		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
 		if err != nil {
 			logger.Info("Cannot verify replication sync, waiting", "pod", ps.name, "error", err)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			return r.waitOrPauseForReplicaSync(ctx, v,
+				fmt.Sprintf("replication status of %s is unavailable: %v", ps.name, err))
 		}
-		if info.MasterSyncInProgress {
-			logger.Info("Replication sync still in progress, waiting", "pod", ps.name)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		if reason := replicationNotEstablishedReason(ps.name, info); reason != "" {
+			logger.Info("Replica has not completed replication, waiting before master failover",
+				"pod", ps.name, "reason", reason)
+			return r.waitOrPauseForReplicaSync(ctx, v, reason)
 		}
 	}
 
+	// Nothing is waiting on replication any more, so the bound must not stay armed:
+	// a leftover first-seen would pre-expire the next wait of the same update.
+	r.clearSyncWaitTimestamp(ctx, v)
+	return nil
+}
+
+// waitOrPauseForReplicaSync arms the sync-wait bound, requeues while it holds, and
+// pauses the rolling update once it has expired.
+func (r *ValkeyReconciler) waitOrPauseForReplicaSync(ctx context.Context, v *vkov1.Valkey, reason string) *RollingUpdateResult {
+	r.ensureSyncWaitTimestamp(ctx, v)
+	if r.isSyncWaitTimedOut(v) {
+		return r.pauseRollingUpdate(ctx, v,
+			fmt.Sprintf("Replication did not complete within %v before the master failover (%s)",
+				v.GetSyncTimeout(), reason))
+	}
+	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// verifyPromotionCandidateHoldsData refuses a promotion whose candidate holds no keys
+// while the outgoing master holds some. It returns nil when the promotion may go
+// ahead: the counts are consistent, or the master itself is empty and there is
+// nothing to lose.
+//
+// The counts are logged on the way through, and that is half the point. The outgoing
+// master is deleted moments after the promotion, so a promotion that turns out to
+// have taken an empty pod cannot be reconstructed from anything afterwards -- a CI
+// failure whose promoted master served an empty dataset could not be attributed for
+// exactly this reason.
+//
+// An unreadable count is an unanswered question, not a negative answer, and degrades
+// toward not promoting (docs/adr/0007-failover-aware-rolling-update.md, D3): it waits on
+// the bounded sync budget like every other unverifiable state here.
+func (r *ValkeyReconciler) verifyPromotionCandidateHoldsData(
+	ctx context.Context, v *vkov1.Valkey, master, candidate podState) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		logger.Info("Could not build TLS config for the pre-promotion key count", "error", err)
+		return r.waitOrPauseForReplicaSync(ctx, v,
+			fmt.Sprintf("the key counts before promoting %s are unavailable: %v", candidate.name, err))
+	}
+
+	password := r.readValkeyPassword(ctx, v)
+	port := int(builder.ServicePort(v))
+
+	masterKeys, err := r.newValkeyClient(
+		health.PodAddressForComponent(v, master.name, common.ComponentValkey, port), password, tlsConfig).DBSize()
+	if err != nil {
+		logger.Info("Cannot read the key count of the outgoing master, waiting",
+			common.RoleMaster, master.name, "error", err)
+		return r.waitOrPauseForReplicaSync(ctx, v,
+			fmt.Sprintf("the key count of %s is unavailable: %v", master.name, err))
+	}
+	if masterKeys == 0 {
+		// Nothing to lose, and an empty cluster is a legitimate state -- refusing here
+		// would stall every rolling update of a cluster that holds no data yet.
+		return nil
+	}
+
+	candidateKeys, err := r.newValkeyClient(
+		health.PodAddressForComponent(v, candidate.name, common.ComponentValkey, port), password, tlsConfig).DBSize()
+	if err != nil {
+		logger.Info("Cannot read the key count of the promotion candidate, waiting",
+			"candidate", candidate.name, "error", err)
+		return r.waitOrPauseForReplicaSync(ctx, v,
+			fmt.Sprintf("the key count of %s is unavailable: %v", candidate.name, err))
+	}
+	if candidateKeys == 0 {
+		logger.Info("Promotion candidate holds no data while the master does, not failing over",
+			"candidate", candidate.name, common.RoleMaster, master.name, "masterKeys", masterKeys)
+		return r.waitOrPauseForReplicaSync(ctx, v,
+			fmt.Sprintf("%s holds no keys while %s holds %d", candidate.name, master.name, masterKeys))
+	}
+
+	logger.Info("Promotion candidate holds data",
+		"candidate", candidate.name, "candidateKeys", candidateKeys,
+		common.RoleMaster, master.name, "masterKeys", masterKeys)
 	return nil
 }
 
@@ -1645,10 +1739,16 @@ const waitWriteSyncClientOverhead = 5 * time.Second
 // have been acknowledged by all replicas before failover. This prevents data loss
 // that can occur during async replication when a failover happens.
 //
-// If WAIT returns fewer acknowledgements than expected (e.g. due to cascaded
-// replication chains where not all replicas connect directly to the master),
-// the method accepts the partial result rather than retrying forever, because
-// waitForReplicasReady has already confirmed that every replica is synced.
+// If WAIT returns fewer acknowledgements than expected -- but at least one -- the
+// method accepts the partial result rather than retrying forever: a cascaded
+// replication chain (replica -> replica -> master) acknowledges through the
+// intermediate node, and waitForReplicasReady has confirmed every replica has its
+// replication established.
+//
+// Zero acknowledgements is not a partial result. It means no replica confirmed the
+// master offset at all, so nothing proves the pod about to be promoted holds the
+// data -- and the outgoing master is deleted moments later. That case waits on the
+// bounded sync budget and pauses the update rather than failing over.
 func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -1686,11 +1786,19 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
+	if acked == 0 {
+		logger.Info("No replica acknowledged the master offset, not failing over",
+			common.RoleMaster, masterPod.name, "expected", numReplicas)
+		return r.waitOrPauseForReplicaSync(ctx, v,
+			fmt.Sprintf("no replica of %s acknowledged its pending writes", masterPod.name))
+	}
+
 	if acked < numReplicas {
 		// This typically happens when replicas form a cascaded replication chain
 		// (replica → replica → master) instead of all connecting directly to the
-		// master. Since waitForReplicasReady already confirmed every replica is
-		// synced, accept the partial acknowledgement and proceed with failover.
+		// master. At least one replica acknowledged, and waitForReplicasReady has
+		// confirmed replication is established on every one of them, so accept the
+		// partial acknowledgement and proceed with failover.
 		logger.Info("Partial WAIT acknowledgement accepted (possible cascaded replication)",
 			common.RoleMaster, masterPod.name, "expected", numReplicas, "acked", acked)
 		return nil
@@ -2626,6 +2734,15 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 	}
 
 	promotedPod := pods[promotedIdx]
+
+	// The last look before the irreversible step. The Sentinel path verifies the same
+	// thing after its failover and calls it a critical safety check
+	// (verifyNewMasterReady); here the outgoing master is deleted seconds after the
+	// promotion, so the check has to happen before it rather than after.
+	if result := r.verifyPromotionCandidateHoldsData(ctx, v, pods[masterIdx], promotedPod); result != nil {
+		return *result
+	}
+
 	if err := r.promoteAndRedirect(ctx, v, pods, promotedPod, masterIdx, promotedIdx); err != nil {
 		logger.Info("Manual failover promotion failed", "error", err)
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -3001,14 +3118,32 @@ func (r *ValkeyReconciler) pod0SyncWaitReason(ctx context.Context, v *vkov1.Valk
 	if err != nil {
 		return fmt.Sprintf("replication status of %s is unavailable: %v", masterPodName, err)
 	}
-	// - role=master means REPLICAOF has not taken effect yet.
-	// - master_link_status != "up" means the connection is still being established.
+	return replicationNotEstablishedReason(masterPodName, info)
+}
+
+// replicationNotEstablishedReason answers the question every gate that is about to
+// act on a replica asks -- has this pod actually received its master dataset? --
+// and returns the reason it has not, or "" when it has.
+//
+// The three fields are one answer, not three:
+//   - role=master means a REPLICAOF has not taken effect yet.
+//   - master_link_status != "up" means the handshake is still running. Right after
+//     REPLICAOF the link sits in CONNECT/CONNECTING, where master_sync_in_progress
+//     is 0 while no byte has moved.
+//   - master_sync_in_progress means the transfer itself is not finished.
+//
+// Checking only the last one accepts a replica that never started syncing. Phase 1
+// has reasoned this way since it was written; the gates in front of the failover
+// did not, which let a promotion take a replica with no dataset and the delete of
+// the outgoing master then take the last copy. The sidecar answers the same
+// question the same way (isSyncedReplica, internal/sidecar/drain.go).
+func replicationNotEstablishedReason(podName string, info *valkeyclient.ReplicationInfo) string {
 	if info.Role == common.RoleMaster || info.MasterLinkStatus != "up" {
 		return fmt.Sprintf("replication not established on %s (role=%s, linkStatus=%s)",
-			masterPodName, info.Role, info.MasterLinkStatus)
+			podName, info.Role, info.MasterLinkStatus)
 	}
 	if info.MasterSyncInProgress {
-		return fmt.Sprintf("%s is still syncing from the promoted replica", masterPodName)
+		return fmt.Sprintf("%s is still syncing from its master", podName)
 	}
 	return ""
 }

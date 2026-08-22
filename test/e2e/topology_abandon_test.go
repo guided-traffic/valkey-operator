@@ -22,6 +22,13 @@ package e2e
 // the operator's REPLICAOF and then never reports master_link_status:up. That is
 // what jamPod0Replication produces, in a form that survives the operator's own
 // REPLICAOF and therefore does not race the state transition.
+//
+// One property of the scenario is worth knowing before reading a failure: from the
+// promotion until the jam is lifted, the promoted replica holds the only copy of the
+// dataset. Persistence is off, pod-0 is deliberately unable to replicate, and the
+// outgoing master was deleted -- so anything that restarts the promoted pod in that
+// window empties the cluster, and the data assertion below fails for a reason that is
+// not a promotion decision. That is what valkeyPodForensics separates.
 
 import (
 	"context"
@@ -193,8 +200,15 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	})
 
 	t.Run("Writes survive on the promoted master", func(t *testing.T) {
-		assert.Equal(t, "before-update", tc.valkeyExec(t, ns, pod1, 6379, "GET", "abandon:key1"),
-			"the pre-update payload must still be served by the promoted master")
+		// The dump on failure is what separates the two ways this can go wrong: a
+		// promotion that took a replica which never had the dataset, or a promoted
+		// master that had it and lost the process afterwards (no persistence is
+		// configured here, so a restart empties it). The pod is gone by the time
+		// the workflow collects anything, so the dump has to happen here.
+		if !assert.Equal(t, "before-update", tc.valkeyExec(t, ns, pod1, 6379, "GET", "abandon:key1"),
+			"the pre-update payload must still be served by the promoted master") {
+			t.Log(tc.valkeyPodForensics(t, ns, pod1, 6379))
+		}
 		require.Equal(t, "OK", tc.valkeyExec(t, ns, pod1, 6379, "SET", "abandon:key2", "after-abandon"),
 			"the abandoned end state must be writable, not just readable")
 	})

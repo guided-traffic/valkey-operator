@@ -36,6 +36,11 @@ Guarded by `TestAbandonTopologyRestoration_ConflictHoldsPhase1`,
 `TestPromotePod0AndRedirect_ConflictHoldsPhase1` in
 [`topology_restore_stall_test.go`](../../internal/controller/topology_restore_stall_test.go).
 
+Amended 2026-08-22: **D13 is restated.** The gates in front of the promotion now share the
+`syncTimeout` budget and can pause the rolling update, so `verifyReplacedReplicasSynced` is no
+longer its only consumer ([ADR 0007](0007-failover-aware-rolling-update.md) D10). The property
+D13 protects is unchanged: none of them runs while the restore phases hold the state.
+
 ## Context
 
 The non-Sentinel rolling update is a state machine that waits: for a replaced pod to come
@@ -157,12 +162,20 @@ state written by an older operator version, or one whose arming write never land
 acquires a bound on the first pass that observes it — otherwise the fix would not reach
 exactly the clusters already stuck.
 
-**D13 — The shared `syncTimeout` budget is two-sided only during the replica
-replacement.** `dispatchMultiReplicaState` routes `restoring-topology` and
-`verifying-topology` **before** `replaceNextReplica`, so `verifyReplacedReplicasSynced` —
-the only consumer that can call `pauseRollingUpdate` — never runs during the restore phases.
-A short `syncTimeout` chosen to make Phase 1 abandon quickly therefore cannot also trip
+**D13 — The shared `syncTimeout` budget is two-sided only during the replica replacement
+and the failover step.** `dispatchMultiReplicaState` routes `restoring-topology` and
+`verifying-topology` **before** `replaceNextReplica` and before the failover step, so no
+consumer that can call `pauseRollingUpdate` runs during the restore phases. A short
+`syncTimeout` chosen to make Phase 1 abandon quickly therefore cannot trip
 `RollingUpdatePaused` from inside the restore phases.
+
+~~`verifyReplacedReplicasSynced` is the only consumer that can call
+`pauseRollingUpdate`~~ (superseded 2026-08-22): the pre-promotion gates share the same
+budget through `waitOrPauseForReplicaSync` — `waitForReplicasReady`, the zero-acknowledgement
+branch of `waitForWriteSync`, and `verifyPromotionCandidateHoldsData`
+([ADR 0007](0007-failover-aware-rolling-update.md) D10). They sit in the failover step, which
+the restore states never reach, so the property above is unchanged; what changed is that four
+consumers now share one annotation rather than one.
 
 **D14 — An arming write whose error is discarded is a defect, not a duplication to fold.**
 Of five inline RFC3339 stall checks, three are readability hygiene — their stamp is written

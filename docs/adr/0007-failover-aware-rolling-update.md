@@ -24,6 +24,17 @@ decisions below landed on branch `feat/support-pdb`. Guards, per decision:
   [`internal/controller/rolling_update_test.go`](../../internal/controller/rolling_update_test.go).
 * D8 — `TestDetectAndResolveSplitBrain_PrefersPromotedPodDuringFailover` in
   [`internal/controller/manual_failover_known_master_test.go`](../../internal/controller/manual_failover_known_master_test.go).
+* D10 — the ten tests of
+  [`internal/controller/failover_sync_gate_test.go`](../../internal/controller/failover_sync_gate_test.go),
+  including the positive controls (an established replica passes; a promotion whose two key
+  counts agree passes; an empty master still rolls) and the bound. Mutation-checked on
+  2026-08-22, each reversal restored and `sha256`-verified: reverting the predicate to the
+  sync flag alone and dropping the zero-acknowledgement branch turns four of them red
+  (`BlocksAReplicaWhoseLinkIsDown`, `BlocksAReplicaThatAnswersMaster`,
+  `PausesTheUpdateOnceTheBoundExpired`,
+  `WaitForWriteSync_RefusesToFailOverWithoutASingleAcknowledgement`), each with "Expected
+  value not to be nil"; dropping the empty-candidate branch turns
+  `VerifyPromotionCandidateHoldsData_RefusesAnEmptyCandidate` red on its own.
 * D1 — the multi-replica cases of the rolling-update unit suite, plus
   `TestE2E_RollingUpdate_MultiReplicaNoSentinel` and `TestE2E_RollingUpdate_HA_NoDataLoss`
   ([`test/e2e/rolling_update_test.go`](../../test/e2e/rolling_update_test.go)). Those two
@@ -32,6 +43,14 @@ decisions below landed on branch `feat/support-pdb`. Guards, per decision:
   `buildPodContainers`, `ProbeCommand` and `HealthServer`; the sticky half of D9 is
   pinned by `TestHealthServer_ReadyzReady`
   ([`internal/sidecar/health_test.go`](../../internal/sidecar/health_test.go)).
+
+Amended 2026-08-22: **D10 is new.** D1 and D9 both say the failover waits on replication
+state, and the code asked only `master_sync_in_progress`, which a replica that has not
+started syncing answers with 0 -- so a pod holding nothing could pass the last gate before
+a promotion whose next step deletes the outgoing master. Found by reading, while
+investigating a CI failure whose promoted master served an empty dataset; that failure is
+**not** explained by this defect (the WAIT gate did report an acknowledging replica) and
+stays open.
 
 ## Context
 
@@ -161,6 +180,39 @@ replication link stays Ready: the readiness probe is a plain PING against a conf
 observed. Consequence to hold on to: **readiness can never be used as a proxy for
 replication health anywhere in the operator** — the rolling update waits on sync state,
 not on readiness.
+
+**D10 — Before a promotion, "synced" is the full replication answer, and the wait for it
+is bounded.** `waitForReplicasReady` and `verifyReplacedReplicasSynced` ask
+`replicationNotEstablishedReason`: role must not be master, `master_link_status` must be
+`up`, and no full sync may be running. The three are one answer. A link in
+CONNECT/CONNECTING reports `master_sync_in_progress:0` while no byte has moved, so the
+sync flag alone accepts a replica that never started -- and the promotion is followed
+immediately by the delete of the outgoing master, which is the last copy of the data.
+Phase 1 has asked the full question since it was written (`pod0SyncWaitReason`) and the
+sidecar always has (`isSyncedReplica`); the gate where the answer decides a promotion did
+not, which is the asymmetry this decision removes.
+
+**Zero WAIT acknowledgements is not a partial result.** A cascaded chain acknowledges
+through the intermediate node, so `acked < numReplicas` with `acked >= 1` is accepted;
+`acked == 0` means no replica confirmed the master offset at all and the failover does not
+proceed on it.
+
+**Both waits are bounded by `spec.rollingUpdate.syncTimeout`** and pause the rolling
+update on expiry ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)). The
+direction is deliberate: a rolling update that stops half-done keeps a serviceable
+cluster and resumes on the next spec change, while a promotion onto a replica that never
+synced destroys the dataset and cannot be undone.
+
+**The last look is the key count** (`verifyPromotionCandidateHoldsData`): a candidate that
+holds no keys while the outgoing master holds some does not get promoted. The Sentinel path
+has verified exactly this since it was written and calls it a critical safety check
+(`verifyNewMasterReady`), but it runs *after* the failover, which is early enough there
+because the old master is only deleted afterwards; on the manual path the delete follows the
+promotion within seconds, so the check has to come before it. An empty master returns early
+-- a cluster that holds no data yet must still be able to roll -- and an unreadable count
+waits rather than assuming a yes (D3). The two counts are also logged on the way through,
+because after the delete of the outgoing master nothing can be asked about what the
+promotion was based on.
 
 ## Consequences
 

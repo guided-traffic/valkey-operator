@@ -54,12 +54,19 @@ func fakeValkeyServer(t *testing.T) string {
 				if readErr != nil {
 					return
 				}
-				// WAIT expects an integer reply; everything else is happy with +OK.
-				if strings.Contains(strings.ToUpper(string(buf[:n])), "WAIT") {
+				// WAIT and DBSIZE expect an integer reply; everything else is happy
+				// with +OK. DBSIZE is what the pre-promotion key-count guard asks
+				// (ADR 0007 D10), and a server that answers +OK to it would fail the
+				// parse and stall every failover this fixture drives.
+				request := strings.ToUpper(string(buf[:n]))
+				switch {
+				case strings.Contains(request, "WAIT"):
 					_, _ = conn.Write([]byte(":1\r\n"))
-					return
+				case strings.Contains(request, "DBSIZE"):
+					_, _ = conn.Write([]byte(":4711\r\n"))
+				default:
+					_, _ = conn.Write([]byte("+OK\r\n"))
 				}
-				_, _ = conn.Write([]byte("+OK\r\n"))
 			}()
 		}
 	}()
