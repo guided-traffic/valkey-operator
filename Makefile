@@ -107,6 +107,17 @@ test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by te
 	@echo "Running E2E tests..."
 	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
 
+# E2E_UPGRADE_FROM is the released chart version the fleet-upgrade E2E provisions
+# its clusters on before upgrading to the local chart. Keep it at the version the
+# production fleet actually runs, so the test measures the upgrade that is due.
+E2E_UPGRADE_FROM ?= 1.10.48
+
+.PHONY: test-e2e-fleet-upgrade
+test-e2e-fleet-upgrade: ## Run the fleet-upgrade E2E (installs $(E2E_UPGRADE_FROM), then upgrades to the local chart).
+	@echo "Running fleet-upgrade E2E (from chart $(E2E_UPGRADE_FROM))..."
+	E2E_UPGRADE_FROM=$(E2E_UPGRADE_FROM) E2E_UPGRADE_TO_IMAGE=$(E2E_IMG) \
+		$(GOTEST) -v -tags=e2e,fleetupgrade -count=1 -timeout=45m -run TestE2E_FleetUpgrade ./test/e2e/...
+
 .PHONY: test-e2e-helm
 test-e2e-helm: build ## Run Helm migration E2E test (requires running Kind cluster with operator).
 	@echo "Running Helm migration E2E test..."
@@ -158,6 +169,19 @@ e2e-local: kind-create cert-manager-install ## Run full E2E test locally with Ki
 		--timeout 120s
 	@echo "Running E2E tests..."
 	$(MAKE) test-e2e
+	@echo "Cleaning up..."
+	$(MAKE) kind-delete
+
+.PHONY: e2e-fleet-upgrade-local
+e2e-fleet-upgrade-local: kind-create cert-manager-install ## Run the fleet-upgrade E2E locally with Kind.
+	@echo "Building E2E image..."
+	docker build -f Containerfile -t $(E2E_IMG) .
+	@echo "Loading E2E image into Kind cluster..."
+	kind load docker-image $(E2E_IMG) --name valkey-operator-test
+	@echo "Running fleet-upgrade E2E..."
+	@# No Helm install here on purpose: the test installs the previous release
+	@# itself and then performs the upgrade, so it owns both ends of the change.
+	$(MAKE) test-e2e-fleet-upgrade
 	@echo "Cleaning up..."
 	$(MAKE) kind-delete
 
