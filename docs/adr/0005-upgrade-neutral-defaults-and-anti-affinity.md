@@ -148,7 +148,7 @@ boundaries are recorded rather than glossed:
   them to be turned on in one place. Section 5 of
   [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) names two of the four as
   schema defaults (`tls.enabled: false`, `podDisruptionBudget.enabled: false`); its
-  hardening checklist in section 8 has **no** item for enabling auth, TLS, PDBs or
+  hardening checklist in section 9 has **no** item for enabling auth, TLS, PDBs or
   anti-affinity — its two adjacent items ("Require client certificates where the
   deployment can", "Do not leave `spec.sentinel.disableAuth` or either
   `allowUnencrypted` on") presuppose TLS and auth are already enabled. The

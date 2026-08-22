@@ -6,7 +6,7 @@ Accepted. Date: 2026-08-21.
 
 Implemented and documented in [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md)
 sections 2 and 6. Four items stay open — see Residual risks; two of them carry an unchecked
-entry on that document's hardening checklist (section 8).
+entry on that document's hardening checklist (section 9).
 
 ## Context
 

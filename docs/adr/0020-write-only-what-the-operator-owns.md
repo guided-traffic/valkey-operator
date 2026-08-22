@@ -24,6 +24,12 @@ counts or **deletes** one — its six pod deletes now carry the ADR 0006 UID pre
 `listMasterLabeledPods`, `replicaConfigMaster`, `recreatedAfter`, `checkAndRecoverNoMaster`
 and `sentinelRolloutComplete` all treat an unproven pod as absent.
 
+**Note 2026-08-22 (restore):** the residual-risk list gains the backup-restore analysis — a
+namespace restore recreates every child with a stale controller-reference UID, the guards
+refuse it by design, and adoption gated on Velero's restore labels was considered and
+rejected. No decision changes; the supported restore path is documented in
+[`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) section 7.
+
 Implemented on branch `feat/support-pdb`, in the same change as this ADR. Fourteen reconcile
 paths carry the guard — `reconcileObserverServiceAccount`, `reconcileSidecarServiceAccount`,
 `reconcileSidecarRole`, `reconcileSidecarRoleBinding`, `reconcileStatefulSet`,
@@ -614,6 +620,25 @@ that alters nothing a user asked for.
   kube-controller-manager, so no tier in this repo runs a garbage collector, and no test
   here observes the deletion the finding is named after. What the tests do prove is the
   operator's half: the reference is never written onto an object it did not verify.
+* **A namespace restore makes every child foreign, and the guards are meant to say so.**
+  A backup tool that restores the CR together with the managed children (Velero restores
+  objects with their backed-up `ownerReferences` but necessarily new UIDs) recreates every
+  child with a controller reference to the *old* CR UID. Every guard then refuses — correctly,
+  these objects are not controlled by the live CR — and the pass blocks with
+  `ReconcileBlocked/ForeignObject` until the upstream garbage collector, which resolves owners
+  by UID, removes the stale children and the operator rebuilds them. The convergence therefore
+  rests on the same unreproduced garbage-collector contract as the bullet above. The supported
+  path — restore only the CR, the auth Secret and the PVCs, and let the operator derive the
+  rest — is documented in
+  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) section 7. **Adoption gated on
+  Velero's `velero.io/backup-name` / `velero.io/restore-name` labels was considered and
+  rejected**: a label is writable by anyone who can create the object, so honoring it would
+  reopen the exact door D1 closed, with a Velero prefix instead of an instance label. The
+  least-bad adoption evidence would be the stale controller reference itself (kind `Valkey`,
+  same name and namespace, UID mismatch) — a shape no victim object legitimately carries —
+  but it is still forgeable by the object's creator and buys only the removal of the
+  delete-and-rebuild window, so it stays unbuilt until that window is shown to matter. No
+  restore has been exercised against a real cluster from this repository.
 * **The Secret door is out of scope and open by design.** The data StatefulSet mounts
   `ValkeyTLSSecretName(v)` by name, and with a user-provided Secret (`spec.tls.secretName`)
   naming any Secret in the namespace is the documented feature. Under cert-manager the name
