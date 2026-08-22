@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +52,11 @@ type DrainHandler struct {
 	headlessSvc           string
 	replicas              int
 	valkeyPort            string
+
+	// signalDir is where the drain-complete marker is written. Empty means the
+	// mount path the operator uses (common.DrainSignalMountPath); tests point it at
+	// a temporary directory.
+	signalDir string
 }
 
 // NewDrainHandlerWithDeps creates a DrainHandler with injected dependencies (for testing).
@@ -89,6 +96,11 @@ func NewDrainHandlerWithDeps(
 // a graceful failover if the pod is the master. Returns nil when safe to exit.
 func (d *DrainHandler) Handle(ctx context.Context) error {
 	log := ctrl.Log.WithName("sidecar").WithName("drain")
+
+	// The Valkey container waits on this marker before it exits, so every way out
+	// of this function has to release it -- including the panic path, which is why
+	// it is deferred here rather than called at each return.
+	defer d.signalDrainComplete(log)
 
 	role, err := d.detector.DetectRole()
 	if err != nil {
@@ -267,6 +279,37 @@ func (d *DrainHandler) findSyncedReplica(log drainLog) (string, bool, error) {
 		return "", false, fmt.Errorf("no synced replica found among %d candidates", len(addrs))
 	}
 	return synced, false, nil
+}
+
+// signalDrainComplete tells the Valkey container that it may exit
+// (internal/common/drain.go).
+//
+// A missing directory is the normal case, not a failure: the operator mounts the
+// shared volume only where the drain performs a manual failover, so a Sentinel or
+// standalone pod has no directory and no preStop hook waiting on it. Checking the
+// mount rather than re-deriving the condition keeps the two sides from drifting
+// apart -- the mount IS the switch.
+//
+// A failed write is logged and nothing more. The preStop bound then expires on its
+// own, which is slower but not wrong, and there is nothing better to do from a
+// process that is itself terminating.
+func (d *DrainHandler) signalDrainComplete(log drainLog) {
+	dir := d.signalDir
+	if dir == "" {
+		dir = common.DrainSignalMountPath
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+
+	path := filepath.Join(dir, common.DrainCompleteFile)
+	content := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		log.Error(err, "could not signal drain completion; the Valkey container will wait out its preStop bound",
+			"path", path)
+		return
+	}
+	log.Info("drain complete, released the Valkey container", "path", path)
 }
 
 // isSyncedReplica returns true if the replication info indicates a fully synced replica.

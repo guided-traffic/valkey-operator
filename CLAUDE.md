@@ -314,7 +314,11 @@ sentences are repeated here so nothing is changed without them.
 5. **The sidecar has no CR access and records its drain promotion on the pod**
    (`vko.gtrfc.com/drain-promoted-at`), which is why the operator has to reason from evidence
    at all. The labeler exits before the drain handler runs, so exactly one pod carries the
-   master label during a drain.
+   master label during a drain. **The drain needs the local Valkey alive**, and the kubelet
+   gives no ordering between the two SIGTERMs, so a `preStop` hook on the Valkey container of
+   multi-replica non-Sentinel clusters waits for `/var/run/vko/drain-complete`. Anything added
+   to `Handle` inherits that contract: every exit path releases the marker, or every pod
+   deletion in the fleet pays the 60 s bound.
    → [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
 
 ## Provenance before every write and every delete

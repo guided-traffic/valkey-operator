@@ -44,6 +44,19 @@ const (
 	// DataVolumeName is the name of the volume for persistent data.
 	DataVolumeName = "data"
 
+	// DrainSignalVolumeName is the emptyDir over which the sidecar tells the Valkey
+	// container that the drain is finished (internal/common/drain.go).
+	DrainSignalVolumeName = "drain-signal"
+
+	// drainPreStopTimeoutSeconds bounds the preStop wait for the drain signal. It is
+	// a bound, not an expectation: a promotion is one REPLICAOF NO ONE against a pod
+	// that is already up, so the file normally appears within a second. The value
+	// matters only when the sidecar cannot write it at all -- a crashed sidecar, an
+	// unmounted volume -- and then it decides how long a pod deletion hangs. 60 s
+	// leaves 15 s of the 75 s terminationGracePeriodSeconds for Valkey to shut down,
+	// so the hook always expires before the kubelet stops waiting.
+	drainPreStopTimeoutSeconds = 60
+
 	// ConfigMountPath is the mount path for the master Valkey configuration (readonly).
 	ConfigMountPath = "/etc/valkey"
 
@@ -157,6 +170,8 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 			},
 		},
 	}
+
+	volumes = append(volumes, drainSignalVolumes(v)...)
 
 	var initContainers []corev1.Container
 
@@ -597,6 +612,64 @@ func configVolumeNameForContainer(v *vkov1.Valkey) string {
 	return ConfigVolumeName
 }
 
+// drainSignalVolumes returns the volume the drain handshake needs, or nothing.
+//
+// The handshake exists only where the drain handler performs the failover itself
+// (docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md, D10). A Sentinel
+// cluster loses at most failover latency when the drain bails, because Sentinel's own
+// down-after-milliseconds timer takes over, and a standalone pod has nothing to fail
+// over to -- neither should pay a preStop on every pod deletion.
+//
+// It returns a slice rather than a pointer so the caller appends unconditionally: the
+// same condition is asked three times (volume, two mounts, hook) and buildPodSpec has no
+// complexity budget left for a fourth branch.
+func drainSignalVolumes(v *vkov1.Valkey) []corev1.Volume {
+	if !v.IsMultiReplicaWithoutSentinel() {
+		return nil
+	}
+	return []corev1.Volume{{
+		Name: DrainSignalVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	}}
+}
+
+// drainPreStop holds the Valkey process open until the sidecar drain handler has
+// finished, or until the bound expires.
+//
+// It is the only ordering primitive Kubernetes offers here. The kubelet SIGTERMs
+// every container at once, and the drain handler needs the local Valkey alive to
+// read its own role and needs the peers to still see their master to qualify as
+// promotion targets. Without the hook the drain loses that race often enough to
+// show up in CI, and the loss is a discarded dataset, not a slow failover.
+//
+// Native sidecar containers (initContainers with restartPolicy Always) do not
+// solve this and must not be mistaken for a simpler version of it: they terminate
+// AFTER the regular containers, so Valkey would be guaranteed to be gone before
+// the drain starts. That makes the race deterministic rather than absent.
+//
+// The shell is safe to rely on: the master-discovery init container already runs
+// `sh -c` with `sleep` in this same image.
+func drainPreStop(v *vkov1.Valkey) *corev1.Lifecycle {
+	if !v.IsMultiReplicaWithoutSentinel() {
+		return nil
+	}
+	marker := common.DrainSignalMountPath + "/" + common.DrainCompleteFile
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"sh", "-c",
+					fmt.Sprintf(
+						"i=0; while [ \"$i\" -lt %d ]; do [ -f %s ] && exit 0; sleep 1; i=$((i+1)); done",
+						drainPreStopTimeoutSeconds, marker),
+				},
+			},
+		},
+	}
+}
+
 // buildValkeyContainer builds the main Valkey container spec.
 func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	cfgMount := configMountForContainer(v)
@@ -620,6 +693,13 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 			Name:      TLSVolumeName,
 			MountPath: TLSMountPath,
 			ReadOnly:  true,
+		})
+	}
+
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      DrainSignalVolumeName,
+			MountPath: common.DrainSignalMountPath,
 		})
 	}
 
@@ -664,6 +744,7 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 		Name:         ValkeyContainerName,
 		Image:        v.Spec.Image,
 		Command:      cmd,
+		Lifecycle:    drainPreStop(v),
 		Ports:        valkeyContainerPorts,
 		VolumeMounts: volumeMounts,
 		ReadinessProbe: &corev1.Probe{
@@ -788,6 +869,15 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 			Name:      TLSVolumeName,
 			MountPath: TLSMountPath,
 			ReadOnly:  true,
+		})
+	}
+
+	// The writing half of the drain handshake. The sidecar treats a missing mount
+	// as "not this cluster", so this mount is what switches the handshake on.
+	if v.IsMultiReplicaWithoutSentinel() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      DrainSignalVolumeName,
+			MountPath: common.DrainSignalMountPath,
 		})
 	}
 

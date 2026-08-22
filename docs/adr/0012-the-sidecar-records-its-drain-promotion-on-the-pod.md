@@ -35,6 +35,25 @@ under that name is relabelled rather than refused — is **closed** by
 reasoning held for the observer and did **not** transfer to the sidecar, which is the
 finding that made ADR 0020 necessary; the bullet below is corrected in place.
 
+Amended 2026-08-22: **D10 is new, and it fixes a defect this ADR never considered.** The
+record and the ordering were reasoned about carefully; that the drain might not run at all
+was not. The kubelet SIGTERMs both containers in one batch and a Valkey with `save ""` exits
+within milliseconds, so the drain lost the race often enough to be seen in CI -- observed in
+[run 32470830344](https://github.com/guided-traffic/valkey-operator/actions/runs/32470830344),
+where no surviving pod was master for seven seconds after the kill, the returning pod-0
+self-claimed the role with an empty dataset, and both replicas full-resynced their only copy
+away. A preStop hook on the Valkey container now waits for the drain. Guarded by
+`TestDrainSignal_OnlyWhereTheDrainPerformsAFailover`,
+`TestDrainPreStop_ExpiresInsideTheGracePeriod`, `TestDrainPreStop_ShellLoopIsBounded` and
+`TestDrainPreStop_IsPartOfThePodSpecHash`
+([`internal/builder/drain_signal_test.go`](../../internal/builder/drain_signal_test.go)) plus
+`TestSignalDrainComplete_EveryExitPathReleasesValkey` and
+`TestSignalDrainComplete_MissingMountIsNotAFailure`
+([`internal/sidecar/drain_signal_test.go`](../../internal/sidecar/drain_signal_test.go)). The
+end-to-end proof that the drain promotes at all is
+`TestE2E_NoSentinel_MasterKill_NoSplitBrain`, which since the same date asserts the promotion
+directly instead of inferring it from the resulting topology.
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -185,6 +204,37 @@ fails — leaves a demoted old master and a promoted new one, which is the inten
 anyway. It loses no data: the operator's `waitForWriteSync` (`WAIT`, same file, called
 immediately before the promotion) drained the pod of writes and it is deleted seconds later.
 
+**D10 — The Valkey process outlives the start of its own drain, and the sidecar decides
+when it may exit.** Everything above assumes the drain handler can talk to the local
+Valkey: `Handle` reads its own role from it before anything else, and `isSyncedReplica`
+(D5) only accepts a peer whose `master_link_status` is still `up`, which stops being true
+the moment the master they replicate from dies. The kubelet gives no ordering between the
+SIGTERM it sends the sidecar and the one it sends Valkey, and a non-persistent Valkey
+(`save ""`) exits in milliseconds -- inside the handler's own `PatchLabel` call. The drain
+then either cannot read its role or finds no promotable peer, and it fails **open**: no
+promotion, no stamp, no Event, and one log line in a container that is about to be deleted.
+
+The fix is a `preStop` hook on the **Valkey** container that waits for
+`/var/run/vko/drain-complete`, written by the drain handler on every exit path
+(`internal/common/drain.go` carries both constants, for the reason D2 gives for the
+annotation). Three properties make it a bound rather than a stall: the hook gives up after
+60 s, which is inside the 75 s `terminationGracePeriodSeconds` and leaves Valkey room to
+shut down; the marker write is a `defer` at the top of `Handle`, so it also covers the
+panic path -- a crashing sidecar must not hold Valkey hostage; and the sidecar treats a
+**missing mount** as "not this cluster", so the two sides cannot drift apart into a hook
+waiting for a file nobody can write.
+
+**Scope: multi-replica without Sentinel only.** That is where the drain performs the
+failover itself and where losing it costs a dataset. A Sentinel cluster hits the same first
+step -- `DetectRole` bails, so `SENTINEL FAILOVER` is never sent -- but Sentinel's own
+`down-after-milliseconds` timer then performs the failover: slower, not lossy. A standalone
+pod has nothing to fail over to. Neither pays a preStop on every deletion.
+
+**Native sidecar containers do not solve this** and must not be mistaken for a simpler
+version of it. Init containers with `restartPolicy: Always` are terminated *after* the
+regular containers, so Valkey would be guaranteed to be gone before the drain starts. That
+converts the race into a certainty.
+
 ## Consequences
 
 * **The operator must infer, from indirect evidence, promotions it did not perform**, and
@@ -192,6 +242,13 @@ immediately before the promotion) drained the pod of writes and it is deleted se
   ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) D11).
 * **The stamp lives on the Pod object**, so it does not survive a delete-recreate: a promoted
   pod that loses its node before any pass reads the stamp comes back without it.
+* **Deleting a data pod of a non-Sentinel multi-replica cluster now waits for the drain**
+  (D10). A replica costs one poll tick, a master costs what its failover costs, and a pod
+  whose sidecar cannot write the marker costs the full 60 s. Every step of a rolling update
+  pays it, because a rolling update is a sequence of pod deletions.
+* **Two more moving parts in the pod spec** (D10): a shared `emptyDir` and a shell loop in a
+  lifecycle hook. The shell is not a new assumption -- the master-discovery init container
+  already runs `sh -c` with `sleep` in the same image.
 * **The sidecar runs the operator image** (`operatorImage`,
   [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go)), so an operator
   upgrade leaves a pod writing no stamp until **that pod** has been rolled onto the new
@@ -263,6 +320,25 @@ costs the injection seam the sidecar tests rely on.
 
 ## Residual risks
 
+* **The preStop is a bound, not a handshake in both directions (D10).** It releases Valkey
+  when the marker appears *or* when 60 s pass, and it cannot tell those apart. A drain that
+  is genuinely slower than the bound -- a very slow API server for the `PatchLabel`, DNS
+  that takes seconds to resolve the peers -- still fails open exactly as before, just far
+  more rarely. Making it a true handshake would mean failing the pod deletion, which trades
+  a rare lost promotion for a pod that will not go away.
+* **`isSyncedReplica` still rejects every peer whose master just died (D5, D10).** The
+  predicate requires `master_link_status: up`, which is precisely false in the seconds after
+  a master is lost. D10 removes the situation rather than the strictness: while Valkey is
+  held open the peers still see their master, so the predicate answers usefully. It was
+  considered and **not** relaxed, because loosening it means choosing a promotion target by
+  replication offset instead of by a binary "is synced" -- a change to the path that discards
+  a dataset when it is wrong, and one that D10 makes unnecessary for the observed failure.
+  What stays uncovered: a Valkey that dies *despite* the hook, for instance by crashing
+  rather than by SIGTERM.
+* **A pod whose sidecar cannot write the marker is slow to delete, fleet-wide (D10).** A
+  broken sidecar image, a volume that failed to mount, a sidecar OOM-killed before SIGTERM:
+  each costs 60 s per pod deletion, and nothing surfaces the cause on the CR. The kubelet
+  event for the expired hook is the only trace.
 * **(Closed 2026-08-21) The sidecar Role is namespace-wide `patch`.** D8 is complete: the
   grant is `patch` on this cluster's own data pods by name, so a stolen sidecar token no
   longer reaches another cluster's pods — and therefore cannot forge the drain stamp the

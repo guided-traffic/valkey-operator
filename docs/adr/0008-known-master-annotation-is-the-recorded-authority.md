@@ -278,6 +278,21 @@ with the `-rw` Service round-robining writes across two independent datasets.
   ordinal fallback as master even when the other pod held the post-failover data. Phase 1
   skips the pod's own host, so with every peer still down there is nothing left to
   confirm the record against, and refusing to boot at all would be worse.
+* **The mirror case of D8: the recorded master returns empty while its replicas hold the
+  only copy.** The self-claim assumes the pod the replica config names is the pod with the
+  post-failover data, which is what makes it safer than the ordinal fallback. It stops
+  holding when that pod comes back with nothing -- a non-persistent cluster whose master
+  was deleted without a drain promotion, so nobody moved the record. The pod boots as
+  master on an empty `emptyDir`, the replicas reconnect, and a fresh replication ID turns
+  the reconnect into a full resync that discards their copy. Observed in CI on
+  2026-08-22, before [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+  D10 held the Valkey process open for the drain. D10 removes the trigger; it does not add
+  a guard here, and there is no cheap one -- the pod cannot tell "I am empty because I am
+  new" from "I am empty because the cluster is". The same shape sits in
+  `checkAndRecoverNoMaster`
+  ([`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go)),
+  which promotes pod-0 unconditionally when it finds no master at all, and which D10 cannot
+  help because its trigger is a node that failed hard enough that no sidecar ran. Open.
 * **A rejected replica-ConfigMap write** returns the original pre-fix behaviour for that
   window. Surfaced by the `KnownMasterPublishFailed` Event and the `ReconcileBlocked`
   condition; the operator cannot write through an admission block.
