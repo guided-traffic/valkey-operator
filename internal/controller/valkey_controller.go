@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -2311,7 +2312,7 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 }
 
 // setStatusCondition sets a named status condition on the Valkey CR.
-// It refreshes the object from the API server before writing to avoid conflicts.
+// It refreshes the object before writing to avoid conflicts.
 //
 // ObservedGeneration is taken from the refreshed object, not from the caller's
 // copy. It therefore names the generation the CR carried at the moment of the
@@ -2333,35 +2334,58 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 // each standalone pass being the live one — issued a status update per reconcile,
 // which is what the skip guards in setReconcileBlockedCondition exist to avoid.
 //
-// Both failures are logged and swallowed rather than returned: a condition is a
-// report about the pass, never a reason to fail it, and every caller is a void
-// helper. Losing one write is self-healing — the condition is recomputed from
-// live state on the next pass and rewritten unless it already matches — but it is
-// not silent any more: a persistent conflict or a lost permission shows up in the
-// operator log instead of leaving the condition stale with no trace.
+// setStatusCondition logs and swallows the outcome: for the callers that report a
+// steady state — ReconcileBlocked, SidecarUpdatePending, RollingUpdatePaused — a
+// condition is a report about the pass, never a reason to fail it, and losing one
+// write is self-healing because the next pass recomputes the condition from live
+// state and rewrites it. It is not silent either: a persistent conflict or a lost
+// permission shows up in the operator log instead of leaving the condition stale
+// with no trace.
+//
+// A caller whose condition is the one-shot record of something that happens
+// exactly once has no next pass to be healed by. It calls writeStatusCondition
+// and decides for itself what a failed write means
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
 func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
-	logger := log.FromContext(ctx)
-
-	if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
-		if !apierrors.IsNotFound(err) {
-			logger.Error(err, "Failed to refresh Valkey before writing a status condition", "condition", condType)
-		}
-		return
-	}
-	if !meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		ObservedGeneration: v.Generation,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
-	}) {
-		return
-	}
-	if err := r.Status().Update(ctx, v); err != nil {
-		logger.Error(err, "Failed to write status condition; it will be retried on the next reconcile",
+	if err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to write status condition; it will be recomputed on the next reconcile",
 			"condition", condType, "reason", reason)
 	}
+}
+
+// writeStatusCondition is the write setStatusCondition documents, reporting
+// whether it landed.
+//
+// Every attempt reads the CR again, because the read goes through the manager
+// cache and a caller that updated the CR itself moments earlier reads back the
+// version from before its own write — the status update is then rejected with a
+// 409 that has nothing to do with a competing writer. Retrying is what turns that
+// into a landed condition; a conflict that survives the retry is handed to the
+// caller, which is the only place that knows whether the record is worth another
+// pass.
+//
+// A CR that disappeared under the pass is not a failure: there is nothing left to
+// record on, and every caller would swallow the NotFound anyway.
+func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if !meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			ObservedGeneration: v.Generation,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		}) {
+			return nil
+		}
+		return r.Status().Update(ctx, v)
+	})
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.

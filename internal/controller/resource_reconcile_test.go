@@ -37,20 +37,15 @@ func ownedByValkey(t *testing.T, v *vkov1.Valkey, obj client.Object) {
 	require.NoError(t, controllerutil.SetControllerReference(v, obj, testScheme()))
 }
 
-// stampStatefulSetUID gives a StatefulSet the fake client creates the same
-// deterministic UID a staged fixture carries.
+// withStatefulSetUID gives a StatefulSet the fake client creates the same
+// deterministic UID a staged fixture carries, without displacing a Create the
+// caller supplied.
 //
 // The fake client assigns no UID at all, and the pod guards compare exactly that
 // field (metav1.IsControlledBy ignores name and kind mismatches only after the UID
 // matches). Without this, a StatefulSet the reconciler created under test would have
 // an empty UID, every pod fixture pointing at testStsUID would read as foreign, and
 // the tests would be measuring the fixture rather than the guard.
-func stampStatefulSetUID() interceptor.Funcs {
-	return withStatefulSetUID(interceptor.Funcs{})
-}
-
-// withStatefulSetUID adds the UID stamp to an existing set of interceptors without
-// displacing a Create the caller supplied.
 func withStatefulSetUID(funcs interceptor.Funcs) interceptor.Funcs {
 	inner := funcs.Create
 	funcs.Create = func(ctx context.Context, cl client.WithWatch, obj client.Object,

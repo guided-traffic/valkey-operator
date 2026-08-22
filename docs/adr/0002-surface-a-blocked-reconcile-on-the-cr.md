@@ -15,6 +15,13 @@ and the e2e `TestE2E_AdmissionRejection_ReconcileBlockedCondition`
 ([`test/e2e/admission_recovery_test.go`](../../test/e2e/admission_recovery_test.go)). Those
 files were read and their assertions match the rules below; no suite was run for this ADR.
 
+Amended 2026-08-22: D7 keeps its rule for the conditions this ADR is about, and gains an
+exception. `setStatusCondition` is now a logging wrapper around `writeStatusCondition`,
+which returns the error and retries a conflict against a freshly read CR; a caller whose
+condition is a one-shot record with no later pass to recompute it uses that function
+directly and decides for itself
+([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D15).
+
 ## Context
 
 During the 2026-08-19 infra-d incident (context in
@@ -94,10 +101,18 @@ skipped, not silently failing.
 and `reconcileWorkload` all run even when the CR **status** subresource is itself
 blocked. Otherwise a webhook guarding `valkeys/status`, or lost RBAC on it, leaves a
 brand-new CR with an empty phase and no condition — invisible for exactly the failure
-class this condition exists to surface. Likewise, `setStatusCondition` logs both of
-its failure paths (the refresh `Get` and the `Status().Update`) and still returns no
-error: a condition is a report about the pass, never a reason to fail it, and the
-write is self-healing because the next pass recomputes it.
+class this condition exists to surface. Likewise, `setStatusCondition` logs its
+failure and still returns no error: a condition is a report about the pass, never a
+reason to fail it, and the write is self-healing because the next pass recomputes it.
+Amended 2026-08-22: that justification is the *reason* for the rule, not decoration,
+and it only holds while a next pass recomputes the condition. `setStatusCondition` now
+wraps `writeStatusCondition`, which returns the error and retries a conflict against a
+freshly read CR — the read goes through the manager cache, so a caller that just wrote
+the CR itself sees its own pre-update version. A condition with exactly one writer per
+rolling update has no self-healing pass and is written through `writeStatusCondition`
+directly ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D15). Every condition
+this ADR is about — `ReconcileBlocked`, `SidecarUpdatePending`, `RollingUpdatePaused` —
+keeps the swallowing rule unchanged.
 
 **D8 — Steady state costs no status write.** `setStatusCondition` returns without
 issuing `Status().Update` when `meta.SetStatusCondition` reports no change, and
@@ -112,7 +127,8 @@ the moment (a cluster-wide admission outage) when the API server can least absor
 object.** `setStatusCondition` stamps `ObservedGeneration: v.Generation` on every
 condition written through it — `ReconcileBlocked`, `SidecarUpdatePending`,
 `RollingUpdatePaused` and `TopologyRestored` — taking the generation from the object
-it refreshed inside the function. kstatus-style tooling reads a missing
+it refreshed inside the function (since 2026-08-22 the refresh and the stamp sit in
+`writeStatusCondition`, which `setStatusCondition` wraps; the rule is unchanged). kstatus-style tooling reads a missing
 `observedGeneration` as generation 0, i.e. as permanently stale, so an unstamped
 condition is ignored by every consumer that checks freshness. The
 skip-if-unchanged guard of D8 **includes** `ObservedGeneration` (added to the message

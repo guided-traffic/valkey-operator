@@ -3056,6 +3056,22 @@ func (r *ValkeyReconciler) abandonTopologyRestoration(ctx context.Context, v *vk
 	r.recordEvent(v, corev1.EventTypeWarning, "TopologyRestoreAbandoned",
 		"Topology restoration abandoned after %v (%s); %s stays master", timeout, reason, promotedPod)
 
+	// The record goes before the state transition, and a conflict on it keeps the
+	// state where it is. This pass is the only one that can write the verdict: the
+	// transition below releases the stall and no later pass re-enters Phase 1, so a
+	// swallowed write loses the record for the life of the cluster. It is the ADR
+	// 0009 shape -- an unrecorded promotion is not a promotion -- applied to the
+	// abandon (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
+	//
+	// Writing it first also removes the conflict that was losing it: the state write
+	// below is this pass's first CR update, so the cached refresh inside the
+	// condition write can no longer read back a version from before it.
+	if err := r.recordTopologyRestoredCondition(ctx, v, metav1.ConditionFalse, "RestoreTimeout",
+		fmt.Sprintf("pod-0 was not restored as master after %v (%s); %s stays master",
+			timeout, reason, promotedPod)); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
 	// Phase 2 gets its own budget, armed here rather than inherited
 	// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10). Both annotations are persisted by
 	// the single Update below.
@@ -3063,18 +3079,43 @@ func (r *ValkeyReconciler) abandonTopologyRestoration(ctx context.Context, v *vk
 	if err := r.setRollingUpdateState(ctx, v, stateVerifyingTopology); err != nil {
 		return RollingUpdateResult{Error: err}
 	}
-	r.setTopologyRestoredCondition(ctx, v, metav1.ConditionFalse, "RestoreTimeout",
-		fmt.Sprintf("pod-0 was not restored as master after %v (%s); %s stays master",
-			timeout, reason, promotedPod))
 
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
 
-// setTopologyRestoredCondition records whether the rolling update handed the
-// master role back to pod-0. The cluster serves normally either way, so this
-// condition is the only durable trace of an abandoned restoration.
-func (r *ValkeyReconciler) setTopologyRestoredCondition(ctx context.Context, v *vkov1.Valkey, status metav1.ConditionStatus, reason, message string) {
-	r.setStatusCondition(ctx, v, vkov1.ConditionTypeTopologyRestored, status, reason, message)
+// recordTopologyRestoredCondition records whether the rolling update handed the
+// master role back to pod-0, and reports whether the record is worth another pass.
+//
+// The cluster serves normally either way, so this condition is the only durable
+// trace of how the restoration ended. Both writers run exactly once per rolling
+// update -- abandonTopologyRestoration and promotePod0AndRedirect each enter
+// stateVerifyingTopology in the same pass, and nothing recomputes the condition
+// afterwards -- which is why they write it before the state transition instead of
+// after it (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
+//
+// Only a conflict is handed back. A conflict means the CR moved between the read
+// and the write, and the next pass reads the moved version; the case seen in CI is
+// the operator racing its own preceding update through the manager cache. Every
+// other failure -- a withdrawn RBAC on the status subresource above all -- repeats
+// identically on every pass, and returning it would pin the rolling update in
+// stateRestoringTopology forever: the unbounded wait D2-D4 exists to remove. Those
+// are logged, and the state machine advances without the record.
+func (r *ValkeyReconciler) recordTopologyRestoredCondition(ctx context.Context, v *vkov1.Valkey,
+	status metav1.ConditionStatus, reason, message string) error {
+	err := r.writeStatusCondition(ctx, v, vkov1.ConditionTypeTopologyRestored, status, reason, message)
+	if err == nil {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+	if apierrors.IsConflict(err) {
+		logger.Info("TopologyRestored write still conflicting, not advancing the rolling update state",
+			"reason", reason, "error", err)
+		return err
+	}
+	logger.Error(err, "Could not record TopologyRestored, advancing the rolling update without it",
+		"reason", reason)
+	return nil
 }
 
 // promotePod0AndRedirect promotes pod-0 to master via REPLICAOF NO ONE, redirects
@@ -3156,6 +3197,16 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 		}
 	}
 
+	// The successful verdict is recorded before the transition for the reason
+	// abandonTopologyRestoration gives: this is the only pass that writes it.
+	// Requeueing without advancing costs nothing here -- as stated above, pod-0 is
+	// already master, REPLICAOF NO ONE on it is a no-op, the recorded known-master
+	// already names it, and the state still reads restoring-topology.
+	if err := r.recordTopologyRestoredCondition(ctx, v, metav1.ConditionTrue, "Restored",
+		fmt.Sprintf("%s was promoted back to master", masterPodName)); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+
 	// Transition to Phase 2: verify replicas reconnected on next reconcile. Its budget is armed here,
 	// at the transition, so a timestamp left behind by an earlier update cannot spend it before the
 	// verification ever runs (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D10).
@@ -3163,8 +3214,6 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 	if err := r.setRollingUpdateState(ctx, v, stateVerifyingTopology); err != nil {
 		return RollingUpdateResult{Error: err}
 	}
-	r.setTopologyRestoredCondition(ctx, v, metav1.ConditionTrue, "Restored",
-		fmt.Sprintf("%s was promoted back to master", masterPodName))
 
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }

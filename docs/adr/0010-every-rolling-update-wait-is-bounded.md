@@ -23,6 +23,19 @@ Amended 2026-08-21: the last two unconverted bounds,
 `TestClearSyncWaitTimestamp_ForgetsTheBound` in
 [`rolling_update_bounds_test.go`](../../internal/controller/rolling_update_bounds_test.go).
 
+Amended 2026-08-22: D3 gains an ordering. `TopologyRestored` was written *after* the
+state transition and its write error was swallowed, so a single rejected status update
+lost the verdict permanently — the writer never runs again. It is now written **before**
+the transition, and a conflict fails the pass instead (D15). Found by
+`TestE2E_RollingUpdate_TopologyRestoreAbandoned` failing on a condition that never
+appeared while the abandon itself had happened
+([run 32577672028](https://github.com/guided-traffic/valkey-operator/actions/runs/32577672028)).
+Guarded by `TestAbandonTopologyRestoration_ConflictHoldsPhase1`,
+`TestAbandonTopologyRestoration_ConflictRetriedThenRecorded`,
+`TestAbandonTopologyRestoration_PermanentFailureStillEscapes` and
+`TestPromotePod0AndRedirect_ConflictHoldsPhase1` in
+[`topology_restore_stall_test.go`](../../internal/controller/topology_restore_stall_test.go).
+
 ## Context
 
 The non-Sentinel rolling update is a state machine that waits: for a replaced pod to come
@@ -68,7 +81,10 @@ long Phase 1 eat Phase 2's budget.
 force-promoted.** An unsynced pod-0 forced to master comes up empty and discards the
 promoted replica's writes. `abandonTopologyRestoration` records the
 `TopologyRestoreAbandoned` Warning, sets `TopologyRestored=False` as the durable record,
-arms the Phase 2 bound and enters `stateVerifyingTopology`. It writes no phase itself: the
+arms the Phase 2 bound and enters `stateVerifyingTopology` — **in that order**, amended
+2026-08-22: the record precedes the state transition, because the transition is what makes
+the record unwritable (D15). The superseded order wrote the condition last and swallowed
+its error. It writes no phase itself: the
 phase returns to `OK` a pass or more later, through `updateStatus`, once Phase 2 reports
 `Completed` — because the cluster **is** healthy. The supported end state of a failed
 restoration is "finished, single master, not pod-0", not "stuck".
@@ -156,6 +172,30 @@ error is discarded, are live unbounded stalls and are tracked as defects. Filing
 unbounded-requeue defect as a readability cleanup means it ships whenever nobody gets round
 to the cleanup.
 
+**D15 — A one-shot verdict is written before the transition that ends its last writer, and
+a conflict fails the pass.** `TopologyRestored` has exactly two writers,
+`abandonTopologyRestoration` and `promotePod0AndRedirect`, and each enters
+`stateVerifyingTopology` in the same pass; no path returns to Phase 1. The condition is
+therefore not a steady-state report that the next pass recomputes — the reasoning
+`setStatusCondition` documents for `ReconcileBlocked` and `SidecarUpdatePending` does not
+transfer — and swallowing its write loses the verdict for the life of the cluster. Both
+writers call `recordTopologyRestoredCondition` first and return
+`RollingUpdateResult{Error}` when it reports a conflict; the state annotation stays where
+it is, the CR is still stalled, and the next pass writes the verdict. This is
+[ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) applied to the abandon: an
+abandon the operator could not record is not a completed abandon.
+
+Two limits are part of the rule. **Only a conflict is handed back.** Anything that repeats
+identically on every pass — a withdrawn RBAC on the `valkeys/status` subresource is the
+realistic one — is logged and the state machine advances without the record, because
+returning it would pin the update in `stateRestoringTopology` forever and trade the lost
+condition for the unbounded wait D2–D4 exists to remove. And **the write reads the CR
+again on every attempt** (`writeStatusCondition`, `retry.RetryOnConflict`): the read goes
+through the manager cache, so a writer that just updated the CR itself reads back the
+version from before its own write and is rejected with a 409 that has no competing writer
+behind it. That is the failure CI hit; putting the record before the state write removes
+the preceding update as well, so the retry is the second line of defence, not the first.
+
 ## Consequences
 
 * The original topology is never restored on the abandon path, and the CR carries
@@ -178,6 +218,12 @@ to the cleanup.
   at its new entry point.
 * Any future bound armed inside a retrying writer must follow D11's order: stamp first, then
   retry the write with that stamp.
+* A status subresource the operator may no longer write costs the `TopologyRestored`
+  verdict outright (D15). The bound wins over the record, and the only trace left is the
+  `TopologyRestoreAbandoned` Event plus an operator-log line.
+* The `TopologyRestoreAbandoned` Event is recorded before the condition, so every retried
+  abandon pass emits it again. Event aggregation turns that into a series count rather than
+  duplicate objects, and `waitForValkeyEvent` in the e2e suite reads it either way.
 * The Event reason does not distinguish a failover stall from a Phase 1 sync timeout —
   operators read the message text, not the reason. A distinct reason string
   (`MasterNeverReturned`) is a one-line change if it is ever wanted.
@@ -242,6 +288,26 @@ stalled restoration never takes.
 
 Not taken: sharing `r.nudges` made the fix free, and D9's separator makes collision
 impossible.
+
+### Retry the `TopologyRestored` write until it lands, whatever the error
+
+Rejected: it re-creates an unbounded wait through the back door. A status subresource the
+operator may no longer write would hold the CR in `stateRestoringTopology` for as long as
+the permission is missing — the exact stall D2–D4 removes, keyed on a different failure.
+D15 hands back only the conflict, which by definition another pass can clear.
+
+### Keep the write last and simply return its error
+
+Rejected: by then `stateVerifyingTopology` is persisted, and no pass re-enters Phase 1.
+Failing the pass would requeue into Phase 2, which does not write the verdict — the record
+stays lost and only the log gets louder. The ordering is what makes the retry meaningful.
+
+### Read the CR through an uncached `APIReader` before the status write
+
+Considered. It removes the stale-cache conflict at its source rather than retrying past it,
+but it means a live API read on every condition write and a new field on the reconciler.
+Not taken: writing the record before the pass's own first update already removes the
+self-inflicted conflict, and `retry.RetryOnConflict` covers a genuine competing writer.
 
 ### Fold all five inline stall checks into `waitBoundExceeded` as one mechanical cleanup
 

@@ -77,12 +77,19 @@ func (m *mockInstanceChecker) GetReplicationInfo(_ context.Context, _ *vkov1.Val
 }
 
 func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client) {
+	return newTestReconcilerWithInterceptor(interceptor.Funcs{}, objs...)
+}
+
+// newTestReconcilerWithInterceptor is newTestReconciler with client interceptors
+// layered under the StatefulSet UID stamp, for the tests that have to make a
+// specific API call fail.
+func newTestReconcilerWithInterceptor(funcs interceptor.Funcs, objs ...client.Object) (*ValkeyReconciler, client.Client) {
 	s := testScheme()
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(objs...).
 		WithStatusSubresource(&vkov1.Valkey{}, &appsv1.StatefulSet{}).
-		WithInterceptorFuncs(stampStatefulSetUID()).
+		WithInterceptorFuncs(withStatefulSetUID(funcs)).
 		Build()
 
 	return &ValkeyReconciler{
