@@ -35,6 +35,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // nudgeAnnotationKey is the annotation the operator bumps to force a
@@ -213,7 +215,7 @@ func TestE2E_AdmissionRejection_StatefulSetNudgeRecovery(t *testing.T) {
 	name := "nudge-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -361,7 +363,7 @@ func TestE2E_AdmissionRejection_ReconcileBlockedCondition(t *testing.T) {
 	t.Log("Creating Valkey CR while ConfigMap creation is rejected")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	}))
 	defer tc.deleteValkey(t, ns, name)
 
@@ -450,7 +452,7 @@ func TestE2E_AdmissionRejection_ReconcileContinuesPastRejectedWrite(t *testing.T
 	t.Log("Creating a healthy single-replica Valkey CR")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	}))
 	defer tc.deleteValkey(t, ns, name)
 

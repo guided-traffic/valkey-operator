@@ -17,6 +17,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // TestE2E_StandaloneCluster tests a single-node Valkey deployment.
@@ -30,7 +32,7 @@ func TestE2E_StandaloneCluster(t *testing.T) {
 	name := "standalone"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR")
@@ -126,7 +128,7 @@ func TestE2E_HAClusterWithSentinel(t *testing.T) {
 	name := "ha-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -280,7 +282,7 @@ func TestE2E_DataReplication(t *testing.T) {
 	name := "repl-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -470,7 +472,7 @@ func TestE2E_DeletionWhileProvisioning(t *testing.T) {
 	// Build a minimal HA Valkey. We do NOT wait for readiness before deleting.
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),

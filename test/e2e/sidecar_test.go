@@ -15,6 +15,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // ---------------------------------------------------------------------------
@@ -129,7 +131,7 @@ func TestE2E_SidecarRoleLabelingAndRouting(t *testing.T) {
 	name := "sc-route"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -244,7 +246,7 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 	name := "sc-drain"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -438,7 +440,7 @@ func TestE2E_SidecarDrainReplica(t *testing.T) {
 	name := "sc-repdr"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -556,7 +558,7 @@ func TestE2E_LegacyServiceCleanup(t *testing.T) {
 	name := "sc-legacy"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -695,7 +697,7 @@ func TestE2E_StandaloneServicesOnly(t *testing.T) {
 	name := "sc-sa"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR for service verification")

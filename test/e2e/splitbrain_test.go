@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // annotationDrainPromotedAtKey is the stamp the sidecar drain handler writes on the
@@ -45,7 +47,7 @@ func TestE2E_NoSentinel_MasterKill_NoSplitBrain(t *testing.T) {
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(replicas),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating 3-replica Valkey CR without Sentinel")

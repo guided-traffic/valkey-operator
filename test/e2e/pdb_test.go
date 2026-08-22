@@ -33,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // pdbSettleTimeout is how long the PDB controller may take to publish a status
@@ -58,7 +60,7 @@ func TestE2E_PodDisruptionBudget_SerializesEvictions(t *testing.T) {
 	t.Log("Creating an HA Valkey CR with PodDisruptionBudgets enabled")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -145,7 +147,7 @@ func TestE2E_PodDisruptionBudget_LeavesForeignBudgetAlone(t *testing.T) {
 	// predates the feature, and it puts the cleanup path on every reconcile pass.
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(2),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	}))
 	defer tc.deleteValkey(t, ns, name)
 
@@ -185,7 +187,7 @@ func TestE2E_PodDisruptionBudget_SkippedForSingleReplica(t *testing.T) {
 	name := "pdb-single"
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"podDisruptionBudget": map[string]interface{}{
 			"enabled": true,
 		},

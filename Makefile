@@ -102,10 +102,26 @@ test-integration-coverage: envtest ## Run integration tests with coverage.
 # scenarios on a control-plane + 3 workers cluster.
 E2E_RUN ?=
 
+# E2E_VALKEY_LINE picks the pinned Valkey line the E2E suite runs against: empty
+# or 9 for the current Valkey 9 release, 8 for the current Valkey 8 one.
+# E2E_VALKEY_IMAGE names an image directly and wins over the line.
+#
+# Both pins live in test/testimages/images.go and are kept current by Renovate.
+# Neither this file nor the workflow carries a copy of them, deliberately: a second
+# copy that lags turns a leg green while it tests the wrong line.
+E2E_VALKEY_LINE ?=
+E2E_VALKEY_IMAGE ?=
+
+.PHONY: test-image-tools
+test-image-tools: ## Verify the pinned Valkey images contain every tool the generated scripts execute (needs docker, no cluster).
+	@echo "Checking the pinned Valkey images for the tools the operator executes in them..."
+	$(GOTEST) -v -tags=imagetools -count=1 -timeout=15m ./test/imagetools/...
+
 .PHONY: test-e2e
 test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by test name).
 	@echo "Running E2E tests..."
-	$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
+	E2E_VALKEY_LINE=$(E2E_VALKEY_LINE) E2E_VALKEY_IMAGE=$(E2E_VALKEY_IMAGE) \
+		$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
 
 # E2E_UPGRADE_FROM is the released chart version the fleet-upgrade E2E provisions
 # its clusters on before upgrading to the local chart. Keep it at the version the

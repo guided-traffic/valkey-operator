@@ -41,6 +41,7 @@ jobs:
             cluster: valkey-operator-test
             run_filter: ""
             require_multi_node: "false"
+            valkey_line: ""
           # Multi-node leg: re-runs only the scenarios whose outcome depends on the
           # node count - eviction serialization and anti-affinity spread.
           # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
@@ -50,6 +51,17 @@ jobs:
             cluster: valkey-operator-test-multinode
             run_filter: TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget
             require_multi_node: "true"
+            valkey_line: ""
+          # Valkey 8 leg: the same suite on the same topology against the other
+          # supported Valkey line. It carries a selector, not an image - the pins
+          # live in test/testimages/images.go and a copy here would have to be
+          # bumped in lockstep with them.
+          - topology: single-node-valkey8
+            workers: 0
+            cluster: valkey-operator-test-valkey8
+            run_filter: ""
+            require_multi_node: "false"
+            valkey_line: "8"
     env:
       KIND_CLUSTER: ${{ matrix.cluster }}
       KIND_WORKERS: ${{ matrix.workers }}
@@ -409,6 +421,10 @@ jobs:
           E2E_RUN: ${{ matrix.run_filter }}
           # Turns "not enough nodes" from a skip into a failure on the multi-node leg.
           E2E_REQUIRE_MULTI_NODE: ${{ matrix.require_multi_node }}
+          # Empty means the pinned Valkey 9 release; the Valkey 8 leg sets "8".
+          # An unrecognised value panics rather than falling back, so a typo here
+          # cannot turn this leg into a second Valkey 9 run reported as a pass.
+          E2E_VALKEY_LINE: ${{ matrix.valkey_line }}
 
       - name: Collect logs on failure
         if: failure()
@@ -577,6 +593,41 @@ jobs:
           name: unit-coverage
           path: coverage/unit.out
           retention-days: 7
+
+  # The operator does not build the Valkey image, it runs shell in it: two init
+  # container scripts, the auth-wrapped container command, the probes and the drain
+  # preStop hook. This job asks the pinned images whether they still contain what
+  # those execute. It needs docker and no cluster, so it answers in seconds and
+  # names the missing binary - instead of surfacing in the E2E job minutes later as
+  # a cluster that will not converge.
+  valkey-image-tools:
+    name: Valkey Image Tools
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: go mod download
+
+      # Docker Hub rate-limits anonymous pulls, and this job pulls two images on
+      # every run.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: guidedtraffic
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Check the pinned Valkey images
+        run: make test-image-tools
 
   govulncheck:
     name: Vulnerability Check
@@ -1000,7 +1051,7 @@ jobs:
 
   semantic-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, coverage-report]
+    needs: [malware-scan, container-malware-scan, gosec, govulncheck, linter, cyclomatic-complexity, generated-manifests, unit-tests, integration-tests, e2e-tests, valkey-image-tools, coverage-report]
     name: Semantic Release
     runs-on: self-hosted
     permissions:

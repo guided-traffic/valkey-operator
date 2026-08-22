@@ -25,6 +25,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // defaultManagerBinary is the path to the compiled operator binary relative to
@@ -48,7 +50,7 @@ func TestE2E_MigrateDefaults(t *testing.T) {
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating Valkey CR for migration test")

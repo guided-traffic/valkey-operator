@@ -46,6 +46,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 const (
@@ -156,7 +158,7 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 			keyPrefix: "fleet:ha",
 			spec: map[string]interface{}{
 				"replicas": int64(3),
-				"image":    "valkey/valkey:8.0",
+				"image":    testimages.Default(),
 				"tls":      tlsSpec(),
 				"sentinel": map[string]interface{}{
 					"enabled":  true,
@@ -172,7 +174,7 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 			keyPrefix: "fleet:plain",
 			spec: map[string]interface{}{
 				"replicas": int64(3),
-				"image":    "valkey/valkey:8.0",
+				"image":    testimages.Default(),
 				"observer": map[string]interface{}{
 					"enabled": true,
 				},

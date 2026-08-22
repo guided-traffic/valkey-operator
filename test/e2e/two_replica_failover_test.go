@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // TestE2E_RollingUpdate_TwoReplicasNoSentinel pins ADR 0008 D4-D7 in a real cluster.
@@ -36,8 +38,8 @@ func TestE2E_RollingUpdate_TwoReplicasNoSentinel(t *testing.T) {
 
 	name := "roll-2r"
 	var replicas int32 = 2
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(replicas),

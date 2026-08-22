@@ -14,6 +14,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // TestE2E_RollingUpdate_Standalone tests a rolling update on a standalone Valkey instance.
@@ -25,8 +27,8 @@ func TestE2E_RollingUpdate_Standalone(t *testing.T) {
 	defer cleanup()
 
 	name := "roll-sa"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
@@ -100,8 +102,8 @@ func TestE2E_RollingUpdate_MultiReplicaNoSentinel(t *testing.T) {
 
 	name := "roll-mr"
 	var replicas int32 = 3
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(replicas),
@@ -221,8 +223,8 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	defer cleanup()
 
 	name := "roll-ha"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
@@ -425,8 +427,8 @@ func TestE2E_RollingUpdate_HA_NoDataLoss(t *testing.T) {
 	defer cleanup()
 
 	name := "roll-dl"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
@@ -516,8 +518,8 @@ func TestE2E_RollingUpdate_HA_Idempotent(t *testing.T) {
 	defer cleanup()
 
 	name := "roll-idem"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
@@ -687,8 +689,8 @@ func TestE2E_RollingUpdate_HA_TLS_NoTLSErrors(t *testing.T) {
 	defer cleanup()
 
 	name := "roll-tls"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),

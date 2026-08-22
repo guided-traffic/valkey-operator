@@ -185,6 +185,7 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Integration tests             | `make test-integration`        |
 | Integration tests w/ coverage | `make test-integration-coverage` |
 | E2E tests                     | `make test-e2e`                |
+| Valkey image tool check       | `make test-image-tools`        |
 | Full E2E local (Kind)         | `make e2e-local`               |
 | All tests with coverage       | `make test`                    |
 | Linting                       | `make lint`                    |
@@ -214,14 +215,35 @@ The full verification policy — mutation and revert checks, what may be an e2e 
 not, fixture rules, coverage boundaries — is
 [ADR 0017](docs/adr/0017-test-and-ci-policy.md).
 
+### The Valkey image is a dependency, pinned in one place
+
+The operator runs shell **inside** the upstream Valkey image: two init container scripts, the
+auth-wrapped container command, the exec probes and the drain preStop hook. What those execute
+is declared in `RequiredImageTools`
+([`internal/builder/image_requirements.go`](internal/builder/image_requirements.go)) and
+checked against the real images by `make test-image-tools` — docker, no cluster, its own CI
+job. **A new tool in a generated script needs a line in that list**; a unit test walks the
+generated scripts and fails otherwise, and the converse test fails on a declared tool nothing
+uses any more.
+
+Both images live in [`test/testimages`](test/testimages/images.go): the current Valkey 9
+release is the default for every suite, the current Valkey 8 release is the second e2e leg and
+the start of every upgrade the suite performs. Renovate maintains both and is capped per major,
+so crossing to a future major is a decision, not an arriving PR. **Do not copy a pin anywhere
+else** — CI passes `E2E_VALKEY_LINE=8`, a selector, and an unrecognised value panics rather than
+falling back. Only e2e is pinned; unit and integration never pull an image, so their image
+strings are fixtures.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D42, D43
+
 ### E2E cluster topology
 
-CI runs the E2E job twice, as a matrix in `.github/workflows/release.yml`:
+CI runs the E2E job three times, as a matrix in `.github/workflows/release.yml`:
 
-| Leg          | Cluster                             | Scope                                             |
-|--------------|-------------------------------------|---------------------------------------------------|
-| `single-node`| control-plane only                  | full suite (`make test-e2e`)                      |
-| `multi-node` | control-plane + 3 workers           | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
+| Leg                   | Cluster                    | Scope                                             |
+|-----------------------|----------------------------|---------------------------------------------------|
+| `single-node`         | control-plane only         | full suite (`make test-e2e`), current Valkey 9    |
+| `multi-node`          | control-plane + 3 workers  | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
+| `single-node-valkey8` | control-plane only         | full suite against the current Valkey 8 release   |
 
 The multi-node leg exists because two behaviors are meaningless on one node:
 eviction serialization and hard-mode anti-affinity spread. Three

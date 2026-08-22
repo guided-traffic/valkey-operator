@@ -35,6 +35,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // hostnameTopologyKey is the default spread domain: one pod per node.
@@ -70,7 +72,7 @@ func TestE2E_AntiAffinity_OffByDefault(t *testing.T) {
 	t.Log("Creating an HA Valkey CR without an antiAffinity block")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -103,7 +105,7 @@ func TestE2E_AntiAffinity_SoftWhenRequested(t *testing.T) {
 	t.Log("Creating an HA Valkey CR with antiAffinity.mode: soft")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -148,7 +150,7 @@ func TestE2E_AntiAffinity_HardSpreadsAcrossNodes(t *testing.T) {
 	t.Log("Creating an HA Valkey CR with antiAffinity.mode: hard")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),
@@ -194,7 +196,7 @@ func TestE2E_AntiAffinity_HardLeavesSurplusPending(t *testing.T) {
 	t.Log("Creating a Valkey CR with hard anti-affinity over a single spread domain")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"antiAffinity": map[string]interface{}{
 			"mode":        "hard",
 			"topologyKey": singleDomainTopologyKey,

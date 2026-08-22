@@ -24,6 +24,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // annotationOperatorVersion is the annotation set by the operator on every
@@ -45,7 +47,7 @@ func TestE2E_Upgrade_OperatorVersionAnnotation(t *testing.T) {
 	name := "ann-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR")
@@ -138,7 +140,7 @@ func TestE2E_Upgrade_RBACDrift(t *testing.T) {
 	name := "rbac-test"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 	})
 
 	t.Log("Creating standalone Valkey CR")
@@ -226,8 +228,8 @@ func TestE2E_Upgrade_SentinelQuorumDuringRollingUpdate(t *testing.T) {
 	defer cleanup()
 
 	name := "quorum-test"
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),

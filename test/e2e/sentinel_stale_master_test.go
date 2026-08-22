@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 	name := "stale-m"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
 			"replicas": int64(3),

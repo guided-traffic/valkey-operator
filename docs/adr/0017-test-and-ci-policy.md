@@ -10,6 +10,15 @@ The `generated-manifests` CI job has since run green on a runner, but only its p
 ([ADR 0014](0014-rbac-lives-in-three-places.md)) — a CI run outcome observed in the Actions UI,
 not reproducible from this repository, which carries the workflow definition and no run record.
 
+Amended 2026-08-22: **D42 and D43 are new.** The operator runs shell inside an image it does
+not build, and nothing checked that the image still contained what the shell executes -- the
+unit tier stubs `timeout` away because macOS lacks it, and the integration tier runs no
+container at all. A fourth tier (`make test-image-tools`) now asks the real images, and the
+Valkey images the suites run against are pinned in one file that Renovate maintains. The
+declared tool list found three dependencies its own author had missed on a careful read
+(`sed`, `seq`, `valkey-sentinel`), which is why the list is guarded from both sides rather
+than hand-maintained.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -351,6 +360,51 @@ stop between the two commits sees the operator evaluating evidence that cannot e
 documentation and CRD field names — regardless of the language used in conversation. Mixed-language
 identifiers in the public API can never be renamed without a breaking change.
 
+**D42 — The image the operator runs shell in is a dependency, and it is checked like one.**
+`internal/builder` generates two init container scripts, an auth-wrapped container command,
+exec probes and a drain preStop hook; all of them run inside the upstream Valkey image.
+`RequiredImageTools` names what they execute and `test/imagetools` asks the pinned images
+whether they provide it (`make test-image-tools`, its own CI job). It needs docker and no
+cluster, so it answers in seconds and names the missing binary rather than surfacing minutes
+later as a cluster that will not converge.
+
+No existing tier could answer this. The unit tier executes the generated scripts against the
+developer's shell and stubs `timeout` because macOS does not ship it
+(`internal/builder/init_script_exec_test.go`); the integration tier runs envtest, which has
+no kubelet and therefore no container. Only a real image can say what is in a real image.
+
+**The list is guarded from both sides, because a hand-maintained one is theatre.**
+`TestRequiredImageTools_CoversTheGeneratedScripts` walks every exec command the builder puts
+into a container that runs the Valkey image and fails on a tool the list does not name; the
+converse test fails on a declared tool nothing uses. Its limit is stated where it lives: a
+script reaching for something outside the recognised command vocabulary passes unseen. The
+guard earned its place immediately -- it found `sed`, `seq` and `valkey-sentinel` missing
+from a list assembled by reading the same scripts, and `sed` is the one whose absence is
+silent, because it substitutes the Sentinel password placeholder.
+
+**D43 — The Valkey images the suites run against are pinned in one file, and CI carries a
+selector rather than a copy.** `test/testimages` holds the current Valkey 9 release (the
+default for every suite) and the current Valkey 8 release (the second e2e leg, and the start
+of every upgrade the suite performs). Renovate keeps both current and is capped per major by
+`allowedVersions`, so crossing to a future major stays a decision rather than an arriving
+pull request.
+
+The e2e matrix passes `E2E_VALKEY_LINE=8`, not an image, and an unrecognised value panics
+instead of falling back. A copy of the pin in the workflow would have to move in lockstep,
+and the failure mode of it lagging is the one this ADR keeps closing elsewhere: a leg that
+goes green while testing something other than what it claims.
+
+**Only the tiers that pull an image are pinned.** Unit and integration never do, so their
+image strings are fixtures whose only requirement is to differ from one another; pinning them
+would churn dozens of call sites on every bump without changing a byte that executes.
+
+**The rolling-update pair is the two pinned lines**, latest 8 to latest 9, rather than two
+tags of one line. Both ends stay current without a third pin Renovate cannot maintain, and
+the tests double as continuous proof that the upgrade users will actually perform loses no
+data. Accepted cost: a genuine cross-major replication break upstream turns these tests red
+for something that is not this operator -- information worth having before a support request
+rather than after one.
+
 ## Consequences
 
 * Every fix costs an extra build-and-run cycle for the mutation check, and the result is
@@ -481,6 +535,20 @@ Rejected: the wrong statement keeps being read, and the analysis and the status 
 Rejected: it contaminates the pass's own verification.
 
 ## Residual risks
+
+* **The drift guard sees only a vocabulary (D42).** `shellCommandCatalog` covers the
+  coreutils and busybox applets a container script realistically uses. A generated script
+  that calls something outside it is not noticed, and the image check then never asks for
+  that tool.
+* **The tool check proves presence, not behaviour (D42).** `command -v` finds a busybox
+  applet as readily as the GNU tool, and the two differ in flags. The shell-construct test
+  covers the constructs the scripts rely on; it does not cover, for example, a `timeout`
+  with a different signature. Executing the real scripts inside the image was considered and
+  deferred as disproportionate for the observed risk.
+* **Only the two pinned images are checked (D42).** `spec.image` is a user field with no
+  operator default, so a cluster may run any image -- `valkey/valkey:9-alpine` being the
+  realistic one. Measured on 2026-08-22: that variant provides every required tool. Nothing
+  keeps it that way, and nothing checks it on a schedule.
 
 * **The abandon-path e2e has never been executed (open).** Its load-bearing premise — a replica
   with `masterauth` set against a master with no `requirepass` must abort the handshake at AUTH
