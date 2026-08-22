@@ -97,7 +97,7 @@ func newReconcilerWithInterceptor(
 		WithScheme(s).
 		WithObjects(objs...).
 		WithStatusSubresource(&vkov1.Valkey{}, &appsv1.StatefulSet{}).
-		WithInterceptorFuncs(funcs).
+		WithInterceptorFuncs(withStatefulSetUID(funcs)).
 		Build()
 	return &ValkeyReconciler{
 		Client:          c,

@@ -25,6 +25,7 @@ import (
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
 	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
 // The write half of docs/adr/0020-write-only-what-the-operator-owns.md: a generated
@@ -907,4 +908,276 @@ func TestDeleteIfOwned_ToleratesAReplacementUnderTheName(t *testing.T) {
 	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, owned)
 
 	assert.NoError(t, r.deleteIfOwned(context.Background(), v, owned, "metrics Service"))
+}
+
+// --- pods: the NA63 half of ADR 0020 ---
+//
+// A pod is the only managed object whose controller is not the CR, so the proof runs
+// pod -> StatefulSet -> CR (D9). The three doors these tests cover are deliberately
+// unequal: the network commands need labels, a per-pod DNS record and the password,
+// while the Patch and the sidecar grant need only the label set.
+
+// foreignPod returns a pod that carries this cluster's full data-pod label set — so
+// every label selector in the operator matches it — and no controller ownerReference
+// at all. That is the shape of a stray: an object nothing of ours created, sitting
+// under a name or a selector the operator reads.
+func foreignPod(v *vkov1.Valkey, name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: v.Namespace,
+			Labels:    common.PodLabels(v, common.ComponentValkey, name, common.RoleMaster, nil),
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "app", Image: "registry.example/theirs:1"},
+		}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+// --- the grant door ---
+
+func TestReconcileSidecarRole_DoesNotGrantPatchOnAForeignPod(t *testing.T) {
+	// The sharpest of the three: no network, no password, no DNS. A pod carrying the
+	// selector labels used to land in the Role's resourceNames, which hands this
+	// cluster's sidecar token `patch` on somebody else's pod — and a patch reaches the
+	// instanceRole label the -rw Service selects on and the drain stamp the
+	// steady-state resolver consumes as evidence.
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 1 })
+	stray := foreignPod(v, "test-stray")
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{},
+		withDataStatefulSet([]client.Object{v, stray})...)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	mustReconcileSidecarRole(t, r, v)
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, role))
+	require.Len(t, role.Rules, 1)
+	assert.NotContains(t, role.Rules[0].ResourceNames, "test-stray",
+		"a pod this cluster's StatefulSet did not create must never enter the grant")
+	assert.Equal(t, []string{"test-0"}, role.Rules[0].ResourceNames,
+		"the desired half is name-derived and stays; only the live half is filtered")
+	require.Len(t, rec.withReason(reasonPodNotOwned), 1,
+		"this step is the family's one reporter (ADR 0020 D9)")
+}
+
+// --- the API-write door ---
+
+func TestClearDrainStamps_LeavesAForeignPodAlone(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	stray := foreignPod(v, "test-stray")
+	stray.Annotations = map[string]string{common.AnnotationDrainPromotedAt: "2026-08-22T10:00:00Z"}
+	r, c := newTestReconciler(withDataStatefulSet([]client.Object{v, stray})...)
+
+	r.clearDrainStamps(context.Background(), v)
+
+	got := &corev1.Pod{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: stray.Name, Namespace: "default"}, got))
+	assert.Contains(t, got.Annotations, common.AnnotationDrainPromotedAt,
+		"clearing a stamp is a Patch, and a Patch onto a foreign pod is a write we cannot make")
+}
+
+// --- the label-selection door ---
+
+func TestSteadyStateSplitBrain_IgnoresAForeignMasterLabeledPod(t *testing.T) {
+	// One real master plus a stray carrying the master label is not a split brain.
+	// Without the filter the count reads two, and the resolver demotes — with
+	// REPLICAOF, against a pod that is not ours, on behalf of a cluster that was
+	// healthy.
+	v := steadyStateFixture(2, 0)
+	r, _, v := wire(t, v,
+		masterLabeledPod(v, 0, common.RoleMaster),
+		foreignPod(v, "test-stray"))
+	checker := newRolesChecker(allMasters("test-0"))
+	r.InstanceChecker = checker
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	var dialed []string
+	wireDemotionTarget(t, r, &dialed)
+
+	_, done, err := r.checkSteadyStateSplitBrain(context.Background(), v)
+
+	require.NoError(t, err)
+	assert.False(t, done, "a single owned master is a healthy cluster, not a split brain")
+	assert.Empty(t, dialed, "nothing may receive REPLICAOF")
+}
+
+// --- the network-command door ---
+
+func TestCheckAndRecoverNoMaster_RefusesAPodItCannotProve(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	mock := &mockInstanceChecker{
+		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
+		},
+	}
+	// Pod-0 is a stray, pod-1 is ours: every pod answers "replica", which is exactly
+	// the unanimous verdict that would promote pod-0 with REPLICAOF NO ONE.
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.StatefulSetName(v, common.ComponentValkey),
+			Namespace: v.Namespace,
+			UID:       testStsUID(v, common.ComponentValkey),
+		},
+	}
+	controllerRefTo(v, sts)
+	pod1 := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	r, c := newTestReconciler(v, sts, foreignPod(v, "test-0"), pod1)
+	r.InstanceChecker = mock
+
+	recovered, err := r.checkAndRecoverNoMaster(context.Background(), v)
+
+	require.NoError(t, err)
+	assert.False(t, recovered, "an unproven pod counts as unreachable, and that aborts the verdict")
+
+	updated := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: "test", Namespace: "default"}, updated))
+	assert.NotEqual(t, vkov1.ValkeyPhaseError, updated.Status.Phase,
+		"the phase write happens only once the promotion is actually decided")
+}
+
+// --- the rolling update: refuse and report, rather than treat as absent ---
+
+func TestCollectPodStates_RefusesAForeignPod(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	sts := stsForValkey(v)
+	r, _ := newTestReconciler(v, sts, foreignPod(v, "test-0"), podFromStsTemplate(v, sts, 1))
+
+	_, _, err := r.collectPodStates(context.Background(), v, sts)
+
+	require.Error(t, err, "this slice feeds four of the six pod deletes")
+	assert.ErrorIs(t, err, errForeignObject)
+}
+
+func TestCheckAndHandleRollingUpdate_RefusesAForeignPod(t *testing.T) {
+	// The NA61 StatefulSet guard proves the wrong object for this decision: a foreign
+	// pod differs from the persisted template by construction, so the very next step
+	// would classify it as outdated and schedule it for deletion.
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	sts := stsForValkey(v)
+	r, c := newTestReconciler(v, sts, foreignPod(v, "test-0"), podFromStsTemplate(v, sts, 1))
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), v)
+
+	require.Error(t, result.Error)
+	assert.ErrorIs(t, result.Error, errForeignObject)
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: "test-0", Namespace: "default"}, &corev1.Pod{}),
+		"the foreign pod must survive the pass")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_RefusesAForeignPod(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	sentinelSts := buildTestSentinelSts(v)
+	stray := foreignPod(v, common.StatefulSetName(v, common.ComponentSentinel)+"-0")
+	r, c := newTestReconciler(v, sentinelSts, stray,
+		createSentinelPod(v, 1, sentinelTestNewImage, true),
+		createSentinelPod(v, 2, sentinelTestNewImage, true))
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+
+	require.Error(t, result.Error)
+	assert.ErrorIs(t, result.Error, errForeignObject)
+
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: stray.Name, Namespace: "default"}, &corev1.Pod{}))
+}
+
+// --- the delete itself ---
+
+// TestDeleteOwnedPod_SendsTheUIDPrecondition pins what keeps the provenance decision
+// and the delete on the same object. The rolling update deletes pods it intends to
+// see recreated, which is exactly the window in which a name changes hands
+// (ADR 0006 D8).
+func TestDeleteOwnedPod_SendsTheUIDPrecondition(t *testing.T) {
+	v := newTestValkey("test", "default")
+	sts := stsForValkey(v)
+	pod := podFromStsTemplate(v, sts, 0)
+	pod.UID = "pod-0-uid"
+
+	var seen []client.DeleteOption
+	funcs := interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.DeleteOption) error {
+			seen = opts
+			return cl.Delete(ctx, obj)
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, sts, pod)
+
+	require.NoError(t, r.deleteOwnedPod(context.Background(), pod))
+
+	require.Len(t, seen, 1)
+	precondition, ok := seen[0].(client.Preconditions)
+	require.True(t, ok, "the delete must carry a UID precondition")
+	require.NotNil(t, precondition.UID)
+	assert.Equal(t, pod.UID, *precondition.UID)
+}
+
+func TestDeleteOwnedPod_ToleratesAReplacementUnderTheName(t *testing.T) {
+	v := newTestValkey("test", "default")
+	sts := stsForValkey(v)
+	pod := podFromStsTemplate(v, sts, 0)
+	funcs := interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object,
+			_ ...client.DeleteOption) error {
+			return apierrors.NewConflict(
+				schema.GroupResource{Resource: "pods"}, pod.Name, errors.New("uid mismatch"))
+		},
+	}
+	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, sts, pod)
+
+	assert.NoError(t, r.deleteOwnedPod(context.Background(), pod),
+		"the pod that decision was about is already gone; the caller requeues and re-reads")
+}
+
+// TestReconcileSidecarRole_GrantsNothingLiveWhenTheStatefulSetIsForeign pins the
+// second hop of the proof on its own. The pod here is a perfectly good child of the
+// StatefulSet under the generated name — its controller reference matches — but that
+// StatefulSet is not this Valkey's, so the chain pod -> StatefulSet -> CR breaks at
+// the far end and the pod is no more ours than the StatefulSet is (ADR 0020 D9).
+func TestReconcileSidecarRole_GrantsNothingLiveWhenTheStatefulSetIsForeign(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 1 })
+	foreignSts := foreignStatefulSet(common.StatefulSetName(v, common.ComponentValkey))
+	foreignSts.UID = "someone-elses-sts-uid"
+
+	// A real child of that foreign StatefulSet, carrying this cluster's selector
+	// labels so every List in the operator matches it.
+	yes := true
+	stray := foreignPod(v, "test-stray")
+	stray.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Kind:       "StatefulSet",
+		Name:       foreignSts.Name,
+		UID:        foreignSts.UID,
+		Controller: &yes,
+	}}
+
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreignSts, stray)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	mustReconcileSidecarRole(t, r, v)
+
+	role := &rbacv1.Role{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
+	}, role))
+	require.Len(t, role.Rules, 1)
+	assert.Equal(t, []string{"test-0"}, role.Rules[0].ResourceNames,
+		"an ownerReference to a StatefulSet this Valkey does not control proves nothing")
+	require.Len(t, rec.withReason(reasonPodNotOwned), 1)
 }

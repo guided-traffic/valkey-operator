@@ -82,6 +82,7 @@ func newTestReconciler(objs ...client.Object) (*ValkeyReconciler, client.Client)
 		WithScheme(s).
 		WithObjects(objs...).
 		WithStatusSubresource(&vkov1.Valkey{}, &appsv1.StatefulSet{}).
+		WithInterceptorFuncs(stampStatefulSetUID()).
 		Build()
 
 	return &ValkeyReconciler{
@@ -930,7 +931,13 @@ func newLegacySentinelSecret(name, namespace string) *corev1.Secret {
 func stagedSentinelStatefulSet(v *vkov1.Valkey, name, tlsSecretName string) *appsv1.StatefulSet {
 	replicas := int32(3)
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "iam", Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  "iam",
+			Generation: 1,
+			// The pod guards compare against this UID; readySentinelPods points at it.
+			UID: types.UID(name + "-sts-uid"),
+		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
 			Template: corev1.PodTemplateSpec{
@@ -961,6 +968,7 @@ func stagedSentinelStatefulSet(v *vkov1.Valkey, name, tlsSecretName string) *app
 // "rev-new" controller-revision-hash that stagedSentinelStatefulSet exposes,
 // used to model a rolled-out fleet.
 func readySentinelPods(stsName string, count int32) []client.Object {
+	yes := true
 	pods := make([]client.Object, 0, count)
 	for i := int32(0); i < count; i++ {
 		pods = append(pods, &corev1.Pod{
@@ -968,6 +976,13 @@ func readySentinelPods(stsName string, count int32) []client.Object {
 				Name:      fmt.Sprintf("%s-%d", stsName, i),
 				Namespace: "iam",
 				Labels:    map[string]string{appsv1.StatefulSetRevisionLabel: "rev-new"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: appsv1.SchemeGroupVersion.String(),
+					Kind:       "StatefulSet",
+					Name:       stsName,
+					UID:        types.UID(stsName + "-sts-uid"),
+					Controller: &yes,
+				}},
 			},
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{
@@ -2827,7 +2842,13 @@ func TestCheckAndRecoverNoMaster_RecoverWhenAllReplicas(t *testing.T) {
 			return &valkeyclient.ReplicationInfo{Role: "slave"}, nil
 		},
 	}
-	r, c := newTestReconciler(v)
+	// The recovery reasons from pods, so they have to exist and be provably this
+	// cluster's: a pod it cannot prove counts as unreachable and aborts the verdict
+	// (ADR 0020 D9).
+	r, c := newTestReconciler(v,
+		createPodForSts(v, 0, "valkey/valkey:8.0", true),
+		createPodForSts(v, 1, "valkey/valkey:8.0", true),
+		createPodForSts(v, 2, "valkey/valkey:8.0", true))
 	r.InstanceChecker = mock
 
 	// First reconcile to create the resources.

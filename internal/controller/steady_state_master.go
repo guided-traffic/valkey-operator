@@ -185,6 +185,13 @@ func (r *ValkeyReconciler) checkSteadyStateSplitBrain(ctx context.Context, v *vk
 // controller-runtime cache (the Pod informer already exists: every reconcile Gets
 // pods in checkAndHandleRollingUpdate), so the healthy case costs no API call and
 // no Valkey connection.
+// A pod this cluster's StatefulSet did not create is filtered out and never
+// reaches the caller (ADR 0020 D9). Both directions of that matter. The resolver
+// this feeds issues REPLICAOF, the data-discarding command the whole master
+// authority is built to contain, so a foreign pod must never be a demotion target.
+// And the count itself is load-bearing: one labeled master is a healthy cluster and
+// two are a split brain, so an unfiltered stray would turn a healthy cluster into a
+// resolution that demotes a real master.
 func (r *ValkeyReconciler) listMasterLabeledPods(ctx context.Context, v *vkov1.Valkey) ([]corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList,
@@ -193,7 +200,14 @@ func (r *ValkeyReconciler) listMasterLabeledPods(ctx context.Context, v *vkov1.V
 	); err != nil {
 		return nil, err
 	}
-	return podList.Items, nil
+
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		return nil, err
+	}
+
+	owned, _ := filterOwnedPods(podList.Items, sts)
+	return owned, nil
 }
 
 // adoptUnrecordedPromotion reconciles the known-master annotation with a single,
@@ -333,6 +347,17 @@ func (r *ValkeyReconciler) recreatedAfter(ctx context.Context, v *vkov1.Valkey,
 	if err := r.Get(ctx, types.NamespacedName{Name: later, Namespace: v.Namespace}, pod); err != nil {
 		log.FromContext(ctx).Info("Cannot read the recorded master pod; treating the creation order as unknown",
 			"pod", later, "error", err)
+		return false
+	}
+
+	// A pod this cluster's StatefulSet did not create is the same answer as a missing
+	// one: unknown, which reads as false here (ADR 0020 D9). The creation-order rule
+	// may only ever refuse a demotion, never grant an adoption, so failing closed on
+	// an unproven pod keeps the rule on the side it is allowed to be wrong.
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil || !podIsOurs(pod, sts) {
+		log.FromContext(ctx).Info("Cannot prove the recorded master pod belongs to this cluster; "+
+			"treating the creation order as unknown", "pod", later)
 		return false
 	}
 	if !earlier.CreationTimestamp.Before(&pod.CreationTimestamp) {
@@ -670,8 +695,21 @@ func (r *ValkeyReconciler) clearDrainStamps(ctx context.Context, v *vkov1.Valkey
 		return
 	}
 
-	for i := range podList.Items {
-		pod := &podList.Items[i]
+	// The cheapest of the pod doors: this is a Patch on whatever carries the selector
+	// labels, with no network, no password and no DNS in the way (ADR 0020 D9). A
+	// List error above is already handled as "clear nothing"; a StatefulSet this
+	// Valkey does not own reaches the same place, because filterOwnedPods keeps
+	// nothing against a nil StatefulSet.
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		logger.Info("Could not read the data StatefulSet to prove pod provenance; leaving the "+
+			"drain-promotion stamps in place", "cluster", v.Name, "error", err)
+		return
+	}
+	owned, _ := filterOwnedPods(podList.Items, sts)
+
+	for i := range owned {
+		pod := &owned[i]
 		if _, stamped := pod.Annotations[common.AnnotationDrainPromotedAt]; !stamped {
 			continue
 		}

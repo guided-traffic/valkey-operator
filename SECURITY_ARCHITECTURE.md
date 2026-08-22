@@ -240,14 +240,22 @@ password.
   or a cert-manager Certificate it did not verify, so a CR deletion can no longer
   garbage-collect a foreign object it adopted by name.
 
-  Two gaps remain. **The guard protects only forward:** an object a *previous*
-  release already stamped passes the ownership check, and nothing in the object
-  distinguishes it from a genuine child — the same Update replaced its labels and
-  wrote the operator-version annotation. Look before upgrading; there is no
-  detection. And the **pod door** is untouched: two steady-state paths probe and
-  command pods derived from the CR name or selected by label without verifying
-  their controller, bounded only by the CR's own auth credentials — tracked as
-  NA63.
+  Pods are covered too, since the NA63 amendment: a pod's controller is its
+  StatefulSet rather than the CR, so the proof runs `pod -> StatefulSet -> CR`
+  (ADR 0020 D9). That closed three unequal doors — the sidecar Role granting
+  `patch` on a foreign pod, an annotation Patch onto one, and the rolling update
+  reading, counting and **deleting** one. Only the first of those needed anything
+  beyond the label set.
+
+  Two gaps remain, both stated rather than fixed. **The guards protect only
+  forward:** an object a *previous* release already stamped passes the ownership
+  check, and nothing in the object distinguishes it from a genuine child — the same
+  Update replaced its labels and wrote the operator-version annotation. Look before
+  upgrading; there is no detection. And **upstream adoption bounds the pod guard:**
+  the statefulset-controller adopts an orphan pod that matches its selector and
+  stamps its own controller reference, so a pod built to carry a cluster's label set
+  and left without a controller becomes genuinely that cluster's by Kubernetes' own
+  rules. The guard closes collisions and strays, not a deliberate mimic.
 - **Namespace is not a trust boundary for the operator itself.** It watches and
   writes everywhere.
 
@@ -526,13 +534,18 @@ analysis.
       child, so this cannot be automated: compare the ServiceMonitors and
       Certificates under `<cr>` names against what you expect the operator to have
       created, in every namespace that runs a Valkey.
-- [ ] **Verify pod provenance before steady-state Valkey commands (NA63).**
-      `checkAndRecoverNoMaster` probes pods `<cr>-0..N-1` by derived name and can
-      promote pod-0; `checkSteadyStateSplitBrain` demotes pods selected by the
-      master label. Neither checks who controls those pods. The CR's auth
-      credentials bound the blast radius — a foreign Valkey with its own password
-      refuses the commands — but a CR without `spec.auth` aimed at unauthenticated
-      foreign pods has no backstop.
+- [x] **Verify pod provenance before touching, granting on, or deleting a pod
+      (NA63)** ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D9,
+      done 2026-08-22). Filed as the two steady-state command paths; the audit found
+      three doors and the filed one was the most expensive to use, since it needs the
+      label set, a per-pod headless DNS record and the CR password. The two cheaper
+      ones needed only labels: `clearDrainStamps` **patched** every label-matching
+      pod, and `listDataPodNames` put them into the `resourceNames` of the sidecar
+      Role, handing this cluster's sidecar token `patch` on a stranger's pod. The
+      destructive one was the rolling update, which reads pods by generated name and
+      deletes them at six call sites — the NA61 StatefulSet guard did not cover it,
+      because a StatefulSet can be provably ours while the pod under `<cr>-N` is not.
+      All are guarded now, and the six deletes carry the UID precondition.
 - [ ] **Give the workload pods a securityContext.** `runAsNonRoot`,
       `readOnlyRootFilesystem` where the data path allows it, `drop: [ALL]`,
       `seccompProfile: RuntimeDefault` — the operator already runs that way itself.

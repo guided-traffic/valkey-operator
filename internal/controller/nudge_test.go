@@ -33,9 +33,13 @@ const nudgeTestReplicas int32 = 3
 func newNudgeStatefulSet(v *vkov1.Valkey, name string, created int32) *appsv1.StatefulSet {
 	desired := nudgeTestReplicas
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: nudgeTestNamespace},
-		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
-		Status:     appsv1.StatefulSetStatus{Replicas: created},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: nudgeTestNamespace,
+			UID:       stsUIDFor(name),
+		},
+		Spec:   appsv1.StatefulSetSpec{Replicas: &desired},
+		Status: appsv1.StatefulSetStatus{Replicas: created},
 	}
 	controllerRefTo(v, sts)
 	return sts

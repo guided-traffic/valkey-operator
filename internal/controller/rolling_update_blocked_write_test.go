@@ -36,7 +36,9 @@ func stsForValkey(v *vkov1.Valkey) *appsv1.StatefulSet {
 	sts.Spec.Replicas = &replicas
 	sts.Status.Replicas = replicas
 	sts.Status.ReadyReplicas = replicas
-	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent, and the pod
+	// guards compare against this UID.
+	sts.UID = testStsUID(v, common.ComponentValkey)
 	controllerRefTo(v, sts)
 	return sts
 }
@@ -60,7 +62,7 @@ func podFromStsTemplate(v *vkov1.Valkey, sts *appsv1.StatefulSet, ordinal int) *
 		})
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        fmt.Sprintf("%s-%d", sts.Name, ordinal),
 			Namespace:   v.Namespace,
@@ -76,6 +78,8 @@ func podFromStsTemplate(v *vkov1.Valkey, sts *appsv1.StatefulSet, ordinal int) *
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 		},
 	}
+	podOwnedBySts(sts, pod)
+	return pod
 }
 
 func podExists(t *testing.T, c client.Client, name string) bool {

@@ -16,6 +16,14 @@ not verify, `replicaConfigMaster` treats a foreign ConfigMap as absent under D8,
 three name-only deletes in the ADR 0006 residual list carry the provenance proof and the UID
 precondition. **D7 is superseded in full** and marked in place.
 
+**Amended 2026-08-22 (NA63):** the rule reaches **pods**, whose controller is the
+StatefulSet rather than the CR, through the two-hop proof of the new D9. Three doors are
+closed: the sidecar Role no longer grants `patch` on a pod this cluster's StatefulSet did not
+create, `clearDrainStamps` no longer patches one, and the rolling update no longer reads,
+counts or **deletes** one — its six pod deletes now carry the ADR 0006 UID precondition.
+`listMasterLabeledPods`, `replicaConfigMaster`, `recreatedAfter`, `checkAndRecoverNoMaster`
+and `sentinelRolloutComplete` all treat an unproven pod as absent.
+
 Implemented on branch `feat/support-pdb`, in the same change as this ADR. Fourteen reconcile
 paths carry the guard — `reconcileObserverServiceAccount`, `reconcileSidecarServiceAccount`,
 `reconcileSidecarRole`, `reconcileSidecarRoleBinding`, `reconcileStatefulSet`,
@@ -53,7 +61,7 @@ PodDisruptionBudgets. On the reconcile write path `reconcilePodDisruptionBudget`
 ([`internal/controller/pdb.go`](../../internal/controller/pdb.go)) is the only managed kind
 that checks `metav1.IsControlledBy` before writing.
 
-Four concrete failures made that gap worth closing. All four were read from the code on this
+Five concrete failures made that gap worth closing. All five were read from the code on this
 branch; none is a report of an object observed being damaged on a cluster.
 
 * **The grant follows the name, not the object.** `BuildSidecarRoleBinding` writes
@@ -112,6 +120,29 @@ branch; none is a report of an object observed being damaged on a cluster.
   share the ownerReference half: they call `SetControllerReference` on `desired` only and
   never touch `current.OwnerReferences`. They still overwrite a foreign object's
   `spec.selector`, `Data` or policy rules, which is why they are bound here too.
+
+* **(2026-08-22, NA63) Pods were reachable through three separate doors, and the one that
+  was filed is the most expensive to use.** The filing named the network commands —
+  `checkAndRecoverNoMaster` probing `<cr>-0..N-1` and `checkSteadyStateSplitBrain` demoting
+  label-selected pods with `REPLICAOF`. Those go through `podAddress`
+  ([`internal/health/checker.go`](../../internal/health/checker.go)), so reaching a foreign
+  pod needs this cluster's label set, a per-pod record under the headless Service **and** the
+  CR's password. The two doors nobody had filed need only the label set:
+
+  * `clearDrainStamps`
+    ([`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go))
+    listed by selector labels and **patched** every match — no network, no password, no DNS.
+  * `listDataPodNames` fed `SidecarRolePodNames`, whose result is the `resourceNames` of the
+    sidecar Role ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)). A pod
+    carrying the labels therefore entered the grant, and this cluster's sidecar token got
+    `patch` on somebody else's pod. That is D3 mirrored: there the grant followed the name of
+    the *subject*, here it followed the name of the *object*.
+
+  And the destructive one: the rolling update reads pods by generated name and deletes them.
+  The NA61 StatefulSet guard does not cover it, because it proves the wrong object — a
+  StatefulSet can be provably ours while a pod under `<cr>-N` was created by somebody else,
+  and a foreign pod differs from our persisted template by construction, so the very next
+  step classifies it as outdated and schedules it for deletion.
 
 ## Decision
 
@@ -340,6 +371,44 @@ A sweep of the remaining kinds found no third consumer: nothing reads back a Ser
 NetworkPolicy, a ServiceMonitor or a Certificate to derive a decision from it. The one
 Certificate reader, `deleteLegacySentinelCertificate`, was already ownership-checked.
 
+**D9 — A pod is proven two-hop, and the proof is the StatefulSet.** *(2026-08-22, NA63.)* A
+pod is the only managed object whose controller is not the CR: the statefulset-controller
+creates it and stamps itself. So the chain is `pod -> StatefulSet -> CR`, `podIsOurs(pod, sts)`
+against a StatefulSet D1 has already proven, and every link compares a UID rather than a name
+([`internal/controller/foreign_object.go`](../../internal/controller/foreign_object.go)).
+
+The fail direction splits by door, on the same D2 question:
+
+| Path | Direction |
+|---|---|
+| `listDataPodNames` (the sidecar grant), `listMasterLabeledPods`, `clearDrainStamps` | filter the pod out |
+| `checkAndRecoverNoMaster`, `recreatedAfter`, `sentinelRolloutComplete`, `replicaConfigMaster` | treat as absent, which each already reads as "unknown" and fails closed on |
+| the rolling update: `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handlePostManualFailover`, `checkAndHandleSentinelRollingUpdate` | refuse and fail the step |
+
+The rolling update is the one that fails rather than filters, because treat-as-absent maps
+onto its existing `exists=false, needsUpdate=true` branch and would leave it waiting for a pod
+that can never appear, reporting "waiting for pod-N" while the truth is "a foreign object
+holds that name". A collision clears only when a human acts, which is the same argument D5
+makes for `ForeignObject` outranking a transient cause. Failing keeps the rolling-update state
+annotation in place, so its bounded waits stay armed
+([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)).
+
+**One reporter, and it is not the rolling update.** `reconcileSidecarRole` runs on every pass
+and lists the data pods anyway, so it emits the `PodNotOwned` Warning for the whole family at
+no extra read; every filtering path stays quiet. The rolling update emits no Event of its own —
+its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
+message — so a collision produces one Event series per pass, the same rule D8 sets.
+
+**Two things D9 deliberately does not do.** The `resourceNames` of the sidecar Role keep the
+*desired* half, `<cr>-0..N-1` derived from `spec.replicas` before those pods exist; that half
+is load-bearing for scale-up (D3, and the comment on `SidecarRolePodNames`), and a name under
+which no pod of ours can ever exist is a name our own StatefulSet is blocked on anyway. And
+the guard does not survive upstream adoption: the statefulset-controller adopts orphan pods
+matching its selector and stamps its own controller reference, so a pod built to carry this
+cluster's label set and left without a controller becomes genuinely ours by Kubernetes' own
+rules. D9 closes collisions and strays, not a deliberate mimic. That adoption behaviour is
+read from the API contract and reproduced nowhere in this repo.
+
 ## Consequences
 
 * **A name collision is now a hard, visible stop for the sidecar.** A CR whose name aims at an
@@ -390,6 +459,25 @@ Certificate reader, `deleteLegacySentinelCertificate`, was already ownership-che
   nothing checked ownership. They now stamp it. Two of them asserted the *opposite* of the
   new rule ("a missing owner reference must be restored") and were rewritten: an object
   without a controller reference is foreign, and restoring one is precisely what D1 forbids.
+
+* **(2026-08-22, NA63) A pod that exists only in the checker's imagination is no longer an
+  answer.** `checkAndRecoverNoMaster` used to accept a probe reply for a pod name whether or
+  not the API server had such a pod; now it reads the object first. That is stricter than the
+  old behaviour by design — a no-master verdict is what promotes pod-0 with `REPLICAOF NO ONE`
+  — and it surfaced as a unit test that had been asserting the recovery with no pods staged
+  at all.
+* **(2026-08-22, NA63) The rolling update stops on a colliding pod instead of deleting it.**
+  A cluster whose `<cr>-N` is held by a foreign pod now reports `ReconcileBlocked/ForeignObject`
+  and phase `Error` rather than quietly rolling. It could not have completed either way — the
+  statefulset-controller cannot create its own pod under a taken name — but the failure is now
+  the reported one rather than a rollout that never finishes.
+* **(2026-08-22, NA63) Every pod fixture in the unit tests had to declare its parent.** The
+  suite staged pods built straight from literals, and the fake client assigns no UID, so a
+  StatefulSet the reconciler created under test had an empty one. Both halves are fixed
+  centrally: fixtures point at a deterministic `<sts-name>-sts-uid`, and a Create interceptor
+  stamps the same string on a StatefulSet the fake client creates. Without the second half the
+  tests would have measured the fixture rather than the guard — the trap `newTestValkey`
+  already documents for the CR's own UID.
 
 ## Alternatives Considered
 
@@ -468,6 +556,30 @@ as their siblings**, for one uniform rule per function. Rejected: it would put a
 refused for the observer. The cost is that two fail directions live in callers rather than in
 the reconciler — stated in D2 so it reads as a decision and not as an inconsistency.
 
+**(NA63) Prove a pod by its labels and its ordinal name** instead of by its parent — the pod
+carries the full operator label set and its name matches `<cr>-N` for `N < spec.replicas`.
+Rejected for the third time in this ADR, and for the same reason as the StatefulSet
+auto-re-own: a label is not a proof, and here it would have been the only one. It also needs
+no extra read, which is exactly what makes it tempting.
+
+**(NA63) Prove a pod by an ownerReference naming a StatefulSet** without looking that
+StatefulSet up. Rejected: the comparison would hang on the StatefulSet's *name*, which is what
+the CR author chooses — ADR 0006 D2's mistake, rebuilt one level down. The test that pins this
+stages a pod which is a perfectly valid child of a foreign StatefulSet under the generated
+name.
+
+**(NA63) Treat a foreign pod as absent inside the rolling update**, the way D8 treats a
+foreign StatefulSet, reusing the `exists=false, needsUpdate=true` branch that its NotFound case
+already has. Genuinely close, and it is the method D8 states. Rejected because the resulting
+wait is honest about the wrong thing: the operator would report "waiting for pod-N to be
+recreated" forever, while what happened is that a foreign object holds the name and no amount
+of waiting fixes it.
+
+**(NA63) Close only the two doors the finding named.** Rejected once the other two were read:
+the network commands need labels, a DNS record and the password, while the `clearDrainStamps`
+patch and the sidecar grant need only the label set — and the grant is the one that hands a
+capability to a stranger rather than merely touching them.
+
 **Amend ADR 0006 instead of writing this one.** Its D2 and D11 are already the rules a refusal
 needs, and its residual list is where the RoleBinding item lived. Rejected on two counts: the
 title would have to widen from "delete only" to "touch only", which means renaming the file
@@ -509,7 +621,14 @@ that alters nothing a user asked for.
   unverified. It is not a new door — a CR author can already name any Secret in the namespace
   through `spec.tls.secretName` and `spec.auth.secretName` — but it is not closed by this
   ADR either.
-* **The pod door is untouched (NA63).** The StatefulSet guards close every action derived
+* **(Closed 2026-08-22, NA63) The pod door is untouched.** All three doors are guarded by D9,
+  and the rolling update's pod deletes carry the UID precondition. What remains open is stated
+  in D9 and repeated here: the `resourceNames` desired half, and upstream adoption of a
+  label-matching orphan.
+* ~~**The pod door is untouched (NA63).**~~ *(Superseded 2026-08-22 by D9; kept because its
+  last two sentences are the bound that still applies to the pods D9 cannot prove either way,
+  and because it names only two of the three doors that were actually there.)* The StatefulSet
+  guards close every action derived
   *from the StatefulSet object*, but two steady-state paths derive pods from the CR alone:
   `checkAndRecoverNoMaster` probes `<cr>-0..N-1` by name and can promote pod-0, and
   `checkSteadyStateSplitBrain` acts on whatever pods carry the master label — both without
@@ -561,6 +680,19 @@ that alters nothing a user asked for.
   [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) and
   [`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go)
   (`replicaConfigMaster`) — the D8 treat-as-absent consumers.
+* The D9 pod paths: `podIsOurs`, `ownedDataStatefulSet`, `podUnderNameIsOurs`,
+  `filterOwnedPods` and `deleteOwnedPod` in
+  [`internal/controller/foreign_object.go`](../../internal/controller/foreign_object.go);
+  `listDataPodNames`, `probeForAnyMaster` and `sentinelRolloutComplete` in
+  [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go);
+  `listMasterLabeledPods`, `clearDrainStamps` and `recreatedAfter` in
+  [`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go);
+  the five pod reads and six pod deletes in
+  [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go).
+* [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `SidecarRolePodNames`, whose
+  live half D9 filters and whose desired half it deliberately leaves alone.
+* [`internal/health/checker.go`](../../internal/health/checker.go) — `podAddress`, which is
+  why the network door needs a per-pod DNS record on top of the labels.
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) —
   `reconcileBlockedReason` and its precedence.
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — the name-based subject and

@@ -694,6 +694,7 @@ func readyStatefulSetFor(v *vkov1.Valkey, replicas int32) *appsv1.StatefulSet {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.StatefulSetName(v, common.ComponentValkey),
 			Namespace: v.Namespace,
+			UID:       testStsUID(v, common.ComponentValkey),
 		},
 		Spec: appsv1.StatefulSetSpec{Replicas: &desired},
 		Status: appsv1.StatefulSetStatus{
@@ -718,7 +719,7 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 		})
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: v.Namespace,
@@ -740,6 +741,8 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 			Conditions: conditions,
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod)
+	return pod
 }
 
 func TestCheckAndHandleRollingUpdate_NoUpdateNeeded(t *testing.T) {
@@ -1265,6 +1268,7 @@ func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ha-post",
 			Namespace: "default",
+			UID:       stsUIDFor("ha-post"),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -1895,6 +1899,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 
 	r, c := newTestReconciler(v, pod0)
 	reconcileOnce(t, r, "test", "default")
@@ -1944,6 +1949,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 	pod1 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "default"},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{
@@ -1957,6 +1963,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod1)
 	pod2 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-2", Namespace: "default"},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{
@@ -1970,6 +1977,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_MultiReplica_DeletesPod
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod2)
 
 	r, c := newTestReconciler(v, pod0, pod1, pod2)
 	reconcileOnce(t, r, "test", "default")
@@ -2012,6 +2020,7 @@ func TestHandleStandaloneRollingUpdate_ValkeyImageChange_StillDeletesPod(t *test
 			},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod0)
 
 	r, c := newTestReconciler(v, pod0)
 	reconcileOnce(t, r, "test", "default")
@@ -2175,7 +2184,7 @@ func createSentinelPod(v *vkov1.Valkey, ordinal int, image string, ready bool) *
 			Status: corev1.ConditionTrue,
 		})
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", stsName, ordinal),
 			Namespace: v.Namespace,
@@ -2185,6 +2194,8 @@ func createSentinelPod(v *vkov1.Valkey, ordinal int, image string, ready bool) *
 		}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: conditions},
 	}
+	ownedByTestSts(v, common.ComponentSentinel, pod)
+	return pod
 }
 
 // buildTestSentinelSts creates a minimal sentinel StatefulSet whose desired container
@@ -2205,7 +2216,9 @@ func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 			},
 		},
 	}
-	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent, and the pod
+	// guards compare against this UID.
+	sts.UID = testStsUID(v, common.ComponentSentinel)
 	controllerRefTo(v, sts)
 	return sts
 }

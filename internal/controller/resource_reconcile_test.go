@@ -37,6 +37,79 @@ func ownedByValkey(t *testing.T, v *vkov1.Valkey, obj client.Object) {
 	require.NoError(t, controllerutil.SetControllerReference(v, obj, testScheme()))
 }
 
+// stampStatefulSetUID gives a StatefulSet the fake client creates the same
+// deterministic UID a staged fixture carries.
+//
+// The fake client assigns no UID at all, and the pod guards compare exactly that
+// field (metav1.IsControlledBy ignores name and kind mismatches only after the UID
+// matches). Without this, a StatefulSet the reconciler created under test would have
+// an empty UID, every pod fixture pointing at testStsUID would read as foreign, and
+// the tests would be measuring the fixture rather than the guard.
+func stampStatefulSetUID() interceptor.Funcs {
+	return withStatefulSetUID(interceptor.Funcs{})
+}
+
+// withStatefulSetUID adds the UID stamp to an existing set of interceptors without
+// displacing a Create the caller supplied.
+func withStatefulSetUID(funcs interceptor.Funcs) interceptor.Funcs {
+	inner := funcs.Create
+	funcs.Create = func(ctx context.Context, cl client.WithWatch, obj client.Object,
+		opts ...client.CreateOption) error {
+		if sts, ok := obj.(*appsv1.StatefulSet); ok && sts.UID == "" {
+			sts.UID = types.UID(sts.Name + "-sts-uid")
+		}
+		if inner != nil {
+			return inner(ctx, cl, obj, opts...)
+		}
+		return cl.Create(ctx, obj, opts...)
+	}
+	return funcs
+}
+
+// testStsUID is the UID every fixture StatefulSet carries and every fixture pod
+// points at. It is deterministic so a pod fixture can be built without the
+// StatefulSet object in hand, and it is non-empty for the reason newTestValkey gives
+// for the CR: metav1.IsControlledBy compares UIDs, so with an empty one on both sides
+// an ownership check passes without testing anything.
+func testStsUID(v *vkov1.Valkey, component string) types.UID {
+	return stsUIDFor(common.StatefulSetName(v, component))
+}
+
+// stsUIDFor is testStsUID for fixtures that name their StatefulSet directly. The
+// suffix is the same string withStatefulSetUID stamps, so a hand-built StatefulSet
+// and a reconciler-created one are indistinguishable to the pod guards.
+func stsUIDFor(name string) types.UID {
+	return types.UID(name + "-sts-uid")
+}
+
+// The two must agree: a pod fixture built without the StatefulSet in hand points at
+// testStsUID, and a StatefulSet the reconciler creates gets the same string from
+// withStatefulSetUID.
+
+// ownedByTestSts stamps the controller ownerReference the statefulset-controller puts
+// on the pods it creates, matching testStsUID. For fixtures that do have the
+// StatefulSet object in hand, podOwnedBySts below is the same thing via the scheme.
+func ownedByTestSts(v *vkov1.Valkey, component string, pod *corev1.Pod) {
+	yes := true
+	pod.OwnerReferences = append(pod.OwnerReferences, metav1.OwnerReference{
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Kind:       "StatefulSet",
+		Name:       common.StatefulSetName(v, component),
+		UID:        testStsUID(v, component),
+		Controller: &yes,
+	})
+}
+
+// podOwnedBySts stamps the controller ownerReference the statefulset-controller puts
+// on every pod it creates. A pod fixture needs it: the pod guards prove provenance
+// two-hop, pod -> StatefulSet -> CR, so a pod without it reads as foreign
+// (docs/adr/0020-write-only-what-the-operator-owns.md D9).
+func podOwnedBySts(sts *appsv1.StatefulSet, pod *corev1.Pod) {
+	if err := controllerutil.SetControllerReference(sts, pod, testScheme()); err != nil {
+		panic(err)
+	}
+}
+
 // controllerRefTo is ownedByValkey for fixture constructors that have no *testing.T.
 // The scheme is fixed, so the only error SetControllerReference can return here is a
 // programming mistake — worth a panic, not a threaded error.
@@ -1408,7 +1481,8 @@ func TestReconcileSidecarRole_KeepsTerminatingPodsInTheGrant(t *testing.T) {
 		masterLabeledPod(v, 3, common.RoleReplica),
 		masterLabeledPod(v, 4, common.RoleReplica),
 	}
-	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, append([]client.Object{v}, pods...)...)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{},
+		withDataStatefulSet(append([]client.Object{v}, pods...))...)
 
 	mustReconcileSidecarRole(t, r, v)
 

@@ -960,19 +960,34 @@ func (r *ValkeyReconciler) reconcileSidecarServiceAccount(ctx context.Context, v
 // listDataPodNames returns the names of the pods that currently carry this cluster's
 // data-pod selector labels, including pods that are terminating — a pod on its way out
 // is exactly the one whose sidecar still needs to patch.
-func (r *ValkeyReconciler) listDataPodNames(ctx context.Context, v *vkov1.Valkey) ([]string, error) {
+// A pod that merely carries the selector labels is not one of ours, and this list
+// is not only read: it becomes the resourceNames of the sidecar Role, so an
+// unfiltered entry hands this cluster's sidecar `patch` on somebody else's pod. That
+// is ADR 0020 D3 mirrored — there the grant followed the name of the subject, here it
+// would follow the name of the object. The refused names are returned rather than
+// logged, because this function's one caller is the family's single reporter (D9).
+func (r *ValkeyReconciler) listDataPodNames(
+	ctx context.Context, v *vkov1.Valkey,
+) (names []string, refused []string, err error) {
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList,
 		client.InNamespace(v.Namespace),
 		client.MatchingLabels(common.SelectorLabels(v, common.ComponentValkey)),
 	); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	names := make([]string, 0, len(podList.Items))
-	for i := range podList.Items {
-		names = append(names, podList.Items[i].Name)
+
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		return nil, nil, err
 	}
-	return names, nil
+
+	owned, refused := filterOwnedPods(podList.Items, sts)
+	names = make([]string, 0, len(owned))
+	for i := range owned {
+		names = append(names, owned[i].Name)
+	}
+	return names, refused, nil
 }
 
 // reconcileSidecarRole creates or updates the sidecar Role.
@@ -988,9 +1003,18 @@ func (r *ValkeyReconciler) listDataPodNames(ctx context.Context, v *vkov1.Valkey
 // whatever it grants; binding to one would grant the sidecar whatever it carries.
 func (r *ValkeyReconciler) reconcileSidecarRole(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
-	livePodNames, err := r.listDataPodNames(ctx, v)
+	livePodNames, refusedPods, err := r.listDataPodNames(ctx, v)
 	if err != nil {
 		return false, fmt.Errorf("listing data pods for the sidecar Role: %w", err)
+	}
+	// The one reporter for the pod family (ADR 0020 D9). This step is wired
+	// unconditionally and lists the data pods anyway, so the Event costs no extra
+	// read, and every other filtering path stays quiet — one Event series per pass,
+	// the same rule D8 sets for the StatefulSet.
+	for _, name := range refusedPods {
+		r.warnForeignObject(ctx, v, reasonPodNotOwned, "Pod", name,
+			"it carries this cluster's labels but was not created by its StatefulSet: the operator "+
+				"will not grant the sidecar patch on it, command it, or count it")
 	}
 	desired := builder.BuildSidecarRole(v, livePodNames)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
@@ -1608,6 +1632,14 @@ func (r *ValkeyReconciler) sentinelRolloutComplete(ctx context.Context, v *vkov1
 				return false, nil
 			}
 			return false, fmt.Errorf("get sentinel pod %s: %w", podName, err)
+		}
+		// A pod this StatefulSet did not create proves nothing about the rollout, and
+		// this verdict gates deleting the legacy Sentinel Secret. Reporting "not
+		// complete" is the same direction the missing-pod branch above takes, and it
+		// keeps the deletion deferred rather than justified by a stranger's revision
+		// label (ADR 0020 D9).
+		if !podIsOurs(pod, sts) {
+			return false, nil
 		}
 		if pod.Labels[appsv1.StatefulSetRevisionLabel] != sts.Status.UpdateRevision {
 			return false, nil
@@ -2383,6 +2415,36 @@ func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vko
 //
 // Returns (true, nil) if recovery was performed, (false, nil) if no recovery needed,
 // or (false, err) if an error occurred during detection or recovery.
+// probeForAnyMaster asks every pod of the cluster whether it is the master and
+// reports the two facts the recovery decision needs: whether one said yes, and how
+// many could not be asked.
+//
+// A pod sts did not create counts as unreachable rather than as an answer: that is
+// the branch the caller already fails closed on, and it keeps an unproven pod from
+// ever contributing to the unanimous no-master verdict that promotes pod-0
+// (docs/adr/0020-write-only-what-the-operator-owns.md, D9).
+func (r *ValkeyReconciler) probeForAnyMaster(
+	ctx context.Context, v *vkov1.Valkey, sts *appsv1.StatefulSet, stsName string,
+	checker InstanceChecker,
+) (hasMaster bool, unreachable int) {
+	for i := int32(0); i < v.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		if !r.podUnderNameIsOurs(ctx, v, podName, sts) {
+			unreachable++
+			continue
+		}
+		info, err := checker.GetReplicationInfo(ctx, v, podName)
+		if err != nil {
+			unreachable++
+			continue
+		}
+		if info.Role == common.RoleMaster {
+			return true, unreachable
+		}
+	}
+	return false, unreachable
+}
+
 func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1.Valkey) (bool, error) {
 	logger := log.FromContext(ctx)
 
@@ -2395,24 +2457,19 @@ func (r *ValkeyReconciler) checkAndRecoverNoMaster(ctx context.Context, v *vkov1
 	checker := r.getInstanceChecker()
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 
-	// Check that all pods are reachable before drawing conclusions.
-	// If any pod is unreachable, we cannot reliably determine cluster topology.
-	hasMaster := false
-	unreachable := 0
-	for i := int32(0); i < v.Spec.Replicas; i++ {
-		podName := fmt.Sprintf("%s-%d", stsName, i)
-		info, err := checker.GetReplicationInfo(ctx, v, podName)
-		if err != nil {
-			unreachable++
-			continue
-		}
-		if info.Role == common.RoleMaster {
-			hasMaster = true
-			break
-		}
+	// The promotion this function can reach is REPLICAOF NO ONE on pod-0, so every
+	// pod it draws a conclusion from has to be proven ours first (ADR 0020 D9). A
+	// StatefulSet this Valkey does not own leaves nothing to recover — the data plane
+	// is not provisioned and reconcileStatefulSet is already reporting that.
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		return false, fmt.Errorf("reading the data StatefulSet: %w", err)
+	}
+	if sts == nil {
+		return false, nil
 	}
 
-	if hasMaster || unreachable > 0 {
+	if hasMaster, unreachable := r.probeForAnyMaster(ctx, v, sts, stsName, checker); hasMaster || unreachable > 0 {
 		return false, nil
 	}
 

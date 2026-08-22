@@ -186,6 +186,17 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			}
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
+		// The NA61 guard above proves the StatefulSet, which is the wrong object for
+		// this decision: a pod holding <cr>-N was not necessarily created by it, and a
+		// foreign one differs from our persisted template by construction, so the very
+		// next step would classify it as outdated and schedule it for deletion. The
+		// refusal fails the step rather than treating the pod as absent, because a name
+		// nothing of ours can ever occupy clears only when a human acts, and the failure
+		// leaves the rolling-update state annotation in place so its bounded waits keep
+		// being driven (ADR 0020 D9, ADR 0010).
+		if !podIsOurs(pod, currentSts) {
+			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
+		}
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash, currentSts.Spec.Template.Spec.Containers) {
 			needsRollingUpdate = true
@@ -1250,6 +1261,11 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 			} else {
 				return nil, -1, fmt.Errorf("getting pod %s: %w", podName, err)
 			}
+		} else if !podIsOurs(pod, currentSts) {
+			// The choke point for four of the six pod deletes below: everything that
+			// deletes a pod takes it from this slice, so proving provenance once here
+			// covers them all (ADR 0020 D9).
+			return nil, -1, foreignObjectError("Pod", podName)
 		} else {
 			ps.pod = pod
 			ps.exists = true
@@ -1354,7 +1370,7 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valk
 		"Deleting replica pod %s for rolling update (youngest-first)", ps.name)
 
 	logger.Info("Deleting replica pod for rolling update", "pod", ps.name)
-	if err := r.Delete(ctx, ps.pod); err != nil {
+	if err := r.deleteOwnedPod(ctx, ps.pod); err != nil {
 		return &RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
 	}
 	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -1722,7 +1738,7 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 		}
 
 		logger.Info("Deleting remaining pod for rolling update", "pod", ps.name)
-		if err := r.Delete(ctx, ps.pod); err != nil {
+		if err := r.deleteOwnedPod(ctx, ps.pod); err != nil {
 			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
 		}
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -2385,6 +2401,9 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			}
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
+		if !podIsOurs(pod, currentSts) {
+			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
+		}
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg, configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
 			// For sidecar-only changes in true standalone mode (single replica),
@@ -2406,7 +2425,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 				fmt.Sprintf("Replacing pod %s with new image", podName))
 
 			logger.Info("Deleting pod for standalone rolling update", "pod", podName)
-			if err := r.Delete(ctx, pod); err != nil {
+			if err := r.deleteOwnedPod(ctx, pod); err != nil {
 				return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", podName, err)}
 			}
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -2576,7 +2595,7 @@ func (r *ValkeyReconciler) deleteNextPendingPod(ctx context.Context, pods []podS
 			continue
 		}
 		logger.Info("Deleting remaining pod for rolling update", "pod", ps.name)
-		if err := r.Delete(ctx, ps.pod); err != nil {
+		if err := r.deleteOwnedPod(ctx, ps.pod); err != nil {
 			return RollingUpdateResult{Error: fmt.Errorf("deleting pod %s: %w", ps.name, err)}
 		}
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
@@ -2640,7 +2659,7 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 	r.recordEvent(v, corev1.EventTypeNormal, "ManualFailover",
 		"Promoted %s to temporary master, deleting old master %s", promotedPod.name, pods[masterIdx].name)
 	logger.Info("Deleting old master pod after manual failover", "pod", pods[masterIdx].name)
-	if err := r.Delete(ctx, pods[masterIdx].pod); err != nil {
+	if err := r.deleteOwnedPod(ctx, pods[masterIdx].pod); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("deleting master pod %s: %w", pods[masterIdx].name, err)}
 	}
 
@@ -2813,6 +2832,16 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 				fmt.Sprintf("%s was never recreated after the failover", masterPodName))
 		}
 		return RollingUpdateResult{Error: fmt.Errorf("getting master pod %s: %w", masterPodName, err)}
+	}
+	// This function decides that the failover finished and the cluster is back to
+	// normal; a pod that is not ours must never be the evidence for that
+	// (ADR 0020 D9).
+	sts, stsErr := r.ownedDataStatefulSet(ctx, v)
+	if stsErr != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("reading the data StatefulSet: %w", stsErr)}
+	}
+	if !podIsOurs(masterPod, sts) {
+		return RollingUpdateResult{Error: foreignObjectError("Pod", masterPodName)}
 	}
 
 	// Skip pods that are being terminated (old pod not yet removed).
@@ -3346,6 +3375,9 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 			}
 			return RollingUpdateResult{Error: fmt.Errorf("getting sentinel pod %s: %w", podName, err)}
 		}
+		if !podIsOurs(pod, sentinelSts) {
+			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
+		}
 		if isPodReady(pod) {
 			readyCount++
 		}
@@ -3367,7 +3399,7 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 	}
 
 	logger.Info("Deleting sentinel pod for rolling update", "pod", firstOutdatedPod.Name)
-	if err := r.Delete(ctx, firstOutdatedPod); err != nil {
+	if err := r.deleteOwnedPod(ctx, firstOutdatedPod); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", firstOutdatedPod.Name, err)}
 	}
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}

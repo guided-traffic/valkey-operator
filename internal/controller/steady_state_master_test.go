@@ -58,7 +58,7 @@ import (
 // selects on, i.e. what the sidecar leaves behind after labeling a pod.
 func masterLabeledPod(v *vkov1.Valkey, ordinal int, role string) *corev1.Pod {
 	name := fmt.Sprintf("%s-%d", v.Name, ordinal)
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: v.Namespace,
@@ -69,6 +69,8 @@ func masterLabeledPod(v *vkov1.Valkey, ordinal int, role string) *corev1.Pod {
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 		},
 	}
+	ownedByTestSts(v, common.ComponentValkey, pod)
+	return pod
 }
 
 // drainStamped adds what internal/sidecar/drain.go stamps onto the pod it promoted
@@ -122,11 +124,11 @@ func splitBrainFixture() (*vkov1.Valkey, []client.Object) {
 			builder.AnnotationKnownMaster: podHost("test", 1),
 		}
 	})
-	return v, []client.Object{
+	return v, withDataStatefulSet([]client.Object{
 		v,
 		createdAt(masterLabeledPod(v, 0, common.RoleMaster), 12*24*time.Hour),
 		createdAt(masterLabeledPod(v, 1, common.RoleMaster), 9*24*time.Hour),
-	}
+	})
 }
 
 // steadyStateFixture builds a non-Sentinel CR of the given size whose known-master
@@ -143,10 +145,46 @@ func steadyStateFixture(replicas, knownOrdinal int) *vkov1.Valkey {
 
 // wire builds the reconciler over the fixture objects and returns the CR as the
 // API server holds it, i.e. with a resourceVersion the annotation writes need.
+// wire builds a reconciler over objs and hands back the CR as the client stores it.
+//
+// It injects the data StatefulSet when the caller did not stage one. The pod guards
+// prove provenance two-hop -- pod -> StatefulSet -> CR -- so without that object every
+// pod fixture reads as foreign and gets filtered out before the check under test ever
+// sees it (docs/adr/0020-write-only-what-the-operator-owns.md D9). The injected object
+// is deliberately minimal: name, namespace, UID and the controller reference, which is
+// everything the provenance chain reads and nothing that would pull a test into the
+// rolling-update paths.
 func wire(t *testing.T, objs ...client.Object) (*ValkeyReconciler, client.Client, *vkov1.Valkey) {
 	t.Helper()
+	objs = withDataStatefulSet(objs)
 	r, c := newTestReconciler(objs...)
 	return r, c, crGet(t, c, "test")
+}
+
+// withDataStatefulSet appends the minimal owned data StatefulSet unless objs already
+// carries one.
+func withDataStatefulSet(objs []client.Object) []client.Object {
+	var v *vkov1.Valkey
+	for _, o := range objs {
+		if _, ok := o.(*appsv1.StatefulSet); ok {
+			return objs
+		}
+		if cr, ok := o.(*vkov1.Valkey); ok {
+			v = cr
+		}
+	}
+	if v == nil {
+		return objs
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.StatefulSetName(v, common.ComponentValkey),
+			Namespace: v.Namespace,
+			UID:       testStsUID(v, common.ComponentValkey),
+		},
+	}
+	controllerRefTo(v, sts)
+	return append(objs, sts)
 }
 
 // rolesChecker answers INFO replication from a pod-name -> role map. A name that

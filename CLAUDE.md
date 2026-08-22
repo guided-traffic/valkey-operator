@@ -328,7 +328,13 @@ inherits it, not an exemption**: guard the write, decide the fail direction by "
 the job it was asked to do", give the kind its own Event reason, and guard the delete with the
 UID precondition (`deleteIfOwned`). If a second code path reads or acts on the object, that
 path treats a foreign one as absent and stays quiet — the reconciler is the one reporter.
-→ [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes and grants),
+
+**Pods are the exception to who the controller is, not to the rule.** The StatefulSet creates
+them, so the proof is two-hop: `podIsOurs(pod, sts)` against a StatefulSet already proven,
+never a label and never a name. It binds touching a pod, deleting one, and putting its name
+into the sidecar Role — that grant follows the name of the *object*, so an unfiltered pod hands
+this cluster's sidecar `patch` on a stranger's pod.
+→ [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes, grants and pods),
 [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
 
 ## Metrics / Exporter

@@ -23,6 +23,12 @@ of `cleanupObserverDeployment` went with the NA61 amendment of ADR 0020; `cleanu
 the NA62 one. All four now prove ownership with `IsControlledBy` and send
 `client.Preconditions{UID: …}`, through the shared `deleteIfOwned` in
 [`internal/controller/foreign_object.go`](../../internal/controller/foreign_object.go).
+Amended 2026-08-22 again: the **pod** deletes are covered. The rolling update deletes pods at
+six call sites, selected by generated name and gated only on the StatefulSet being ours — the
+wrong object for that decision. [ADR 0020](0020-write-only-what-the-operator-owns.md) D9 proves
+the pod itself two-hop and routes all six through `deleteOwnedPod`, which sends the D8 UID
+precondition and treats Conflict as "already gone" rather than as a failure.
+
 **One item stays open**: `deleteLegacyServices`, which scans ownerReferences but takes its
 Delete without a UID precondition and accepts any ownerReference rather than the controller
 one — see Residual risks.
