@@ -660,7 +660,7 @@ that alters nothing a user asked for.
   verifying the pods' controller. The commands authenticate with the CR's credentials, so a
   foreign Valkey with its own password refuses them and the probe failure blocks the
   recovery path; a CR *without* `spec.auth` aimed at unauthenticated foreign pods has no
-  such backstop. Filed as NA63 in `local_valkey_operator_admission_gap.md`.
+  such backstop. Tracked as NA63; closed 2026-08-22 by D9.
 * **The selector-immutability backstop was never reproduced.** The claim that a
   template-write onto a selector-mismatched StatefulSet is rejected by the apiserver is
   upstream behaviour read from the API contract. It stopped being load-bearing with this
