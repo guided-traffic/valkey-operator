@@ -30,7 +30,7 @@ func TestDropResolvedSyncRetries(t *testing.T) {
 			kept: false,
 		},
 		{
-			// The exact ordering that turned the single-node leg red: one refusal
+			// The exact ordering that turned the Valkey 9 leg red: one refusal
 			// while pod-0 was still binding its port, then the sync that followed.
 			name: "the startup ordering that flaked in CI is dropped",
 			logs: []string{

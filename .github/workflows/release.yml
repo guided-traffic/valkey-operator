@@ -35,17 +35,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Historical leg: the full suite on a single-node cluster.
-          - topology: single-node
+          # Valkey 9 leg: the full suite on a single-node cluster, against the
+          # line that is also the default. The selector is spelled out rather
+          # than left empty, because a leg whose name claims a line must not
+          # follow the default when the default moves - that is how a leg goes
+          # green while testing something other than what it says.
+          # The cluster keeps the Makefile default name, so reproducing this leg
+          # locally is `make e2e-local` with nothing overridden.
+          - topology: single-node-valkey9
             workers: 0
             cluster: valkey-operator-test
             run_filter: ""
             require_multi_node: "false"
-            valkey_line: ""
+            valkey_line: "9"
           # Multi-node leg: re-runs only the scenarios whose outcome depends on the
           # node count - eviction serialization and anti-affinity spread.
           # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
           # multi-node clusters, so spreading three replicas needs three workers.
+          # It follows the default Valkey line on purpose: what this leg varies is
+          # the node count, and it should not need a bump when the default moves.
           - topology: multi-node
             workers: 3
             cluster: valkey-operator-test-multinode
@@ -118,7 +126,7 @@ jobs:
           nodes:
           - role: control-plane
           EOF
-            # One worker line per matrix worker; the single-node leg emits none.
+            # One worker line per matrix worker; the single-node legs emit none.
             worker=0
             while [ "${worker}" -lt "${KIND_WORKERS}" ]; do
               echo "- role: worker"
@@ -459,9 +467,9 @@ jobs:
         run: kind delete cluster --name "${KIND_CLUSTER}" || true
 
   # Branch protection requires the status context "E2E Tests". The matrix legs
-  # report as "E2E Tests (single-node)" / "E2E Tests (multi-node)", so this gate
-  # job carries the stable context and fails unless every leg succeeded. Keeps
-  # the required check independent of future matrix reshaping.
+  # report as "E2E Tests (<topology>)" - one context per leg, renamed whenever a
+  # leg is - so this gate job carries the stable context and fails unless every
+  # leg succeeded. Keeps the required check independent of matrix reshaping.
   e2e-gate:
     name: E2E Tests
     runs-on: self-hosted

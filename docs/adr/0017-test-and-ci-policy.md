@@ -19,9 +19,13 @@ declared tool list found three dependencies its own author had missed on a caref
 (`sed`, `seq`, `valkey-sentinel`), which is why the list is guarded from both sides rather
 than hand-maintained.
 
-Amended 2026-08-22: **D44 is new.** `TestE2E_TLS_HACluster` failed on the single-node leg
+Amended 2026-08-22: **D44 is new.** `TestE2E_TLS_HACluster` failed on the Valkey 9 leg
 because a replica logged one refused SYNC connect while pod-0 was still binding its TLS port,
 and the log scan treated "Connection refused" as a critical error wherever it appeared.
+
+Amended 2026-08-22: **D31 is restated.** The matrix has three legs, not two, since D43 added
+the Valkey 8 leg, and the leg that runs the default line is now named for it
+(`single-node-valkey9`) and carries `E2E_VALKEY_LINE=9` rather than an empty selector.
 
 ## Context
 
@@ -297,11 +301,19 @@ not optional, and names what to check beyond PASS/FAIL.
 
 ### CI topology
 
-**D31 — E2E runs as a two-leg matrix with an aggregating gate job.** `single-node` runs the
-full suite; `multi-node` (control-plane + **3** workers) runs
-`E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'`. The legs run in parallel on
-separate runner pods with distinct cluster names. A separate `e2e-gate` job named "E2E Tests"
-aggregates both, so the pre-existing required status check keeps one stable name.
+**D31 — E2E runs as a three-leg matrix with an aggregating gate job.**
+~~Two legs, the full-suite one named `single-node`~~ (superseded 2026-08-22, when D43 added the
+third leg): `single-node-valkey9` runs the full suite; `multi-node` (control-plane + **3**
+workers) runs `E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'`;
+`single-node-valkey8` runs the full suite against the other pinned line. The legs run in
+parallel on separate runner pods with distinct cluster names. A separate `e2e-gate` job named
+"E2E Tests" aggregates all of them, so the pre-existing required status check keeps one stable
+name while legs are renamed or added.
+
+**A leg named after a Valkey line passes that line explicitly**, never an empty selector that
+resolves to the default. Both spellings run the same image today; they differ on the day the
+default moves, and then the empty one reports a green Valkey 9 leg that ran Valkey 10. The
+multi-node leg does follow the default, deliberately — what it varies is the node count.
 
 **D32 — Three workers, never two.** Kind removes the control-plane `NoSchedule` taint only on
 single-node clusters, so 2 workers plus a tainted control plane leaves 2 schedulable nodes and
@@ -310,7 +322,7 @@ exactly the defect it was written to fix.
 
 **D33 — Every cluster-setup step is node-count agnostic**, derived from `KIND_WORKERS`: the
 kind config renders one worker line per worker via an explicit `while` loop (`seq` counts
-*down* on BSD and emitted two workers for the single-node leg), and the sysctl step, the image
+*down* on BSD and emitted two workers for the zero-worker leg), and the sysctl step, the image
 import and the kube-proxy settings all loop over `kind get nodes`. The image import matters
 specifically because the operator runs with `pullPolicy: Never`, so on a multi-node cluster its
 pod can land on any worker.
@@ -449,7 +461,7 @@ ordering that failed CI, including the two cases where the line must survive
 * A genuinely broken budget takes up to three attempts (~95 s) to report (D26).
 * Two Kind clusters per CI run; the multi-node leg costs ~6 min (observed in the Actions UI, no
   run record in this repository) and three extra node containers
-  (control-plane + 3 workers against the single-node leg's one).
+  (control-plane + 3 workers against a single-node leg's one).
   Renaming a guarded test requires updating the grep and `E2E_RUN` in the same change.
 * The repo's headline coverage number is permanently capped by the wiring boundary (D34), and
   the exhaustive 0% list must be re-stated each pass so the gap stays a decision.
