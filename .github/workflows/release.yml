@@ -413,12 +413,30 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
+          # 100 lines covered about four minutes of a busy suite, which put the
+          # message of the failing reconcile out of reach and left only its stack
+          # trace -- the whole reason the TopologyRestored defect took a second
+          # run to diagnose. The operator logs one line per pass and per CR.
           echo "=== Operator logs ==="
-          kubectl -n valkey-operator-system logs -l app.kubernetes.io/name=valkey-operator --tail=100 || true
+          kubectl -n valkey-operator-system logs -l app.kubernetes.io/name=valkey-operator --tail=2000 || true
           echo "=== Describe pods ==="
           kubectl -n valkey-operator-system describe pods || true
           echo "=== Events ==="
           kubectl -n valkey-operator-system get events --sort-by='.lastTimestamp' || true
+          # Pod logs of the test namespaces. Only the operator was ever collected,
+          # so a defect that lives in the sidecar -- the drain handler failing over
+          # a dying master is the one that matters -- left no artifact at all. The
+          # drain runs while the pod terminates, so --previous is the half that
+          # carries it once the replacement is up.
+          echo "=== Test namespace pod logs ==="
+          for ns in $(kubectl get ns -o name | sed 's|namespace/||' | grep '^e2e-'); do
+            for pod in $(kubectl -n "$ns" get pods -o name | sed 's|pod/||'); do
+              echo "--- $ns/$pod (current) ---"
+              kubectl -n "$ns" logs "$pod" --all-containers --prefix --tail=300 2>&1 || true
+              echo "--- $ns/$pod (previous) ---"
+              kubectl -n "$ns" logs "$pod" --all-containers --prefix --previous --tail=300 2>&1 || true
+            done
+          done
 
       - name: Cleanup Kind cluster
         if: always()
