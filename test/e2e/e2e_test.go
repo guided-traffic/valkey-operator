@@ -293,6 +293,41 @@ func (tc *testClients) waitForPodReady(t *testing.T, namespace, name string) {
 	require.NoError(t, err, "Pod %s/%s did not become ready", namespace, name)
 }
 
+// waitForPodRecreated waits until the named pod exists under a UID other than the
+// one it carried before it was deleted, and is Ready.
+//
+// It exists because the obvious wait is not one. A StatefulSet counts a terminating
+// pod in status.readyReplicas until the kubelet reports it gone, so
+// waitForStatefulSetReady returns immediately after a delete -- observed at 106 ms
+// in CI, with the deleted pod still running -- and every assertion that follows
+// measures the pod that is on its way out. The UID is the only field that
+// distinguishes the replacement from the original.
+func (tc *testClients) waitForPodRecreated(t *testing.T, namespace, name string, previousUID types.UID) {
+	t.Helper()
+	ctx := context.Background()
+
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
+		pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if pod.UID == previousUID {
+			return false, nil
+		}
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	require.NoError(t, err,
+		"Pod %s/%s was not replaced by a new, ready pod (previous UID %s)", namespace, name, previousUID)
+}
+
 // getStatefulSet retrieves a StatefulSet.
 func (tc *testClients) getStatefulSet(t *testing.T, namespace, name string) *appsv1.StatefulSet {
 	t.Helper()

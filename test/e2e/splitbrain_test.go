@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,7 +11,20 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
+
+// annotationDrainPromotedAtKey is the stamp the sidecar drain handler writes on the
+// pod it promoted (internal/common/annotations.go, written by stampPromotion in
+// internal/sidecar/drain.go).
+const annotationDrainPromotedAtKey = "vko.gtrfc.com/drain-promoted-at"
+
+// drainPromotionTimeout bounds the wait for the drain to fail over. It is a
+// generous multiple of what the drain needs -- a promotion is one REPLICAOF NO ONE
+// against a pod that is already up -- and still well inside the time the deleted
+// pod needs to be rescheduled, which is what makes the check meaningful.
+const drainPromotionTimeout = time.Minute
 
 // TestE2E_NoSentinel_MasterKill_NoSplitBrain is a regression test for the
 // split-brain scenario observed after a chaos-monkey run: when a non-sentinel
@@ -71,10 +85,18 @@ func TestE2E_NoSentinel_MasterKill_NoSplitBrain(t *testing.T) {
 	// Kill the master pod. The StatefulSet controller will recreate it.
 	// The sidecar drain handler on the dying pod promotes a replica.
 	t.Run("delete master pod", func(t *testing.T) {
+		killedUID := tc.getPod(t, ns, initialMaster).UID
 		t.Logf("Deleting master pod %s", initialMaster)
 		tc.deletePod(t, ns, initialMaster)
 
-		// Wait for the pod to be recreated and the cluster to become ready.
+		// Before anything else: the drain either failed over or it did not, and
+		// every later assertion in this test is unreadable if it did not.
+		tc.requireDrainPromotedAReplica(t, ns, name, replicas, initialMaster)
+
+		// Wait for the pod to be recreated and the cluster to become ready. The
+		// StatefulSet counts the terminating pod as ready, so the replacement is
+		// waited for by UID first -- see waitForPodRecreated.
+		tc.waitForPodRecreated(t, ns, initialMaster, killedUID)
 		tc.waitForStatefulSetReady(t, ns, name, replicas)
 		tc.waitForValkeyPhase(t, ns, name, "OK")
 	})
@@ -140,4 +162,64 @@ func TestE2E_NoSentinel_MasterKill_NoSplitBrain(t *testing.T) {
 		}, 30*time.Second, 2*time.Second,
 			"New data should replicate to restarted pod %s", initialMaster)
 	})
+}
+
+// requireDrainPromotedAReplica proves that the sidecar drain handler on the dying
+// master actually failed over, while the killed pod is still away and cannot
+// confuse the picture.
+//
+// The assertion is on the promotion, not on the stamp. The stamp is the drain's own
+// signature -- nothing else writes it -- and it is polled for and reported here, but
+// it is transient: the operator clears every stamp of the cluster the moment it
+// records the promoted master (clearDrainStamps, from recordPromotedMaster), so a
+// loaded run can adopt and clear between two polls. Gating on it would trade this
+// test's failure mode for a flake.
+//
+// What cannot flake is the promotion itself. A drain that runs promotes a replica
+// within seconds, long before the deleted pod is rescheduled. A drain that does not
+// run leaves the cluster with no master at all until the killed pod returns and
+// self-claims the role from the replica ConfigMap -- with an empty dataset when
+// persistence is off, which the replicas then full-resync away. That is what CI
+// observed in run 32577672028's predecessor, and this reports it as one named
+// failure instead of three downstream ones about roles and missing keys.
+func (tc *testClients) requireDrainPromotedAReplica(t *testing.T, namespace, name string,
+	replicas int, killedPod string) {
+	t.Helper()
+
+	promoted, stamped := "", ""
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, drainPromotionTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			for i := 0; i < replicas; i++ {
+				podName := fmt.Sprintf("%s-%d", name, i)
+				if podName == killedPod {
+					continue
+				}
+				if stamped == "" {
+					pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+					if err == nil && pod.Annotations[annotationDrainPromotedAtKey] != "" {
+						stamped = podName
+					}
+				}
+				info := tc.valkeyExecQuick(t, namespace, podName, 6379, "INFO", "replication")
+				if strings.Contains(info, "role:master") {
+					promoted = podName
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+	require.NoError(t, err,
+		"no surviving pod became master within %v of deleting %s: the sidecar drain handler did not "+
+			"promote a replica, so the returning pod self-claims the role from the replica ConfigMap",
+		drainPromotionTimeout, killedPod)
+
+	if stamped == "" {
+		t.Logf("Drain promoted %s; the %s stamp was already cleared when polled",
+			promoted, annotationDrainPromotedAtKey)
+		return
+	}
+	assert.Equal(t, promoted, stamped,
+		"the drain stamp must sit on the pod that holds the master role, otherwise the operator "+
+			"adopts the wrong one on the next multi-master pass")
+	t.Logf("Drain promoted %s and stamped it with %s", promoted, annotationDrainPromotedAtKey)
 }
