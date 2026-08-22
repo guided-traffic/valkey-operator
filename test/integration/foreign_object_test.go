@@ -166,3 +166,96 @@ func TestForeignObserverServiceAccount_Integration(t *testing.T) {
 	assert.Empty(t, got.OwnerReferences,
 		"leaving it unowned is what keeps it out of this CR's garbage collection")
 }
+
+// TestForeignDataStatefulSet_Integration is the NA61 half of ADR 0020: the data
+// StatefulSet carries the bare CR name, so it is the name a pre-existing foreign
+// StatefulSet is most likely to hold. The operator must refuse the write — the
+// destructive alternative is installing its pod template into someone else's
+// workload — say so on the CR, leave the object entirely alone (no nudge patch,
+// no ownerReference), and provision its own StatefulSet by itself once the
+// collision is removed.
+func TestForeignDataStatefulSet_Integration(t *testing.T) {
+	ctx := testCtx
+	crName := "foreign-sts-test"
+	key := types.NamespacedName{Name: crName, Namespace: "default"}
+
+	replicas := int32(1)
+	foreign := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      crName,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    &replicas,
+			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": "theirs"}},
+			ServiceName: "theirs",
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "theirs"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example/theirs:1"}},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, foreign))
+
+	v := &vkov1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: "default"},
+		Spec:       vkov1.ValkeySpec{Replicas: 1, Image: "valkey/valkey:8.0"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, v))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, v) })
+
+	t.Run("the write is refused and reported", func(t *testing.T) {
+		require.Eventually(t, func() bool {
+			current := &vkov1.Valkey{}
+			if err := k8sClient.Get(ctx, key, current); err != nil {
+				return false
+			}
+			blocked := meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
+			return blocked != nil &&
+				blocked.Status == metav1.ConditionTrue &&
+				blocked.Reason == vkov1.ReasonForeignObject
+		}, 30*time.Second, 250*time.Millisecond,
+			"the collision is only actionable if the CR names it: ReconcileBlocked/ForeignObject")
+
+		current := &vkov1.Valkey{}
+		require.NoError(t, k8sClient.Get(ctx, key, current))
+		assert.Equal(t, vkov1.ValkeyPhaseError, current.Status.Phase,
+			"a CR whose data plane cannot exist must not read OK or Provisioning in kubectl get")
+
+		// The foreign StatefulSet came through untouched: template, labels,
+		// ownership — and no nudge annotation, which is also a write.
+		got := &appsv1.StatefulSet{}
+		require.NoError(t, k8sClient.Get(ctx, key, got))
+		assert.Equal(t, "registry.example/theirs:1", got.Spec.Template.Spec.Containers[0].Image,
+			"writing the pod template onto a foreign StatefulSet replaces its workload")
+		assert.Equal(t, "someone-else", got.Labels["owner"])
+		assert.Empty(t, got.OwnerReferences, "the operator must not adopt it either")
+		assert.NotContains(t, got.Annotations, builder.AnnotationNudge,
+			"the nudge patch is a write and must not land on a foreign StatefulSet")
+	})
+
+	t.Run("removing the collision provisions the operator's own StatefulSet", func(t *testing.T) {
+		require.NoError(t, k8sClient.Delete(ctx, foreign))
+
+		require.Eventually(t, func() bool {
+			got := &appsv1.StatefulSet{}
+			if err := k8sClient.Get(ctx, key, got); err != nil {
+				return false
+			}
+			return metav1.IsControlledBy(got, v)
+		}, 90*time.Second, 500*time.Millisecond,
+			"the operator has to pick itself back up and create its own StatefulSet")
+
+		require.Eventually(t, func() bool {
+			current := &vkov1.Valkey{}
+			if err := k8sClient.Get(ctx, key, current); err != nil {
+				return false
+			}
+			blocked := meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeReconcileBlocked)
+			return blocked != nil && blocked.Status == metav1.ConditionFalse
+		}, 30*time.Second, 250*time.Millisecond, "the condition must clear once the collision is gone")
+	})
+}

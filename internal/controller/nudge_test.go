@@ -28,13 +28,17 @@ const nudgeTestReplicas int32 = 3
 
 // newNudgeStatefulSet builds a StatefulSet that wants nudgeTestReplicas pods and
 // reports `created` of them in status.replicas, as the statefulset-controller would.
-func newNudgeStatefulSet(name string, created int32) *appsv1.StatefulSet {
+// It carries v's controller ownerReference: the nudge treats a StatefulSet the
+// operator does not own as absent (ADR 0020).
+func newNudgeStatefulSet(v *vkov1.Valkey, name string, created int32) *appsv1.StatefulSet {
 	desired := nudgeTestReplicas
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: nudgeTestNamespace},
 		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
 		Status:     appsv1.StatefulSetStatus{Replicas: created},
 	}
+	controllerRefTo(v, sts)
+	return sts
 }
 
 // newSentinelValkey returns a 3-replica HA Valkey CR.
@@ -122,7 +126,7 @@ func TestReconcile_KeepsNudgesOfOtherCRs(t *testing.T) {
 
 func TestNudgeShortStatefulSets_NoNudgeWhenHealthy(t *testing.T) {
 	v := newSentinelValkey()
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 3)
 	r, c := newTestReconciler(v, sts)
 
 	key := nudgeKey(sts.Name)
@@ -140,7 +144,7 @@ func TestNudgeShortStatefulSets_NoNudgeWhenHealthy(t *testing.T) {
 
 func TestNudgeShortStatefulSets_NoNudgeWithinGracePeriod(t *testing.T) {
 	v := newSentinelValkey()
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
 	r, c := newTestReconciler(v, sts)
 
 	// No tracker seeding: this is the first observation of the short state.
@@ -152,7 +156,7 @@ func TestNudgeShortStatefulSets_NoNudgeWithinGracePeriod(t *testing.T) {
 
 func TestNudgeShortStatefulSets_NudgesAfterGracePeriod(t *testing.T) {
 	v := newSentinelValkey()
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
 	r, c := newTestReconciler(v, sts)
 
 	pastGrace(r, nudgeKey(sts.Name))
@@ -167,7 +171,7 @@ func TestNudgeShortStatefulSets_NudgesAfterGracePeriod(t *testing.T) {
 
 func TestNudgeShortStatefulSets_RateLimitHonored(t *testing.T) {
 	v := newSentinelValkey()
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
 	recent := time.Now().Add(-builder.NudgeInterval / 2).UTC().Format(time.RFC3339)
 	sts.Annotations = map[string]string{builder.AnnotationNudge: recent}
 	r, c := newTestReconciler(v, sts)
@@ -182,7 +186,7 @@ func TestNudgeShortStatefulSets_RateLimitHonored(t *testing.T) {
 
 func TestNudgeShortStatefulSets_RebumpsStaleNudge(t *testing.T) {
 	v := newSentinelValkey()
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
 	stale := time.Now().Add(-builder.NudgeInterval - time.Minute).UTC().Format(time.RFC3339)
 	sts.Annotations = map[string]string{builder.AnnotationNudge: stale}
 	r, c := newTestReconciler(v, sts)
@@ -204,7 +208,7 @@ func TestNudgeShortStatefulSets_RebumpsStaleNudge(t *testing.T) {
 func TestNudgeShortStatefulSets_NudgesDataStatefulSetDuringRollingUpdate(t *testing.T) {
 	v := newSentinelValkey()
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
-	sts := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 2)
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 2)
 	r, c := newTestReconciler(v, sts)
 
 	pastGrace(r, nudgeKey(sts.Name))
@@ -221,8 +225,8 @@ func TestNudgeShortStatefulSets_NudgesSentinelStatefulSet(t *testing.T) {
 	v := newSentinelValkey()
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
 	sentinelName := common.StatefulSetName(v, common.ComponentSentinel)
-	data := newNudgeStatefulSet(dataName, 3)
-	sentinel := newNudgeStatefulSet(sentinelName, 1)
+	data := newNudgeStatefulSet(v, dataName, 3)
+	sentinel := newNudgeStatefulSet(v, sentinelName, 1)
 	r, c := newTestReconciler(v, data, sentinel)
 
 	pastGrace(r,
@@ -241,7 +245,7 @@ func TestNudgeShortStatefulSets_SkipsSentinelWhenDisabled(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
 	sentinelName := common.StatefulSetName(v, common.ComponentSentinel)
 	// A leftover Sentinel StatefulSet from a previous HA configuration.
-	sentinel := newNudgeStatefulSet(sentinelName, 0)
+	sentinel := newNudgeStatefulSet(v, sentinelName, 0)
 	r, c := newTestReconciler(v, sentinel)
 
 	pastGrace(r, nudgeKey(sentinelName))
@@ -271,8 +275,8 @@ func TestNudgeShortStatefulSets_MissingStatefulSetIsNoOp(t *testing.T) {
 func TestNudgeShortStatefulSets_ReportsShortOfPods(t *testing.T) {
 	v := newSentinelValkey()
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
-	data := newNudgeStatefulSet(dataName, 0)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	data := newNudgeStatefulSet(v, dataName, 0)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), 3)
 	r, _ := newTestReconciler(v, data, sentinel)
 
 	// Deliberately no pastGrace: the very first observation must already report the
@@ -284,8 +288,8 @@ func TestNudgeShortStatefulSets_ReportsShortOfPods(t *testing.T) {
 
 func TestNudgeShortStatefulSets_ReportsHealthy(t *testing.T) {
 	v := newSentinelValkey()
-	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	data := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 3)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), 3)
 	r, _ := newTestReconciler(v, data, sentinel)
 
 	assert.False(t, r.nudgeShortStatefulSets(context.Background(), v),
@@ -294,8 +298,8 @@ func TestNudgeShortStatefulSets_ReportsHealthy(t *testing.T) {
 
 func TestNudgeShortStatefulSets_ReportsShortSentinelOnly(t *testing.T) {
 	v := newSentinelValkey()
-	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 3)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 1)
+	data := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 3)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), 1)
 	r, _ := newTestReconciler(v, data, sentinel)
 
 	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
@@ -305,7 +309,7 @@ func TestNudgeShortStatefulSets_ReportsShortSentinelOnly(t *testing.T) {
 func TestNudgeShortStatefulSets_ReportsShortDuringRollingUpdate(t *testing.T) {
 	v := newSentinelValkey()
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
-	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 0)
+	data := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
 	r, _ := newTestReconciler(v, data)
 
 	assert.True(t, r.nudgeShortStatefulSets(context.Background(), v),
@@ -322,8 +326,8 @@ func TestNudgeShortStatefulSets_NudgesBothDuringDataRollingUpdate(t *testing.T) 
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
 	sentinelName := common.StatefulSetName(v, common.ComponentSentinel)
-	data := newNudgeStatefulSet(dataName, 2)
-	sentinel := newNudgeStatefulSet(sentinelName, 1)
+	data := newNudgeStatefulSet(v, dataName, 2)
+	sentinel := newNudgeStatefulSet(v, sentinelName, 1)
 	r, c := newTestReconciler(v, data, sentinel)
 
 	pastGrace(r, nudgeKey(dataName), nudgeKey(sentinelName))
@@ -351,6 +355,7 @@ func TestReconcileWorkload_RequeuesWhileShortOfPods(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &desired},
 		Status:     appsv1.StatefulSetStatus{Replicas: 0},
 	}
+	controllerRefTo(v, sts)
 	r, _ := newTestReconciler(v, sts)
 
 	result, err := r.reconcileWorkload(context.Background(), v)
@@ -411,7 +416,7 @@ func sentinelQuorumWaitFixture(dataCreated int32) (*vkov1.Valkey, []client.Objec
 	const outdatedImage = "valkey/valkey:8.0"
 
 	v := newSentinelValkey()
-	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), dataCreated)
+	data := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), dataCreated)
 	sentinel := buildTestSentinelSts(v)
 	sentinel.Status.Replicas = 2
 
@@ -480,8 +485,8 @@ func dataRecreationBlockedFixture() (*vkov1.Valkey, []client.Object) {
 	v.Spec.Image = "valkey/valkey:9.0"
 	v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
 
-	data := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentValkey), 2)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), nudgeTestReplicas)
+	data := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 2)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), nudgeTestReplicas)
 
 	pod0 := createPodForSts(v, 0, outdatedImage, true)
 	pod0.Labels[common.LabelInstanceRole] = common.RoleMaster
@@ -559,8 +564,8 @@ func failStatefulSetGet(name string) interceptor.Funcs {
 func TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue(t *testing.T) {
 	v := newSentinelValkey()
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
-	data := newNudgeStatefulSet(dataName, 0)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	data := newNudgeStatefulSet(v, dataName, 0)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), 3)
 	r, _ := newInterceptedReconciler(failStatefulSetGet(dataName), v, data, sentinel)
 
 	pastGrace(r, nudgeKey(dataName))
@@ -575,8 +580,8 @@ func TestNudgeShortStatefulSets_TransientGetErrorKeepsRequeue(t *testing.T) {
 func TestNudgeShortStatefulSets_TransientGetErrorKeepsObservation(t *testing.T) {
 	v := newSentinelValkey()
 	dataName := common.StatefulSetName(v, common.ComponentValkey)
-	data := newNudgeStatefulSet(dataName, 0)
-	sentinel := newNudgeStatefulSet(common.StatefulSetName(v, common.ComponentSentinel), 3)
+	data := newNudgeStatefulSet(v, dataName, 0)
+	sentinel := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentSentinel), 3)
 	r, _ := newInterceptedReconciler(failStatefulSetGet(dataName), v, data, sentinel)
 
 	pastGrace(r, nudgeKey(dataName))

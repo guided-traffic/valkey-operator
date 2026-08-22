@@ -690,7 +690,7 @@ func TestRollingUpdateResult_Defaults(t *testing.T) {
 // the status to match the pods a test creates keeps the fixture honest.
 func readyStatefulSetFor(v *vkov1.Valkey, replicas int32) *appsv1.StatefulSet {
 	desired := replicas
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.StatefulSetName(v, common.ComponentValkey),
 			Namespace: v.Namespace,
@@ -701,6 +701,9 @@ func readyStatefulSetFor(v *vkov1.Valkey, replicas int32) *appsv1.StatefulSet {
 			ReadyReplicas: replicas,
 		},
 	}
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	controllerRefTo(v, sts)
+	return sts
 }
 
 func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *corev1.Pod {
@@ -1280,6 +1283,7 @@ func TestHandlePostFailover_RequeuesWhenNoNewMaster(t *testing.T) {
 			},
 		},
 	}
+	controllerRefTo(v, sts)
 
 	r, _ := newTestReconciler(v, pod0, pod1, pod2, sts)
 
@@ -2190,7 +2194,7 @@ const sentinelTestNewImage = "valkey/valkey:9.0"
 func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	replicas := v.Spec.Sentinel.Replicas
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: v.Namespace},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -2201,6 +2205,9 @@ func buildTestSentinelSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 			},
 		},
 	}
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	controllerRefTo(v, sts)
+	return sts
 }
 
 func TestCheckAndHandleSentinelRollingUpdate_AllUpToDate(t *testing.T) {

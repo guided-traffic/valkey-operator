@@ -205,6 +205,14 @@ func (r *ValkeyReconciler) nudgeStatefulSet(ctx context.Context, v *vkov1.Valkey
 		return true
 	}
 
+	// A foreign StatefulSet is treated as absent, exactly like NotFound: the
+	// nudge patch is a write, and the operator does not write objects it cannot
+	// prove it owns (ADR 0020). The StatefulSet reconciler reports the collision.
+	if !metav1.IsControlledBy(sts, v) {
+		r.nudges.forget(key)
+		return false
+	}
+
 	desired := int32(1)
 	if sts.Spec.Replicas != nil {
 		desired = *sts.Spec.Replicas

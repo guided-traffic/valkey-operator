@@ -36,6 +36,8 @@ func stsForValkey(v *vkov1.Valkey) *appsv1.StatefulSet {
 	sts.Spec.Replicas = &replicas
 	sts.Status.Replicas = replicas
 	sts.Status.ReadyReplicas = replicas
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	controllerRefTo(v, sts)
 	return sts
 }
 

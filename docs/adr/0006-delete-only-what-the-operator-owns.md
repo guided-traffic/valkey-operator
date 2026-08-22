@@ -286,13 +286,15 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
 
 ## Residual risks
 
-* **`cleanupMetricsService`, `cleanupObserverDeployment` and `cleanupServiceMonitor`
-  still delete by name.** Their names are operator-suffixed (`-metrics`, `-observer`)
-  and are not names a hand-written object would plausibly carry, so this is a
-  consistency follow-up rather than a severity-driven fix. A hand-written object under
-  one of those names is still deleted on every pass. `cleanupObserverDeployment` deletes
-  two objects this way: the `-observer` Deployment and, with NetworkPolicies enabled, the
-  `-observer` NetworkPolicy.
+* **`cleanupMetricsService`, `cleanupServiceMonitor` and the NetworkPolicy half of
+  `cleanupObserverDeployment` still delete by name.** Their names are operator-suffixed
+  (`-metrics`, `-observer`) and are not names a hand-written object would plausibly carry,
+  so this is a consistency follow-up rather than a severity-driven fix. A hand-written
+  object under one of those names is still deleted on every pass. *(Amended 2026-08-22:
+  the `-observer` **Deployment** half is closed — [ADR 0020](0020-write-only-what-the-operator-owns.md)
+  put the write guard on `reconcileObserverDeployment`, and refusing to write a foreign
+  Deployment while still deleting it on disable would have been absurd, so the delete now
+  checks `IsControlledBy` and carries the D8 UID precondition.)*
 * **(Closed 2026-08-21) `reconcileSidecarRoleBinding` deleted and recreated by name.**
   `RoleRef` is immutable, so a live RoleBinding under `<cr>-sidecar` whose `RoleRef`
   differs from the desired one was deleted and rebuilt — with neither `IsControlledBy`

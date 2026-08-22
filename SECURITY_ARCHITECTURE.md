@@ -193,6 +193,11 @@ password.
   handing `pods: patch` to a stranger
   ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md),
   [`internal/controller/foreign_object.go`](internal/controller/foreign_object.go)).
+- The same refusal covers the **data and Sentinel StatefulSets and the observer
+  Deployment**, and a foreign StatefulSet is treated as **absent** by every other
+  consumer: it is not nudged, no rolling update deletes its pods, and its replica
+  counts never enter the CR status (ADR 0020 D8). The observer Deployment cleanup
+  deletes only what the CR provably owns, with a UID precondition.
 
 **What does not hold — read this before treating a namespace as a tenant boundary.**
 
@@ -221,20 +226,25 @@ password.
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
   arbitrary strings with no registry allowlist, and the pods run with the
   namespace's default security posture.
-- **Every managed object name is derived from the CR name, and most writes still
+- **Every managed object name is derived from the CR name, and some writes still
   do not check who owns the name.** There is no admission webhook constraining CR
   names ([ADR 0015](docs/adr/0015-one-crd-validated-by-schema-only.md)), so whoever
   may `create valkeys` in a namespace chooses the names of that CR's derived
-  objects. Guarded today: every delete
+  objects. Guarded today: every delete except the three name-only cleanups in the
+  ADR 0006 residual list
   ([ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md)), the
-  PodDisruptionBudget write, and the four writes of
-  [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md). **Not** guarded:
-  the data and Sentinel StatefulSets, Services, ConfigMaps, NetworkPolicies, the
-  observer Deployment, the ServiceMonitor and the cert-manager Certificate — each
-  is written by name onto whatever object holds it. The last two go further and
-  stamp this CR's controller ownerReference onto an object they never verified, so
-  deleting the CR garbage-collects a foreign object. Tracked as NA61 and NA62;
-  ADR 0020 D7 says why they were not taken together with the rest.
+  PodDisruptionBudget write, and the seven writes of
+  [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) — which since the
+  NA61 amendment include the data and Sentinel StatefulSets and the observer
+  Deployment. **Not** guarded: Services, ConfigMaps, NetworkPolicies, the
+  ServiceMonitor and the cert-manager Certificate — each is written by name onto
+  whatever object holds it. The last two go further and stamp this CR's controller
+  ownerReference onto an object they never verified, so deleting the CR
+  garbage-collects a foreign object. Tracked as NA62; ADR 0020 D7 says why each
+  kind is decided on its own. The **pod door** is separate and open: two
+  steady-state paths probe and command pods derived from the CR name or selected
+  by label without verifying their controller, bounded by the CR's own auth
+  credentials — tracked as NA63.
 - **Namespace is not a trust boundary for the operator itself.** It watches and
   writes everywhere.
 
@@ -476,6 +486,24 @@ analysis.
       with the colliding name. The same change stopped both ServiceAccount
       reconcilers from erasing a target's annotations, and the observer refusal
       keeps the Deployment running because that identity grants it nothing.
+- [x] **Refuse to write the data and Sentinel StatefulSets and the observer
+      Deployment onto a foreign object
+      ([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D8, done 2026-08-22).**
+      The data StatefulSet carries the bare CR name — the likeliest name for an
+      accidental or aimed collision — and the Update installs the pod template
+      into whatever holds it. Both StatefulSet writes now refuse and fail the
+      pass; every other consumer treats a foreign StatefulSet as absent, so it is
+      neither nudged nor rolled nor counted; the observer Deployment refuses
+      without failing and its cleanup deletes only with provenance plus a UID
+      precondition. Operator upgrades are unaffected: every release since the
+      first commit stamps the controller reference on create.
+- [ ] **Verify pod provenance before steady-state Valkey commands (NA63).**
+      `checkAndRecoverNoMaster` probes pods `<cr>-0..N-1` by derived name and can
+      promote pod-0; `checkSteadyStateSplitBrain` demotes pods selected by the
+      master label. Neither checks who controls those pods. The CR's auth
+      credentials bound the blast radius — a foreign Valkey with its own password
+      refuses the commands — but a CR without `spec.auth` aimed at unauthenticated
+      foreign pods has no backstop.
 - [ ] **Give the workload pods a securityContext.** `runAsNonRoot`,
       `readOnlyRootFilesystem` where the data path allows it, `drop: [ALL]`,
       `seccompProfile: RuntimeDefault` — the operator already runs that way itself.

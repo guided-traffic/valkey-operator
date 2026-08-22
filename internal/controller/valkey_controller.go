@@ -1105,6 +1105,21 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 		return err
 	}
 
+	// The data StatefulSet carries the bare CR name, so this is the name an
+	// arbitrary pre-existing StatefulSet is most likely to hold. Writing the pod
+	// template onto a foreign one replaces its workload — and its own
+	// updateStrategy (which the operator does not write) rolls that template out
+	// immediately, without the OnDelete pacing. Without the data StatefulSet the
+	// CR cannot do its job, so the refusal fails the step, unlike the observer
+	// ones (ADR 0020 D2). Every other consumer treats the foreign object as
+	// absent; this function is the one reporter.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonStatefulSetNotOwned, "StatefulSet", desired.Name,
+			"the data plane is not provisioned: the operator will not write the object, nudge it, "+
+				"run rolling updates against it, or count its pods in status")
+		return foreignObjectError("StatefulSet", desired.Name)
+	}
+
 	// Detect drift and update.
 	if builder.StatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating StatefulSet", "name", desired.Name)
@@ -1194,6 +1209,17 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	}
 	if err != nil {
 		return err
+	}
+
+	// Same rule and same fail direction as the data StatefulSet: without its
+	// Sentinels an HA cluster has no failover authority, so the CR cannot do its
+	// job and the refusal fails the step (ADR 0020 D2). This function is the one
+	// reporter; every other consumer treats the foreign object as absent.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonSentinelStatefulSetNotOwned, "StatefulSet", desired.Name,
+			"Sentinel is not provisioned: the operator will not write the object, nudge it, "+
+				"run rolling updates against it, or count its pods in status")
+		return foreignObjectError("StatefulSet", desired.Name)
 	}
 
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -1469,6 +1495,12 @@ func (r *ValkeyReconciler) sentinelRolloutComplete(ctx context.Context, v *vkov1
 	if err != nil {
 		return false, fmt.Errorf("get sentinel statefulset: %w", err)
 	}
+	// A foreign StatefulSet is treated as absent, which here means "trivially
+	// complete": no pod of ours is bound to the legacy Secret. The downstream
+	// legacy-cleanup deletes are ownership-guarded themselves.
+	if !metav1.IsControlledBy(sts, v) {
+		return true, nil
+	}
 
 	// Wait until the StatefulSet controller has observed our latest spec
 	// change and computed an updated revision.
@@ -1667,6 +1699,18 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 		return err
 	}
 
+	// The observer is a diagnostic component: the CR still does its job without
+	// it, so the refusal does not fail the step (ADR 0020 D2), mirroring the
+	// observer ServiceAccount. The recheck is what brings the operator back once
+	// an administrator removes the collision — the foreign object carries no
+	// ownerReference to this CR, so no Owns() watch fires for it.
+	if !metav1.IsControlledBy(current, v) {
+		r.warnForeignObject(ctx, v, reasonObserverDeploymentNotOwned, "Deployment", desired.Name,
+			"the observer is not deployed and status.observerReady stays false")
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return nil
+	}
+
 	if builder.ObserverDeploymentHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Observer Deployment", "name", desired.Name)
 		current.Spec = desired.Spec
@@ -1682,13 +1726,29 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 
-	// Delete Observer Deployment.
+	// Delete Observer Deployment — but only the one this CR owns, with the UID
+	// precondition keeping the delete on the object that was inspected (ADR 0006
+	// D8, D9). Refusing to *write* a foreign Deployment while still deleting it
+	// on disable would have been the write guard's absurd mirror image.
 	deploy := &appsv1.Deployment{}
 	deployName := types.NamespacedName{Name: builder.ObserverDeploymentName(v), Namespace: v.Namespace}
 	if err := r.Get(ctx, deployName, deploy); err == nil {
-		logger.Info("Deleting Observer Deployment", "name", deploy.Name)
-		if err := r.Delete(ctx, deploy); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("deleting observer deployment: %w", err)
+		switch {
+		case !metav1.IsControlledBy(deploy, v):
+			logger.Info("Skipping Observer Deployment deletion: not owned by this Valkey", "name", deploy.Name)
+		default:
+			logger.Info("Deleting Observer Deployment", "name", deploy.Name)
+			err := r.Delete(ctx, deploy, client.Preconditions{UID: &deploy.UID})
+			switch {
+			case err == nil || apierrors.IsNotFound(err):
+			case apierrors.IsConflict(err):
+				// The name holds a different object than the one this pass
+				// inspected; nothing of ours is left to delete.
+				logger.Info("Skipping Observer Deployment deletion: the object was replaced under its name",
+					"name", deploy.Name)
+			default:
+				return fmt.Errorf("deleting observer deployment: %w", err)
+			}
 		}
 	}
 
@@ -1783,6 +1843,14 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 			return r.updatePhase(ctx, v, vkov1.ValkeyPhaseProvisioning, "Waiting for StatefulSet creation")
 		}
 		return err
+	}
+
+	// A foreign StatefulSet is treated as absent: its replica counts and pod
+	// roles describe someone else's workload. reconcileStatefulSet reports the
+	// collision and fails its step, so the blocked pass writes the authoritative
+	// Error phase over the Provisioning written here.
+	if !metav1.IsControlledBy(sts, v) {
+		return r.updatePhase(ctx, v, vkov1.ValkeyPhaseProvisioning, "Waiting for StatefulSet creation")
 	}
 
 	// Refresh the Valkey object to avoid conflicts.
@@ -1932,7 +2000,9 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		Name:      fmt.Sprintf("%s-sentinel", v.Name),
 		Namespace: v.Namespace,
 	}
-	if err := r.Get(ctx, sentinelName, sentinelSts); err == nil {
+	// A foreign Sentinel StatefulSet is treated as absent — its ready count
+	// describes someone else's pods (reconcileSentinelStatefulSet reports it).
+	if err := r.Get(ctx, sentinelName, sentinelSts); err == nil && metav1.IsControlledBy(sentinelSts, v) {
 		sentinelReady = sentinelSts.Status.ReadyReplicas
 	}
 

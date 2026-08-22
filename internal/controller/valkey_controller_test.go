@@ -927,9 +927,9 @@ func newLegacySentinelSecret(name, namespace string) *corev1.Secret {
 // matches generation, updateRevision set). Used as a base for migration tests;
 // callers add Pods that carry the matching revision label to simulate "rollout
 // complete" or supply an older label to simulate "rollout in progress".
-func stagedSentinelStatefulSet(name, tlsSecretName string) *appsv1.StatefulSet {
+func stagedSentinelStatefulSet(v *vkov1.Valkey, name, tlsSecretName string) *appsv1.StatefulSet {
 	replicas := int32(3)
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "iam", Generation: 1},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -952,6 +952,9 @@ func stagedSentinelStatefulSet(name, tlsSecretName string) *appsv1.StatefulSet {
 			CurrentRevision:    "rev-new",
 		},
 	}
+	// The ADR 0020 guards treat an un-owned StatefulSet as absent.
+	controllerRefTo(v, sts)
+	return sts
 }
 
 // readySentinelPods returns N ready Sentinel pods all stamped with the
@@ -1023,7 +1026,7 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenSTSStillMountsLegacySecret(t 
 	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
 	// STS still points at legacy Secret AND pods still on the old revision.
-	sts := stagedSentinelStatefulSet(stsName, legacyCertName)
+	sts := stagedSentinelStatefulSet(v, stsName, legacyCertName)
 	pods := readySentinelPods(stsName, 3)
 	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
 	r, c := newTestReconciler(objs...)
@@ -1041,7 +1044,7 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodOnOldRevision(t *testin
 	legacyCert := newLegacySentinelCert(v, legacyCertName)
 	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	sts := stagedSentinelStatefulSet(v, stsName, unifiedSecretName)
 	// Two pods rolled to the new revision, one still on the old one.
 	pods := readySentinelPods(stsName, 2)
 	pods = append(pods, &corev1.Pod{
@@ -1070,7 +1073,7 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenAnyPodNotReady(t *testing.T) 
 	legacyCert := newLegacySentinelCert(v, legacyCertName)
 	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	sts := stagedSentinelStatefulSet(v, stsName, unifiedSecretName)
 	pods := readySentinelPods(stsName, 2)
 	pods = append(pods, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1098,7 +1101,7 @@ func TestReconcileLegacySentinelCleanup_Defers_WhenObservedGenerationStale(t *te
 	legacyCert := newLegacySentinelCert(v, legacyCertName)
 	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	sts := stagedSentinelStatefulSet(v, stsName, unifiedSecretName)
 	// Spec-update has happened (Generation bumped) but STS controller has not yet
 	// observed it — pods may still be on the previous revision.
 	sts.Generation = 2
@@ -1119,7 +1122,7 @@ func TestReconcileLegacySentinelCleanup_Deletes_WhenAllPodsOnNewRevision(t *test
 	legacyCert := newLegacySentinelCert(v, legacyCertName)
 	legacySecret := newLegacySentinelSecret(legacyCertName, "iam")
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, unifiedSecretName)
+	sts := stagedSentinelStatefulSet(v, stsName, unifiedSecretName)
 	pods := readySentinelPods(stsName, 3)
 	objs := append([]client.Object{v, legacyCert, legacySecret, sts}, pods...)
 	r, c := newTestReconciler(objs...)
@@ -1156,7 +1159,7 @@ func TestReconcileLegacySentinelCleanup_Deletes_WhenSentinelSTSAbsent(t *testing
 func TestReconcileLegacySentinelCleanup_Idempotent_NotFound(t *testing.T) {
 	v := newTestValkeyUnified()
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
 	pods := readySentinelPods(stsName, 3)
 	objs := append([]client.Object{v, sts}, pods...)
 	r, _ := newTestReconciler(objs...)

@@ -31,6 +31,9 @@ const (
 	reasonSidecarServiceAccountNotOwned  = "SidecarServiceAccountNotOwned"
 	reasonSidecarRoleNotOwned            = "SidecarRoleNotOwned"
 	reasonSidecarRoleBindingNotOwned     = "SidecarRoleBindingNotOwned"
+	reasonStatefulSetNotOwned            = "StatefulSetNotOwned"
+	reasonSentinelStatefulSetNotOwned    = "SentinelStatefulSetNotOwned"
+	reasonObserverDeploymentNotOwned     = "ObserverDeploymentNotOwned"
 )
 
 // foreignObjectRecheckInterval is how soon a pass that refused a write without

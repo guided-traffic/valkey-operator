@@ -592,7 +592,7 @@ func TestReconcileLegacySentinelCleanup_LeavesForeignSecretUnderLegacyName(t *te
 	}
 
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
 	objs := append([]client.Object{v, foreign, sts}, readySentinelPods(stsName, 3)...)
 	r, c := newTestReconciler(objs...)
 	rec := &fakeEventRecorder{}

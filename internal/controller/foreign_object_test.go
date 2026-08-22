@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
+	"github.com/guided-traffic/valkey-operator/internal/common"
 )
 
 // The write half of docs/adr/0020-write-only-what-the-operator-owns.md: a generated
@@ -307,4 +309,220 @@ func TestPassState_KeepsTheShortestRequest(t *testing.T) {
 func TestRequestRecheck_IsANoOpWithoutPassState(t *testing.T) {
 	// Unit tests call a single step directly, without the state Reconcile builds.
 	assert.NotPanics(t, func() { requestRecheck(context.Background(), time.Second) })
+}
+
+// --- StatefulSets and observer Deployment: the NA61 half of ADR 0020 ---
+
+// foreignStatefulSet returns a StatefulSet under name that no Valkey controls,
+// with its own selector and workload — the shape of a pre-existing application
+// that happens to hold the generated name.
+func foreignStatefulSet(name string) *appsv1.StatefulSet {
+	replicas := int32(1)
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "theirs"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "theirs"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example/theirs:1"}},
+				},
+			},
+		},
+	}
+}
+
+func TestReconcileStatefulSet_RefusesAForeignStatefulSet(t *testing.T) {
+	v := newTestValkey("test", "default")
+	foreign := foreignStatefulSet(v.Name)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileStatefulSet(context.Background(), v)
+
+	require.Error(t, err, "without the data StatefulSet the CR cannot do its job (ADR 0020 D2)")
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: v.Name, Namespace: "default"}, got))
+	assert.Equal(t, "registry.example/theirs:1", got.Spec.Template.Spec.Containers[0].Image,
+		"writing the pod template onto a foreign StatefulSet replaces its workload")
+	assert.Equal(t, foreign.Labels, got.Labels, "a foreign StatefulSet keeps its labels")
+	assert.Empty(t, got.OwnerReferences, "the operator must not take ownership of it either")
+	require.Len(t, rec.withReason(reasonStatefulSetNotOwned), 1)
+}
+
+func TestReconcileSentinelStatefulSet_RefusesAForeignStatefulSet(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	foreign := foreignStatefulSet(common.StatefulSetName(v, common.ComponentSentinel))
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileSentinelStatefulSet(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+
+	got := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, "registry.example/theirs:1", got.Spec.Template.Spec.Containers[0].Image)
+	require.Len(t, rec.withReason(reasonSentinelStatefulSetNotOwned), 1)
+}
+
+func TestReconcileObserverDeployment_LeavesAForeignDeploymentUntouched(t *testing.T) {
+	// The observer is diagnostic: refusing it must not fail the step, but it must
+	// ask for the recheck that brings the operator back (ADR 0020 D2, D6).
+	v := newTestValkey("test", "default", observerEnabled)
+	foreign := builder.BuildObserverDeployment(v, "registry.example/theirs:1")
+	foreign.Labels = map[string]string{"owner": "someone-else"}
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	ctx, state := passCtx()
+	require.NoError(t, r.reconcileObserverDeployment(ctx, v))
+
+	got := &appsv1.Deployment{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, got))
+	assert.Equal(t, foreign.Labels, got.Labels, "a foreign Deployment keeps its labels")
+	assert.Empty(t, got.OwnerReferences)
+	require.Len(t, rec.withReason(reasonObserverDeploymentNotOwned), 1)
+	assert.Equal(t, foreignObjectRecheckInterval, state.interval())
+}
+
+func TestCleanupObserverDeployment_LeavesAForeignDeploymentAlone(t *testing.T) {
+	// Refusing to write a foreign Deployment while still deleting it on disable
+	// would be the guard's absurd mirror image (ADR 0006).
+	v := newTestValkey("test", "default") // observer disabled: the cleanup path
+	foreign := builder.BuildObserverDeployment(v, "registry.example/theirs:1")
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, foreign)
+
+	require.NoError(t, r.cleanupObserverDeployment(context.Background(), v))
+
+	err := c.Get(context.Background(),
+		types.NamespacedName{Name: foreign.Name, Namespace: "default"}, &appsv1.Deployment{})
+	assert.NoError(t, err, "a foreign Deployment under the generated name must survive the cleanup")
+}
+
+func TestNudgeShortStatefulSets_DoesNotNudgeAForeignStatefulSet(t *testing.T) {
+	// The nudge patch is a write; a StatefulSet the operator does not own is
+	// treated as absent, exactly like NotFound.
+	v := newSentinelValkey()
+	sts := newNudgeStatefulSet(v, common.StatefulSetName(v, common.ComponentValkey), 0)
+	sts.OwnerReferences = nil
+	r, c := newTestReconciler(v, sts)
+
+	pastGrace(r, nudgeKey(sts.Name))
+
+	short := r.nudgeShortStatefulSets(context.Background(), v)
+
+	assert.Empty(t, nudgeAnnotation(t, c, sts.Name),
+		"a foreign StatefulSet must not be patched, however short it is")
+	assert.False(t, short, "a foreign StatefulSet is treated as absent, not as short")
+	assert.False(t, nudgeTracked(r, sts.Name), "and it must not keep a tracker entry")
+}
+
+func TestCheckAndHandleRollingUpdate_TreatsAForeignStatefulSetAsAbsent(t *testing.T) {
+	// The rolling update deletes pods against the persisted template. When the
+	// template is not ours, neither are the pods.
+	old := newTestValkey("test", "default")
+	oldSts := stsForValkey(old)
+	pod0 := podFromStsTemplate(old, oldSts, 0)
+
+	desired := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Image = "valkey/valkey:9.0"
+	})
+	newSts := stsForValkey(desired)
+	newSts.OwnerReferences = nil // replaced under its name by something foreign
+
+	r, c := newTestReconciler(desired, newSts, pod0)
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), desired)
+
+	assert.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+	assert.True(t, podExists(t, c, pod0.Name),
+		"pods of a foreign StatefulSet are not ours to delete")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_TreatsAForeignStatefulSetAsAbsent(t *testing.T) {
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	sts := buildTestSentinelSts(v)
+	sts.OwnerReferences = nil
+	const oldImg = "valkey/valkey:8.0"
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+
+	assert.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("%s-%d", sts.Name, i)
+		assert.True(t, podExists(t, c, name), "no sentinel pod of a foreign StatefulSet may be deleted")
+	}
+}
+
+func TestSentinelRolloutComplete_TreatsAForeignStatefulSetAsAbsent(t *testing.T) {
+	v := newTestValkeyUnified()
+	stsName := common.StatefulSetName(v, common.ComponentSentinel)
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
+	sts.OwnerReferences = nil
+	r, _ := newTestReconciler(v, sts)
+
+	ready, err := r.sentinelRolloutComplete(context.Background(), v)
+
+	require.NoError(t, err)
+	assert.True(t, ready, "absent means trivially complete: no pod of ours is bound to the legacy Secret")
+}
+
+func TestUpdateStatus_TreatsAForeignStatefulSetAsAbsent(t *testing.T) {
+	// Its replica counts describe someone else's workload; the CR must not report
+	// readiness from them.
+	v := newTestValkey("test", "default")
+	foreign := foreignStatefulSet(v.Name)
+	foreign.Status.Replicas = 1
+	foreign.Status.ReadyReplicas = 1
+	r, _ := newTestReconciler(v, foreign)
+
+	require.NoError(t, r.updateStatus(context.Background(), v))
+
+	assert.Equal(t, vkov1.ValkeyPhaseProvisioning, v.Status.Phase,
+		"a foreign StatefulSet reads as absent, not as a ready cluster")
+	assert.Zero(t, v.Status.ReadyReplicas)
+}
+
+func TestReconcileResources_ForeignDataStatefulSetFailsThePass(t *testing.T) {
+	// End to end through the step runner: the refusal must survive the step
+	// wrapping so the ReconcileBlocked reason comes out as ForeignObject.
+	v := newTestValkey("test", "default")
+	foreign := foreignStatefulSet(v.Name)
+	r, _ := newTestReconciler(v, foreign)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileResources(context.Background(), v)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errForeignObject)
+	assert.Equal(t, vkov1.ReasonForeignObject, reconcileBlockedReason(err))
 }

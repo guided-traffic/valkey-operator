@@ -2,26 +2,32 @@
 
 ## Status
 
-Accepted. Date: 2026-08-21.
+Accepted. Date: 2026-08-21. **Amended 2026-08-22 (NA61):** the guard now also binds
+`reconcileStatefulSet`, `reconcileSentinelStatefulSet` and `reconcileObserverDeployment`,
+`cleanupObserverDeployment` gained the ADR 0006 delete guard, and D8 makes every other
+StatefulSet consumer treat a foreign object as absent. D7 is superseded for these kinds and
+still current for the rest.
 
-Implemented on branch `feat/support-pdb`, in the same change as this ADR. Four reconcile
+Implemented on branch `feat/support-pdb`, in the same change as this ADR. Seven reconcile
 paths carry the guard — `reconcileObserverServiceAccount`, `reconcileSidecarServiceAccount`,
-`reconcileSidecarRole` and `reconcileSidecarRoleBinding`, all in
+`reconcileSidecarRole`, `reconcileSidecarRoleBinding`, `reconcileStatefulSet`,
+`reconcileSentinelStatefulSet` and `reconcileObserverDeployment`, all in
 [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) —
 with the shared refusal machinery in
 [`internal/controller/foreign_object.go`](../../internal/controller/foreign_object.go).
 
-This ADR closes one open residual of
+This ADR closes two open residuals of
 [ADR 0006](0006-delete-only-what-the-operator-owns.md): the delete-and-recreate in
-`reconcileSidecarRoleBinding` now refuses a foreign binding and sends a UID precondition
-when it recreates its own.
+`reconcileSidecarRoleBinding` refuses a foreign binding and sends a UID precondition
+when it recreates its own, and the observer Deployment half of `cleanupObserverDeployment`
+deletes only what `IsControlledBy` proves is ours, with the same UID precondition.
 
-**Deliberately out of scope**, and tracked separately: every other managed kind is still
-written by generated name with no ownership check. The two that matter most are filed in
-`local_valkey_operator_admission_gap.md` as NA61 (the data and Sentinel StatefulSets) and
-NA62 (`reconcileServiceMonitor` and `reconcileCertificate` stamp the CR ownerReference onto
-an object they never verified, which makes the garbage collector delete a foreign object when
-the CR goes). D7 says why they were not taken here.
+**Deliberately out of scope**, and tracked separately: Service, ConfigMap, NetworkPolicy,
+ServiceMonitor and Certificate are still written by generated name with no ownership check.
+The sharpest of these is filed in `local_valkey_operator_admission_gap.md` as NA62
+(`reconcileServiceMonitor` and `reconcileCertificate` stamp the CR ownerReference onto an
+object they never verified, which makes the garbage collector delete a foreign object when
+the CR goes). D7 says why each kind is decided on its own.
 
 ## Context
 
@@ -86,8 +92,20 @@ this branch; none is a report of an object observed being damaged on a cluster.
 
 **D1 — No write onto a generated name the operator cannot prove it owns.** Provenance is
 `metav1.IsControlledBy(obj, v)`, exactly as [ADR 0006](0006-delete-only-what-the-operator-owns.md)
-D2 defines it for deletes; a label is not a proof. The rule binds the four paths listed under
+D2 defines it for deletes; a label is not a proof. The rule binds the seven paths listed under
 Status. It does **not** yet bind every managed kind — see D7.
+
+The strictness was re-decided for the StatefulSets (2026-08-22) and held: no second proof
+channel. An object that *lost* its controller reference — a CR deleted with
+`--cascade=orphan` and recreated, a backup restore that changed the CR UID, a hand edit —
+is refused like any other foreign object, visibly, with a downtime-free recovery
+(`kubectl delete sts <name> --cascade=orphan` keeps the pods; the operator recreates the
+StatefulSet and the statefulset-controller re-adopts the label-matching orphans — upstream
+behaviour, asserted from the API contract). An operator *upgrade* is not such a loss: the
+CR object and its UID survive the upgrade untouched, and every release ever built stamped
+the reference on create — `reconcileStatefulSet` since `b0081d9`, the Sentinel variant
+since `88b721b`, the observer Deployment since `c6f97e2` — so no operator-created object
+is refused by the new guards.
 
 The wording avoids the word *adoption* on purpose: throughout
 [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) and `CLAUDE.md` that
@@ -115,6 +133,13 @@ This is deliberately the opposite of the PodDisruptionBudget choice
 ([ADR 0004](0004-opt-in-poddisruptionbudgets.md) D10), where a budget that is not written
 silently protects nothing and the pass continues. The distinguishing question is not
 "was something not written" but "can the CR still do its job".
+
+The 2026-08-22 amendment sorts the three new paths by the same test. The **data
+StatefulSet** refusal fails its step — without it there is no data plane at all. The
+**Sentinel StatefulSet** refusal fails its step — an HA cluster without its Sentinels has
+no failover authority. The **observer Deployment** refusal returns `nil` with the D6
+recheck, exactly like the observer ServiceAccount: the observer is diagnostic, the CR does
+its job without it, and `status.observerReady` records the degradation.
 
 **D3 — A refusal reaches the RoleBinding through the ServiceAccount and the Role, not through
 the RoleBinding's own provenance.** `reconcileSidecarRBAC` takes a `(bool, error)` verdict
@@ -179,17 +204,37 @@ own once the colliding object is removed, and neither needs a CR edit or an oper
 Both intervals are 30 s so the two kinds of refusal recover at the same cadence.
 
 **D7 — The other managed kinds keep their current behaviour until each is decided on its own.**
-Extending D1 to the data StatefulSet is not a mechanical repeat: it is the most critical object
-in the system, and a guard there refuses every StatefulSet that lost its controller
-ownerReference — a backup restore, a migration, an older operator release — which turns an
-upgrade into an outage. That needs its own upgrade analysis, and bundling it here would have
-made one change decide four fail directions at once. NA62 needs a *different* fix shape
-("do not stamp an ownerReference onto an object you did not verify"), not this one.
+*(Superseded for the data and Sentinel StatefulSets and the observer Deployment on
+2026-08-22 — those are now bound by D1 and D8. Still current for Service, ConfigMap,
+NetworkPolicy, ServiceMonitor and Certificate.)* Extending D1 to the data StatefulSet is
+not a mechanical repeat: it is the most critical object in the system, and a guard there
+refuses every StatefulSet that lost its controller ownerReference — a backup restore, a
+migration, an older operator release — which turns an upgrade into an outage. That needs
+its own upgrade analysis, and bundling it here would have made one change decide four fail
+directions at once. NA62 needs a *different* fix shape ("do not stamp an ownerReference
+onto an object you did not verify"), not this one.
 
 The upgrade question was checked for the objects this ADR does bind and came out clean:
 `reconcileSidecarServiceAccount` carried `controllerutil.SetControllerReference` in its very
 first commit (`73f6efe`), so every sidecar ServiceAccount the operator ever created has the
-reference and no existing cluster is refused by the new guard.
+reference and no existing cluster is refused by the new guard. The 2026-08-22 amendment
+repeated that check for the three newly bound paths — first commits `b0081d9`, `88b721b`
+and `c6f97e2`, each already stamping the reference — with the same result; the analysis
+D7 asked for is in D1.
+
+**D8 — A StatefulSet the operator does not own is treated as absent by every consumer, and
+the reconciler is the one reporter.** Refusing the Update alone would not have stopped the
+operator from *acting on* the foreign object: the nudge patches an annotation onto it, the
+rolling update deletes pods against its persisted template, and the status counts its
+replicas as the CR's own. Each of those is a write to, or an action derived from, an object
+that is not ours. The guarded consumers, each taking the branch its NotFound case already
+has: `nudgeStatefulSet` ([`internal/controller/nudge.go`](../../internal/controller/nudge.go)),
+`checkAndHandleRollingUpdate`, `handlePostFailover` and `checkAndHandleSentinelRollingUpdate`
+([`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go)),
+`sentinelRolloutComplete`, `updateStatus` and `updateHAStatus`
+([`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go)).
+Only `reconcileStatefulSet` and `reconcileSentinelStatefulSet` warn and emit the Event, so a
+blocked CR produces one Event series per pass, not one per consumer.
 
 ## Consequences
 
@@ -209,6 +254,19 @@ reference and no existing cluster is refused by the new guard.
 * **`Phase = Error` for the sidecar case is written by the existing blocked-pass authority**,
   so it does not flap against the phase computed from the data plane
   ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)). Nothing new writes the phase.
+* **(2026-08-22) A name collision on the StatefulSet names is now a hard, visible stop for
+  the whole CR.** Before the amendment the Update was near-certainly rejected by the
+  apiserver anyway — `spec.selector` is immutable and not among the written fields — but
+  the operator kept nudging the foreign object and counting its pods, and in the one case
+  where the selectors *did* match, the Update succeeded and replaced the foreign workload's
+  pod template. Both are gone: the refusal is deliberate, reported with the colliding name,
+  and recovery needs a human (delete or rename one of the two).
+* **(2026-08-22) A StatefulSet that lost its controller reference out-of-band is refused
+  after the operator upgrade** — orphan-delete plus CR recreate, a restore that changed the
+  CR UID, a hand edit. That silent adoption was load-bearing for nobody the repo knows of,
+  and the recovery is downtime-free (D1). An ordinary upgrade is unaffected; the
+  from-previous-release upgrade e2e creates its fleet with the real prior image and the
+  new operator must keep updating it.
 
 ## Alternatives Considered
 
@@ -223,8 +281,22 @@ ServiceAccount rather than referencing the object, and in the ordinary collision
 does not exist yet and is created fresh.
 
 **Refuse the sidecar ServiceAccount, the Role, the RoleBinding *and* the data StatefulSet.**
-Rejected here, not on the merits — see D7. It is the more consistent end state and it is what
-NA61 will decide.
+Rejected in the original decision, not on the merits — see D7. The 2026-08-22 amendment is
+exactly this end state.
+
+**Auto-re-own a reference-less StatefulSet on structural evidence** (full operator label set
+plus a selector equal to the generated one) — considered for the amendment, to let
+orphan-recreate and restore heal without a human. Rejected: it opens a second proof channel
+that D1, [ADR 0006](0006-delete-only-what-the-operator-owns.md) D2 and the PDB precedent all
+explicitly closed ("a label is not a proof"), and a deliberately crafted mimic object would
+be adopted with whatever the operator does not write — `volumeClaimTemplates` above all,
+which are immutable and decide where the data lands. The legitimate population it would
+serve is rare and has a visible, downtime-free manual recovery (D1).
+
+**Treat a foreign StatefulSet as absent without refusing the write** — i.e. only D8, no D1.
+Rejected: the pass would end error-free with no StatefulSet written, reporting Provisioning
+forever with no condition naming the cause. The refusal is what makes the collision visible
+and drives the retry.
 
 **Refuse the observer Deployment as well, matching the PodDisruptionBudget precedent.**
 Rejected: the pod names the ServiceAccount by string with or without the guard, so refusing
@@ -265,10 +337,24 @@ that alters nothing a user asked for.
   annotations and the recovery were all read from the code and then exercised against envtest.
   No collision was aimed at a real workload, and no foreign identity was observed patching a
   pod.
-* **The other managed kinds remain unguarded on the write path** — StatefulSet, Service,
-  ConfigMap, NetworkPolicy, Deployment, ServiceMonitor and Certificate. NA61 and NA62 name the
-  two with the sharpest consequences; the rest are unticketed. D7 says why, and this is the
-  largest open item of this ADR.
+* **The remaining managed kinds are still unguarded on the write path** — Service,
+  ConfigMap, NetworkPolicy, ServiceMonitor and Certificate. NA62 names the pair with the
+  sharpest consequence (a stamped ownerReference makes the garbage collector delete a
+  foreign object); the Service family deserves its own look — a Service `spec.selector` is
+  mutable, so unlike the StatefulSet there is no immutability backstop behind a takeover.
+  The rest are unticketed. D7 says why each kind is decided on its own.
+* **The pod door is untouched (NA63).** The StatefulSet guards close every action derived
+  *from the StatefulSet object*, but two steady-state paths derive pods from the CR alone:
+  `checkAndRecoverNoMaster` probes `<cr>-0..N-1` by name and can promote pod-0, and
+  `checkSteadyStateSplitBrain` acts on whatever pods carry the master label — both without
+  verifying the pods' controller. The commands authenticate with the CR's credentials, so a
+  foreign Valkey with its own password refuses them and the probe failure blocks the
+  recovery path; a CR *without* `spec.auth` aimed at unauthenticated foreign pods has no
+  such backstop. Filed as NA63 in `local_valkey_operator_admission_gap.md`.
+* **The selector-immutability backstop was never reproduced.** The claim that a
+  template-write onto a selector-mismatched StatefulSet is rejected by the apiserver is
+  upstream behaviour read from the API contract. It stopped being load-bearing with this
+  amendment — the guard refuses first — and stays unverified.
 * **The recovery test does not isolate its wake-up source.**
   `TestForeignSidecarServiceAccount_Integration` proves the operator finishes provisioning
   after the collision is removed, with no CR edit and no restart. It does not prove the work
@@ -297,8 +383,12 @@ that alters nothing a user asked for.
   sentinel error, the Event reasons, the per-pass recheck state and the warn helper.
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) —
   `reconcileObserverServiceAccount`, `reconcileSidecarRBAC`, `reconcileSidecarServiceAccount`,
-  `reconcileSidecarRole`, `reconcileSidecarRoleBinding`, and the `applyRecheck` fold in
-  `Reconcile`.
+  `reconcileSidecarRole`, `reconcileSidecarRoleBinding`, `reconcileStatefulSet`,
+  `reconcileSentinelStatefulSet`, `reconcileObserverDeployment`, `cleanupObserverDeployment`,
+  and the `applyRecheck` fold in `Reconcile`.
+* [`internal/controller/nudge.go`](../../internal/controller/nudge.go) and
+  [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) —
+  the D8 treat-as-absent consumers.
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) —
   `reconcileBlockedReason` and its precedence.
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — the name-based subject and

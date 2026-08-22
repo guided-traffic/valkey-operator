@@ -37,6 +37,15 @@ func ownedByValkey(t *testing.T, v *vkov1.Valkey, obj client.Object) {
 	require.NoError(t, controllerutil.SetControllerReference(v, obj, testScheme()))
 }
 
+// controllerRefTo is ownedByValkey for fixture constructors that have no *testing.T.
+// The scheme is fixed, so the only error SetControllerReference can return here is a
+// programming mistake — worth a panic, not a threaded error.
+func controllerRefTo(v *vkov1.Valkey, obj client.Object) {
+	if err := controllerutil.SetControllerReference(v, obj, testScheme()); err != nil {
+		panic(err)
+	}
+}
+
 // mustReconcileSidecarRole runs the step and asserts it neither failed nor refused.
 func mustReconcileSidecarRole(t *testing.T, r *ValkeyReconciler, v *vkov1.Valkey) {
 	t.Helper()
@@ -260,6 +269,7 @@ func TestReconcileObserverDeployment_Update_AdoptsNewOperatorImage(t *testing.T)
 
 	stale := builder.BuildObserverDeployment(v, "ghcr.io/guided-traffic/valkey-operator:old")
 	stale.Labels = map[string]string{"stale": "yes"}
+	ownedByValkey(t, v, stale)
 
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 	r.OperatorImage = "ghcr.io/guided-traffic/valkey-operator:new"
@@ -717,7 +727,7 @@ func TestSentinelRolloutComplete_PropagatesStatefulSetGetError(t *testing.T) {
 func TestSentinelRolloutComplete_FalseWhenUpdateRevisionEmpty(t *testing.T) {
 	v := newTestValkeyUnified()
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
 	// The StatefulSet controller has not computed a revision yet.
 	sts.Status.UpdateRevision = ""
 	objs := append([]client.Object{v, sts}, readySentinelPods(stsName, 3)...)
@@ -732,7 +742,7 @@ func TestSentinelRolloutComplete_FalseWhenUpdateRevisionEmpty(t *testing.T) {
 func TestSentinelRolloutComplete_FalseWhenPodMissing(t *testing.T) {
 	v := newTestValkeyUnified()
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
 	// Only two of the three pods exist — the third is being recreated.
 	objs := append([]client.Object{v, sts}, readySentinelPods(stsName, 2)...)
 	r, _ := newTestReconciler(objs...)
@@ -746,7 +756,7 @@ func TestSentinelRolloutComplete_FalseWhenPodMissing(t *testing.T) {
 func TestSentinelRolloutComplete_PropagatesPodGetError(t *testing.T) {
 	v := newTestValkeyUnified()
 	stsName := common.StatefulSetName(v, common.ComponentSentinel)
-	sts := stagedSentinelStatefulSet(stsName, builder.ValkeyTLSSecretName(v))
+	sts := stagedSentinelStatefulSet(v, stsName, builder.ValkeyTLSSecretName(v))
 	funcs := interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Pod); ok {
@@ -1256,6 +1266,7 @@ func TestCleanupObserverDeployment_RemovesDeploymentAndPolicy(t *testing.T) {
 		// Observer intentionally left disabled: this is the "turned off" path.
 	})
 	deploy := builder.BuildObserverDeployment(v, "img")
+	ownedByValkey(t, v, deploy)
 	np := builder.BuildObserverNetworkPolicy(v)
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy, np)
 
@@ -1274,6 +1285,7 @@ func TestCleanupObserverDeployment_RemovesDeploymentAndPolicy(t *testing.T) {
 func TestCleanupObserverDeployment_LeavesPolicyWhenNetworkPolicyDisabled(t *testing.T) {
 	v := newTestValkey("test", "default")
 	deploy := builder.BuildObserverDeployment(v, "img")
+	ownedByValkey(t, v, deploy)
 	np := builder.BuildObserverNetworkPolicy(v)
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy, np)
 
@@ -1288,6 +1300,7 @@ func TestCleanupObserverDeployment_LeavesPolicyWhenNetworkPolicyDisabled(t *test
 func TestCleanupObserverDeployment_PropagatesDeploymentDeleteError(t *testing.T) {
 	v := newTestValkey("test", "default")
 	deploy := builder.BuildObserverDeployment(v, "img")
+	ownedByValkey(t, v, deploy)
 	funcs := interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
 			return internalErr("deployment delete denied")

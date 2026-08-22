@@ -160,6 +160,12 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		}
 		return RollingUpdateResult{Error: fmt.Errorf("getting StatefulSet: %w", err)}
 	}
+	// A foreign StatefulSet is treated as absent (ADR 0020): the rolling update
+	// deletes pods against the persisted template, and neither belongs to this
+	// CR. reconcileStatefulSet reports the collision and fails its step.
+	if !metav1.IsControlledBy(currentSts, v) {
+		return RollingUpdateResult{}
+	}
 
 	// Check if any pods are running a different image or config than the
 	// persisted StatefulSet template. All four inputs come from the live
@@ -1744,6 +1750,12 @@ func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valk
 	if err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: v.Namespace}, currentSts); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("getting StatefulSet in post-failover: %w", err)}
 	}
+	// Treated as absent, like in checkAndHandleRollingUpdate: the StatefulSet was
+	// ours when this rolling update entered its state machine, so a foreign one
+	// here means it was replaced mid-update (ADR 0020).
+	if !metav1.IsControlledBy(currentSts, v) {
+		return RollingUpdateResult{}
+	}
 
 	freshPods, _, err := r.collectPodStates(ctx, v, currentSts)
 	if err != nil {
@@ -3306,6 +3318,11 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 			return RollingUpdateResult{}
 		}
 		return RollingUpdateResult{Error: fmt.Errorf("getting sentinel StatefulSet: %w", err)}
+	}
+	// A foreign StatefulSet is treated as absent (ADR 0020); its pods are not
+	// ours to delete. reconcileSentinelStatefulSet reports the collision.
+	if !metav1.IsControlledBy(sentinelSts, v) {
+		return RollingUpdateResult{}
 	}
 
 	totalSentinels := int(*sentinelSts.Spec.Replicas)
