@@ -15,7 +15,7 @@ single-replica skip — verified by reading the file; no run of it is recorded i
 repository. Those assertions call the Eviction API directly; a real `kubectl drain`
 is deliberately not exercised (see the file header), so quorum preservation is
 verified through the budget a drain would hit, not through a drain. That also makes
-them node-count-agnostic: the `multi-node` CI leg
+them node-count-agnostic: the `multi-node-valkey9` CI leg
 ([`.github/workflows/release.yml`](../../.github/workflows/release.yml)) re-runs them
 under three workers and greps its log for
 `--- PASS: TestE2E_PodDisruptionBudget_SerializesEvictions`, which proves the test

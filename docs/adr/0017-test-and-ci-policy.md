@@ -24,8 +24,9 @@ because a replica logged one refused SYNC connect while pod-0 was still binding 
 and the log scan treated "Connection refused" as a critical error wherever it appeared.
 
 Amended 2026-08-22: **D31 is restated.** The matrix has three legs, not two, since D43 added
-the Valkey 8 leg, and the leg that runs the default line is now named for it
-(`single-node-valkey9`) and carries `E2E_VALKEY_LINE=9` rather than an empty selector.
+the Valkey 8 leg, and every leg is now named for the Valkey line it runs and passes that line
+explicitly (`single-node-valkey9`, `multi-node-valkey9`, `single-node-valkey8`) instead of
+leaving the default one nameless behind an empty selector.
 
 ## Context
 
@@ -302,18 +303,21 @@ not optional, and names what to check beyond PASS/FAIL.
 ### CI topology
 
 **D31 — E2E runs as a three-leg matrix with an aggregating gate job.**
-~~Two legs, the full-suite one named `single-node`~~ (superseded 2026-08-22, when D43 added the
-third leg): `single-node-valkey9` runs the full suite; `multi-node` (control-plane + **3**
-workers) runs `E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'`;
-`single-node-valkey8` runs the full suite against the other pinned line. The legs run in
-parallel on separate runner pods with distinct cluster names. A separate `e2e-gate` job named
-"E2E Tests" aggregates all of them, so the pre-existing required status check keeps one stable
-name while legs are renamed or added.
+~~Two legs, the full-suite one named `single-node` and the topology one `multi-node`~~
+(superseded 2026-08-22, when D43 added the third leg): `single-node-valkey9` runs the full
+suite; `multi-node-valkey9` (control-plane + **3** workers) runs
+`E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'`; `single-node-valkey8` runs the
+full suite against the other pinned line. The legs run in parallel on separate runner pods with
+distinct cluster names. A separate `e2e-gate` job named "E2E Tests" aggregates all of them, so
+the pre-existing required status check keeps one stable name while legs are renamed or added.
 
-**A leg named after a Valkey line passes that line explicitly**, never an empty selector that
-resolves to the default. Both spellings run the same image today; they differ on the day the
-default moves, and then the empty one reports a green Valkey 9 leg that ran Valkey 10. The
-multi-node leg does follow the default, deliberately — what it varies is the node count.
+**Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
+empty selector that resolves to the default — including the leg that varies the node count,
+whose result does not depend on the line at all. All three spellings run the same images today;
+they differ on the day the default moves, and then an empty selector reports a green leg that
+ran a line nobody chose for it. The cost is the honest one: moving the fleet to a new major
+edits the names and the selectors together, which is what D43 means by calling that move a
+decision.
 
 **D32 — Three workers, never two.** Kind removes the control-plane `NoSchedule` taint only on
 single-node clusters, so 2 workers plus a tainted control plane leaves 2 schedulable nodes and

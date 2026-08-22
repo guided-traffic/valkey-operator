@@ -52,14 +52,15 @@ jobs:
           # node count - eviction serialization and anti-affinity spread.
           # Three workers, not two: Kind keeps the control-plane NoSchedule taint on
           # multi-node clusters, so spreading three replicas needs three workers.
-          # It follows the default Valkey line on purpose: what this leg varies is
-          # the node count, and it should not need a bump when the default moves.
-          - topology: multi-node
+          # The line it runs is irrelevant to what it tests, but it is named and
+          # passed like every other leg: no leg leaves the reader to resolve an
+          # empty selector against the current default.
+          - topology: multi-node-valkey9
             workers: 3
             cluster: valkey-operator-test-multinode
             run_filter: TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget
             require_multi_node: "true"
-            valkey_line: ""
+            valkey_line: "9"
           # Valkey 8 leg: the same suite on the same topology against the other
           # supported Valkey line. It carries a selector, not an image - the pins
           # live in test/testimages/images.go and a copy here would have to be

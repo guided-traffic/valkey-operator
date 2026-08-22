@@ -242,13 +242,13 @@ CI runs the E2E job three times, as a matrix in `.github/workflows/release.yml`:
 | Leg                   | Cluster                    | Valkey line              | Scope                                             |
 |-----------------------|----------------------------|--------------------------|---------------------------------------------------|
 | `single-node-valkey9` | control-plane only         | `E2E_VALKEY_LINE=9`      | full suite (`make test-e2e`)                      |
-| `multi-node`          | control-plane + 3 workers  | default (currently 9)    | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
+| `multi-node-valkey9`  | control-plane + 3 workers  | `E2E_VALKEY_LINE=9`      | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
 | `single-node-valkey8` | control-plane only         | `E2E_VALKEY_LINE=8`      | full suite                                        |
 
-The two named legs spell their line out; the multi-node leg follows the default,
-because what it varies is the node count. A leg whose name claims a line and
-passes an empty selector would go green against a different line the day the
-default moves.
+Every leg names the line it runs and passes it explicitly. An empty selector
+resolves to whatever the default is, so a leg carrying one would keep its name
+and quietly change what it tests the day the default moves - and crossing a
+major is meant to be a decision, not an arriving PR (ADR 0017 D43).
 
 The multi-node leg exists because two behaviors are meaningless on one node:
 eviction serialization and hard-mode anti-affinity spread. Three
