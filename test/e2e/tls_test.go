@@ -19,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // certificateGVR is the GroupVersionResource for the cert-manager Certificate CRD.
@@ -294,7 +296,7 @@ func TestE2E_TLS_Standalone(t *testing.T) {
 	name := "tls-standalone"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsSpec(),
 	})
 
@@ -527,7 +529,7 @@ func TestE2E_TLS_HACluster(t *testing.T) {
 	name := "tls-ha-nosent"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsSpec(),
 		// No sentinel — all pods run independently.
 	})
@@ -934,7 +936,7 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	name := "tls-ha"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsSpec(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,
@@ -1570,13 +1572,10 @@ func (tc *testClients) findMasterPodTLS(t *testing.T, namespace, name string, re
 // waitForConnectedReplicasTLS waits for connected replicas over TLS.
 func (tc *testClients) waitForConnectedReplicasTLS(t *testing.T, namespace, masterPod string, expectedReplicas int) {
 	t.Helper()
-	expectedStr := fmt.Sprintf("connected_slaves:%d", expectedReplicas)
 	require.Eventually(t, func() bool {
-		info := tc.valkeyTLSExecAllowError(t, namespace, masterPod, tlsValkeyPort, "INFO", "replication")
-		if !strings.Contains(info, expectedStr) {
-			return false
-		}
-		return !strings.Contains(info, "master_sync_in_progress:1")
+		return replicationEstablished(
+			tc.valkeyTLSExecAllowError(t, namespace, masterPod, tlsValkeyPort, "INFO", "replication"),
+			expectedReplicas)
 	}, 90*time.Second, 2*time.Second, "Master %s should have %d connected replicas over TLS", masterPod, expectedReplicas)
 	t.Logf("TLS replication established: %d replicas connected to %s", expectedReplicas, masterPod)
 }
@@ -1616,7 +1615,7 @@ func TestE2E_TLS_AllowUnencrypted_Standalone(t *testing.T) {
 	name := "tls-dual-standalone"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(1),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsAllowUnencryptedSpec(),
 	})
 
@@ -1788,7 +1787,7 @@ func TestE2E_TLS_AllowUnencrypted_HA(t *testing.T) {
 	name := "tls-dual-ha"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsAllowUnencryptedSpec(),
 		"sentinel": tlsSentinelAllowUnencryptedSpec(3),
 	})
@@ -1945,7 +1944,7 @@ func TestE2E_TLS_HAClusterWithSentinel_ReplicaAnnounceIP(t *testing.T) {
 	name := "announce"
 	valkey := buildValkeyObject(name, ns, map[string]interface{}{
 		"replicas": int64(3),
-		"image":    "valkey/valkey:8.0",
+		"image":    testimages.Default(),
 		"tls":      tlsSpec(),
 		"sentinel": map[string]interface{}{
 			"enabled":  true,

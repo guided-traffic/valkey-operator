@@ -35,6 +35,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
 
 // Rolling update annotations the operator writes on the Valkey CR
@@ -107,8 +109,8 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	name := "abandon-2r"
 	pod0 := fmt.Sprintf("%s-0", name)
 	pod1 := fmt.Sprintf("%s-1", name)
-	initialImage := "valkey/valkey:8.0"
-	updatedImage := "valkey/valkey:8.1"
+	initialImage := testimages.UpgradeFrom
+	updatedImage := testimages.UpgradeTo
 
 	t.Log("Creating a 2-replica Valkey CR without Sentinel and with a short sync timeout")
 	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
@@ -213,11 +215,16 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 		// replica ConfigMap, whose replicaof still names the promoted master.
 		tc.deletePod(t, ns, pod0)
 
-		// connected_slaves on the promoted master is the unambiguous gate: it is 0
-		// while pod-0 replicates the blackhole and only reaches 1 once the *new*
-		// pod-0 has synced. Waiting on the pod's Ready condition first would accept
-		// the still-terminating old pod.
+		// Two gates, and each closes what the other leaves open. The master-side one
+		// rejects the still-terminating old pod-0: it replicates the blackhole and
+		// never registers, so waiting on the pod Ready condition first would accept
+		// it. It does not prove the dataset arrived, though -- a replica is counted
+		// from the moment it asks for synchronization, and the master then sits out
+		// repl-diskless-sync-delay before it even starts the BGSAVE. The replica-side
+		// master_link_status:up is the moment the RDB is loaded and the GET below
+		// can be answered.
 		tc.waitForConnectedReplicas(t, ns, pod1, 6379, 1)
+		tc.waitForReplicaSynced(t, ns, pod0, 6379)
 		tc.waitForPodReady(t, ns, pod0)
 
 		assert.Equal(t, "after-abandon", tc.valkeyExec(t, ns, pod0, 6379, "GET", "abandon:key2"),

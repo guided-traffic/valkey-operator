@@ -430,23 +430,58 @@ func (tc *testClients) waitForServiceEndpoints(t *testing.T, namespace, name str
 	require.NoError(t, err, "Service %s/%s did not get endpoints", namespace, name)
 }
 
+// replicationEstablished reports whether a master INFO replication output shows the
+// expected number of replicas that have finished their initial sync.
+//
+// connected_slaves alone does not say that, which is the trap this function exists to
+// close. A replica is counted from the moment it asks for synchronization, and the
+// master then holds it at state=wait_bgsave for repl-diskless-sync-delay (Valkey
+// default 5 s) so that further replicas can share one BGSAVE. Throughout that window
+// connected_slaves already reads the final number while the replica still serves an
+// empty dataset. TestE2E_RollingUpdate_TopologyRestoreAbandoned read a key 24 ms
+// before the RDB finished loading that way.
+//
+// The per-replica state carries the answer: the master flips a replica to
+// state=online once the transfer is acknowledged. master_sync_in_progress is not an
+// alternative and never was — it is a field of a REPLICA INFO and never appears in a
+// master response, so the guard that used to stand here could not fail.
+func replicationEstablished(info string, expectedReplicas int) bool {
+	if !strings.Contains(info, fmt.Sprintf("connected_slaves:%d", expectedReplicas)) {
+		return false
+	}
+	return strings.Count(info, "state=online") == expectedReplicas
+}
+
 // waitForConnectedReplicas waits until the master pod has the expected number of
 // connected replicas with replication sync complete.
 // This replaces unreliable time.Sleep for replication readiness.
 func (tc *testClients) waitForConnectedReplicas(t *testing.T, namespace, masterPod string, port, expectedReplicas int) {
 	t.Helper()
-	expectedStr := fmt.Sprintf("connected_slaves:%d", expectedReplicas)
 	// Allow 3 minutes — after a rolling update replicas need time to reconnect and
 	// complete the initial replication sync, which can be slow on a loaded Kind cluster.
 	require.Eventually(t, func() bool {
-		info := tc.valkeyExecQuick(t, namespace, masterPod, port, "INFO", "replication")
-		if !strings.Contains(info, expectedStr) {
-			return false
-		}
-		// Ensure no sync is in progress.
-		return !strings.Contains(info, "master_sync_in_progress:1")
+		return replicationEstablished(
+			tc.valkeyExecQuick(t, namespace, masterPod, port, "INFO", "replication"), expectedReplicas)
 	}, 3*time.Minute, 3*time.Second, "Master %s should have %d connected replicas", masterPod, expectedReplicas)
 	t.Logf("Replication established: %d replicas connected to %s", expectedReplicas, masterPod)
+}
+
+// waitForReplicaSynced waits until a replica pod reports a live link to its master
+// with no sync in flight, which is the moment its dataset is queryable.
+//
+// It is the replica-side half of replicationEstablished and the stricter of the two:
+// the master flips a replica to state=online once it has sent the RDB, the replica
+// reports master_link_status:up once it has loaded it. A test that reads back a value
+// written before the sync needs the second one, not the first.
+func (tc *testClients) waitForReplicaSynced(t *testing.T, namespace, replicaPod string, port int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		info := tc.valkeyExecQuick(t, namespace, replicaPod, port, "INFO", "replication")
+		return strings.Contains(info, "master_link_status:up") &&
+			!strings.Contains(info, "master_sync_in_progress:1")
+	}, 2*time.Minute, 2*time.Second,
+		"Replica %s should report a synced link to its master", replicaPod)
+	t.Logf("Replica %s is synced with its master", replicaPod)
 }
 
 // valkeyExecQuick is a fast, no-retry kubectl exec helper intended for use inside
