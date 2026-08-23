@@ -169,7 +169,11 @@ password.
 
 - Every generated object carries an ownerReference to its CR, so deleting the CR
   removes the whole cluster and nothing survives except user-owned Secrets and
-  PVCs.
+  PVCs. Turning `spec.persistence.enabled` off leaves them behind too: it needs
+  the manual StatefulSet migration in
+  [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md), and the
+  operator never deletes a PVC — so the RDB/AOF data of a cluster that is no
+  longer persistent stays on disk until someone removes the claims by hand.
 - Each Valkey CR gets **its own** ServiceAccount, Role and RoleBinding
   (`<cr-name>-sidecar`), and the Role names the pods it may patch, so the blast
   radius of a stolen sidecar token is **one cluster** — not the namespace, and not

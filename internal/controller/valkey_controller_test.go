@@ -1282,14 +1282,25 @@ func TestCleanseCertificateSpec_RemovesPrivateKey(t *testing.T) {
 
 // --- ConfigMap Update ---
 
+// TestReconcile_UpdatesConfigMapOnSpecChange keeps its original subject — the
+// ConfigMap converges on a spec change — and now asserts the second half with it.
+//
+// Toggling spec.persistence on a running cluster is the one change the StatefulSet
+// cannot take: its volumeClaimTemplates are immutable, so the pass refuses the
+// write and reports it. The inversion from "the pass succeeds" to "the pass reports
+// a conflict" is deliberate and is the documented consequence of ADR 0023 A2(i) —
+// the ConfigMap keeps converging while the StatefulSet is held. Both halves are
+// asserted, because a pass that stopped writing the ConfigMap and a pass that wrote
+// the StatefulSet anyway would each be a regression.
 func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, c := newTestReconciler(v)
+	key := types.NamespacedName{Name: "test", Namespace: "default"}
 
 	reconcileOnce(t, r, "test", "default")
 
 	// Enable persistence.
-	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	err := c.Get(context.Background(), key, v)
 	require.NoError(t, err)
 
 	v.Spec.Persistence = &vkov1.PersistenceSpec{
@@ -1300,7 +1311,9 @@ func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	err = c.Update(context.Background(), v)
 	require.NoError(t, err)
 
-	reconcileOnce(t, r, "test", "default")
+	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	require.Error(t, err, "the live StatefulSet has no claims and cannot gain one")
+	assert.ErrorIs(t, err, errRecreateRequired)
 
 	cm := &corev1.ConfigMap{}
 	err = c.Get(context.Background(), types.NamespacedName{
@@ -1309,7 +1322,15 @@ func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should now contain RDB save directives.
-	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "save 900 1")
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "save 900 1",
+		"a held StatefulSet must not stop the rest of the pass from converging (ADR 0001 D1)")
+
+	stored := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), key, stored))
+	blocked := findCondition(stored, vkov1.ConditionTypeReconcileBlocked)
+	require.NotNil(t, blocked, "the conflict has to be visible on the CR, not only in the returned error")
+	assert.Equal(t, metav1.ConditionTrue, blocked.Status)
+	assert.Equal(t, vkov1.ReasonRecreateRequired, blocked.Reason)
 }
 
 // --- StatefulSet Update ---

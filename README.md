@@ -814,6 +814,87 @@ Spreading across availability zones instead of nodes is a `topologyKey` change:
 | `storageClass` | `string` | `""` | StorageClass name (empty = default) |
 | `size` | `Quantity` | `1Gi` | Requested storage size |
 
+`mode` is a config-file setting and propagates like any other one — it changes the
+config hash and rides the failover-aware rolling update. **`enabled`,
+`storageClass` and `size` are read when the StatefulSet is created and never
+again.** A StatefulSet's `volumeClaimTemplates` are immutable, the API server
+rejects every update that touches them, and the operator never writes them — so
+changing storage on an existing cluster is not drift that a later pass converges
+([ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md)).
+
+The operator reports the difference instead of submitting a write that cannot fix
+it — enabling persistence on an existing StatefulSet is rejected by the API server,
+and disabling it is *accepted*, which is worse: the pod template gains an
+`emptyDir` while the live claims stay on the object.
+
+| Change on an existing cluster | What the operator does |
+|---|---|
+| `enabled` toggled in either direction | Writes **nothing** to that StatefulSet — replica, image and label changes are held together with the storage change. `StorageSpecNotApplied=True` with reason `RecreateRequired`, `ReconcileBlocked=True` with the same reason, and a `StatefulSetRecreateRequired` Warning Event on every pass. |
+| `size` or `storageClass` changed while `enabled: true` | Applies every other change normally; only the storage stays as it is. `StorageSpecNotApplied=True` with reason `VolumeClaimTemplatesImmutable` and a `StatefulSetRecreateRequired` Warning Event naming the difference. The reconcile is **not** blocked. |
+
+Both shapes use the same Event reason — `StatefulSetRecreateRequired` for the data
+StatefulSet, `SentinelStatefulSetRecreateRequired` for the Sentinel one, which
+carries no `volumeClaimTemplates` today and therefore never conflicts — and the
+message says which shape it is. While a `RecreateRequired` conflict stands the
+**ConfigMap keeps converging** — the `save`/`appendonly` directives follow the spec
+even though the volumes do not, so a pod that restarts for any other reason boots
+the new persistence config against the old volume layout. That costs consistency
+between the dump settings and the volume, never the dataset: the pod rejoins as a
+replica and resyncs from the master.
+
+**The migration works in one direction and not the other.** Both were walked on a
+running three-replica cluster (2026-08-23, Kind, Kubernetes 1.36); the results are
+not symmetric and the difference decides whether you can do this at all.
+
+Either way the first step is the same, and `--cascade=orphan` is not optional:
+
+```bash
+kubectl delete statefulset <name> -n <namespace> --cascade=orphan
+```
+
+> **Never omit `--cascade=orphan`.** Without it the delete takes every pod at once,
+> and a cluster whose data is only in memory loses it on the spot.
+
+**Turning persistence off: verified, lossless.** The pods survive the delete, the
+operator recreates the StatefulSet without claim templates, the
+statefulset-controller re-adopts the pods, and the failover-aware rolling update
+replaces them one by one with `emptyDir`-backed ones. Measured end state: three new
+pods, `phase: OK`, and the dataset intact on all three. The old
+PersistentVolumeClaims stay behind, still bound (see below).
+
+**Turning persistence on: do not do this on a cluster whose data matters.** The
+same first step wedges. Re-adoption itself works, but the statefulset-controller
+then tries to attach the new claim to each adopted pod, which pod immutability
+forbids — `Pod "<name>-0" is invalid: spec: Forbidden: pod updates may not change
+fields other than ...`. The sync fails on the lowest such ordinal and returns, so no
+missing pod is created either: a cluster the operator had already started rolling
+stays short of pods indefinitely. Deleting the adopted pods by hand, lowest ordinal
+first, does clear the wedge — and in the measured run the dataset did **not**
+survive that step: the empty replacement of ordinal 0 is still the recorded master,
+and the split-brain resolver demoted the drain-promoted pod that held the data.
+Until those two defects are fixed, treat enabling persistence on an existing cluster
+as "stand up a new cluster and restore into it", and back up first
+(`valkey-cli --rdb`, or `BGSAVE` plus a copy out of the pod). Both findings, with
+their reproductions, are in
+[ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md).
+
+Reverting `spec.persistence` to what the StatefulSet was created with clears the
+block at once, touches no pod and costs nothing — the right move whenever the change
+was not deliberate.
+
+**Recreating does not resize or reclass the volumes that already exist.** The
+claims are named `data-<name>-<ordinal>` and are reused by name, so a recreated
+StatefulSet binds the same PersistentVolumeClaims it had before — only claims
+created *later*, when a scale-out adds a new ordinal, follow the new `size` or
+`storageClass`. Growing a volume is an edit on each PersistentVolumeClaim and needs
+a StorageClass with `allowVolumeExpansion: true`; changing the class means moving
+the data.
+
+**Turning persistence off leaves the data on disk.** The operator never deletes a
+PersistentVolumeClaim and sets no `persistentVolumeClaimRetentionPolicy`, so the
+old claims and their RDB/AOF files outlive the migration. They are reattached if a
+persistent cluster of the same name is created again, and removed only by hand.
+
 ### `spec.rollingUpdate`
 
 | Field | Type | Default | Description |
@@ -860,7 +941,8 @@ does not fit in five minutes.
 | `RollingUpdatePaused` | A rolling update stopped because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. It resumes on the next spec change. |
 | `TopologyRestored` | The last multi-replica rolling update handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. |
 | `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. A clearing branch exists but is not reached when the drift resolves (a pass with nothing to update returns before dispatching), so a `True` can outlive it — confirm the running image rather than this field. |
-| `ReconcileBlocked` | A managed resource could not be written. The reason distinguishes an admission-webhook rejection from any other write failure. |
+| `ReconcileBlocked` | A managed resource could not be written, or the operator refused to write it. The reason says which, because they end differently: `AdmissionWebhookDenied` (a cluster-side admission gate rejected the write, or a fail-closed webhook could not be called — clears itself once the gate reopens), `ForeignObject` (one of the generated names is held by an object this `Valkey` does not control — clears when someone deletes or renames it), `RecreateRequired` (a StatefulSet whose immutable `volumeClaimTemplates` no longer match `spec.persistence` — clears when the StatefulSet is recreated or the spec is put back, see [`spec.persistence`](#specpersistence)), `WriteFailed` (any other write failure: RBAC, quota, conflict, API server unreachable). When one pass produces several, the reason reported is the one that needs a human: `ForeignObject` before `RecreateRequired` before `AdmissionWebhookDenied`. |
+| `StorageSpecNotApplied` | The storage `spec.persistence` asks for is not the storage the cluster runs on, because a StatefulSet's `volumeClaimTemplates` are immutable. Reason `RecreateRequired` means the operator writes nothing to that StatefulSet at all until it is recreated (`ReconcileBlocked` carries the same reason); reason `VolumeClaimTemplatesImmutable` means only `size`/`storageClass`/access modes are stuck while every other change still applies. The message names the difference. It goes `False` with reason `StorageSpecApplied` once the live claims match again, and is written only on a cluster that had a conflict — clusters that never had one carry no such condition. See [`spec.persistence`](#specpersistence) and [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md). |
 | `SentinelPeersStale` | At least one Sentinel knows more other Sentinels than the cluster has. Sentinel never forgets a peer it has seen, and the majority a failover leader needs is computed over that whole table — so the surplus is failover capacity that is already gone, not a display issue. The message names each pod and its count. Clear it with `SENTINEL RESET <cluster-name>` on one Sentinel at a time **while the master is healthy** (a reset with the master unreachable leaves that Sentinel knowing nothing and unable to rediscover), or leave it to the next Sentinel roll. Only written while all Valkey and Sentinel pods are Ready; a pass where no Sentinel answers leaves the previous value. A cluster reporting `True` is re-checked every 5 minutes, so a reset shows up as a cleared condition within the maintenance window rather than at the next cache resync. See [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md). |
 
 #### Phase Values

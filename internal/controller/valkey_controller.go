@@ -1218,6 +1218,14 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 		return foreignObjectError("StatefulSet", desired.Name)
 	}
 
+	// volumeClaimTemplates are immutable and this function never writes them, so a
+	// difference between spec.persistence and the live claims is not drift the next
+	// pass converges. Checked before the drift detection, because the update the
+	// drift would trigger is the doomed one (ADR 0023).
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current, reasonStatefulSetRecreateRequired); err != nil {
+		return err
+	}
+
 	// Detect drift and update.
 	if builder.StatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating StatefulSet", "name", desired.Name)
@@ -1328,6 +1336,15 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 			"Sentinel is not provisioned: the operator will not write the object, nudge it, "+
 				"run rolling updates against it, or count its pods in status")
 		return foreignObjectError("StatefulSet", desired.Name)
+	}
+
+	// Sentinel keeps its state on an emptyDir and the builder writes no
+	// volumeClaimTemplates at all, so this compares empty against empty and costs
+	// nothing. It is here so that a future Sentinel storage feature cannot
+	// reintroduce the trap in a reconciler that shares no code with the data one
+	// (ADR 0023).
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current, reasonSentinelStatefulSetRecreateRequired); err != nil {
+		return err
 	}
 
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {

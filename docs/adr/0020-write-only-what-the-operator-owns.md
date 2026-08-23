@@ -4,6 +4,14 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended 2026-08-23 (ADR 0023):** the pod re-adoption this ADR twice called "asserted from
+the API contract, reproduced nowhere in this repo" has been run and holds — both statements
+are corrected in place. The same run found the limit of the orphan-delete recovery D1 names:
+it is downtime-free only when the recreated StatefulSet keeps the `volumeClaimTemplates` the
+old one had. Adding a claim wedges the statefulset-controller on the adopted pods
+([ADR 0023](0023-volume-claim-templates-are-immutable.md) D6), so nothing recommends that
+procedure for that case any more.
+
 **Amended 2026-08-22 (NA61):** the guard also binds `reconcileStatefulSet`,
 `reconcileSentinelStatefulSet` and `reconcileObserverDeployment`, `cleanupObserverDeployment`
 gained the ADR 0006 delete guard, and D8 makes every other StatefulSet consumer treat a
@@ -177,10 +185,22 @@ channel.
 
 An object that *lost* its controller reference — a CR deleted with
 `--cascade=orphan` and recreated, a backup restore that changed the CR UID, a hand edit —
-is refused like any other foreign object, visibly, with a downtime-free recovery
-(`kubectl delete sts <name> --cascade=orphan` keeps the pods; the operator recreates the
-StatefulSet and the statefulset-controller re-adopts the label-matching orphans — upstream
-behaviour, asserted from the API contract). An operator *upgrade* is not such a loss: the
+is refused like any other foreign object, visibly, with a recovery that keeps the pods
+running (`kubectl delete sts <name> --cascade=orphan` keeps the pods; the operator
+recreates the StatefulSet and the statefulset-controller re-adopts the label-matching
+orphans).
+
+**Amended 2026-08-23.** The adoption half of that sentence said "upstream behaviour,
+asserted from the API contract" and has now been run: pods orphaned by
+`--cascade=orphan` *are* adopted by the recreated StatefulSet, keyed on its new UID. The
+hedge can go. What replaced it is a narrower limitation the run also found: the recovery
+is downtime-free only when the recreated StatefulSet's `volumeClaimTemplates` are the
+ones the old object had. When the recreate *adds* a claim, the controller adopts the pods
+and then wedges trying to attach it to them, because a pod spec is immutable — and no
+missing pod is created either. That case, and why nothing recommends this procedure for
+it any more, is [ADR 0023](0023-volume-claim-templates-are-immutable.md) D6.
+
+An operator *upgrade* is not such a loss: the
 CR object and its UID survive the upgrade untouched, and every release ever built stamped
 the reference on create — `reconcileStatefulSet` and `reconcileConfigMap` since `b0081d9`,
 the Sentinel StatefulSet and `reconcileReplicaConfigMap` since `88b721b`, the observer
@@ -412,8 +432,10 @@ which no pod of ours can ever exist is a name our own StatefulSet is blocked on 
 the guard does not survive upstream adoption: the statefulset-controller adopts orphan pods
 matching its selector and stamps its own controller reference, so a pod built to carry this
 cluster's label set and left without a controller becomes genuinely ours by Kubernetes' own
-rules. D9 closes collisions and strays, not a deliberate mimic. That adoption behaviour is
-read from the API contract and reproduced nowhere in this repo.
+rules. D9 closes collisions and strays, not a deliberate mimic. That adoption behaviour was
+read from the API contract and, since 2026-08-23, is reproduced: a Kind run for
+[ADR 0023](0023-volume-claim-templates-are-immutable.md) orphan-deleted a StatefulSet and
+watched the recreated one adopt the surviving pods under its new UID.
 
 ## Consequences
 

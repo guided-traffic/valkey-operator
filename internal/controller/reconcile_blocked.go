@@ -56,10 +56,18 @@ func isAdmissionRejection(err error) bool {
 // pass clears the condition, while a name collision persists until a human deletes
 // or renames the colliding object. Reporting the transient cause would hide the one
 // that needs an operator (docs/adr/0020-write-only-what-the-operator-owns.md).
+//
+// A StatefulSet that needs recreating ranks between the two, by the same argument
+// applied twice: it also clears only when a human acts, so it outranks the
+// admission gate — but a foreign object means nothing under that name is ours at
+// all, which has to be said first
+// (docs/adr/0023-volume-claim-templates-are-immutable.md).
 func reconcileBlockedReason(err error) string {
 	switch {
 	case errors.Is(err, errForeignObject):
 		return vkov1.ReasonForeignObject
+	case errors.Is(err, errRecreateRequired):
+		return vkov1.ReasonRecreateRequired
 	case isAdmissionRejection(err):
 		return vkov1.ReasonAdmissionWebhookDenied
 	default:

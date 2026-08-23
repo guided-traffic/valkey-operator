@@ -45,12 +45,29 @@ const (
 	// topology differs from the canonical one.
 	ConditionTypeTopologyRestored ConditionType = "TopologyRestored"
 
-	// ConditionTypeReconcileBlocked is set when the operator could not write one
-	// of the managed resources. Its reason distinguishes an admission-webhook
-	// rejection (a cluster-side gate, e.g. a fail-closed policy webhook whose
-	// backend is down) from any other write failure, so users do not have to read
-	// operator logs to tell the two apart.
+	// ConditionTypeReconcileBlocked is set when the operator could not write one of
+	// the managed resources, or refused to. Its reason names which of the four
+	// causes it was -- an admission-webhook rejection (a cluster-side gate, e.g. a
+	// fail-closed policy webhook whose backend is down), a generated name held by a
+	// foreign object, a StatefulSet whose immutable fields no longer match the spec,
+	// or any other write failure -- so users do not have to read operator logs to
+	// tell them apart. They end differently: the first clears itself, the other
+	// three clear only when someone acts.
 	ConditionTypeReconcileBlocked ConditionType = "ReconcileBlocked"
+
+	// ConditionTypeStorageSpecNotApplied reports that the storage spec.persistence
+	// asks for is not the storage the cluster runs on. A StatefulSet's
+	// volumeClaimTemplates are immutable, so neither toggling persistence nor
+	// changing the size or storage class of an existing cluster is something a
+	// reconcile can converge; the condition is the durable record of that, since
+	// the Events naming it expire.
+	//
+	// True with reason RecreateRequired means the operator also refuses to write the
+	// StatefulSet at all (ReconcileBlocked carries the same reason). True with
+	// reason VolumeClaimTemplatesImmutable means only the storage parameters are
+	// stuck and every other change is still applied.
+	// See docs/adr/0023-volume-claim-templates-are-immutable.md.
+	ConditionTypeStorageSpecNotApplied ConditionType = "StorageSpecNotApplied"
 
 	// ConditionTypeSentinelPeersStale reports that at least one Sentinel knows more
 	// other Sentinels than the cluster has. Sentinel never forgets a peer it has
@@ -82,6 +99,26 @@ const (
 	// condition clears only when a human deletes or renames the colliding object
 	// (docs/adr/0020-write-only-what-the-operator-owns.md).
 	ReasonForeignObject = "ForeignObject"
+
+	// ReasonRecreateRequired is the ReconcileBlocked reason for a StatefulSet the
+	// operator refused to update because its volumeClaimTemplates are immutable and
+	// no longer match spec.persistence. Like ReasonForeignObject nothing failed --
+	// the operator could have submitted the write and chose not to, because the API
+	// server rejects it when persistence was enabled and, worse, accepts it when
+	// persistence was disabled, leaving the pod template and the live claims
+	// disagreeing. It clears only when the StatefulSet is recreated or the spec is
+	// put back (docs/adr/0023-volume-claim-templates-are-immutable.md).
+	ReasonRecreateRequired = "RecreateRequired"
+
+	// ReasonVolumeClaimTemplatesImmutable is the StorageSpecNotApplied reason for a
+	// size, storage class or access mode that differs from the live claims while the
+	// claims themselves are the ones the spec asks for. It never blocks a reconcile:
+	// the pod template write is unrelated and still happens.
+	ReasonVolumeClaimTemplatesImmutable = "VolumeClaimTemplatesImmutable"
+
+	// ReasonStorageSpecApplied clears StorageSpecNotApplied once the live
+	// volumeClaimTemplates match spec.persistence again.
+	ReasonStorageSpecApplied = "StorageSpecApplied"
 
 	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
 	// reconcile pass over all managed resources.

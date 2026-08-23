@@ -63,7 +63,12 @@ spec:
               ReconcileBlocked has been True for 15 minutes with reason
               {{ "{{ $labels.reason }}" }}. WriteFailed and ForeignObject clear only when a
               human acts; AdmissionWebhookDenied usually clears on its own once the
-              admission gate reopens.
+              admission gate reopens. RecreateRequired also needs a human: the
+              StatefulSet's volumeClaimTemplates are immutable and no longer match
+              spec.persistence, so the operator writes nothing to it - replica, image and
+              label changes are held with it. Putting spec.persistence back clears it at
+              no cost; applying it needs the StatefulSet recreated by hand and does not
+              preserve the dataset (see the spec.persistence section of the README).
 
         - alert: ValkeyPhaseNotOK
           expr: |

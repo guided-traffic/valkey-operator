@@ -112,7 +112,10 @@ spec:
     enabled: true
     namePrefix: "my-prefix"
   persistence:
-    enabled: true
+    enabled: true    # volumeClaimTemplates are immutable: toggling this on an existing
+                     # cluster blocks reconciliation until the StatefulSet is recreated
+                     # by hand, which is a rebuild and does not preserve the dataset; a
+                     # changed size/storageClass is reported, never applied - ADR 0023
     mode: rdb        # rdb | aof | both
     storageClass: ""
     size: 1Gi

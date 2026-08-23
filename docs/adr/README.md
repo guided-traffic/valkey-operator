@@ -50,6 +50,7 @@ A reader must never find the old rule stated as current.
 | [0004](0004-opt-in-poddisruptionbudgets.md) | Opt-in PodDisruptionBudgets with a quorum-derived Sentinel budget |
 | [0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) | Upgrade-neutral defaults, and pod anti-affinity off by default |
 | [0006](0006-delete-only-what-the-operator-owns.md) | Delete only what the operator can prove it owns |
+| [0023](0023-volume-claim-templates-are-immutable.md) | A StatefulSet whose volumeClaimTemplates no longer match the spec is refused, not rewritten |
 
 ### Data plane and master authority
 
