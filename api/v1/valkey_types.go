@@ -79,6 +79,18 @@ const (
 	// Sentinel roll.
 	// See docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md.
 	ConditionTypeSentinelPeersStale ConditionType = "SentinelPeersStale"
+
+	// ConditionTypeSentinelUpdatePending reports that the Sentinel tier is being
+	// rolled: at least one Sentinel pod runs a spec older than the Sentinel
+	// StatefulSet template, or a replacement pod is not Ready yet. The data tier
+	// always finishes first — its RollingUpdateComplete event fires before the
+	// first Sentinel pod is touched — so this condition, and the
+	// SentinelUpdateComplete event emitted exactly when it flips back to False,
+	// are the signal that the update as a whole is finished. The condition's own
+	// previous value is the memory that a roll was in flight; there is no
+	// annotation behind it.
+	// See docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md.
+	ConditionTypeSentinelUpdatePending ConditionType = "SentinelUpdatePending"
 )
 
 const (
@@ -123,6 +135,21 @@ const (
 	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
 	// reconcile pass over all managed resources.
 	ReasonReconcileSucceeded = "ReconcileSucceeded"
+
+	// ReasonSentinelPodsOutdated is the SentinelUpdatePending reason while the
+	// Sentinel tier rolls: at least one Sentinel pod is on an outdated spec or a
+	// replacement pod is not Ready yet. The message carries the progress count.
+	ReasonSentinelPodsOutdated = "SentinelPodsOutdated"
+
+	// ReasonSentinelUpdateComplete clears SentinelUpdatePending once every
+	// Sentinel pod runs the desired spec and is Ready. The transition to this
+	// reason is the one moment the SentinelUpdateComplete event is emitted.
+	ReasonSentinelUpdateComplete = "Completed"
+
+	// ReasonSentinelDisabled clears SentinelUpdatePending on a CR whose Sentinel
+	// was disabled while the condition stood — disabling is not completing, so no
+	// SentinelUpdateComplete event accompanies it.
+	ReasonSentinelDisabled = "SentinelDisabled"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -137,6 +164,10 @@ const (
 	ValkeyphaseSyncing ValkeyPhase = "Syncing"
 	// ValkeyPhaseRollingUpdate indicates a rolling update is in progress.
 	ValkeyPhaseRollingUpdate ValkeyPhase = "Rolling Update"
+	// ValkeyPhaseSentinelRollingUpdate indicates the Sentinel tier is being
+	// rolled. It follows the data tier's "Rolling Update" phase (the data tier
+	// always converges first) and appears alone on Sentinel-only spec changes.
+	ValkeyPhaseSentinelRollingUpdate ValkeyPhase = "Sentinel Rolling Update"
 	// ValkeyPhaseFailover indicates a failover is in progress.
 	ValkeyPhaseFailover ValkeyPhase = "Failover in progress"
 	// ValkeyPhaseError indicates an error state.

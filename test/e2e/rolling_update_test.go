@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -319,6 +320,61 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 			assert.Equal(t, updatedImage, pod.Spec.Containers[0].Image,
 				"Pod %d should run updated image", i)
 		}
+	})
+
+	t.Run("Sentinel tier reports its own completion", func(t *testing.T) {
+		// The data tier's RollingUpdateComplete fires before the first sentinel
+		// pod is replaced (ADR 0024), so the sentinel tier must produce its own
+		// marker: SentinelUpdatePending ends False with reason Completed, and a
+		// SentinelUpdateComplete event exists that was not recorded before the
+		// data tier's marker.
+		tc.waitForAllPodsImage(t, ns, fmt.Sprintf("%s-sentinel", name), 3, updatedImage)
+
+		require.Eventually(t, func() bool {
+			status := tc.getValkeyStatus(t, ns, name)
+			conds, _, _ := unstructured.NestedSlice(status, "conditions")
+			for _, c := range conds {
+				cm, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if cm["type"] == "SentinelUpdatePending" {
+					return cm["status"] == "False" && cm["reason"] == "Completed"
+				}
+			}
+			return false
+		}, 2*time.Minute, 3*time.Second,
+			"SentinelUpdatePending should end False/Completed once every sentinel pod is current and ready")
+
+		events, err := tc.kube.CoreV1().Events(ns).List(context.Background(), metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("involvedObject.name=%s", name),
+		})
+		require.NoError(t, err, "Listing events for %s", name)
+
+		eventTime := func(ev corev1.Event) time.Time {
+			if !ev.EventTime.IsZero() {
+				return ev.EventTime.Time
+			}
+			return ev.FirstTimestamp.Time
+		}
+		var dataDone, sentinelDone *time.Time
+		for _, ev := range events.Items {
+			ts := eventTime(ev)
+			switch ev.Reason {
+			case "RollingUpdateComplete":
+				if dataDone == nil || ts.Before(*dataDone) {
+					dataDone = &ts
+				}
+			case "SentinelUpdateComplete":
+				if sentinelDone == nil || ts.After(*sentinelDone) {
+					sentinelDone = &ts
+				}
+			}
+		}
+		require.NotNil(t, dataDone, "RollingUpdateComplete event should exist")
+		require.NotNil(t, sentinelDone, "SentinelUpdateComplete event should exist")
+		assert.False(t, sentinelDone.Before(*dataDone),
+			"SentinelUpdateComplete (%s) must not precede RollingUpdateComplete (%s)", sentinelDone, dataDone)
 	})
 
 	t.Run("Cluster is healthy after rolling update", func(t *testing.T) {

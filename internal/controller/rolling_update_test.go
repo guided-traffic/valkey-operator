@@ -12,9 +12,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8sevents "k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -2399,6 +2401,217 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
 		Name: fmt.Sprintf("%s-2", stsName), Namespace: "default",
 	}, pod2))
+}
+
+// --- ADR 0024: the Sentinel tier reports its own completion ---
+
+// sentinelUpdatePendingTrue seeds the CR with SentinelUpdatePending=True, the
+// memory that a Sentinel roll is in flight.
+func sentinelUpdatePendingTrue(v *vkov1.Valkey) {
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:    vkov1.ConditionTypeSentinelUpdatePending,
+		Status:  metav1.ConditionTrue,
+		Reason:  vkov1.ReasonSentinelPodsOutdated,
+		Message: "Sentinel rolling update in progress: 2/3 pods updated and ready",
+	})
+}
+
+func getSentinelUpdatePending(t *testing.T, c client.Client, v *vkov1.Valkey) *metav1.Condition {
+	t.Helper()
+	fresh := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, fresh))
+	return meta.FindStatusCondition(fresh.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_RecordsPendingConditionAndPhase(t *testing.T) {
+	// All 3 sentinel pods outdated and ready → the pass deletes one, and before
+	// acting it must record the roll: condition True with the progress count, and
+	// the phase naming the current task (the data tier's completion event has
+	// already fired at this point).
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	require.True(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond, "SentinelUpdatePending must be recorded while the roll is in flight")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelPodsOutdated, cond.Reason)
+	assert.Contains(t, cond.Message, "0/3")
+
+	fresh := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, fresh))
+	assert.Equal(t, vkov1.ValkeyPhase("Sentinel Rolling Update 0/3"), fresh.Status.Phase)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_NoCompletionWhileReplacementBoots(t *testing.T) {
+	// The last outdated pod was deleted (p2 absent), p0/p1 are current and ready,
+	// and the roll is recorded in flight. No pod needs an update any more, but
+	// completion must not fire while the replacement is still booting — that is
+	// exactly the too-early edge the marker exists to remove.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		sentinelUpdatePendingTrue(v)
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	// p2 intentionally absent: deleted last pass, replacement not created yet.
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.True(t, result.NeedsRequeue, "Completion detection must keep driving itself while a replacement boots")
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status, "Condition must stay True until every pod is current and Ready")
+	assert.Empty(t, rec.Events, "No completion event while a replacement pod is still booting")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_EmitsCompletionEventExactlyOnce(t *testing.T) {
+	// Roll recorded in flight, every pod current and ready → the condition flips
+	// to False and SentinelUpdateComplete is emitted. A second pass over the same
+	// state must stay silent: the event is gated on the flip actually landing.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		sentinelUpdatePendingTrue(v)
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, true)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelUpdateComplete, cond.Reason)
+
+	require.Len(t, rec.Events, 1, "Exactly one completion event on the flip")
+	event := <-rec.Events
+	assert.Contains(t, event, "SentinelUpdateComplete")
+
+	// Second pass over the converged state: no new event, no condition change.
+	result = r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+	assert.Empty(t, rec.Events, "A repeated pass over the converged state must not re-emit the event")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_SteadyStateWritesNothing(t *testing.T) {
+	// A healthy pass with no roll in flight must stay exactly as silent as before
+	// the condition existed: no condition written onto the CR, no event. This is
+	// what keeps the upgrade from stamping SentinelUpdatePending=False onto every
+	// sentinel-enabled cluster in the fleet.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, true)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+
+	assert.Nil(t, getSentinelUpdatePending(t, c, v), "Steady state must not create the condition")
+	assert.Empty(t, rec.Events)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_QuorumWaitKeepsConditionTrue(t *testing.T) {
+	// quorum=2, readyCount=2 → the delete is deferred, but the roll is still in
+	// flight and must be recorded as such.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, false)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	require.True(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond, "The quorum wait is part of the roll and must be recorded")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+}
+
+func TestClearSentinelUpdatePending_OnlyWhenPresent(t *testing.T) {
+	// A CR without the condition must not gain one (fleet-neutral upgrade); a CR
+	// carrying True gets it flipped to False with the disabled reason and no
+	// completion event — disabling is not completing.
+	bare := newTestValkey("bare", "default")
+	carrying := newTestValkey("carrying", "default", sentinelUpdatePendingTrue)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(bare, carrying)
+	r.Recorder = rec
+
+	r.clearSentinelUpdatePending(context.Background(), bare)
+	assert.Nil(t, getSentinelUpdatePending(t, c, bare), "No condition may be created on a CR that never carried one")
+
+	r.clearSentinelUpdatePending(context.Background(), carrying)
+	cond := getSentinelUpdatePending(t, c, carrying)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelDisabled, cond.Reason)
+	assert.Empty(t, rec.Events, "Disabling Sentinel must not emit a completion event")
+}
+
+func TestHandlePostRollingUpdateChecks_SentinelDisabledClearsCondition(t *testing.T) {
+	// Sentinel was disabled while the condition stood. The sentinel branch is
+	// skipped forever on such a CR, so the clear must happen on the non-sentinel
+	// path — otherwise the condition is permanent drift (the T6 class).
+	v := newTestValkey("standalone", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		sentinelUpdatePendingTrue(v)
+	})
+	r, c := newTestReconciler(v)
+
+	_, done, err := r.handlePostRollingUpdateChecks(context.Background(), v)
+	require.NoError(t, err)
+	assert.False(t, done)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelDisabled, cond.Reason)
 }
 
 // --- ADR 0001 D7: a Sentinel rolling-update error must lead to a retry ---

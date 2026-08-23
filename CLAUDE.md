@@ -161,7 +161,8 @@ vko.gtrfc.com/instanceRole: <replica | master>
 
 The CRD status must be visible in Lens and show the current operator task per instance:
 - `OK` when the instance is healthy
-- A short description of the current task otherwise (e.g., `Rolling Update 2/3`, `Syncing`, `Failover in progress`)
+- A short description of the current task otherwise (e.g., `Rolling Update 2/3`,
+  `Sentinel Rolling Update 1/3`, `Syncing`, `Failover in progress`)
 
 ## Testing
 
@@ -325,6 +326,14 @@ while the master holds some is refused (`verifyPromotionCandidateHoldsData`). Ev
 these waits is bounded by `spec.rollingUpdate.syncTimeout` and pauses the update rather than
 promoting.
 → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D10
+
+**Completion is reported per tier.** `RollingUpdateComplete` means the data tier and fires
+before the first Sentinel pod is replaced; the Sentinel tier rolls afterwards, carries the
+`SentinelUpdatePending` condition while it does (phase `Sentinel Rolling Update i/n`), and
+emits `SentinelUpdateComplete` exactly when that condition flips back to False. Anything
+sequencing on "the update is finished" on a sentinel-enabled cluster waits for the Sentinel
+marker, not the data one.
+→ [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md)
 
 ## Reconcile concurrency
 

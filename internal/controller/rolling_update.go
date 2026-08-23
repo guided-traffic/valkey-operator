@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -590,9 +591,12 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 		}
 	}
 
-	logger.Info("Rolling update complete, all pods running new image")
+	logger.Info("Rolling update complete, all data pods running new image")
+	// This event covers the data tier only: the Sentinel tier rolls afterwards
+	// and reports its own SentinelUpdateComplete
+	// (docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
 	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
-		"Rolling update completed successfully, all pods running desired version")
+		"Rolling update of the data pods completed successfully; any outdated Sentinel pods are rolled next")
 	// Clean up state annotation.
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -3237,7 +3241,7 @@ func (r *ValkeyReconciler) abandonTopologyRestoration(ctx context.Context, v *vk
 // are logged, and the state machine advances without the record.
 func (r *ValkeyReconciler) recordTopologyRestoredCondition(ctx context.Context, v *vkov1.Valkey,
 	status metav1.ConditionStatus, reason, message string) error {
-	err := r.writeStatusCondition(ctx, v, vkov1.ConditionTypeTopologyRestored, status, reason, message)
+	_, err := r.writeStatusCondition(ctx, v, vkov1.ConditionTypeTopologyRestored, status, reason, message)
 	if err == nil {
 		return nil
 	}
@@ -3543,6 +3547,7 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 	desiredTemplate := sentinelSts.Spec.Template
 
 	readyCount := 0
+	updatedReadyCount := 0
 	var firstOutdatedPod *corev1.Pod
 
 	for i := 0; i < totalSentinels; i++ {
@@ -3562,18 +3567,28 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 		if !podIsOurs(pod, sentinelSts) {
 			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
 		}
+		outdated := sentinelPodNeedsUpdate(pod, desiredTemplate)
 		if isPodReady(pod) {
 			readyCount++
+			if !outdated {
+				updatedReadyCount++
+			}
 		}
-		if firstOutdatedPod == nil && sentinelPodNeedsUpdate(pod, desiredTemplate) {
+		if firstOutdatedPod == nil && outdated {
 			firstOutdatedPod = pod
 		}
 	}
 
 	if firstOutdatedPod == nil {
-		// All sentinel pods are running the desired image.
-		return RollingUpdateResult{}
+		return r.finishSentinelRollingUpdate(ctx, v, updatedReadyCount, totalSentinels)
 	}
+
+	// A roll is in flight. Record it before acting: the True condition is the
+	// memory whose flip back to False is the completion edge, and the phase is
+	// the status contract's "current task" — the data tier's RollingUpdateComplete
+	// has already fired at this point (or, on a Sentinel-only spec change, the
+	// data tier never rolled and the phase would otherwise keep reading OK).
+	r.recordSentinelUpdateProgress(ctx, v, updatedReadyCount, totalSentinels)
 
 	// Guard quorum: after deleting one pod we need at least `quorum` sentinels left.
 	if readyCount-1 < quorum {
@@ -3587,6 +3602,70 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", firstOutdatedPod.Name, err)}
 	}
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// sentinelUpdatePending reports whether the CR carries SentinelUpdatePending=True —
+// the memory that a Sentinel roll is in flight. It reads the pass's cached copy;
+// a lagging cache can at worst delay the completion edge by one pass, never emit
+// it twice, because the emission is gated on the condition flip actually landing
+// (writeStatusCondition) and a status update from a stale copy cannot land.
+func sentinelUpdatePending(v *vkov1.Valkey) bool {
+	cond := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending)
+	return cond != nil && cond.Status == metav1.ConditionTrue
+}
+
+// recordSentinelUpdateProgress marks the Sentinel roll as in flight on the CR:
+// SentinelUpdatePending=True carrying the progress count, and the phase per the
+// CLAUDE.md status contract ("OK when healthy, otherwise the current task").
+// updatedReady counts pods that are on the desired spec AND Ready, so the
+// number is monotone across the roll and reaches total exactly at completion.
+// Both writes skip themselves when nothing changed, so a wait pass costs no
+// status update.
+func (r *ValkeyReconciler) recordSentinelUpdateProgress(ctx context.Context, v *vkov1.Valkey, updatedReady, total int) {
+	message := fmt.Sprintf("Sentinel rolling update in progress: %d/%d pods updated and ready", updatedReady, total)
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeSentinelUpdatePending,
+		metav1.ConditionTrue,
+		vkov1.ReasonSentinelPodsOutdated,
+		message)
+	_ = r.updatePhase(ctx, v,
+		ValkeyPhase(fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseSentinelRollingUpdate, updatedReady, total)),
+		message)
+}
+
+// finishSentinelRollingUpdate handles the pass in which no Sentinel pod needs
+// replacing. For a CR not carrying SentinelUpdatePending=True that is the steady
+// state of every healthy pass, and it stays exactly as silent as it was before
+// the condition existed. With the condition standing, convergence is more than
+// "no outdated pod": every pod must exist, be current and be Ready — otherwise
+// the pod deleted last is still booting, and "complete" would fire while it
+// does, which is the same too-early edge this marker exists to remove (the
+// data tier's RollingUpdateComplete already fires before the Sentinel tier
+// starts). The completion event is gated on the condition flip actually
+// landing, so it is emitted exactly once per roll; a failed flip requeues,
+// because with every pod Ready nothing else re-triggers the pass.
+func (r *ValkeyReconciler) finishSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey, updatedReady, total int) RollingUpdateResult {
+	if !sentinelUpdatePending(v) {
+		return RollingUpdateResult{}
+	}
+	if updatedReady < total {
+		r.recordSentinelUpdateProgress(ctx, v, updatedReady, total)
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	message := fmt.Sprintf("Sentinel rolling update completed, all %d sentinel pods running the desired spec", total)
+	changed, err := r.writeStatusCondition(ctx, v,
+		vkov1.ConditionTypeSentinelUpdatePending,
+		metav1.ConditionFalse,
+		vkov1.ReasonSentinelUpdateComplete,
+		message)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Could not clear SentinelUpdatePending, retrying")
+		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+	if changed {
+		r.recordEvent(v, corev1.EventTypeNormal, "SentinelUpdateComplete", "%s", message)
+	}
+	return RollingUpdateResult{}
 }
 
 // ValkeyPhase is a type alias to allow constructing rolling update phase strings.

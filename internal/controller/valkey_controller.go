@@ -388,6 +388,12 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 		if sentinelResult.NeedsRequeue {
 			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
 		}
+	} else {
+		// Disabling Sentinel mid-roll skips the check above forever, which would
+		// leave a standing SentinelUpdatePending=True as permanent drift (the T6
+		// class). Clearing it here is one map lookup on every non-Sentinel pass
+		// and a single write on the transition.
+		r.clearSentinelUpdatePending(ctx, v)
 	}
 
 	// For multi-replica non-Sentinel clusters, detect a no-master state and recover
@@ -2449,14 +2455,17 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 // and decides for itself what a failed write means
 // (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
 func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
-	if err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
+	if _, err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to write status condition; it will be recomputed on the next reconcile",
 			"condition", condType, "reason", reason)
 	}
 }
 
 // writeStatusCondition is the write setStatusCondition documents, reporting
-// whether it landed.
+// whether it landed and whether it changed anything. The changed verdict is what
+// lets a caller emit a transition edge (an Event) exactly once: a write that
+// found the stored condition already matching reports false, so a repeated pass
+// over the same state stays silent.
 //
 // Every attempt reads the CR again, because the read goes through the manager
 // cache and a caller that updated the CR itself moments earlier reads back the
@@ -2468,8 +2477,10 @@ func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valk
 //
 // A CR that disappeared under the pass is not a failure: there is nothing left to
 // record on, and every caller would swallow the NotFound anyway.
-func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) (bool, error) {
+	changed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		changed = false
 		if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -2486,8 +2497,13 @@ func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Va
 		}) {
 			return nil
 		}
-		return r.Status().Update(ctx, v)
+		if err := r.Status().Update(ctx, v); err != nil {
+			return err
+		}
+		changed = true
+		return nil
 	})
+	return changed, err
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
@@ -2532,6 +2548,23 @@ func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vko
 		return
 	}
 	r.setSidecarUpdatePendingCondition(ctx, v, false)
+}
+
+// clearSentinelUpdatePending flips SentinelUpdatePending to False on a CR whose
+// Sentinel is disabled, but only for a CR that actually carries the condition —
+// the same presence guard as clearSidecarUpdatePending, and for the same reason:
+// an unconditional call would write the condition onto every non-Sentinel CR in
+// the fleet. Disabling is not completing, so no SentinelUpdateComplete event
+// accompanies the flip (docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
+func (r *ValkeyReconciler) clearSentinelUpdatePending(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeSentinelUpdatePending,
+		metav1.ConditionFalse,
+		vkov1.ReasonSentinelDisabled,
+		"Sentinel is disabled; no sentinel pods to update")
 }
 
 // checkAndRecoverNoMaster detects a no-master state in multi-replica non-Sentinel
