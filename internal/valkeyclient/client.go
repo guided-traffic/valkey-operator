@@ -41,6 +41,14 @@ type SentinelMasterInfo struct {
 	NumSlaves int
 	Quorum    int
 	Flags     string
+
+	// NumOtherSentinels is how many other Sentinels this one knows for the
+	// monitored master. It is the size of a table Sentinel never garbage-collects,
+	// not a count of live peers, and it is the denominator of the majority a
+	// failover leader needs -- so a count above the number of live Sentinels is
+	// failover capacity that is already gone.
+	// See docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md.
+	NumOtherSentinels int
 }
 
 // SentinelReplicaInfo holds parsed info for a single replica from SENTINEL REPLICAS.
@@ -638,6 +646,7 @@ func parseSentinelMasterInfo(raw string) *SentinelMasterInfo {
 	info.Flags = kvMap["flags"]
 	_, _ = fmt.Sscanf(kvMap["num-slaves"], "%d", &info.NumSlaves)
 	_, _ = fmt.Sscanf(kvMap["quorum"], "%d", &info.Quorum)
+	_, _ = fmt.Sscanf(kvMap["num-other-sentinels"], "%d", &info.NumOtherSentinels)
 
 	return info
 }

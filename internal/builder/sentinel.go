@@ -580,7 +580,10 @@ func ComputeSentinelPodSpecHash(v *vkov1.Valkey) string {
 // init container. The script:
 //  1. Copies the read-only ConfigMap sentinel.conf to the writable volume.
 //  2. Replaces the %VALKEY_PASSWORD% placeholder (when auth is enabled).
-//  3. Validates the configured master by probing Valkey pods via the ROLE command.
+//  3. Pins "sentinel myid" to a digest of the pod hostname so a replacement pod
+//     keeps the identity of its ordinal instead of appearing as an additional
+//     Sentinel to its peers (docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md).
+//  4. Validates the configured master by probing Valkey pods via the ROLE command.
 //     If the configured master is unreachable or not actually a master, the script
 //     scans all known Valkey pods to discover the real master and rewrites the
 //     "sentinel monitor" line in sentinel.conf. This prevents stale master entries
@@ -609,6 +612,28 @@ func buildSentinelInitCommand(v *vkov1.Valkey) string {
 		`# Step 1: Copy read-only config to writable volume.
 cp /etc/sentinel-readonly/%[1]s %[2]s/%[1]s
 %[3]s
+# Step 1b: Pin this pod's Sentinel identity to its ordinal.
+#
+# The writable config volume is an emptyDir, so a replacement pod would otherwise
+# boot with a freshly generated "sentinel myid" and a new pod IP. Its peers match
+# neither by runid nor by address, so they keep the dead identity as an s_down
+# entry forever and every replacement inflates the electorate a failover leader
+# needs a majority of. Deriving the id from the pod hostname makes the ordinal the
+# identity: the peers take Sentinel's address-switch path and replace the entry.
+#
+# Falling back to Sentinel's own random id when HOSTNAME is unset is deliberate.
+# An empty hostname would give every Sentinel of this cluster the same id, which
+# collapses three voters into one -- worse than the drift this prevents.
+if [ -n "$HOSTNAME" ]; then
+  MYID=$(echo "$HOSTNAME.%[8]s" | sha1sum | cut -d' ' -f1)
+  echo "" >> %[2]s/%[1]s
+  echo "# Pinned Sentinel identity (injected by init container)" >> %[2]s/%[1]s
+  echo "sentinel myid $MYID" >> %[2]s/%[1]s
+  echo "Pinned sentinel myid $MYID for $HOSTNAME"
+else
+  echo "HOSTNAME is unset, leaving the Sentinel id to Sentinel"
+fi
+
 # Step 2: Validate the configured master.
 # Extract the current master host from the sentinel monitor line.
 CONFIGURED_MASTER=$(grep "^sentinel monitor" %[2]s/%[1]s | awk '{print $4}')

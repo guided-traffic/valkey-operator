@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -2131,6 +2133,88 @@ func (r *ValkeyReconciler) currentMasterPod(ctx context.Context, v *vkov1.Valkey
 	return pod0
 }
 
+// sentinelPeerDriftRecheckInterval is how soon a cluster carrying stale Sentinel
+// peer entries is looked at again.
+//
+// Deliberately slow. The drift itself changes only when a Sentinel pod is replaced
+// or an administrator resets a table, so this is not a signal that needs following
+// closely -- it is the clock that lets a SENTINEL RESET show up as a cleared
+// condition within a maintenance window instead of at the next cache resync. Only
+// clusters that already report drift pay it.
+const sentinelPeerDriftRecheckInterval = 5 * time.Minute
+
+// recordSentinelPeerDrift turns the peer counts the health pass already collected
+// into the SentinelPeersStale condition.
+//
+// It is a report, not a repair. Removing a stale entry means SENTINEL RESET, which
+// wipes that Sentinel's replica and peer tables and rebuilds them through the
+// master -- harmless with a healthy master, unrecoverable without one, since
+// discovery has no other channel. The operator does not take that decision on its
+// own; ADR 0022 keeps the identity stable so the drift stops accruing, and this
+// says which clusters still carry the entries that predate it.
+//
+// Nothing is written when no sentinel answered: an empty map is "not measured",
+// and overwriting a True condition with False on the strength of three failed
+// connections would clear exactly the signal the operator is meant to act on.
+func (r *ValkeyReconciler) recordSentinelPeerDrift(ctx context.Context, v *vkov1.Valkey, state *health.ClusterState) {
+	if len(state.SentinelPeers) == 0 {
+		return
+	}
+
+	stale := staleSentinelPods(state)
+	if len(stale) == 0 {
+		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               vkov1.ConditionTypeSentinelPeersStale,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: v.Generation,
+			Reason:             "SentinelPeersConsistent",
+			Message: fmt.Sprintf("Every Sentinel knows %d other Sentinels, as expected",
+				state.SentinelPeersExpected),
+		})
+		return
+	}
+
+	details := make([]string, 0, len(stale))
+	for _, pod := range stale {
+		details = append(details, fmt.Sprintf("%s knows %d", pod, state.SentinelPeers[pod]))
+	}
+
+	// Clearing the entries is a manual SENTINEL RESET (ADR 0022 D6), and that
+	// produces no Kubernetes event at all: no pod restarts, no owned object
+	// changes, and the CR watch is generation-gated. Without this recheck the
+	// condition would keep saying True until the 10 h cache resync, which is
+	// exactly the window an operator wants to verify the reset in. Only a cluster
+	// that is actually carrying drift polls, and it stops on the pass that finds
+	// the tables agreeing again.
+	requestRecheck(ctx, sentinelPeerDriftRecheckInterval)
+
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:               vkov1.ConditionTypeSentinelPeersStale,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: v.Generation,
+		Reason:             "StaleSentinelEntries",
+		Message: fmt.Sprintf(
+			"Expected %d other Sentinels, but %s. Dead entries still count towards the "+
+				"majority a failover leader needs; clear them with SENTINEL RESET while the "+
+				"master is healthy, or leave them to the next Sentinel roll",
+			state.SentinelPeersExpected, strings.Join(details, ", ")),
+	})
+}
+
+// staleSentinelPods returns the sentinel pods whose peer table is larger than the
+// cluster, sorted by pod name so the condition message is stable across passes --
+// a message that reorders itself would rewrite the status on every reconcile.
+func staleSentinelPods(state *health.ClusterState) []string {
+	var stale []string
+	for pod, known := range state.SentinelPeers {
+		if known > state.SentinelPeersExpected {
+			stale = append(stale, pod)
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
 // updateHAStatus updates the status for HA (Sentinel) mode.
 func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, readyReplicas int32) error {
 	sentinelReady := int32(0)
@@ -2163,6 +2247,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		// Verify actual cluster health before reporting OK.
 		checker := r.getInstanceChecker()
 		clusterState := checker.CheckCluster(ctx, v)
+		r.recordSentinelPeerDrift(ctx, v, clusterState)
 
 		if clusterState.Error != nil {
 			v.Status.Phase = vkov1.ValkeyPhaseError

@@ -393,6 +393,25 @@ this cluster's sidecar `patch` on a stranger's pod.
 → [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes, grants and pods),
 [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
 
+## Sentinel identity is pinned to the pod
+
+Sentinel never forgets a peer it has seen, and a failover leader needs a majority of that
+whole table. Because the Sentinel config lives on an `emptyDir`, a replacement pod used to
+boot with a fresh `sentinel myid` and a new IP, so every survivor recorded it next to the
+dead one — measured: two live Sentinels with five known peers each never promoted a replica
+after the master was killed, where the same topology with clean tables promoted one in under
+ten seconds. The init container now derives `sentinel myid` from the pod hostname, so the
+ordinal *is* the identity and peers switch the address instead of adding a voter. **A missing
+`HOSTNAME` falls back to Sentinel's own random id on purpose** — one shared id across the
+tier is worse than the drift.
+
+**The operator never issues `SENTINEL RESET` itself.** A reset rebuilds that Sentinel's peer
+and replica tables through the master, which is harmless with a healthy master and
+unrecoverable without one. Drift is *reported* as the `SentinelPeersStale` condition, read
+from the `SENTINEL MASTER` reply the health pass already asks for, and cleared by an operator
+or by the next Sentinel roll.
+→ [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md)
+
 ## Metrics / Exporter
 
 `spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on

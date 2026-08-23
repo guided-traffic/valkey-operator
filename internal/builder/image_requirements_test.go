@@ -31,7 +31,8 @@ var shellCommandCatalog = []string{
 	"awk", "base64", "basename", "cat", "chmod", "chown", "cp", "cut", "date",
 	"dirname", "echo", "env", "expr", "find", "grep", "head", "hostname", "id",
 	"ln", "ls", "mkdir", "mktemp", "mv", "nc", "nslookup", "printf", "ps", "pwd",
-	"readlink", "rev", "rm", "sed", "seq", "sh", "sleep", "sort", "stat", "tail",
+	"readlink", "rev", "rm", "sed", "seq", "sh", "sha1sum", "sleep", "sort",
+	"stat", "tail",
 	"tee", "test", "timeout", "touch", "tr", "uniq", "wc", "wget", "xargs",
 	"valkey-cli", "valkey-server", "valkey-sentinel", "curl", "dig", "getent",
 }

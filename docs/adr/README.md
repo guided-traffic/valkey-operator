@@ -61,6 +61,7 @@ A reader must never find the old rule stated as current.
 | [0010](0010-every-rolling-update-wait-is-bounded.md) | Every rolling-update wait is bounded and has a named exit |
 | [0011](0011-evidence-based-steady-state-split-brain-resolution.md) | Evidence-based steady-state split-brain resolution |
 | [0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) | The sidecar records its drain promotion on the pod, not on the CR |
+| [0022](0022-sentinel-identity-is-pinned-to-the-pod.md) | A Sentinel's identity is pinned to its pod, and peer drift is reported rather than reset |
 
 ### Security and API surface
 

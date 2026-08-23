@@ -41,6 +41,14 @@ type ClusterState struct {
 	// SentinelMonitoring is true when sentinel instances agree on the master.
 	SentinelMonitoring bool
 
+	// SentinelPeers maps each sentinel pod that answered to the number of other
+	// Sentinels it knows. Empty when Sentinel is disabled or no sentinel answered.
+	SentinelPeers map[string]int
+
+	// SentinelPeersExpected is how many other Sentinels each of them should know:
+	// one less than the configured replica count.
+	SentinelPeersExpected int
+
 	// Error holds any error encountered during health check.
 	Error error
 }
@@ -123,7 +131,10 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 
 	// Check sentinel view if sentinel is enabled.
 	if v.IsSentinelEnabled() {
-		state.SentinelMonitoring = h.checkSentinel(ctx, v)
+		observed := h.observeSentinels(ctx, v)
+		state.SentinelMonitoring = observed.monitoring()
+		state.SentinelPeers = observed.peers
+		state.SentinelPeersExpected = observed.expectedPeers
 	}
 
 	return state
@@ -258,8 +269,33 @@ func masterCandidateNames(candidates []masterCandidate) []string {
 	return names
 }
 
-// checkSentinel checks if sentinel instances are monitoring the cluster correctly.
-func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
+// sentinelObservation is what one pass of SENTINEL MASTER over every sentinel pod
+// saw: how many of them report a healthy master, and how many other Sentinels each
+// of them knows.
+//
+// Both answers come from the same reply. Peer drift would otherwise cost a second
+// connection per sentinel per reconcile pass for a field that is already on the
+// wire.
+type sentinelObservation struct {
+	// agreeing is the number of sentinels reporting the master with no error flags.
+	agreeing int
+	// replicas is the configured sentinel replica count.
+	replicas int32
+	// expectedPeers is how many other Sentinels each of them should know.
+	expectedPeers int
+	// peers maps a sentinel pod name to its num-other-sentinels. A sentinel that
+	// did not answer is absent rather than zero.
+	peers map[string]int
+}
+
+// monitoring reports whether a majority of the configured sentinels sees a healthy
+// master.
+func (o sentinelObservation) monitoring() bool {
+	return o.agreeing > int(o.replicas/2)
+}
+
+// observeSentinels queries every sentinel pod once and reports what it saw.
+func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentinelObservation {
 	logger := log.FromContext(ctx)
 	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
 	monitorName := builder.SentinelMonitorName(v)
@@ -277,10 +313,16 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 	}
 
 	// Build TLS config for sentinel connections (uses sentinel TLS secret).
+	observation := sentinelObservation{
+		replicas:      sentinelReplicas,
+		expectedPeers: int(sentinelReplicas) - 1,
+		peers:         map[string]int{},
+	}
+
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 	if err != nil {
 		logger.Info("Could not build TLS config for sentinel health check", "error", err)
-		return false
+		return observation
 	}
 
 	// Sentinel port: use TLS port (36379) when TLS is enabled, plaintext (26379) otherwise.
@@ -290,7 +332,6 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 		port = builder.SentinelTLSPort
 	}
 
-	agreeing := 0
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
 		addr := podAddress(v, podName, port)
@@ -302,13 +343,15 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 			continue
 		}
 
+		observation.peers[podName] = masterInfo.NumOtherSentinels
+
 		// Sentinel should report the master with "master" flag and no error flags.
 		if masterInfo.Flags == "master" {
-			agreeing++
+			observation.agreeing++
 		}
 	}
 
-	return agreeing > int(sentinelReplicas/2)
+	return observation
 }
 
 // buildTLSConfig constructs a tls.Config for connecting to TLS-enabled Valkey/Sentinel pods.

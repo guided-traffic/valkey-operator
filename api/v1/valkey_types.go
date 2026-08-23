@@ -51,6 +51,17 @@ const (
 	// backend is down) from any other write failure, so users do not have to read
 	// operator logs to tell the two apart.
 	ConditionTypeReconcileBlocked ConditionType = "ReconcileBlocked"
+
+	// ConditionTypeSentinelPeersStale reports that at least one Sentinel knows more
+	// other Sentinels than the cluster has. Sentinel never forgets a peer it has
+	// seen, so a replacement pod that announced a new identity is recorded next to
+	// the dead one, and the majority a failover leader needs is computed over the
+	// whole table. The condition is therefore failover capacity that is already
+	// gone, not a cosmetic discrepancy. It clears itself once the tables agree with
+	// the replica count -- either through a one-time SENTINEL RESET or at the next
+	// Sentinel roll.
+	// See docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md.
+	ConditionTypeSentinelPeersStale ConditionType = "SentinelPeersStale"
 )
 
 const (

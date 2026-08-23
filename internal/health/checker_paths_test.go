@@ -529,7 +529,7 @@ func TestCheckSentinel_UnreadableSentinelTLSSecretReturnsFalse(t *testing.T) {
 
 	// The Valkey TLS secret exists, the Sentinel one does not: in the default
 	// (non-unified) cert-manager mode those are two distinct Secrets.
-	agreeing := newFakeChecker(valkeyCASecret()).checkSentinel(ctx, v)
+	agreeing := newFakeChecker(valkeyCASecret()).observeSentinels(ctx, v).monitoring()
 
 	assert.False(t, agreeing)
 	assert.Contains(t, capture.joined(), "Could not build TLS config for sentinel health check")
@@ -545,7 +545,7 @@ func TestCheckSentinel_UnifiedCertificateSharesTheValkeySecret(t *testing.T) {
 
 	// Only the Valkey secret exists. In unified mode that is the sentinel secret
 	// too, so the check must proceed to the sentinels instead of bailing out.
-	agreeing := newFakeChecker(valkeyCASecret()).checkSentinel(ctx, v)
+	agreeing := newFakeChecker(valkeyCASecret()).observeSentinels(ctx, v).monitoring()
 
 	assert.False(t, agreeing, "no sentinel answers, so there is no quorum")
 	assert.NotContains(t, capture.joined(), "Could not build TLS config for sentinel health check")
@@ -594,7 +594,7 @@ func TestCheckSentinel_ProbedPodSet(t *testing.T) {
 			ctx, _ := newProbeContext(t)
 			v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Sentinel = tc.sentinel })
 
-			assert.False(t, newFakeChecker().checkSentinel(ctx, v),
+			assert.False(t, newFakeChecker().observeSentinels(ctx, v).monitoring(),
 				"a silent sentinel never counts towards the quorum")
 			assert.Equal(t, tc.wantHosts, resolverProbe.hosts())
 		})
@@ -632,7 +632,7 @@ func TestCheckSentinel_PortDependsOnTLS(t *testing.T) {
 			}
 			v := newTestValkey("test", "default", opts...)
 
-			assert.False(t, newFakeChecker(tc.objects...).checkSentinel(ctx, v))
+			assert.False(t, newFakeChecker(tc.objects...).observeSentinels(ctx, v).monitoring())
 			assert.Contains(t, capture.joined(),
 				fmt.Sprintf("test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:%d", tc.wantPort),
 				"the V(1) diagnostic must name the address that was actually dialled")
@@ -654,7 +654,7 @@ func TestCheckSentinel_DoubleDigitOrdinalIsMisrouted(t *testing.T) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 11}
 	})
 
-	assert.False(t, newFakeChecker().checkSentinel(ctx, v))
+	assert.False(t, newFakeChecker().observeSentinels(ctx, v).monitoring())
 	assert.Contains(t, resolverProbe.hosts(), "test-sentinel-10.test-headless.default.svc.cluster.local",
 		"BUG: sentinel-10 is addressed through the Valkey headless service")
 	assert.NotContains(t, resolverProbe.hosts(), "test-sentinel-10.test-sentinel-headless.default.svc.cluster.local")
