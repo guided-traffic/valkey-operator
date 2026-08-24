@@ -4,6 +4,11 @@
 
 Accepted. Date: 2026-08-21. Applies to **non-Sentinel** multi-replica clusters.
 
+Amended 2026-08-24 by [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md):
+the shared `demoteRogueMaster` helper (D20) emits `SplitBrainResolved` as a **Normal** Event,
+and the Consequence about status invisibility is narrowed to this check. Both are marked in
+place below.
+
 Supersedes two earlier shapes of the same check, both written and discarded during
 development on this branch. **Neither shipped, and neither is reproducible from git:**
 `internal/controller/steady_state_master.go` has exactly one commit in the whole history
@@ -261,6 +266,15 @@ disagree with the one that actually routes writes, so the operator would consoli
 different set of masters than clients reach; a second demote path would duplicate the most
 destructive operation in the codebase.
 
+*Amended 2026-08-24 ([ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D7).*
+Sharing `demoteRogueMaster` means sharing its Event: it emits `SplitBrainResolved` as
+**Normal**, not Warning, in both regimes. ~~The helper emitted `SplitBrainResolved` as a
+Warning.~~ It reports a repair that succeeded, and the monitoring contract below names
+`SplitBrainUnresolved`, `SplitBrainDemotionRefused` and `MasterAdoptionRefused` — never this
+reason — so nothing documented here depended on the type. Reporting a completed repair as an
+alarm is what made the Warning channel unreadable during a rolling update; a Warning named
+split-brain now means one that nobody resolved.
+
 **D21 — No Pod watch.** The operator watches its owned objects and Secrets only. Evidence
 must therefore be durable enough to be read by a pass that arrives **late**, not only by one
 that observes a transient window — which is exactly what the drain stamp provides, at no new
@@ -290,6 +304,12 @@ at random.
   and the recorded pod as `status.masterPod` (`currentMasterPod` deliberately declines to
   pick a winner between two labeled masters). **Monitoring must key on all three Events**;
   the CR status will not show the split brain.
+  *Amended 2026-08-24:* still true for **this** check. The rolling-update regime does set a
+  condition since [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+  — `MultipleMasters`, written by `resolveSplitBrain` — but that condition is written only
+  while a rolling update is in flight, and D1 above is exactly the statement that this check
+  is the one that runs outside one. A steady-state split brain the operator could not resolve
+  is therefore still invisible in the CR status.
 * An unadopted, unrecorded promotion persists until the next natural reconcile. Accepted:
   it is not a data-plane emergency.
 * A split brain that appears while a rolling-update state annotation is *stuck* is not

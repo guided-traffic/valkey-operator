@@ -64,6 +64,7 @@ A reader must never find the old rule stated as current.
 | [0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) | The sidecar records its drain promotion on the pod, not on the CR |
 | [0022](0022-sentinel-identity-is-pinned-to-the-pod.md) | A Sentinel's identity is pinned to its pod, and peer drift is reported rather than reset |
 | [0024](0024-the-sentinel-tier-reports-its-own-completion.md) | The Sentinel tier reports its own completion — RollingUpdateComplete means the data tier |
+| [0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) | A Warning named split-brain means one that did not resolve itself |
 
 ### Security and API surface
 

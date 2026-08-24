@@ -335,6 +335,26 @@ sequencing on "the update is finished" on a sentinel-enabled cluster waits for t
 marker, not the data one.
 → [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md)
 
+## A Warning named split-brain means one that did not resolve itself
+
+Two pods answering `master` is the **design** of every controlled failover — the promoted pod
+has taken `REPLICAOF NO ONE` and the outgoing one answers until it terminates. The level is a
+condition (`MultipleMasters`, True from the first pass, message naming the pods and the
+authority); the `SplitBrainDetected` **Warning** is the edge where that level outlived
+`splitBrainWarnAfter` = 90 s — above the 75 s `terminationGracePeriodSeconds` and the 60 s
+drain preStop hook, below `finalizationStallTimeout`. `SplitBrainResolved` is Normal: it
+reports a repair that succeeded.
+
+The deadline lives in the condition's `LastTransitionTime` and its *reason* remembers whether
+the Warning already fired — no annotation. **`detectAndResolveSplitBrain` reports nothing**;
+the reporting wrapper is `resolveSplitBrain`, and the condition is written at its call sites
+because `writeStatusCondition` re-`Get`s the CR. **An unreachable pod carrying a
+`DeletionTimestamp` is not a master**: nothing clears the `instanceRole` label at delete time,
+so the label used to resurrect the pod the operator had just demoted and deleted. A clean
+rolling update emits **zero** Warning Events on either topology, and an e2e subtest per
+topology says so.
+→ [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+
 ## Reconcile concurrency
 
 The operator reconciles **4 Valkey CRs at a time** (`--max-concurrent-reconciles`, chart value

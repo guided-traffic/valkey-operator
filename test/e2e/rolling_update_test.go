@@ -213,6 +213,14 @@ func TestE2E_RollingUpdate_MultiReplicaNoSentinel(t *testing.T) {
 		resp = tc.valkeyExec(t, ns, newMaster, 6379, "GET", "post-mr-roll")
 		assert.Equal(t, "success", resp)
 	})
+
+	// The non-Sentinel half of ADR 0025 D7. This update passed through the manual
+	// failover, the master replacement and the topology restoration -- every window
+	// in which two pods answer master by design -- and none of them may reach an
+	// operator as an alarm.
+	t.Run("Rolling update raised no Warning", func(t *testing.T) {
+		tc.requireNoWarningEvents(t, ns, name)
+	})
 }
 
 // TestE2E_RollingUpdate_HA tests a rolling update on a 3-node HA cluster with Sentinel.
@@ -467,6 +475,14 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 
 		readyReplicas, _, _ := unstructuredNestedFloat64(status, "readyReplicas")
 		assert.Equal(t, float64(3), readyReplicas)
+	})
+
+	// The Sentinel half of ADR 0025 D7. Sentinel promotes the replica before it
+	// reconfigures the outgoing master, so this topology has a designed
+	// double-master window on every failover and used to emit a Warning named
+	// split-brain on every one of them.
+	t.Run("Rolling update raised no Warning", func(t *testing.T) {
+		tc.requireNoWarningEvents(t, ns, name)
 	})
 }
 

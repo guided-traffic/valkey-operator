@@ -97,6 +97,13 @@ func newTestReconcilerWithInterceptor(funcs interceptor.Funcs, objs ...client.Ob
 		Scheme:          s,
 		InstanceChecker: &mockInstanceChecker{},
 		OperatorImage:   "ghcr.io/guided-traffic/valkey-operator:test",
+		// Every test reconciler records Events, whether or not the test looks at
+		// them. recordEvent returns early on a nil recorder, so the previous default
+		// meant a test could neither observe a new Event nor fail on one -- which is
+		// how a Warning per controlled failover shipped with zero assertions against
+		// it (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D8).
+		// A test that wants to read them replaces this with its own recorder.
+		Recorder: &fakeEventRecorder{},
 		// Redirect all Valkey client connections to localhost so unit tests
 		// get instant "connection refused" instead of DNS/TCP timeouts.
 		// The original port is preserved so tests that verify port selection

@@ -452,7 +452,7 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 	// This is critical to break the deadlock where a rogue master prevents
 	// replaceNextReplica from finding candidates and blocks waitForReplicasReady.
 	sentinelMaster := r.getSentinelMasterPodName(ctx, v)
-	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, sentinelMaster)
+	pods, masterIdx = r.resolveSplitBrain(ctx, v, pods, masterIdx, sentinelMaster)
 
 	// Count how many pods have been updated.
 	updatedCount := countUpdatedPods(pods)
@@ -884,7 +884,7 @@ func (r *ValkeyReconciler) waitBoundExceeded(v *vkov1.Valkey, annotation, bound 
 func (r *ValkeyReconciler) forgetWaitBounds(namespace, name string) {
 	for _, bound := range []string{
 		boundTopologyRestore, boundFinalization, boundManualFailover,
-		boundSentinelAwareness, boundSyncWait,
+		boundSentinelAwareness, boundSyncWait, boundMultipleMasters,
 	} {
 		r.nudges.forget(waitBoundKey(namespace, name, bound))
 	}
@@ -1057,6 +1057,13 @@ func countMasters(pods []podState) int {
 //     failover is in flight. May be empty.
 //  2. Falling back to the master with the most connected slaves (preserves data).
 //
+// It reports nothing. Two pods answering master is a designed state for as long
+// as a controlled failover is in flight, and this function counts four lines
+// before it has consulted the authority that could tell the designed window from
+// the undesigned one -- so an Event emitted here can only be a guess. The report
+// is resolveSplitBrain's, which runs after the authority has been applied and
+// after the bound has had its say (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D2).
+//
 // Returns the updated pod states and the corrected master index.
 func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int, knownMaster string) ([]podState, int) {
 	logger := log.FromContext(ctx)
@@ -1075,8 +1082,6 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 
 	logger.Info("Split-brain detected: multiple masters found",
 		"masterCount", len(masterIndices), "masterIndices", masterIndices)
-	r.recordEvent(v, corev1.EventTypeWarning, "SplitBrainDetected",
-		"Split-brain detected: %d pods report master role", len(masterIndices))
 
 	// Determine the real master from the authoritative name, if one was given.
 	realMasterIdx := -1
@@ -1215,7 +1220,14 @@ func (r *ValkeyReconciler) demoteRogueMaster(ctx context.Context, v *vkov1.Valke
 		return fmt.Errorf("REPLICAOF command failed on %s: %w", roguePod.name, err)
 	}
 
-	r.recordEvent(v, corev1.EventTypeWarning, "SplitBrainResolved",
+	// Normal, not Warning: this reports a repair that succeeded. The Warning that
+	// matters is the one nobody repaired, and it has its own edge
+	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D4).
+	// The steady-state path reaches this line through the same helper
+	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D20), whose monitoring
+	// contract names SplitBrainUnresolved, SplitBrainDemotionRefused and
+	// MasterAdoptionRefused -- never this reason.
+	r.recordEvent(v, corev1.EventTypeNormal, "SplitBrainResolved",
 		"Demoted rogue master %s to replica of %s", roguePod.name, realMasterPodName)
 
 	logger.Info("Successfully demoted rogue master",
@@ -1231,6 +1243,26 @@ func hasPendingUpdates(pods []podState) bool {
 		}
 	}
 	return false
+}
+
+// labelClaimsMaster reports whether an unreachable pod may still be counted as a
+// master on the strength of its instanceRole label alone.
+//
+// A pod carrying a DeletionTimestamp may not. Nothing clears the label at delete
+// time -- the sidecar labeler polls on its own clock and the kubelet gives no
+// ordering between the two SIGTERMs
+// (docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) -- so the operator would
+// demote the outgoing master exactly as intended, delete it, and then watch its
+// own stale label manufacture it back into a second master that answers nothing.
+// demoteRogueMaster refuses a not-Ready pod, so the report never closed either.
+// Silence is not evidence
+// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D6), and a pod that is
+// being deleted is silence with a reason.
+func labelClaimsMaster(pod *corev1.Pod) bool {
+	if pod == nil || pod.DeletionTimestamp != nil {
+		return false
+	}
+	return pod.Labels[common.LabelInstanceRole] == common.RoleMaster
 }
 
 // podState holds the state of a single pod during a rolling update.
@@ -1282,9 +1314,12 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 			// transient connectivity issues.
 			info, infoErr := checker.GetReplicationInfo(ctx, v, podName)
 			if infoErr == nil && info.Role == common.RoleMaster {
+				// An answer beats every heuristic, terminating or not: a master that
+				// still serves INFO still holds writes, and dropping it would let the
+				// resolver demote the pod that has the data.
 				ps.isMaster = true
 				masterIdx = i
-			} else if infoErr != nil && ps.pod != nil && ps.pod.Labels[common.LabelInstanceRole] == common.RoleMaster {
+			} else if infoErr != nil && labelClaimsMaster(ps.pod) {
 				// GetReplicationInfo failed; trust the pod label written by the sidecar.
 				ps.isMaster = true
 				masterIdx = i
@@ -2631,7 +2666,7 @@ func (r *ValkeyReconciler) handleMultiReplicaRollingUpdate(ctx context.Context, 
 	case stateRestoringTopology, stateVerifyingTopology:
 		preferredMaster = knownMasterPodName(v)
 	}
-	pods, masterIdx = r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, preferredMaster)
+	pods, masterIdx = r.resolveSplitBrain(ctx, v, pods, masterIdx, preferredMaster)
 
 	updatedCount := countUpdatedPods(pods)
 	if updatedCount == totalPods {
@@ -3442,6 +3477,14 @@ func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.
 		// the resolver would then pick pod-0 by lowest ordinal and demote the pod
 		// holding the data (the ADR 0008 D10, D11 failure mode). The known-master annotation
 		// names pod-0 on the normal path and the promoted replica otherwise.
+		//
+		// The bare resolver, not resolveSplitBrain: rogueCount > 0 above and
+		// len(masterIndices) > 1 inside the resolver are the same predicate, and
+		// TopologyRestoreIncomplete has already reported it. Every pass that reaches
+		// here came through handleMultiReplicaRollingUpdate, which ran the reporting
+		// resolver on the same pod set moments ago, so the condition is current and a
+		// second report would only double the Event count for one fact
+		// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D5).
 		r.detectAndResolveSplitBrain(ctx, v, pods, masterIdx, knownMasterPodName(v))
 
 		r.ensureFinalizationTimestamp(ctx, v)

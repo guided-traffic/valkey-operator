@@ -91,6 +91,21 @@ const (
 	// annotation behind it.
 	// See docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md.
 	ConditionTypeSentinelUpdatePending ConditionType = "SentinelUpdatePending"
+
+	// ConditionTypeMultipleMasters reports that more than one data pod answered
+	// that it is the master while a rolling update was in flight. Two masters are
+	// not by themselves a fault: every controlled failover has a window in which
+	// the promoted pod and the outgoing one both answer master, and the operator
+	// closes it on the same pass. The condition is therefore the level -- True for
+	// as long as the window is open -- while the SplitBrainDetected Warning Event
+	// is the edge that the window outlived splitBrainWarnAfter.
+	//
+	// The reason tells the two apart: MultipleMastersTransitional is inside the
+	// bound, MultipleMastersPersisted is past it and is the one moment the Warning
+	// is emitted. It is written by the rolling-update resolver only; outside a
+	// rolling update nothing measures it.
+	// See docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md.
+	ConditionTypeMultipleMasters ConditionType = "MultipleMasters"
 )
 
 const (
@@ -150,6 +165,22 @@ const (
 	// was disabled while the condition stood — disabling is not completing, so no
 	// SentinelUpdateComplete event accompanies it.
 	ReasonSentinelDisabled = "SentinelDisabled"
+
+	// ReasonMultipleMastersTransitional is the MultipleMasters reason while the
+	// double-master window is younger than splitBrainWarnAfter. Every controlled
+	// failover passes through it, so it carries no Warning Event.
+	ReasonMultipleMastersTransitional = "MultipleMastersTransitional"
+
+	// ReasonMultipleMastersPersisted is the MultipleMasters reason once the window
+	// outlived splitBrainWarnAfter. The transition into this reason is the one
+	// moment the SplitBrainDetected Warning Event is emitted, which is why the
+	// reason -- not an annotation and not process memory -- is what remembers that
+	// the Warning already fired.
+	ReasonMultipleMastersPersisted = "MultipleMastersPersisted"
+
+	// ReasonSingleMaster clears MultipleMasters once at most one pod answers that
+	// it is the master.
+	ReasonSingleMaster = "SingleMaster"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
