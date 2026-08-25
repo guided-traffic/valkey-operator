@@ -350,7 +350,18 @@ Rejected once the discarded error in two of the five was noticed — see D14.
   and completes, the state clears; a pod-0 that then *exists* but does not match the live
   template — stuck `Terminating`, or otherwise not replaced — keeps `needsRollingUpdate` true,
   so the next pass re-enters at `replaceNextReplica` and requeues with no bound, and the "tail
-  of the pass is skipped" consequence returns for that case. A pod-0 that was never created is
+  of the pass is skipped" consequence returns for that case.
+  *(Narrowed 2026-08-25.* The stuck-`Terminating` half of this item is now covered:
+  [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5 routes every wait on a
+  terminating pod — the delete gate and the `!available()` waits alike — through
+  `terminationWait`, which after `podTerminationOverrun` = 2 min stops setting `NeedsRequeue`
+  and reports `PodTerminationStalled` instead, so the tail of the pass runs again. The
+  *refusal* is still not resumed, deliberately. What remains open here is a pod-0 that does not
+  match the template for any **other** reason, which still requeues unbounded.
+  ADR 0026 D5 is also the one bounded rolling-update wait that does **not** go through
+  `ensureWaitBound`: it measures the pod's own `metadata.deletionTimestamp`, a timestamp the
+  API server writes, so the D7/D8 failure this ADR is about — an arming write that fails
+  silently — cannot occur there. The reasoning is recorded in that ADR rather than here.) A pod-0 that was never created is
   **not** that case: `checkAndHandleRollingUpdate` skips absent pods when deciding whether an
   update is needed, so with the state already cleared it returns before any dispatch, the pass
   runs on through `handlePostRollingUpdateChecks` and `updateStatus`, and the short-StatefulSet

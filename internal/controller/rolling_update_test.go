@@ -509,9 +509,9 @@ func TestContainersResourceChanged_RequestsAddedInDesired(t *testing.T) {
 
 func TestCountReplacedPods(t *testing.T) {
 	pods := []podState{
-		{name: "p-0", needsUpdate: true, ready: true},
-		{name: "p-1", needsUpdate: false, ready: true},
-		{name: "p-2", needsUpdate: false, ready: false}, // replaced but not ready
+		{name: "p-0", needsUpdate: true, readyCondition: true},
+		{name: "p-1", needsUpdate: false, readyCondition: true},
+		{name: "p-2", needsUpdate: false, readyCondition: false}, // replaced but not ready
 	}
 	// countUpdatedPods only counts ready + !needsUpdate → 1
 	assert.Equal(t, 1, countUpdatedPods(pods))
@@ -1208,9 +1208,9 @@ func TestWaitForWriteSync_NoReplicas_ReturnsNil(t *testing.T) {
 
 	// Master is pod 2, replicas are not ready or still need update → numReplicas == 0.
 	pods := []podState{
-		{name: "ha-0", needsUpdate: true, ready: false},
-		{name: "ha-1", needsUpdate: true, ready: false},
-		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+		{name: "ha-0", needsUpdate: true, readyCondition: false},
+		{name: "ha-1", needsUpdate: true, readyCondition: false},
+		{name: "ha-2", needsUpdate: true, readyCondition: true, isMaster: true},
 	}
 	masterIdx := 2
 
@@ -1229,9 +1229,9 @@ func TestWaitForWriteSync_ConnectionFails_Requeues(t *testing.T) {
 
 	// Two replicas are ready and updated, master is pod 2.
 	pods := []podState{
-		{name: "ha-0", needsUpdate: false, ready: true},
-		{name: "ha-1", needsUpdate: false, ready: true},
-		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+		{name: "ha-0", needsUpdate: false, readyCondition: true},
+		{name: "ha-1", needsUpdate: false, readyCondition: true},
+		{name: "ha-2", needsUpdate: true, readyCondition: true, isMaster: true},
 	}
 	masterIdx := 2
 
@@ -2850,9 +2850,9 @@ func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testin
 	reconcileOnce(t, r, "ha-cascaded", "default")
 
 	pods := []podState{
-		{name: "ha-cascaded-0", pod: pod0, exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "ha-cascaded-1", pod: pod1, exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "ha-cascaded-2", pod: pod2, exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "ha-cascaded-0", pod: pod0, exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "ha-cascaded-1", pod: pod1, exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "ha-cascaded-2", pod: pod2, exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 
 	// checkFinalizationTopology must return nil (proceed with partial sync) even
@@ -2881,10 +2881,10 @@ func TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMaste
 
 	// Pod-2 is master (not pod-0 — verifies the fix avoids the pod-0 fallback).
 	masterPS := podState{
-		name:     "ha-errstall-2",
-		isMaster: true,
-		exists:   true,
-		ready:    true,
+		name:           "ha-errstall-2",
+		isMaster:       true,
+		exists:         true,
+		readyCondition: true,
 	}
 
 	// Default mockInstanceChecker returns an error for GetReplicationInfo,
@@ -3435,25 +3435,25 @@ func TestSentinelPodNeedsUpdate_ConfigHashMatch(t *testing.T) {
 
 func TestCountUpdatedPods_AllUpdatedAndReady(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: true},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: true},
 	}
 	assert.Equal(t, 3, countUpdatedPods(pods))
 }
 
 func TestCountUpdatedPods_NoneUpdated(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: true, ready: true},
-		{needsUpdate: true, ready: true},
+		{needsUpdate: true, readyCondition: true},
+		{needsUpdate: true, readyCondition: true},
 	}
 	assert.Equal(t, 0, countUpdatedPods(pods))
 }
 
 func TestCountUpdatedPods_UpdatedButNotReady(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: false},
-		{needsUpdate: false, ready: false},
+		{needsUpdate: false, readyCondition: false},
+		{needsUpdate: false, readyCondition: false},
 	}
 	assert.Equal(t, 0, countUpdatedPods(pods))
 }
@@ -3465,16 +3465,16 @@ func TestCountUpdatedPods_EmptySlice(t *testing.T) {
 
 func TestCountReplacedPods_AllReplaced(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: false},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: false},
 	}
 	assert.Equal(t, 2, countReplacedPods(pods))
 }
 
 func TestCountReplacedPods_NoneReplaced(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: true, ready: true},
-		{needsUpdate: true, ready: false},
+		{needsUpdate: true, readyCondition: true},
+		{needsUpdate: true, readyCondition: false},
 	}
 	assert.Equal(t, 0, countReplacedPods(pods))
 }
@@ -3516,9 +3516,9 @@ func TestPodSpecHashFromSts_EmptyAnnotations(t *testing.T) {
 
 func TestFindPromotionCandidate_FindsReadyUpdatedReplica(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 1, idx)
@@ -3526,9 +3526,9 @@ func TestFindPromotionCandidate_FindsReadyUpdatedReplica(t *testing.T) {
 
 func TestFindPromotionCandidate_SkipsMaster(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 2, idx)
@@ -3536,9 +3536,9 @@ func TestFindPromotionCandidate_SkipsMaster(t *testing.T) {
 
 func TestFindPromotionCandidate_NoCandidates(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
-		{name: "pod-2", exists: true, ready: false, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: false, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, -1, idx)
@@ -3546,9 +3546,9 @@ func TestFindPromotionCandidate_NoCandidates(t *testing.T) {
 
 func TestFindPromotionCandidate_SkipsNotExisting(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: false, ready: false, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: false, readyCondition: false, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 2, idx)
@@ -3639,9 +3639,9 @@ func TestFinalizeMultiReplicaRollingUpdate_ClearsState(t *testing.T) {
 	r, _ := newTestReconciler(v)
 
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 
 	result := r.finalizeMultiReplicaRollingUpdate(context.Background(), v, pods)
@@ -3751,9 +3751,9 @@ func TestVerifyReplacedReplicasSynced_AllSynced(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3776,9 +3776,9 @@ func TestVerifyReplacedReplicasSynced_SyncInProgress(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3795,9 +3795,9 @@ func TestVerifyReplacedReplicasSynced_SkipsMasterAndPendingPods(t *testing.T) {
 	// Default mock returns error — should not matter because all pods are skipped.
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},    // master: skip
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: true, isMaster: false},    // needs update: skip
-		{name: "sync-test-2", exists: false, ready: false, needsUpdate: false, isMaster: false}, // not exists: skip
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},    // master: skip
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},    // needs update: skip
+		{name: "sync-test-2", exists: false, readyCondition: false, needsUpdate: false, isMaster: false}, // not exists: skip
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3811,10 +3811,10 @@ func TestVerifyReplacedReplicasSynced_NotReadyBlocksNextDeletion(t *testing.T) {
 	r, _ := newTestReconciler(v)
 
 	pods := []podState{
-		{name: "sync-notready-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-notready-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
 		// Pod-1 was replaced (needsUpdate=false) but is not yet ready — must block.
-		{name: "sync-notready-1", exists: true, ready: false, needsUpdate: false, isMaster: false},
-		{name: "sync-notready-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-notready-1", exists: true, readyCondition: false, needsUpdate: false, isMaster: false},
+		{name: "sync-notready-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3835,9 +3835,9 @@ func TestVerifyReplacedReplicasSynced_ErrorRequeues(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-err-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-err-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-err-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-err-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-err-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-err-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3864,9 +3864,9 @@ func TestVerifyReplacedReplicasSynced_TimeoutPausesUpdate(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-timeout-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-timeout-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-timeout-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-timeout-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-timeout-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-timeout-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -4025,9 +4025,9 @@ func TestDetectAndResolveSplitBrain_NoSplitBrain_SingleMaster(t *testing.T) {
 
 	r, _ := newTestReconciler(v)
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -4047,9 +4047,9 @@ func TestDetectAndResolveSplitBrain_NoSplitBrain_NoMaster(t *testing.T) {
 
 	r, _ := newTestReconciler(v)
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-1", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-1", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, -1, "")
@@ -4094,11 +4094,11 @@ func TestDetectAndResolveSplitBrain_TwoMasters_FallbackToConnectedSlaves(t *test
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true,
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
 	}
 
@@ -4125,11 +4125,11 @@ func TestDetectAndResolveSplitBrain_SentinelBasedResolution(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	// Sentinel says test-0 is the real master — should override connected slaves fallback.
@@ -4165,11 +4165,11 @@ func TestDetectAndResolveSplitBrain_ThreeMasters(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: true, needsUpdate: false, exists: true, ready: true,
+		{name: "test-2", isMaster: true, needsUpdate: false, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
 	}
 
@@ -4203,11 +4203,11 @@ func TestDetectAndResolveSplitBrain_ReplicationInfoUnavailable(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -4243,11 +4243,11 @@ func TestDetectAndResolveSplitBrain_RoguePodNotReady(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: false,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: false,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", false)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -4692,9 +4692,9 @@ func TestIsFinalizationStalled_UsedForTopologyVerification(t *testing.T) {
 func TestFindPromotionCandidate_SkipsPod0(t *testing.T) {
 	// masterIdx=2 (pod-2 is master); pod-0 and pod-1 are updated replicas.
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-1", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-2", isMaster: true, needsUpdate: true, ready: true, exists: true},
+		{name: "test-0", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-1", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-2", isMaster: true, needsUpdate: true, readyCondition: true, exists: true},
 	}
 	candidate := findPromotionCandidate(pods, 2)
 	assert.Equal(t, 1, candidate, "Should pick pod-1, never pod-0")
@@ -4703,8 +4703,8 @@ func TestFindPromotionCandidate_SkipsPod0(t *testing.T) {
 func TestFindPromotionCandidate_Pod0IsOnlyCandidate_ReturnsNegative(t *testing.T) {
 	// Only pod-0 is available as a non-master updated replica → no valid candidate.
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-1", isMaster: true, needsUpdate: true, ready: true, exists: true},
+		{name: "test-0", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, readyCondition: true, exists: true},
 	}
 	candidate := findPromotionCandidate(pods, 1)
 	assert.Equal(t, -1, candidate, "Should return -1 when only pod-0 is available")

@@ -285,7 +285,7 @@ func TestDemoteRogueMaster_ReportsASucceededRepairAsNormal(t *testing.T) {
 		return valkeyclient.New(addr)
 	}
 
-	rogue := podState{name: pods[1].Name, pod: pods[1], exists: true, ready: true}
+	rogue := podState{name: pods[1].Name, pod: pods[1], exists: true, readyCondition: true}
 	require.NoError(t, r.demoteRogueMaster(context.Background(), v, rogue, pods[0].Name))
 
 	resolved := recorderOf(t, r).withReason("SplitBrainResolved")

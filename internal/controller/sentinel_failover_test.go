@@ -306,9 +306,9 @@ func midFailoverCluster(t *testing.T, name string, annotations map[string]string
 	}
 
 	pods := []podState{
-		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, ready: true, exists: true},
-		{name: pod1.Name, pod: pod1, ready: true, exists: true},
-		{name: pod2.Name, pod: pod2, ready: true, exists: true},
+		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, readyCondition: true, exists: true},
+		{name: pod2.Name, pod: pod2, readyCondition: true, exists: true},
 	}
 
 	return r, c, crGet(t, c, name), pods
@@ -517,7 +517,7 @@ func TestHandleMasterFailover_SkipsWhenAFailoverIsAlreadyInFlight(t *testing.T) 
 // that is still coming up cannot take over the writes.
 func TestHandleMasterFailover_WaitsForAReplicaThatIsNotReady(t *testing.T) {
 	r, c, v, pods := midFailoverCluster(t, "hmf-notready", nil, nil)
-	pods[2].ready = false
+	pods[2].readyCondition = false
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
@@ -948,7 +948,7 @@ func TestVerifyNewMasterReady_IgnoresTheOldMasterAwaitingReplacement(t *testing.
 // A promoted pod that is not ready yet is not a master to hand the cluster to.
 func TestVerifyNewMasterReady_IgnoresPodsThatAreNotReady(t *testing.T) {
 	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-notready", masterInfo(2), nil)
-	pods[1].ready = false
+	pods[1].readyCondition = false
 
 	verified, _ := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
 
@@ -1038,7 +1038,7 @@ func TestVerifyNewMasterReady_RejectsWhenTheTLSConfigCannotBeBuilt(t *testing.T)
 		"vnm-tls-1": masterInfo(2),
 	}}
 
-	pods := []podState{{name: pod1.Name, pod: pod1, ready: true, exists: true}}
+	pods := []podState{{name: pod1.Name, pod: pod1, readyCondition: true, exists: true}}
 	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified)
@@ -1072,7 +1072,7 @@ func TestReplaceRemainingPods_WaitsForAPodThatIsGone(t *testing.T) {
 
 func TestReplaceRemainingPods_WaitsForAPodThatIsNotReady(t *testing.T) {
 	r, c, v, pods, _ := verifiedMasterCluster(t, "rrp-notready", masterInfo(2), nil)
-	pods[0].ready = false
+	pods[0].readyCondition = false
 
 	result := r.replaceRemainingPods(context.Background(), v, pods)
 
@@ -1119,8 +1119,8 @@ func TestReplaceRemainingPods_WithoutSentinelSkipsTheMasterVerification(t *testi
 	r, c := newTestReconciler(v, pod0, pod1)
 
 	pods := []podState{
-		{name: pod0.Name, pod: pod0, needsUpdate: true, ready: true, exists: true},
-		{name: pod1.Name, pod: pod1, ready: true, exists: true},
+		{name: pod0.Name, pod: pod0, needsUpdate: true, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, readyCondition: true, exists: true},
 	}
 
 	result := r.replaceRemainingPods(context.Background(), crGet(t, c, "rrp-plain"), pods)
@@ -1620,11 +1620,11 @@ func TestDeleteNextPendingPod_DeletesTheFirstReadyPodThatNeedsUpdating(t *testin
 
 	pods := []podState{
 		{name: "dnp-0", needsUpdate: true}, // gone, skipped
-		{name: pod1.Name, pod: pod1, needsUpdate: true, ready: true, exists: true},
-		{name: pod2.Name, pod: pod2, needsUpdate: true, ready: true, exists: true},
+		{name: pod1.Name, pod: pod1, needsUpdate: true, readyCondition: true, exists: true},
+		{name: pod2.Name, pod: pod2, needsUpdate: true, readyCondition: true, exists: true},
 	}
 
-	result := r.deleteNextPendingPod(context.Background(), pods)
+	result := r.deleteNextPendingPod(context.Background(), v, pods)
 
 	require.NoError(t, result.Error)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
@@ -1642,7 +1642,7 @@ func TestDeleteNextPendingPod_RequeuesWhenNoCandidateIsReady(t *testing.T) {
 		{name: pod1.Name, pod: pod1, needsUpdate: true, exists: true}, // not ready
 	}
 
-	result := r.deleteNextPendingPod(context.Background(), pods)
+	result := r.deleteNextPendingPod(context.Background(), v, pods)
 
 	assert.True(t, result.NeedsRequeue)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
@@ -1658,8 +1658,8 @@ func TestDeleteNextPendingPod_SurfacesTheDeleteFailure(t *testing.T) {
 		},
 	}, v, pod0)
 
-	result := r.deleteNextPendingPod(context.Background(),
-		[]podState{{name: pod0.Name, pod: pod0, needsUpdate: true, ready: true, exists: true}})
+	result := r.deleteNextPendingPod(context.Background(), v,
+		[]podState{{name: pod0.Name, pod: pod0, needsUpdate: true, readyCondition: true, exists: true}})
 
 	require.Error(t, result.Error)
 	assert.Contains(t, result.Error.Error(), "deleting pod dnp-fail-0")
@@ -1762,9 +1762,9 @@ func finalizingCluster(t *testing.T, name string, annotations map[string]string,
 	}
 
 	pods := []podState{
-		{name: pod0.Name, pod: pod0, ready: true, exists: true},
-		{name: pod1.Name, pod: pod1, ready: true, exists: true, isMaster: true},
-		{name: pod2.Name, pod: pod2, ready: true, exists: true},
+		{name: pod0.Name, pod: pod0, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, readyCondition: true, exists: true, isMaster: true},
+		{name: pod2.Name, pod: pod2, readyCondition: true, exists: true},
 	}
 	return r, c, crGet(t, c, name), pods
 }
@@ -2006,7 +2006,7 @@ func TestReplaceNextReplica_ReturnsNilWhenOnlyTheMasterIsLeft(t *testing.T) {
 func TestReplaceNextReplica_WaitsForACandidateThatIsNotReady(t *testing.T) {
 	r, c, v, pods := midFailoverCluster(t, "rnr-notready", nil, nil)
 	pods[2].needsUpdate = true
-	pods[2].ready = false
+	pods[2].readyCondition = false
 	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
 		"rnr-notready-1": replicaInfo(),
 	}}
@@ -2094,8 +2094,8 @@ func TestWaitForWriteSync_RequeuesWhenTheTLSConfigCannotBeBuilt(t *testing.T) {
 	router.attach(r)
 
 	pods := []podState{
-		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, ready: true, exists: true},
-		{name: pod1.Name, pod: pod1, ready: true, exists: true},
+		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, readyCondition: true, exists: true},
 	}
 	result := r.waitForWriteSync(context.Background(), v, pods, 0)
 

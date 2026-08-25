@@ -106,6 +106,22 @@ const (
 	// rolling update nothing measures it.
 	// See docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md.
 	ConditionTypeMultipleMasters ConditionType = "MultipleMasters"
+
+	// ConditionTypePodTerminationStalled reports that the rolling update is
+	// refusing to delete the next pod because another pod of the same tier has
+	// been Terminating for longer than the operator considers legitimate.
+	//
+	// The refusal itself is never lifted -- deleting a second pod while the first
+	// is wedged is the failure the refusal exists to prevent. What the condition
+	// marks is the moment the operator stops ending the reconcile pass on the
+	// wait, so the rest of the pass (the Sentinel roll, no-master recovery, the
+	// steady-state split-brain check and the status write) runs again while the
+	// stall lasts. It clears by itself once the pod is gone.
+	//
+	// There is no Event: a clean rolling update must emit zero Warnings
+	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md).
+	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
+	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
 )
 
 const (
@@ -181,6 +197,15 @@ const (
 	// ReasonSingleMaster clears MultipleMasters once at most one pod answers that
 	// it is the master.
 	ReasonSingleMaster = "SingleMaster"
+
+	// ReasonPodStuckTerminating is the PodTerminationStalled reason while a pod of
+	// the tier being rolled has outlived podTerminationStallTimeout in Terminating.
+	// The message names the pod.
+	ReasonPodStuckTerminating = "PodStuckTerminating"
+
+	// ReasonPodTerminationCleared clears PodTerminationStalled once no pod of the
+	// tier carries a DeletionTimestamp any more.
+	ReasonPodTerminationCleared = "PodTerminationCleared"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.

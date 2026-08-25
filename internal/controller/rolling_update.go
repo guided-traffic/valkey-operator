@@ -94,6 +94,31 @@ const annotationManualFailoverStarted = "vko.gtrfc.com/manual-failover-started"
 // recover, rather than blocking indefinitely before even attempting failover).
 const annotationSentinelAwarenessStarted = "vko.gtrfc.com/sentinel-awareness-started"
 
+// podTerminationOverrun is how far past its own graceful deadline a pod may stay
+// Terminating before the rolling update stops ending the reconcile pass on it and
+// reports PodTerminationStalled
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5).
+//
+// The clock is the pod's own metadata.deletionTimestamp, and that field is not the
+// instant of the delete: the API server sets it to now + gracePeriodSeconds
+// (k8s.io/apiserver@v0.35.0, pkg/registry/rest/delete.go:162), i.e. to the moment
+// the graceful deletion is supposed to be over. time.Since of it is therefore the
+// *overrun*, zero at the deadline and per-tier-correct without this file knowing
+// any grace period: 75 s for a data pod, 30 s for a Sentinel pod, both already
+// inside the zero point.
+//
+// Two minutes of overrun is well past any kubelet force-kill latency, so a pod
+// still present by then is stuck on something no requeue resolves — a NotReady
+// node above all, where the DeletionTimestamp never clears at all.
+//
+// This deliberately does not go through ensureWaitBound like the five waits around
+// it. Those measure something the operator itself started and have no timestamp
+// but the one they write, which is the failure ADR 0010 D7/D8 is about. This one
+// measures an API object with a server-written start time: nothing is armed, so
+// nothing can fail to arm, and the deadline is per pod rather than first-seen-wins
+// per CR (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5).
+const podTerminationOverrun = 2 * time.Minute
+
 // finalizationStallTimeout is the duration after which finalizeRollingUpdate
 // will proceed with best-effort sentinel sync even if topology checks are still
 // uncertain. This prevents the rolling update from stalling indefinitely in
@@ -139,6 +164,18 @@ type RollingUpdateResult struct {
 
 	// Completed indicates the rolling update has fully completed.
 	Completed bool
+
+	// DeferredRequeueAfter is a recheck cadence the rolling update wants applied
+	// only after the rest of the reconcile pass has run. It is set instead of
+	// NeedsRequeue by a wait whose bound has expired: the wait itself continues --
+	// nothing is deleted, nothing is resumed -- but ending the pass on it would
+	// keep the Sentinel roll, the no-master recovery, the steady-state split-brain
+	// check and the status write suspended for as long as the stall lasts
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5).
+	//
+	// It mirrors the pending result handlePostRollingUpdateChecks already returns
+	// for the same reason. NeedsRequeue wins when both are set.
+	DeferredRequeueAfter time.Duration
 
 	// Error holds any error encountered during the rolling update step.
 	Error error
@@ -586,6 +623,25 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 	// we need to verify the cluster settled correctly before declaring completion.
 	currentState := r.getRollingUpdateState(v)
 	if v.IsSentinelEnabled() && currentState != "" {
+		// The completion hold (docs/adr/0026-a-pod-being-deleted-is-not-available.md,
+		// D4). countUpdatedPods deliberately still counts a terminating pod, because
+		// excluding it there does not delay this completion — it drops the pass out of
+		// the `updatedCount == totalPods` branch and back into the post-failover state
+		// machine with a failover timestamp that is minutes old. The hold belongs here
+		// instead, where nothing can reroute and where the finalization bound already
+		// caps the wait at finalizationStallTimeout.
+		//
+		// It runs before checkFinalizationTopology rather than after it: that function
+		// ends in syncSentinelWithMaster, which points Sentinel at the pod it believes
+		// is the master, and a terminating master still answers INFO as one (ADR 0022 —
+		// a Sentinel reset routed through a dying master is the unrecoverable
+		// direction).
+		if terminating := firstTerminatingPod(pods); terminating.name != "" && !r.isFinalizationStalled(v) {
+			r.ensureFinalizationTimestamp(ctx, v)
+			logger.Info("Holding rolling update completion while a data pod terminates",
+				"pod", terminating.name)
+			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		}
 		if result := r.checkFinalizationTopology(ctx, v, pods); result != nil {
 			return *result
 		}
@@ -1200,7 +1256,7 @@ func (r *ValkeyReconciler) demoteRogueMaster(ctx context.Context, v *vkov1.Valke
 	logger.Info("Demoting rogue master to replica",
 		"roguePod", roguePod.name, "realMaster", realMasterPodName)
 
-	if !roguePod.exists || !roguePod.ready {
+	if !roguePod.exists || !roguePod.reachable() {
 		return fmt.Errorf("rogue pod %s is not ready for demotion", roguePod.name)
 	}
 
@@ -1266,13 +1322,47 @@ func labelClaimsMaster(pod *corev1.Pod) bool {
 }
 
 // podState holds the state of a single pod during a rolling update.
+//
+// readyCondition is deliberately not called "ready": readiness answers only one of
+// the two questions the rolling update asks about a pod, and a pod being deleted
+// answers them differently. Read it through available() or reachable(), never
+// directly (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1).
 type podState struct {
 	name        string
 	pod         *corev1.Pod
 	needsUpdate bool
 	isMaster    bool
-	ready       bool
-	exists      bool
+	// readyCondition is the pod's PodReady condition and nothing else. kubelet
+	// keeps it True for the whole termination of a pod whose readiness probe still
+	// passes, which is why it cannot answer "may I spend this pod" on its own.
+	readyCondition bool
+	// terminating is pod.DeletionTimestamp != nil, captured at collection time.
+	// It is a field rather than a dereference of pod so that every reader works on
+	// a podState built without a live pod object (ADR 0026, D6).
+	terminating bool
+	// terminatingSince is the pod's own deletionTimestamp — the moment its graceful
+	// deletion was due, not the moment it was requested. Zero unless terminating.
+	terminatingSince time.Time
+	exists           bool
+}
+
+// available reports whether the operator may spend this pod: delete it, promote
+// it, count it toward a quorum or toward the completion of an update. A pod that
+// is being deleted is not available, however healthy it still answers
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1).
+//
+// This is the default answer. A site that needs reachable() instead is the
+// exception and says why.
+func (ps podState) available() bool {
+	return ps.readyCondition && !ps.terminating
+}
+
+// reachable reports whether the operator can still talk to this pod. A terminating
+// pod that keeps answering INFO still holds writes, so the commands that repair the
+// topology — the demotion of a rogue master above all — must keep being sent to it
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D2).
+func (ps podState) reachable() bool {
+	return ps.readyCondition
 }
 
 // collectPodStates gathers the current state of all pods in the StatefulSet.
@@ -1306,7 +1396,11 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 			ps.pod = pod
 			ps.exists = true
 			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers)
-			ps.ready = isPodReady(pod)
+			ps.readyCondition = isPodReady(pod)
+			if pod.DeletionTimestamp != nil {
+				ps.terminating = true
+				ps.terminatingSince = pod.DeletionTimestamp.Time
+			}
 
 			// Determine if this pod is the master via GetReplicationInfo.
 			// If that fails (e.g., pod restarting), fall back to the pod label
@@ -1331,11 +1425,21 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 	return pods, masterIdx, nil
 }
 
-// countUpdatedPods returns how many pods are updated and ready.
+// countUpdatedPods returns how many pods are updated and Ready.
+//
+// This is the one counting site that deliberately keeps reachable() rather than
+// available() (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D4). Its
+// result is the dispatch predicate updatedCount == totalPods, and on the Sentinel
+// path handleRollingUpdate has no state switch under it: excluding a terminating
+// pod there does not delay the completion, it re-enters the post-failover state
+// machine with a failover timestamp that is minutes old, where the timed-out
+// branch either resets Sentinel through a dying master (ADR 0022) or triggers a
+// real failover on a healthy cluster. The completion hold lives inside
+// finalizeRollingUpdate instead, where finalizationStallTimeout bounds it.
 func countUpdatedPods(pods []podState) int {
 	count := 0
 	for _, ps := range pods {
-		if !ps.needsUpdate && ps.ready {
+		if !ps.needsUpdate && ps.reachable() {
 			count++
 		}
 	}
@@ -1355,6 +1459,156 @@ func countReplacedPods(pods []podState) int {
 		}
 	}
 	return count
+}
+
+// terminatingPod names a pod that is being deleted and carries its own graceful
+// deadline. The zero value means no pod of the tier is terminating.
+type terminatingPod struct {
+	name string
+	// since is the pod's metadata.deletionTimestamp, which the API server sets to
+	// now + gracePeriodSeconds — the moment the graceful deletion is due, not the
+	// moment it was requested. See podTerminationOverrun.
+	since time.Time
+}
+
+// firstTerminatingPod reports the first pod of the tier that is being deleted:
+// its name and the deletionTimestamp it carries. It returns "" when none is.
+//
+// "The tier" is exactly the slice it is given, and that slice is the ordinal range
+// [0, *sts.Spec.Replicas) collectPodStates walks — never a label-selector List. A
+// selector would also return surplus ordinals draining from a concurrent
+// scale-down, so a 5-to-3 scale-down applied together with an image bump would
+// hold every delete for the whole drain of pods the roll never touched
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D7).
+//
+// It reads ps.terminating rather than ps.pod.DeletionTimestamp on purpose: a
+// podState is routinely built for a pod that does not exist, where pod is nil
+// (ADR 0026 D6).
+func firstTerminatingPod(pods []podState) terminatingPod {
+	for _, ps := range pods {
+		if ps.terminating {
+			return terminatingPod{name: ps.name, since: ps.terminatingSince}
+		}
+	}
+	return terminatingPod{}
+}
+
+// terminationWait is the shared shape of every wait the rolling update does on a
+// pod that is being deleted (docs/adr/0026-a-pod-being-deleted-is-not-available.md,
+// D5). It never resumes anything; it only decides how the wait is reported.
+//
+//   - inside the overrun budget: NeedsRequeue, which ends the pass. This is the
+//     normal case and costs a clean roll nothing — a replica releases the drain
+//     hook in about a second.
+//   - past it: DeferredRequeueAfter plus the PodTerminationStalled condition. The
+//     wait is unchanged, but ending the pass on it would keep everything after the
+//     rolling-update check suspended for as long as the stall lasts: the Sentinel
+//     roll, the no-master recovery, the steady-state split-brain check (ADR 0011
+//     D1 — the only thing that re-detects a split brain outside a rolling update)
+//     and the status write. On a NotReady node the DeletionTimestamp never clears,
+//     so that blackout would be permanent.
+//
+// No Event on any of it: a clean rolling update emits zero Warnings (ADR 0025 D8),
+// and the e2e asserts it on both topologies.
+func (r *ValkeyReconciler) terminationWait(ctx context.Context, v *vkov1.Valkey,
+	tier string, t terminatingPod, what string) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+	overrun := time.Since(t.since)
+	if overrun <= podTerminationOverrun {
+		logger.Info(what, "tier", tier, "pod", t.name)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	message := fmt.Sprintf(
+		"%s pod %s is %s past its graceful deletion deadline; the rolling update of that tier is holding",
+		tier, t.name, overrun.Round(time.Second))
+	logger.Info("Pod stuck terminating; holding the rolling update and resuming the rest of the pass",
+		"tier", tier, "pod", t.name, "overrun", overrun.Round(time.Second))
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypePodTerminationStalled,
+		metav1.ConditionTrue,
+		vkov1.ReasonPodStuckTerminating,
+		message)
+	return &RollingUpdateResult{DeferredRequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// holdDeleteWhileTerminating is the delete gate of ADR 0026 D5: the operator never
+// deletes a pod of a tier while any pod of that tier is terminating.
+//
+// It sits immediately in front of a deleteOwnedPod call and nowhere else. At a
+// function head it would be a pass gate rather than a delete gate, and the three
+// functions that delete all do load-bearing work above their delete — clearing the
+// sync-wait bound, returning the nil that advances the state machine, resetting the
+// reconnect counter — which a head gate would discard.
+//
+// Returns nil when the delete may proceed, and clears the stall condition on the
+// way: this is the one call every delete site makes on every pass, so it is where
+// a resolved stall is noticed.
+func (r *ValkeyReconciler) holdDeleteWhileTerminating(ctx context.Context, v *vkov1.Valkey,
+	tier string, t terminatingPod) *RollingUpdateResult {
+	if t.name == "" {
+		r.clearPodTerminationStalled(ctx, v)
+		return nil
+	}
+	return r.terminationWait(ctx, v, tier, t,
+		"Waiting for a pod to finish terminating before deleting the next one")
+}
+
+// waitForUnavailablePod is the wait a pod that is not available earns, and it
+// splits by the reason it is not: a booting pod gets the plain requeue it always
+// got, a terminating one gets the bounded observation above.
+//
+// The split matters because the two used to be one. Before the availability rule
+// these sites let a terminating pod through, its probe then failed, and the sync
+// wait bounded the retry. Excluding the pod without routing it here would replace
+// a bounded wait with an unbounded one, which is the ADR 0010 D1 failure in the
+// other direction.
+//
+// The tier is always the data one: the Sentinel roll has no per-pod availability
+// wait, it decides on counters and the delete gate.
+func (r *ValkeyReconciler) waitForUnavailablePod(ctx context.Context, v *vkov1.Valkey,
+	ps podState, what string) *RollingUpdateResult {
+	if ps.terminating {
+		return r.terminationWait(ctx, v, common.ComponentValkey,
+			terminatingPod{name: ps.name, since: ps.terminatingSince}, what)
+	}
+	log.FromContext(ctx).Info(what, "pod", ps.name)
+	return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// standaloneWait is waitForUnavailablePod for the standalone handler, which works
+// on raw pods rather than on podStates. It returns nil when the pod is available
+// and the caller may proceed.
+func standaloneWait(ctx context.Context, r *ValkeyReconciler, v *vkov1.Valkey,
+	pod *corev1.Pod, what string) *RollingUpdateResult {
+	ps := podState{name: pod.Name, pod: pod, exists: true, readyCondition: isPodReady(pod)}
+	if pod.DeletionTimestamp != nil {
+		ps.terminating = true
+		ps.terminatingSince = pod.DeletionTimestamp.Time
+	}
+	if ps.available() {
+		return nil
+	}
+	return r.waitForUnavailablePod(ctx, v, ps, what)
+}
+
+// clearPodTerminationStalled flips PodTerminationStalled back to False, but only
+// for a CR that carries it.
+//
+// The presence guard is what keeps this from writing a new condition onto every
+// cluster in the fleet on the next upgrade: meta.SetStatusCondition adds an absent
+// condition and reports a change, so an unconditional call would stamp
+// PodTerminationStalled=False on clusters that never stalled. Same reasoning as
+// clearSidecarUpdatePending.
+func (r *ValkeyReconciler) clearPodTerminationStalled(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypePodTerminationStalled) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypePodTerminationStalled,
+		metav1.ConditionFalse,
+		vkov1.ReasonPodTerminationCleared,
+		"No pod of the tier is terminating any more")
 }
 
 // replaceNextReplica finds the next replica pod that needs updating and deletes it.
@@ -1387,9 +1641,9 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valk
 		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	if !ps.ready {
-		logger.Info("Waiting for replaced pod to become ready", "pod", ps.name)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	if !ps.available() {
+		return r.waitForUnavailablePod(ctx, v, ps,
+			"Waiting for the replaced pod to become available")
 	}
 
 	// Set state to replacing-replicas if not already set.
@@ -1397,6 +1651,21 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valk
 		if err := r.setRollingUpdateState(ctx, v, stateReplacingReplicas); err != nil {
 			return &RollingUpdateResult{Error: err}
 		}
+	}
+
+	// The delete gate (ADR 0026 D5), below verifyReplacedReplicasSynced so that its
+	// clear of the sync-wait bound still runs, and below the len(candidates) == 0
+	// return so that the nil this function uses to mean "nothing left to replace"
+	// still reaches handleMasterFailover and handleManualFailover.
+	//
+	// It catches what the candidates[0] check above cannot: an already-replaced
+	// replica being deleted for an unrelated reason (chaos, eviction, node drain),
+	// and a still-outdated replica away from position 0. Both keep answering Ready
+	// for their whole termination, and deleting the next candidate on top of either
+	// is two replicas down at once.
+	if result := r.holdDeleteWhileTerminating(ctx, v, common.ComponentValkey,
+		firstTerminatingPod(pods)); result != nil {
+		return result
 	}
 
 	totalPods := len(pods)
@@ -1456,13 +1725,21 @@ func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *
 			continue
 		}
 
-		// A replaced pod that exists but is not yet ready must block the next
-		// deletion. Without this guard, the operator would skip the not-ready
+		// A replaced pod that exists but is not available must block the next
+		// deletion. Without this guard, the operator would skip the unavailable
 		// pod and immediately delete the next candidate, resulting in multiple
 		// replicas being replaced simultaneously.
-		if !ps.ready {
-			logger.Info("Replaced pod not yet ready, waiting before replacing next", "pod", ps.name)
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		//
+		// available() rather than the Ready condition: a replaced replica that is
+		// being deleted keeps answering Ready and master_link_status:up for its
+		// whole termination, so the Ready condition alone waved through exactly the
+		// shape this guard exists to stop
+		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1). Returning
+		// before the probe also keeps the sync-wait bound from being armed against a
+		// pod that is on its way out.
+		if !ps.available() {
+			return r.waitForUnavailablePod(ctx, v, ps,
+				"Replaced pod not yet available, waiting before replacing next")
 		}
 
 		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
@@ -1666,9 +1943,9 @@ func (r *ValkeyReconciler) waitForReplicasReady(ctx context.Context, v *vkov1.Va
 		if i == masterIdx {
 			continue
 		}
-		if !ps.ready || ps.needsUpdate {
-			logger.Info("Waiting for all replicas to be ready before master failover")
-			return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		if !ps.available() || ps.needsUpdate {
+			return r.waitForUnavailablePod(ctx, v, ps,
+				"Waiting for all replicas to be available before the master failover")
 		}
 
 		info, err := checker.GetReplicationInfo(ctx, v, ps.name)
@@ -1797,7 +2074,11 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 	// Count the number of non-master replicas that should acknowledge.
 	numReplicas := 0
 	for i, ps := range pods {
-		if i != masterIdx && ps.ready && !ps.needsUpdate {
+		// reachable(), not available(): excluding a terminating replica lowers
+		// numReplicas, and at zero the function skips WAIT entirely — the exclusion
+		// would relax the gate in front of a promotion instead of tightening it
+		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D3).
+		if i != masterIdx && ps.reachable() && !ps.needsUpdate {
 			numReplicas++
 		}
 	}
@@ -1865,9 +2146,9 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		if !ps.ready {
-			logger.Info("Waiting for pod to become ready", "pod", ps.name)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		if !ps.available() {
+			return *r.waitForUnavailablePod(ctx, v, ps,
+				"Waiting for the pod to become available")
 		}
 
 		// Before deleting the former master (now a replica after failover),
@@ -1877,6 +2158,15 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 			if !verified {
 				return result
 			}
+		}
+
+		// The delete gate (ADR 0026 D5), inside the loop rather than at the function
+		// head: handleMasterWithNoReplicas clears the reconnect counter and then tail
+		// calls this function, so a head gate would discard that call, restart the
+		// counter at zero and reopen the infinite retry loop it exists to break.
+		if result := r.holdDeleteWhileTerminating(ctx, v, common.ComponentValkey,
+			firstTerminatingPod(pods)); result != nil {
+			return *result
 		}
 
 		// Mark state as replacing-master.
@@ -1926,8 +2216,13 @@ func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valk
 	}
 
 	// Find the new master among pods with the new image.
+	//
+	// available(): whatever this loop picks is handed to handleNewMasterFound, and
+	// from there to replaceRemainingPods, which deletes the old master. A pod that
+	// is being deleted must never be the master that authorises that
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1).
 	for _, ps := range freshPods {
-		if ps.needsUpdate || !ps.ready || !ps.exists {
+		if ps.needsUpdate || !ps.available() || !ps.exists {
 			continue
 		}
 		info, infoErr := checker.GetReplicationInfo(ctx, v, ps.name)
@@ -2034,7 +2329,10 @@ func (r *ValkeyReconciler) forceReplicaConnections(ctx context.Context, v *vkov1
 	password := r.readValkeyPassword(ctx, v)
 
 	for _, ps := range pods {
-		if ps.name == masterPodName || !ps.exists || !ps.ready {
+		// reachable(): a best-effort REPLICAOF at a pod that is on its way out costs
+		// one round trip and can still stop it from serving stale writes
+		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D2).
+		if ps.name == masterPodName || !ps.exists || !ps.reachable() {
 			continue
 		}
 		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, int(builder.ServicePort(v)))
@@ -2157,8 +2455,15 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 // Returns (true, _) if verified, (false, result) if we need to wait.
 func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker InstanceChecker) (bool, RollingUpdateResult) {
 	logger := log.FromContext(ctx)
+	var skippedTerminating terminatingPod
 	for _, other := range pods {
-		if other.needsUpdate || !other.ready {
+		// available(): this is the gate in front of the old master's delete, so a
+		// pod that is itself being deleted must not be accepted as the new master
+		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1).
+		if other.needsUpdate || !other.available() {
+			if other.terminating && skippedTerminating.name == "" {
+				skippedTerminating = terminatingPod{name: other.name, since: other.terminatingSince}
+			}
 			continue
 		}
 		info, err := checker.GetReplicationInfo(ctx, v, other.name)
@@ -2201,6 +2506,14 @@ func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Va
 		}
 	}
 
+	if skippedTerminating.name != "" {
+		// The only candidate was on its way out. Report it through the same bounded
+		// observation as every other termination wait rather than adding one more
+		// member to this function's unbounded requeue below (ADR 0026 D5).
+		return false, *r.terminationWait(ctx, v, common.ComponentValkey, skippedTerminating,
+			"Waiting for a terminating pod before verifying the new master")
+	}
+
 	logger.Info("No new-image master found yet, waiting for failover to complete")
 	return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
@@ -2238,6 +2551,14 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	// calls it for any dispatch target that reports Completed. Calling it earlier,
 	// from inside a target, is still correct and costs nothing the second time.
 	r.forgetWaitBounds(v.Namespace, v.Name)
+
+	// Same reason, for the stall marker of a termination wait: the delete gate
+	// clears it on the next pass that reaches a delete site, and the one case with
+	// no such pass is a stall on the *last* pod the roll replaces — the pod returns,
+	// every pod is current, and the pass finalizes without ever passing a gate again
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5). One map lookup on
+	// a CR that never carried the condition.
+	r.clearPodTerminationStalled(ctx, v)
 
 	if v.Annotations == nil {
 		return nil
@@ -2563,9 +2884,12 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 				continue
 			}
 
-			if !isPodReady(pod) {
-				logger.Info("Pod not ready, waiting", "pod", podName)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			// A single-pod tier: the delete gate and the boot wait are the same
+			// branch, and both need availability rather than readiness. Deleting the
+			// only pod again while it terminates is the no-op this whole rule started
+			// from (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1, D5).
+			if result := standaloneWait(ctx, r, v, pod, "Pod not available, waiting"); result != nil {
+				return *result
 			}
 
 			_ = r.updatePhase(ctx, v, ValkeyPhase(fmt.Sprintf("%s %d/%d", vkov1.ValkeyPhaseRollingUpdate, 0, *currentSts.Spec.Replicas)),
@@ -2578,9 +2902,8 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 		}
 
-		if !isPodReady(pod) {
-			logger.Info("Updated pod not yet ready", "pod", podName)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		if result := standaloneWait(ctx, r, v, pod, "Updated pod not yet available"); result != nil {
+			return *result
 		}
 	}
 
@@ -2731,15 +3054,24 @@ func (r *ValkeyReconciler) dispatchMultiReplicaState(ctx context.Context, v *vko
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	return r.deleteNextPendingPod(ctx, pods)
+	return r.deleteNextPendingPod(ctx, v, pods)
 }
 
 // deleteNextPendingPod finds and deletes the first pod that still needs updating.
-func (r *ValkeyReconciler) deleteNextPendingPod(ctx context.Context, pods []podState) RollingUpdateResult {
+//
+// The loop skips to the next pod rather than waiting, which is what makes the
+// delete gate load-bearing here: with two or more pending pods and the first one
+// terminating, skipping hands the delete straight to the second.
+func (r *ValkeyReconciler) deleteNextPendingPod(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	for _, ps := range pods {
-		if !ps.needsUpdate || !ps.exists || !ps.ready {
+		if !ps.needsUpdate || !ps.exists || !ps.available() {
 			continue
+		}
+		// The delete gate (ADR 0026 D5).
+		if result := r.holdDeleteWhileTerminating(ctx, v, common.ComponentValkey,
+			firstTerminatingPod(pods)); result != nil {
+			return *result
 		}
 		logger.Info("Deleting remaining pod for rolling update", "pod", ps.name)
 		if err := r.deleteOwnedPod(ctx, ps.pod); err != nil {
@@ -2814,6 +3146,17 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 		fmt.Sprintf("Manual failover: promoted %s, replacing master %s", promotedPod.name, pods[masterIdx].name))
 	r.recordEvent(v, corev1.EventTypeNormal, "ManualFailover",
 		"Promoted %s to temporary master, deleting old master %s", promotedPod.name, pods[masterIdx].name)
+	// No delete gate here, and that is a decision rather than an omission
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D9). The pod being
+	// deleted is pods[masterIdx], the master this function just failed over from,
+	// so the exemption condition — the pod being deleted is itself the master —
+	// holds structurally at this site. The promotion has already happened, which
+	// means the two-down risk was accepted a few lines above; and if the
+	// best-effort demotion inside promoteAndRedirect failed, holding the delete
+	// would extend a genuine two-master state toward splitBrainWarnAfter = 90 s,
+	// the edge the e2e asserts on. With the demotion succeeding that clock never
+	// starts and nothing is terminating here in a clean roll, so the exemption is
+	// insurance rather than a hot path.
 	logger.Info("Deleting old master pod after manual failover", "pod", pods[masterIdx].name)
 	if err := r.deleteOwnedPod(ctx, pods[masterIdx].pod); err != nil {
 		return RollingUpdateResult{Error: fmt.Errorf("deleting master pod %s: %w", pods[masterIdx].name, err)}
@@ -2891,7 +3234,7 @@ func (r *ValkeyReconciler) persistManualFailoverState(ctx context.Context, v *vk
 // handlePostManualFailover to send it REPLICAOF <pod-0> — an infinite self-loop.
 func findPromotionCandidate(pods []podState, masterIdx int) int {
 	for i, ps := range pods {
-		if i == 0 || i == masterIdx || ps.needsUpdate || !ps.ready || !ps.exists {
+		if i == 0 || i == masterIdx || ps.needsUpdate || !ps.available() || !ps.exists {
 			continue
 		}
 		return i
@@ -2945,8 +3288,13 @@ func (r *ValkeyReconciler) promoteAndRedirect(ctx context.Context, v *vkov1.Valk
 	}
 
 	// Redirect all other replicas to the promoted pod.
+	//
+	// reachable(): same reasoning as forceReplicaConnections — pointing a dying
+	// replica at the new master is best-effort and harmless, and skipping it would
+	// leave it replicating from a master that is about to be deleted
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D2).
 	for i, ps := range pods {
-		if i == masterIdx || i == promotedIdx || !ps.exists || !ps.ready {
+		if i == masterIdx || i == promotedIdx || !ps.exists || !ps.reachable() {
 			continue
 		}
 		addr := health.PodAddressForComponent(v, ps.name, common.ComponentValkey, port)
@@ -3556,18 +3904,105 @@ func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateS
 	return false
 }
 
+// sentinelScan is one sweep over the Sentinel tier: everything
+// checkAndHandleSentinelRollingUpdate needs to decide whether to delete a pod,
+// computed in a single pass over the ordinal range.
+//
+// It exists as its own type because the caller sat at exactly the cyclomatic
+// ceiling (gocyclo -over 15) before this change, and both the availability guard
+// and the delete gate had to land in it.
+type sentinelScan struct {
+	// readyCount is the number of Sentinel pods that are available -- Ready and
+	// not being deleted. It feeds the quorum guard.
+	readyCount int
+	// updatedReadyCount is the subset of readyCount that already runs the desired
+	// spec. It is the progress number of the SentinelUpdatePending condition and
+	// the completion edge of ADR 0024.
+	updatedReadyCount int
+	// firstOutdatedPod is the pod the roll would replace next, terminating or not:
+	// a terminating outdated pod stays the selection and is waited on, exactly as
+	// the data tier keeps the terminating pod at candidates[0].
+	firstOutdatedPod *corev1.Pod
+	// terminating names the first Sentinel pod carrying a DeletionTimestamp and the
+	// deadline it carries. Zero when none does. It is the input to the delete gate.
+	terminating terminatingPod
+}
+
+// scanSentinelPods walks the Sentinel StatefulSet's ordinal range once and reports
+// what the roll needs to know about it.
+//
+// The range comes from the StatefulSet's replica count and never from a label
+// selector: a selector would also return surplus ordinals draining from a
+// concurrent scale-down, which the roll neither caused nor can influence
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D7).
+//
+// One predicate feeds both counters, and it is availability rather than readiness:
+// a Sentinel that is being deleted must not hold up a quorum it is about to leave,
+// and must not be counted as converged by the completion marker (ADR 0026 D1,
+// ADR 0024).
+func (r *ValkeyReconciler) scanSentinelPods(ctx context.Context, v *vkov1.Valkey, sentinelSts *appsv1.StatefulSet) (sentinelScan, error) {
+	scan := sentinelScan{}
+	stsName := sentinelSts.Name
+	desiredTemplate := sentinelSts.Spec.Template
+
+	for i := 0; i < int(*sentinelSts.Spec.Replicas); i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Pod does not exist yet (initial deployment) or is being recreated
+				// after a recent deletion. In both cases, skip it — it neither counts
+				// toward readyCount nor can be an outdated pod to delete.
+				// The quorum guard will naturally prevent triggering another
+				// deletion while a pod is missing (reducing the effective ready count).
+				continue
+			}
+			return sentinelScan{}, fmt.Errorf("getting sentinel pod %s: %w", podName, err)
+		}
+		if !podIsOurs(pod, sentinelSts) {
+			return sentinelScan{}, foreignObjectError("Pod", podName)
+		}
+		terminating := pod.DeletionTimestamp != nil
+		if terminating && scan.terminating.name == "" {
+			scan.terminating = terminatingPod{name: pod.Name, since: pod.DeletionTimestamp.Time}
+		}
+		outdated := sentinelPodNeedsUpdate(pod, desiredTemplate)
+		if isPodReady(pod) && !terminating {
+			scan.readyCount++
+			if !outdated {
+				scan.updatedReadyCount++
+			}
+		}
+		if scan.firstOutdatedPod == nil && outdated {
+			scan.firstOutdatedPod = pod
+		}
+	}
+	return scan, nil
+}
+
 // checkAndHandleSentinelRollingUpdate detects sentinel pods running outdated container
-// images and replaces them one at a time while verifying sentinel quorum is maintained.
+// images and replaces them while verifying sentinel quorum is maintained.
 //
 // Because the sentinel StatefulSet uses OnDelete, Kubernetes will not automatically
 // restart pods after a spec update. The operator must coordinate pod deletion here.
 //
 // Strategy:
 //  1. Identify sentinel pods whose container images differ from the current template.
-//  2. Before deleting any pod, check that the remaining ready sentinels (after
+//  2. Before deleting any pod, check that the remaining available sentinels (after
 //     deletion) will still meet quorum (readyCount - 1 >= quorum).
-//  3. Delete the first outdated pod and requeue so the next reconcile
+//  3. Refuse the delete outright while any sentinel pod is terminating
+//     (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5).
+//  4. Delete the first outdated pod and requeue so the next reconcile
 //     waits for the replacement to become ready before moving on.
+//
+// The quorum guard is the invariant, not "one pod at a time" -- an earlier version
+// of this comment claimed the latter. A pod that is already **gone** is skipped by
+// the scan, which lowers readyCount but also removes it from the delete gate; with
+// five sentinels and quorum three the arithmetic then permits deleting the next one
+// while the previous replacement is still booting. That is the same quorum ADR 0004
+// derives the Sentinel PDB from, and it is deliberately what bounds this loop
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D8). For a three-pod tier
+// there is no difference: the guard blocks the second delete either way.
 func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -3587,43 +4022,14 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 
 	totalSentinels := int(*sentinelSts.Spec.Replicas)
 	quorum := totalSentinels/2 + 1
-	desiredTemplate := sentinelSts.Spec.Template
 
-	readyCount := 0
-	updatedReadyCount := 0
-	var firstOutdatedPod *corev1.Pod
-
-	for i := 0; i < totalSentinels; i++ {
-		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		pod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
-			if apierrors.IsNotFound(err) {
-				// Pod does not exist yet (initial deployment) or is being recreated
-				// after a recent deletion. In both cases, skip it — it neither counts
-				// toward readyCount nor can be an outdated pod to delete.
-				// The quorum guard below will naturally prevent triggering another
-				// deletion while a pod is missing (reducing effectiveReadyCount).
-				continue
-			}
-			return RollingUpdateResult{Error: fmt.Errorf("getting sentinel pod %s: %w", podName, err)}
-		}
-		if !podIsOurs(pod, sentinelSts) {
-			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
-		}
-		outdated := sentinelPodNeedsUpdate(pod, desiredTemplate)
-		if isPodReady(pod) {
-			readyCount++
-			if !outdated {
-				updatedReadyCount++
-			}
-		}
-		if firstOutdatedPod == nil && outdated {
-			firstOutdatedPod = pod
-		}
+	scan, err := r.scanSentinelPods(ctx, v, sentinelSts)
+	if err != nil {
+		return RollingUpdateResult{Error: err}
 	}
 
-	if firstOutdatedPod == nil {
-		return r.finishSentinelRollingUpdate(ctx, v, updatedReadyCount, totalSentinels)
+	if scan.firstOutdatedPod == nil {
+		return r.finishSentinelRollingUpdate(ctx, v, scan.updatedReadyCount, totalSentinels)
 	}
 
 	// A roll is in flight. Record it before acting: the True condition is the
@@ -3631,18 +4037,24 @@ func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Conte
 	// the status contract's "current task" — the data tier's RollingUpdateComplete
 	// has already fired at this point (or, on a Sentinel-only spec change, the
 	// data tier never rolled and the phase would otherwise keep reading OK).
-	r.recordSentinelUpdateProgress(ctx, v, updatedReadyCount, totalSentinels)
+	r.recordSentinelUpdateProgress(ctx, v, scan.updatedReadyCount, totalSentinels)
 
 	// Guard quorum: after deleting one pod we need at least `quorum` sentinels left.
-	if readyCount-1 < quorum {
+	if scan.readyCount-1 < quorum {
 		logger.Info("Waiting for sentinel quorum before updating sentinel pod",
-			"pod", firstOutdatedPod.Name, "readyCount", readyCount, "quorum", quorum)
+			"pod", scan.firstOutdatedPod.Name, "readyCount", scan.readyCount, "quorum", quorum)
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
-	logger.Info("Deleting sentinel pod for rolling update", "pod", firstOutdatedPod.Name)
-	if err := r.deleteOwnedPod(ctx, firstOutdatedPod); err != nil {
-		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", firstOutdatedPod.Name, err)}
+	// The delete gate, after the quorum guard and immediately before the delete.
+	if result := r.holdDeleteWhileTerminating(ctx, v, common.ComponentSentinel,
+		scan.terminating); result != nil {
+		return *result
+	}
+
+	logger.Info("Deleting sentinel pod for rolling update", "pod", scan.firstOutdatedPod.Name)
+	if err := r.deleteOwnedPod(ctx, scan.firstOutdatedPod); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("deleting sentinel pod %s: %w", scan.firstOutdatedPod.Name, err)}
 	}
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }

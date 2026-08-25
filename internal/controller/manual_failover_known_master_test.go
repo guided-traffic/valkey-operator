@@ -87,8 +87,8 @@ func twoReplicaFailoverFixture(t *testing.T) (*vkov1.Valkey, []podState, *corev1
 	pod1 := podFromStsTemplate(v, sts, 1)
 
 	pods := []podState{
-		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, ready: true, exists: true},
-		{name: pod1.Name, pod: pod1, needsUpdate: false, isMaster: false, ready: true, exists: true},
+		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, needsUpdate: false, isMaster: false, readyCondition: true, exists: true},
 	}
 
 	replicaCM := builder.BuildReplicaConfigMap(v)

@@ -355,6 +355,31 @@ rolling update emits **zero** Warning Events on either topology, and an e2e subt
 topology says so.
 → [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
 
+## A pod being deleted is not available
+
+kubelet keeps `PodReady=True` for the **whole termination** of a pod whose readiness probe
+still passes — measured on Kubernetes 1.36.1, no flip, right up to the moment the object is
+gone. `podState.ready` is therefore renamed `readyCondition` and read only through two
+accessors: **`available()` = Ready and not being deleted is the default**, and every site that
+*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it;
+`reachable()` = Ready alone is the carve-out for the four sites that only *talk* to a pod, of
+which `demoteRogueMaster` is the load-bearing one — refusing to demote a terminating master
+would leave it accepting writes for the rest of its termination. **The rule is the rename, not
+a list of sites**: it had been stated as a list three times and been incomplete every time.
+
+On top of it one invariant: **the operator never deletes a pod of a tier while any pod of that
+tier is terminating.** The gate sits immediately in front of each `deleteOwnedPod` and never at
+a function head; "the tier" is the ordinal range `[0, *sts.Spec.Replicas)`, never a
+label-selector List. The refusal is never resumed — the *observation* of it is bounded, by the
+pod's own `deletionTimestamp` (which the API server sets to `now + gracePeriodSeconds`, so
+`time.Since` of it is the overrun) rather than by `ensureWaitBound`. Past
+`podTerminationOverrun` = 2 min the pass stops ending on the wait and reports
+`PodTerminationStalled`, so the Sentinel roll, the no-master recovery, the steady-state
+split-brain check and the status write run again. **No Event on any of it** — ADR 0025 D7 still
+promises zero Warnings on a clean roll. `countUpdatedPods` deliberately still counts a
+terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel path only.
+→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md)
+
 ## Reconcile concurrency
 
 The operator reconciles **4 Valkey CRs at a time** (`--max-concurrent-reconciles`, chart value

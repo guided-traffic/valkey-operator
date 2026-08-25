@@ -216,3 +216,4 @@ store for a one-off.
 - [ADR 0017](0017-test-and-ci-policy.md) — the tier this is verified in, and the image-tool contract
 - [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) — why a condition is enough to make this alertable
 - [ADR 0007](0007-failover-aware-rolling-update.md) — the Sentinel tier roll this rides on
+- [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — a Sentinel being deleted no longer counts toward the quorum that authorises the next delete, and why a reset routed through a dying master is the shape its D4 avoids

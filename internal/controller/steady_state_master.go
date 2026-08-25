@@ -590,7 +590,17 @@ func (r *ValkeyReconciler) demoteConfirmedRogues(ctx context.Context, v *vkov1.V
 			}
 		}
 
-		rogue := podState{name: pod.Name, pod: pod, exists: true, ready: isPodReady(pod)}
+		// terminating is filled in even though this path only ever asks reachable():
+		// available() must never be structurally false at a construction site, or the
+		// next reader of this podState gets the safe-looking answer for the wrong
+		// reason (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D6).
+		rogue := podState{
+			name:           pod.Name,
+			pod:            pod,
+			exists:         true,
+			readyCondition: isPodReady(pod),
+			terminating:    pod.DeletionTimestamp != nil,
+		}
 		if demoteErr := r.demoteRogueMaster(ctx, v, rogue, authority); demoteErr != nil {
 			logger.Info("Steady-state demotion failed, will retry on the next pass",
 				"pod", pod.Name, "authority", authority, "error", demoteErr)

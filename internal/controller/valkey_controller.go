@@ -326,6 +326,15 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	if rollingResult.NeedsRequeue {
 		return ctrl.Result{RequeueAfter: rollingResult.RequeueAfter}, nil
 	}
+	// A rolling-update wait that has outlived its bound without being resumed. The
+	// wait continues — nothing was deleted and nothing is retried early — but the
+	// pass must not end on it, or everything below stays suspended for as long as
+	// the stall lasts: the Sentinel roll, the no-master recovery, the steady-state
+	// split-brain check and the status write
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5). The cadence is
+	// applied at the end of the pass, exactly like the one a post-update check asks
+	// for without taking it.
+	deferredRequeue := ctrl.Result{RequeueAfter: rollingResult.DeferredRequeueAfter}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
 	//
@@ -363,7 +372,10 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 
 	// The recheck a post-update check asked for without ending the pass. Zero
 	// unless one of them set it, so the healthy path still returns no requeue.
-	return pending, nil
+	if pending.RequeueAfter > 0 {
+		return pending, nil
+	}
+	return deferredRequeue, nil
 }
 
 // handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery

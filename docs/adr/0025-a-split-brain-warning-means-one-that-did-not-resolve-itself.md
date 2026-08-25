@@ -281,6 +281,9 @@ during a genuine split brain would restart the silence.
   bound.
 - [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) D6, D20 — silence is not
   evidence; the shared demotion helper, amended here.
+- [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D2, D5 — the carve-out that keeps
+  `demoteRogueMaster` reachable for a terminating master, and the reason the new termination
+  waits report through a condition and never through an Event.
 - [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) — why the role label
   outlives the pod.
 - [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) — how the condition

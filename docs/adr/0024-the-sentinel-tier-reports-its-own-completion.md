@@ -2,12 +2,13 @@
 
 ## Status
 
-Accepted. Date: 2026-08-23.
+Accepted, amended 2026-08-25 (D3, see D8). Date: 2026-08-23.
 
 Implemented: the `SentinelUpdatePending` condition, the `SentinelUpdateComplete`
 event, the `Sentinel Rolling Update i/n` phase, the reworded
 `RollingUpdateComplete` message, and the clear on a CR whose Sentinel was
-disabled mid-roll.
+disabled mid-roll. Amended 2026-08-25: convergence additionally excludes a
+Sentinel pod that is being deleted (D8).
 
 ## Context
 
@@ -63,7 +64,8 @@ for pods the driver will never replace.
   machine behind it; a CR that never rolled never carries the condition, so a
   healthy steady-state pass writes nothing and the upgrade is fleet-neutral.
 - **D3 — Convergence means every pod is current AND Ready, judged by the
-  driver's own predicate.** The completion check counts pods that exist, pass
+  driver's own predicate.** *(Amended 2026-08-25 by D8: "Ready" is now
+  "available", i.e. Ready and not being deleted.)* The completion check counts pods that exist, pass
   `sentinelPodNeedsUpdate` and are Ready (`updatedReadyCount == replicas`).
   "No outdated pod" alone is not completion — after the last delete the
   replacement is still booting, which is exactly the too-early edge this ADR
@@ -86,6 +88,20 @@ for pods the driver will never replace.
   non-Sentinel path of `handlePostRollingUpdateChecks`, with no completion
   event. The clear is presence-guarded, like `clearSidecarUpdatePending`, so no
   condition is ever created on a CR that never carried one.
+
+- **D8 — Amendment, 2026-08-25: a Sentinel pod that is being deleted is not
+  converged either.** kubelet keeps `PodReady=True` for the whole termination of
+  a pod whose readiness probe still passes, so the Ready predicate of D3 counted
+  a Sentinel that was on its way out — the same too-early edge D3 exists to
+  remove, reached through a different input. `scanSentinelPods` now feeds both
+  the quorum guard and `updatedReadyCount` from one availability predicate
+  (Ready **and** no `DeletionTimestamp`), so the marker cannot fire over a pod
+  that is not running. The price is stated rather than hidden: the completion
+  marker now also waits out a Sentinel termination the roll did not cause — a
+  chaos kill, an eviction, a node drain — and anything sequencing on
+  `SentinelUpdateComplete` sees it that much later. The counterpart of the
+  change, and the full rule, is
+  [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D6.
 
 ## Consequences
 
@@ -161,4 +177,6 @@ for pods the driver will never replace.
   annotation must end at the data tier),
   [0020](0020-write-only-what-the-operator-owns.md) (foreign objects are
   absent), [0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md)
-  (conditions export as metrics)
+  (conditions export as metrics),
+  [0026](0026-a-pod-being-deleted-is-not-available.md) (D8: a terminating
+  Sentinel is not converged)

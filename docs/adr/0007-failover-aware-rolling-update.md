@@ -181,6 +181,14 @@ observed. Consequence to hold on to: **readiness can never be used as a proxy fo
 replication health anywhere in the operator** — the rolling update waits on sync state,
 not on readiness.
 
+*Second half, added 2026-08-25:* readiness is not a proxy for **being spendable** either.
+kubelet keeps `PodReady=True` for the whole termination of a pod whose probe still passes,
+so a pod the operator itself has just deleted answers Ready until it is gone. Every site
+that deletes, promotes or counts a pod therefore asks `podState.available()` rather than
+the Ready condition, and the four sites that only need to talk to a pod ask `reachable()`.
+The full rule, the carve-out and the delete gate:
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md).
+
 **D10 — Before a promotion, "synced" is the full replication answer, and the wait for it
 is bounded.** `waitForReplicasReady` and `verifyReplacedReplicasSynced` ask
 `replicationNotEstablishedReason`: role must not be master, `master_link_status` must be
