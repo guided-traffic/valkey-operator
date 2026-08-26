@@ -143,8 +143,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 // PingPod sends a PING to a specific Valkey pod.
 func (h *Checker) PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error {
 	password := h.readAuthPassword(ctx, v)
-	port := int(builder.ServicePort(v))
-	addr := podAddress(v, podName, port)
+	addr := valkeyPodAddress(v, podName)
 
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if err != nil {
@@ -158,8 +157,7 @@ func (h *Checker) PingPod(ctx context.Context, v *vkov1.Valkey, podName string) 
 // GetReplicationInfo returns the replication info for a specific Valkey pod.
 func (h *Checker) GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error) {
 	password := h.readAuthPassword(ctx, v)
-	port := int(builder.ServicePort(v))
-	addr := podAddress(v, podName, port)
+	addr := valkeyPodAddress(v, podName)
 
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if err != nil {
@@ -220,7 +218,6 @@ func (h *Checker) probeMasterRole(
 func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string, tlsConfig *tls.Config) (string, string, error) {
 	logger := log.FromContext(ctx)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
-	port := int(builder.ServicePort(v))
 
 	found := make([]*masterCandidate, v.Spec.Replicas)
 	var wg sync.WaitGroup
@@ -230,7 +227,7 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		go func(idx int32) {
 			defer wg.Done()
 			podName := fmt.Sprintf("%s-%d", stsName, idx)
-			found[idx] = h.probeMasterRole(ctx, v, podName, podAddress(v, podName, port), password, tlsConfig)
+			found[idx] = h.probeMasterRole(ctx, v, podName, valkeyPodAddress(v, podName), password, tlsConfig)
 		}(i)
 	}
 	wg.Wait()
@@ -325,16 +322,9 @@ func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentine
 		return observation
 	}
 
-	// Sentinel port: use TLS port (36379) when TLS is enabled, plaintext (26379) otherwise.
-	// With TLS enabled, Sentinel listens on SentinelTLSPort (tls-port directive).
-	port := builder.SentinelPort
-	if v.IsTLSEnabled() {
-		port = builder.SentinelTLSPort
-	}
-
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := podAddress(v, podName, port)
+		addr := sentinelPodAddress(v, podName)
 
 		c := h.newValkeyClient(addr, sentinelPassword, tlsConfig)
 		masterInfo, err := c.SentinelMaster(monitorName)
@@ -405,20 +395,49 @@ func (h *Checker) newValkeyClient(addr, password string, tlsConfig *tls.Config) 
 	return valkeyclient.New(addr)
 }
 
-// podAddress returns the FQDN address for a pod using the headless service.
-func podAddress(v *vkov1.Valkey, podName string, port int) string {
-	component := common.ComponentValkey
-	// Detect sentinel pods by name suffix.
-	if len(podName) > 9 && podName[len(podName)-10:len(podName)-2] == "sentinel" {
-		component = common.ComponentSentinel
-	}
+// valkeyPodAddress returns the address of a data-tier pod: the Valkey headless
+// Service and the Valkey client port, chosen in one place so they cannot
+// disagree.
+//
+// The component is never derived from the pod name. It used to be, by testing a
+// fixed-offset window of the name against "sentinel", and that guess was wrong in
+// two directions at once: a data pod of a CR whose own name ends in "sentinel"
+// (`term-no-sentinel-0`) was dialled through the Sentinel headless Service, and a
+// Sentinel pod from ordinal 10 upward was dialled through the data one. Both
+// resolve to nothing, so the operator went blind to its own pods -- loudly for
+// PingPod (phase Error), silently for GetReplicationInfo and findMaster, which
+// read an unreachable pod as "not the master".
+//
+// Every caller of these helpers already knows which tier it is addressing, and
+// already picks the matching port. Pairing the two removes the only place that
+// had to guess (docs/adr/0029-a-name-is-not-a-component.md, D1, D2).
+func valkeyPodAddress(v *vkov1.Valkey, podName string) string {
+	return PodAddressForComponent(v, podName, common.ComponentValkey, int(builder.ServicePort(v)))
+}
 
-	headlessSvc := common.HeadlessServiceName(v, component)
-	return fmt.Sprintf("%s.%s.%s.svc.cluster.local:%d",
-		podName, headlessSvc, v.Namespace, port)
+// sentinelPodAddress returns the address of a Sentinel-tier pod: the Sentinel
+// headless Service and the Sentinel port, chosen together for the reason
+// valkeyPodAddress states.
+func sentinelPodAddress(v *vkov1.Valkey, podName string) string {
+	return PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort(v))
+}
+
+// sentinelPort is the port Sentinel listens on: the TLS port when TLS is enabled
+// (Sentinel is configured with the tls-port directive), the plaintext port
+// otherwise.
+func sentinelPort(v *vkov1.Valkey) int {
+	if v.IsTLSEnabled() {
+		return builder.SentinelTLSPort
+	}
+	return builder.SentinelPort
 }
 
 // PodAddressForComponent returns the FQDN for a pod given an explicit component.
+//
+// The component and the port belong together -- a Sentinel Service with a Valkey
+// port resolves to nothing, and so does the converse. Callers inside this package
+// use valkeyPodAddress or sentinelPodAddress, which pair them; a caller that uses
+// this function directly owns that pairing itself.
 func PodAddressForComponent(v *vkov1.Valkey, podName, component string, port int) string {
 	headlessSvc := common.HeadlessServiceName(v, component)
 	return fmt.Sprintf("%s.%s.%s.svc.cluster.local:%d",

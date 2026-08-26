@@ -437,33 +437,10 @@ func TestReadAuthPassword_EmptySecretName(t *testing.T) {
 	assert.Equal(t, "", password, "empty secret name means auth not enabled")
 }
 
-// --- podAddress edge cases ---
-
-func TestPodAddress_Valkey(t *testing.T) {
-	v := newTestValkey("test", "default")
-	addr := podAddress(v, "test-0", 6379)
-	assert.Equal(t, "test-0.test-headless.default.svc.cluster.local:6379", addr)
-}
-
-func TestPodAddress_Sentinel(t *testing.T) {
-	v := newTestValkey("test", "default")
-	addr := podAddress(v, "test-sentinel-0", 26379)
-	assert.Equal(t, "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:26379", addr)
-}
-
-func TestPodAddress_ShortPodName(t *testing.T) {
-	// Pod name shorter than 10 chars — sentinel detection should not panic.
-	v := newTestValkey("t", "ns")
-	addr := podAddress(v, "t-0", 6379)
-	assert.Contains(t, addr, "t-0.")
-	assert.Contains(t, addr, ".ns.svc.cluster.local:6379")
-}
-
-func TestPodAddress_TLSPort(t *testing.T) {
-	v := newTestValkey("test", "default")
-	addr := podAddress(v, "test-0", 16379)
-	assert.Equal(t, "test-0.test-headless.default.svc.cluster.local:16379", addr)
-}
+// The former podAddress edge cases (valkey pod, sentinel pod, short pod name,
+// TLS port) now live as rows of TestPodAddress_ComponentIsNeverDerivedFromTheName
+// in checker_paths_test.go, which covers them against the tier-paired helpers
+// that replaced the name-sniffing podAddress.
 
 // --- PodAddressForComponent edge cases ---
 

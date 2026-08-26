@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// clusterDomainSuffix is the suffix podAddress appends to every pod name.
+// clusterDomainSuffix is the suffix every pod address ends in.
 const clusterDomainSuffix = ".svc.cluster.local"
 
 type dnsProbe struct {
@@ -403,19 +403,20 @@ func TestFindMaster_ZeroReplicasScansNothing(t *testing.T) {
 	assert.Empty(t, resolverProbe.hosts())
 }
 
-// TestFindMaster_ClusterNameEndingInSentinelIsMisrouted documents a real defect.
+// TestFindMaster_ClusterNameEndingInSentinelStillUsesTheDataService is the
+// regression guard for the defect that made a CR name decide which tier a pod
+// belongs to.
 //
-// podAddress infers the component from the pod name: it treats a pod as a
-// Sentinel when the eight characters before the ordinal spell "sentinel". A
-// Valkey CR named "valkey-sentinel" produces the data pod "valkey-sentinel-0",
-// which matches, so findMaster dials the data pods through the *Sentinel*
-// headless service. That service selects no data pods, so the health check can
-// never find the master for such a cluster.
+// A Valkey CR named "valkey-sentinel" produces the data pod
+// "valkey-sentinel-0". The old podAddress read the eight characters before the
+// ordinal, found "sentinel" in the *cluster* name, and dialled the data pods
+// through the Sentinel headless Service -- which selects no data pod, so the
+// health check could never find the master of such a cluster. The e2e clusters
+// "term-sentinel" and "term-no-sentinel" sat in exactly that window.
 //
-// The fix is to pass the component explicitly instead of guessing it from the
-// name; when it lands, the expectation below flips to
-// "valkey-sentinel-0.valkey-sentinel-headless.default.svc.cluster.local".
-func TestFindMaster_ClusterNameEndingInSentinelIsMisrouted(t *testing.T) {
+// The address must come from the component the caller means, never from the
+// name it happens to have.
+func TestFindMaster_ClusterNameEndingInSentinelStillUsesTheDataService(t *testing.T) {
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("valkey-sentinel", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 1 })
 
@@ -425,9 +426,9 @@ func TestFindMaster_ClusterNameEndingInSentinelIsMisrouted(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Equal(t,
-		[]string{"valkey-sentinel-0.valkey-sentinel-sentinel-headless.default.svc.cluster.local"},
+		[]string{"valkey-sentinel-0.valkey-sentinel-headless.default.svc.cluster.local"},
 		resolverProbe.hosts(),
-		"BUG: the data pod is addressed through the sentinel headless service")
+		"a data pod is addressed through the data headless service, whatever the cluster is called")
 }
 
 // --- PingPod ---
@@ -640,72 +641,155 @@ func TestCheckSentinel_PortDependsOnTLS(t *testing.T) {
 	}
 }
 
-// TestCheckSentinel_DoubleDigitOrdinalIsMisrouted documents the second face of
-// the podAddress defect: the sentinel marker is looked for at a fixed offset
-// before the ordinal, so it is missed as soon as the ordinal has two digits and
-// the pod is addressed through the Valkey headless service instead.
+// TestObserveSentinels_DoubleDigitOrdinalUsesTheSentinelService is the
+// regression guard for the second face of the same defect: the marker was read
+// at a fixed offset before the ordinal, so it was missed as soon as the ordinal
+// had two digits and the Sentinel pod was dialled through the Valkey headless
+// Service instead.
 //
 // Eleven sentinels is not a realistic configuration; it is the smallest input
-// that reaches the defect. When podAddress takes the component explicitly, the
-// expectation below becomes "test-sentinel-10.test-sentinel-headless...".
-func TestCheckSentinel_DoubleDigitOrdinalIsMisrouted(t *testing.T) {
+// that reaches the defect, and spec.sentinel.replicas has no Maximum, so it is
+// reachable rather than hypothetical.
+func TestObserveSentinels_DoubleDigitOrdinalUsesTheSentinelService(t *testing.T) {
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 11}
 	})
 
 	assert.False(t, newFakeChecker().observeSentinels(ctx, v).monitoring())
-	assert.Contains(t, resolverProbe.hosts(), "test-sentinel-10.test-headless.default.svc.cluster.local",
-		"BUG: sentinel-10 is addressed through the Valkey headless service")
-	assert.NotContains(t, resolverProbe.hosts(), "test-sentinel-10.test-sentinel-headless.default.svc.cluster.local")
+	assert.Contains(t, resolverProbe.hosts(), "test-sentinel-10.test-sentinel-headless.default.svc.cluster.local",
+		"a sentinel pod is addressed through the sentinel headless service at every ordinal")
+	assert.NotContains(t, resolverProbe.hosts(), "test-sentinel-10.test-headless.default.svc.cluster.local")
 }
 
-// --- podAddress: the defect in isolation ---
+// --- the tier of a pod is never read out of its name ---
 
-func TestPodAddress_SentinelDetectionIsPositional(t *testing.T) {
+// TestPodAddress_ComponentIsNeverDerivedFromTheName pins the rule that replaced
+// the old name-sniffing podAddress: the caller says which tier it means, and the
+// headless Service and the port are chosen together from that.
+//
+// The cases that end in "sentinel" and the two-digit ordinals are the ones the
+// old fixed-offset guess got wrong, in both directions. They are kept as a
+// table so a future shortcut that reads the tier out of the name again fails
+// here first (docs/adr/0029-a-name-is-not-a-component.md, D1).
+func TestPodAddress_ComponentIsNeverDerivedFromTheName(t *testing.T) {
 	tests := []struct {
 		name     string
 		cluster  string
 		podName  string
+		sentinel bool
+		tls      bool
 		wantAddr string
-		bug      string
 	}{
 		{
-			name:     "valkey pod",
+			name:     "data pod",
 			cluster:  "test",
 			podName:  "test-0",
 			wantAddr: "test-0.test-headless.default.svc.cluster.local:6379",
 		},
 		{
+			name:     "data pod of a cluster whose name ends in sentinel",
+			cluster:  "valkey-sentinel",
+			podName:  "valkey-sentinel-0",
+			wantAddr: "valkey-sentinel-0.valkey-sentinel-headless.default.svc.cluster.local:6379",
+		},
+		{
+			name:     "data pod of a cluster named exactly sentinel",
+			cluster:  "sentinel",
+			podName:  "sentinel-0",
+			wantAddr: "sentinel-0.sentinel-headless.default.svc.cluster.local:6379",
+		},
+		{
+			name:     "data pod with a two digit ordinal",
+			cluster:  "test",
+			podName:  "test-10",
+			wantAddr: "test-10.test-headless.default.svc.cluster.local:6379",
+		},
+		{
+			// The old guess sliced the name and needed a length guard to avoid
+			// panicking here. Nothing reads the name any more, but the shortest
+			// legal name stays covered.
+			name:     "data pod of a single character cluster",
+			cluster:  "t",
+			podName:  "t-0",
+			wantAddr: "t-0.t-headless.default.svc.cluster.local:6379",
+		},
+		{
+			name:     "data pod on the TLS port",
+			cluster:  "test",
+			podName:  "test-0",
+			tls:      true,
+			wantAddr: "test-0.test-headless.default.svc.cluster.local:16379",
+		},
+		{
 			name:     "sentinel pod with a single digit ordinal",
 			cluster:  "test",
 			podName:  "test-sentinel-0",
-			wantAddr: "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:6379",
+			sentinel: true,
+			wantAddr: "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:26379",
 		},
 		{
 			name:     "sentinel pod with a two digit ordinal",
 			cluster:  "test",
 			podName:  "test-sentinel-10",
-			wantAddr: "test-sentinel-10.test-headless.default.svc.cluster.local:6379",
-			bug:      "the marker is checked at a fixed offset, so it is missed once the ordinal grows",
+			sentinel: true,
+			wantAddr: "test-sentinel-10.test-sentinel-headless.default.svc.cluster.local:26379",
 		},
 		{
-			name:     "data pod of a cluster whose name ends in sentinel",
+			name:     "sentinel pod of a cluster whose name ends in sentinel",
 			cluster:  "valkey-sentinel",
-			podName:  "valkey-sentinel-0",
-			wantAddr: "valkey-sentinel-0.valkey-sentinel-sentinel-headless.default.svc.cluster.local:6379",
-			bug:      "a data pod is mistaken for a sentinel pod purely because of the CR name",
+			podName:  "valkey-sentinel-sentinel-0",
+			sentinel: true,
+			wantAddr: "valkey-sentinel-sentinel-0.valkey-sentinel-sentinel-headless.default.svc.cluster.local:26379",
+		},
+		{
+			name:     "sentinel pod on the TLS port",
+			cluster:  "test",
+			podName:  "test-sentinel-0",
+			sentinel: true,
+			tls:      true,
+			wantAddr: "test-sentinel-0.test-sentinel-headless.default.svc.cluster.local:36379",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			v := newTestValkey(tc.cluster, "default")
-			msg := "expected addressing"
-			if tc.bug != "" {
-				msg = "BUG (documented, not fixed): " + tc.bug
+			opts := []func(*vkov1.Valkey){}
+			if tc.tls {
+				opts = append(opts, func(v *vkov1.Valkey) {
+					v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+				})
 			}
-			assert.Equal(t, tc.wantAddr, podAddress(v, tc.podName, builder.ValkeyPort), msg)
+			v := newTestValkey(tc.cluster, "default", opts...)
+
+			got := valkeyPodAddress(v, tc.podName)
+			if tc.sentinel {
+				got = sentinelPodAddress(v, tc.podName)
+			}
+			assert.Equal(t, tc.wantAddr, got)
 		})
 	}
+}
+
+// TestPodAddress_TheTwoTiersNeverShareAnAddress states the property the pairing
+// exists for: whatever the cluster is called, a data pod and a Sentinel pod of
+// the same cluster never produce the same FQDN, and neither borrows the other's
+// Service or port.
+//
+// The cluster name is the adversarial one -- it ends in "sentinel", so under the
+// old guess the data pod took the Sentinel Service and collided with the tier it
+// is not part of.
+func TestPodAddress_TheTwoTiersNeverShareAnAddress(t *testing.T) {
+	v := newTestValkey("valkey-sentinel", "default")
+
+	data := valkeyPodAddress(v, "valkey-sentinel-0")
+	sentinel := sentinelPodAddress(v, "valkey-sentinel-sentinel-0")
+
+	assert.NotEqual(t, data, sentinel)
+	assert.Contains(t, data, ".valkey-sentinel-headless.")
+	assert.Contains(t, sentinel, ".valkey-sentinel-sentinel-headless.")
+	// Substring checks are treacherous here: "valkey-sentinel-headless" contains
+	// "-sentinel-headless". Compare the Service segment itself.
+	assert.Equal(t, "valkey-sentinel-headless", strings.Split(data, ".")[1])
+	assert.Equal(t, "valkey-sentinel-sentinel-headless", strings.Split(sentinel, ".")[1])
 }

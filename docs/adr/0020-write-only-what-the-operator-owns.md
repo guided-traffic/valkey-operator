@@ -144,8 +144,9 @@ branch; none is a report of an object observed being damaged on a cluster.
 * **(2026-08-22, NA63) Pods were reachable through three separate doors, and the one that
   was filed is the most expensive to use.** The filing named the network commands —
   `checkAndRecoverNoMaster` probing `<cr>-0..N-1` and `checkSteadyStateSplitBrain` demoting
-  label-selected pods with `REPLICAOF`. Those go through `podAddress`
-  ([`internal/health/checker.go`](../../internal/health/checker.go)), so reaching a foreign
+  label-selected pods with `REPLICAOF`. Those go through `valkeyPodAddress`
+  ([`internal/health/checker.go`](../../internal/health/checker.go); it was `podAddress` until
+  [ADR 0029](0029-a-name-is-not-a-component.md) replaced it), so reaching a foreign
   pod needs this cluster's label set, a per-pod record under the headless Service **and** the
   CR's password. The two doors nobody had filed need only the label set:
 
@@ -773,8 +774,9 @@ that alters nothing a user asked for.
   [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go).
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `SidecarRolePodNames`, whose
   live half D9 filters and whose desired half it deliberately leaves alone.
-* [`internal/health/checker.go`](../../internal/health/checker.go) — `podAddress`, which is
-  why the network door needs a per-pod DNS record on top of the labels.
+* [`internal/health/checker.go`](../../internal/health/checker.go) — `valkeyPodAddress` and
+  `PodAddressForComponent`, which are why the network door needs a per-pod DNS record on top
+  of the labels.
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) —
   `reconcileBlockedReason` and its precedence.
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — the name-based subject and
