@@ -4,6 +4,12 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended 2026-08-26:** the D8/NA62 read-path sweep is corrected in place — it omitted
+Deployments, and `isObserverDeploymentReady` was the unguarded consumer, which inverted the
+`status.observerReady` signal this ADR's own observer refusal direction rests on. The reader
+now treats a foreign Deployment as absent. Verified in this repository: `make test-unit`,
+`make lint` and `make cyclo` are green; no e2e or integration suite was run.
+
 **Amended 2026-08-23 (ADR 0023):** the pod re-adoption this ADR twice called "asserted from
 the API contract, reproduced nowhere in this repo" has been run and holds — both statements
 are corrected in place. The same run found the limit of the orphan-delete recovery D1 names:
@@ -396,6 +402,35 @@ one reporter.
 A sweep of the remaining kinds found no third consumer: nothing reads back a Service, a
 NetworkPolicy, a ServiceMonitor or a Certificate to derive a decision from it. The one
 Certificate reader, `deleteLegacySentinelCertificate`, was already ownership-checked.
+
+Corrected 2026-08-26: **that sweep missed Deployments, and the consumer it missed is the one
+this ADR's own observer decision rests on.** `isObserverDeploymentReady` read the Deployment
+under `<cr>-observer` and returned `Status.ReadyReplicas > 0` with no `IsControlledBy` check,
+while both sibling readers in the same function — the data StatefulSet in `updateStatus` and
+the Sentinel StatefulSet in `updateHAStatus` — had one. So a stranger holding the generated
+name had its ready replica reported as *our* observer's readiness, at the same time as
+`reconcileObserverDeployment` was refusing to write and emitting an Event saying "the
+observer is not deployed and `status.observerReady` stays false". The unguarded read
+inverted precisely the signal the refusal direction was chosen for (see Consequences: "the
+observer is diagnostic, the CR does its job without it, and `status.observerReady` records
+the degradation"), and the rejected alternative below leans on the same field.
+
+The reader now treats a foreign Deployment as absent and returns `false`. Fail direction
+toward `false` is the honest answer and the one D2 prescribes for a diagnostic component,
+and no Event is added — `reconcileObserverDeployment` stays the one reporter. Guarded by the
+`a foreign deployment is not ready` subtest of `TestIsObserverDeploymentReady`
+([`internal/controller/resource_reconcile_test.go`](../../internal/controller/resource_reconcile_test.go)).
+Note what the fix cost outside the reader: the two positive subtests were passing against
+Deployments with **no** ownerReference at all, because `builder.BuildObserverDeployment`
+does not stamp one — `reconcileObserverDeployment` does — so the fixtures had to start
+declaring the ownership they were implicitly assuming. A fixture that cannot tell owned from
+foreign is how a read-path gap survives a test suite.
+
+The corrected sweep, verified by grep over every non-test caller: **Deployment** has one
+reader (`isObserverDeploymentReady`, now guarded); Service, NetworkPolicy, ServiceMonitor
+and Certificate still have none beyond the ownership-checked one named above. Every managed
+kind's read path is now either guarded or provably absent, which is the claim the original
+sweep intended to make.
 
 **D9 — A pod is proven two-hop, and the proof is the StatefulSet.** *(2026-08-22, NA63.)* A
 pod is the only managed object whose controller is not the CR: the statefulset-controller

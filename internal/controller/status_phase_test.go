@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -223,6 +224,61 @@ func TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked(t *testing.T) {
 		"readyReplicas must keep tracking the data plane while blocked")
 	assert.Equal(t, "test-0", after.Status.MasterPod,
 		"masterPod must keep tracking the data plane while blocked")
+
+	// The Ready contract, pinned rather than only written down (ConditionTypeReady in
+	// api/v1). Ready is the DATA-PLANE verdict and phase carries the operator's ability to
+	// converge the spec, so on a blocked-but-healthy cluster the two disagree by design.
+	// A fleet audit read that pair as a contradiction; it is ADR 0002 D5 doing its job.
+	ready := apimeta.FindStatusCondition(after.Status.Conditions, vkov1.ConditionTypeReady)
+	require.NotNil(t, ready, "a blocked pass must still report a data-plane verdict")
+	assert.Equal(t, metav1.ConditionTrue, ready.Status,
+		"the data plane is healthy; a rejected managed write says nothing about it")
+	assert.Equal(t, "AllReplicasReady", ready.Reason)
+}
+
+// The same contract on the HA path, which is the shape the finding was actually reported
+// on: gitlab-valkey showed Ready=True/HAClusterReady beside phase=Error/ReconcileBlocked,
+// and no test at any tier reached that combination. The standalone twin above pins reason
+// AllReplicasReady, so it does not cover this one.
+func TestUpdateHAStatus_KeepsReadyTrueWhileBlocked(t *testing.T) {
+	v := newTestValkey("ha-blocked", testNamespace, func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	v.Status.Phase = vkov1.ValkeyPhaseError
+	v.Status.Message = "Failed to reconcile resources: NetworkPolicies: rejected"
+	r, c := newTestReconciler(v)
+	require.NoError(t, reconcileFor(t, r, v))
+	markStatefulSetReady(t, c, v)
+	markSentinelStatefulSetReady(t, c, v)
+
+	stored := crGet(t, c, v.Name)
+	stored.Status.Phase = vkov1.ValkeyPhaseError
+	stored.Status.Message = "Failed to reconcile resources: NetworkPolicies: rejected"
+	require.NoError(t, c.Status().Update(context.Background(), stored))
+
+	require.NoError(t, r.updateStatus(withBlockedPass(context.Background()), stored))
+
+	after := crGet(t, c, v.Name)
+	assert.Equal(t, vkov1.ValkeyPhaseError, after.Status.Phase,
+		"the blocked pass owns the phase (ADR 0002 D3)")
+	ready := apimeta.FindStatusCondition(after.Status.Conditions, vkov1.ConditionTypeReady)
+	require.NotNil(t, ready)
+	assert.Equal(t, metav1.ConditionTrue, ready.Status,
+		"Ready reports the data plane, which is healthy - the disagreement with phase is the design")
+	assert.Equal(t, "HAClusterReady", ready.Reason)
+}
+
+// markSentinelStatefulSetReady drives the Sentinel StatefulSet to fully ready, the other
+// half of the all-ready branch of updateHAStatus.
+func markSentinelStatefulSetReady(t *testing.T, c client.Client, v *vkov1.Valkey) {
+	t.Helper()
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: common.StatefulSetName(v, common.ComponentSentinel), Namespace: v.Namespace}, sts))
+	sts.Status.Replicas = v.Spec.Sentinel.Replicas
+	sts.Status.ReadyReplicas = v.Spec.Sentinel.Replicas
+	require.NoError(t, c.Status().Update(context.Background(), sts))
 }
 
 // --- ADR 0002 D7: a rejected initial phase write must not own the pass ---

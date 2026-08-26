@@ -4,6 +4,11 @@
 
 Accepted. Date: 2026-08-21.
 
+Amended 2026-08-26: D15 gains a clarification — "one-shot verdict" means the condition is
+**history**, and the type comment that claimed liveness was corrected. No rule changed and
+no code changed; the two consequences of the historical reading (the freeze on class exit,
+and what a clear would destroy) are recorded under D15 as accepted rather than fixed.
+
 Implemented on branch `feat/support-pdb`, not yet released — no tag contains this
 branch's HEAD and none of the files named below exist on `origin/main`. Guarded by
 [`internal/controller/rolling_update_bounds_test.go`](../../internal/controller/rolling_update_bounds_test.go),
@@ -197,6 +202,37 @@ writers call `recordTopologyRestoredCondition` first and return
 it is, the CR is still stalled, and the next pass writes the verdict. This is
 [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) applied to the abandon: an
 abandon the operator could not record is not a completed abandon.
+
+Clarified 2026-08-26: **"one-shot verdict" means the condition is history, and its own type
+comment used to say otherwise.** The rule below is unchanged; what was missing is the
+consequence for a *reader*. Because nothing outside a rolling update writes
+`TopologyRestored`, a steady-state adoption ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md))
+or a no-master recovery moves the master and leaves the condition where it stood — so a
+`True` reading "pod-0 was promoted back to master" can sit next to a non-pod-0 master
+indefinitely. Measured read-only on a live fleet (2026-08-25): a chaos pod-kill promoted
+pod-1 two minutes after a roll ended, and three days later the CR still carried
+`TopologyRestored=True` naming pod-0, with `status.masterPod`, the `known-master` annotation
+and the labels all correctly on pod-1.
+
+That is this rule working, not a defect — ADR 0011's Context already books it as an accepted
+trace-gap, and README's condition table already said "the **last** rolling update". The
+defect was that
+[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) claimed the condition was "the only
+durable record that the topology differs from the canonical one", a *live* claim no writer
+supports, and that the `currentMasterPod` doc comment read the same way. Both now state the
+direction explicitly: **`status.masterPod` is the live answer ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)
+D11); this condition answers what the last update did.** A fleet audit read the two together
+and filed the pair as a bug, which is what a documentation defect in this area costs.
+
+Two consequences of the historical reading are recorded rather than fixed. A CR that leaves
+the multi-replica-non-Sentinel class — `spec.sentinel.enabled: true`, or a scale to one
+replica — reaches no writer again, so the verdict freezes for the life of the cluster with
+no path back; under the historical reading that is correct, and the presence-guarded
+class-exit clear that `SentinelUpdatePending` gets is deliberately **not** applied here,
+because ADR 0002 D10 is scoped to deferred *work* and extending it to a completed *verdict*
+is a different decision. And any clear that were added would have to carry the prior verdict
+forward: overwriting a standing `False`/`RestoreTimeout` discards the only durable record of
+an abandon, which is exactly what this rule exists to protect.
 
 Two limits are part of the rule. **Only a conflict is handed back.** Anything that repeats
 identically on every pass — a withdrawn RBAC on the `valkeys/status` subresource is the

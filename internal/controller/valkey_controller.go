@@ -49,8 +49,6 @@ const (
 	certManagerGroup = "cert-manager.io"
 	// certManagerKindCertificate is the Kind of cert-manager Certificate resources.
 	certManagerKindCertificate = "Certificate"
-	// conditionTypeReady is the standard "Ready" condition type.
-	conditionTypeReady = "Ready"
 	// certManagerCertificateNameAnnotation is the annotation cert-manager stamps
 	// on every Secret it issues, naming the Certificate that produced it. Verified
 	// against cert-manager v1.21.1: present on all 119 issued Secrets of the
@@ -1996,13 +1994,23 @@ func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v 
 }
 
 // isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.
+//
+// A foreign Deployment holding the generated name is treated as absent, like the data
+// StatefulSet in updateStatus and the Sentinel StatefulSet in updateHAStatus: without
+// the guard this reported a stranger's ready replica as our observer's readiness, while
+// reconcileObserverDeployment was refusing to write and saying "the observer is not
+// deployed and status.observerReady stays false". The refusal returns nil precisely
+// because this field is meant to record the degradation, so reading the collision as
+// health inverted the one signal that decision rests on
+// (docs/adr/0020-write-only-what-the-operator-owns.md). No Event here — the reconciler
+// is the one reporter.
 func (r *ValkeyReconciler) isObserverDeploymentReady(ctx context.Context, v *vkov1.Valkey) bool {
 	deploy := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      builder.ObserverDeploymentName(v),
 		Namespace: v.Namespace,
 	}, deploy)
-	if err != nil {
+	if err != nil || !metav1.IsControlledBy(deploy, v) {
 		return false
 	}
 	return deploy.Status.ReadyReplicas > 0
@@ -2037,19 +2045,12 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 	}
 
 	// Always record which operator version last reconciled this resource.
-	// NOTE: v.Status.OperatorVersion is set inside the sub-functions (after prevStatus capture)
-	// so that a version change is detected by statusUnchanged.
+	// NOTE: v.Status.OperatorVersion is set inside persistStatus (after prevStatus
+	// capture) so that a version change is detected by statusUnchanged. status.observerReady
+	// is set there for the same reason and had to be moved for it (ADR 0002 D5).
 
 	readyReplicas := sts.Status.ReadyReplicas
 	v.Status.ReadyReplicas = readyReplicas
-
-	// Update observer status.
-	if v.IsObserverEnabled() {
-		observerReady := r.isObserverDeploymentReady(ctx, v)
-		v.Status.ObserverReady = &observerReady
-	} else {
-		v.Status.ObserverReady = nil
-	}
 
 	// In HA mode, also check Sentinel readiness.
 	if v.IsSentinelEnabled() {
@@ -2073,7 +2074,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Message = fmt.Sprintf("Instance unreachable: %v", err)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ConnectivityCheckFailed",
@@ -2086,7 +2087,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.MasterPod = r.currentMasterPod(ctx, v)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "AllReplicasReady",
@@ -2098,7 +2099,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = fmt.Sprintf("Waiting for replicas: %d/%d ready", readyReplicas, v.Spec.Replicas)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "ReplicasNotReady",
@@ -2109,7 +2110,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = "Waiting for replicas to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "NoReplicasReady",
@@ -2131,6 +2132,12 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 // not on the ordinal -- so the status field was lying exactly where the condition
 // next to it was trying to tell the truth (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md,
 // D11).
+//
+// "The condition next to it" is not a live one, and the direction of the reading matters:
+// TopologyRestored is the verdict of the last data-tier roll, so this field is the live
+// answer and the condition is not. A drain adoption after that roll moves the master here
+// and leaves the condition where it stood
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D15).
 //
 // The order of the three answers is the order of their authority:
 //
@@ -2289,7 +2296,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			v.Status.Message = fmt.Sprintf("Cluster health check failed: %v", clusterState.Error)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ClusterHealthCheckFailed",
@@ -2302,7 +2309,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				clusterState.ReadyReplicas, clusterState.TotalReplicas)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ReplicationSyncing",
@@ -2315,7 +2322,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "HAClusterReady",
@@ -2328,7 +2335,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterProvisioning",
@@ -2340,7 +2347,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		v.Status.Message = "Waiting for HA cluster pods to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterNotReady",
@@ -2358,6 +2365,16 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 // previous ones kept, so the pass keeps its single Error phase write. Everything
 // else — readyReplicas, masterPod, observerReady, conditions — keeps updating:
 // a rejected managed write says nothing about the running data plane.
+//
+// observerReady is computed HERE and not in updateStatus, for the same reason
+// OperatorVersion is: statusUnchanged compares it, so a value assigned before the
+// caller captured prevStatus is compared against itself and can never be the reason a
+// write happens. It was assigned in updateStatus's prologue until 2026-08-26 and was
+// therefore frozen at whatever the last pass that changed some *other* status field had
+// sampled — measured on wds18 as three seconds of real observer downtime persisting for
+// hours, in both directions (ADR 0002 D5). Every path that reached the old assignment
+// reaches this one: updateStatus's two early returns are in front of both, and
+// persistStatus is the sole return of updateStandaloneStatus and of updateHAStatus.
 func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, prevStatus *vkov1.ValkeyStatus) error {
 	if passIsBlocked(ctx) {
 		v.Status.Phase = prevStatus.Phase
@@ -2366,6 +2383,16 @@ func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, p
 
 	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
 	v.Status.OperatorVersion = r.OperatorVersion
+
+	// Same reason, see the doc comment: a change in observer readiness alone has to be
+	// able to trigger the write.
+	if v.IsObserverEnabled() {
+		observerReady := r.isObserverDeploymentReady(ctx, v)
+		v.Status.ObserverReady = &observerReady
+	} else {
+		v.Status.ObserverReady = nil
+	}
+
 	if statusUnchanged(prevStatus, &v.Status) {
 		return nil
 	}
@@ -2519,15 +2546,27 @@ func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Va
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
-// When pending is true the condition is set to True, indicating that a standalone pod
-// has an outdated sidecar image that will be updated on the next natural pod restart.
-func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pending bool) {
-	if pending {
+// A non-empty pod name sets it to True and names that pod as the one whose sidecar image
+// is outdated and will be updated on its next natural restart; the empty string clears it.
+//
+// The pod name is a parameter rather than an implied "the standalone pod" because the
+// message used to say exactly that and was read on a three-replica cluster, where it
+// looked like a contradiction rather than what it was. That mismatch is still reachable:
+// the deferral guard reads spec.Replicas <= 1 while the loop walks the live
+// StatefulSet's replica count, and a refused StatefulSet write (an immutable
+// volumeClaimTemplates conflict, ADR 0023) holds the two apart — so a cluster scaled
+// down to one replica in that state can carry three running pods. The message therefore
+// reports spec.replicas as the number the decision was actually made on, not a claim
+// about how many pods exist.
+func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pod string) {
+	if pod != "" {
 		r.setStatusCondition(ctx, v,
 			vkov1.ConditionTypeSidecarUpdatePending,
 			metav1.ConditionTrue,
 			"SidecarImageDrift",
-			"Standalone pod has an outdated sidecar image; update will occur on the next pod restart")
+			fmt.Sprintf("Pod %s has an outdated sidecar image. spec.replicas is %d, so the operator does "+
+				"not restart the pod for a sidecar-only change; the update applies on its next restart.",
+				pod, v.Spec.Replicas))
 		return
 	}
 	r.setStatusCondition(ctx, v,
@@ -2549,6 +2588,12 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 // True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable from a
 // cluster that never applied it, and permanent drift for anything keyed on the condition.
 //
+// It has two callers since 2026-08-26, both in checkAndHandleRollingUpdate and both proving
+// convergence: the converged-steady-state early return, and the completion branch. Neither
+// subsumes the other -- the completing pass got past the early return by definition, and a
+// leftover from a roll that finished long ago is only ever reached by the early return
+// (ADR 0002 D10, amended).
+//
 // The presence check is what keeps this from being a new condition on every CR in the
 // fleet: meta.SetStatusCondition adds an absent condition and reports a change, so
 // calling it unconditionally would write SidecarUpdatePending=False onto clusters that
@@ -2559,7 +2604,7 @@ func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vko
 	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSidecarUpdatePending) == nil {
 		return
 	}
-	r.setSidecarUpdatePendingCondition(ctx, v, false)
+	r.setSidecarUpdatePendingCondition(ctx, v, "")
 }
 
 // clearSentinelUpdatePending flips SentinelUpdatePending to False on a CR whose

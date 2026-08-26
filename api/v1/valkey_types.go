@@ -25,6 +25,25 @@ const (
 type ConditionType = string
 
 const (
+	// ConditionTypeReady is the data-plane verdict: the instances the CR asks for are
+	// running, reachable and, on a multi-replica cluster, replicating. Every Valkey CR
+	// carries it, and it is recomputed on every pass that reaches updateStatus.
+	//
+	// It answers a different question than status.phase, and on a blocked cluster the two
+	// disagree BY DESIGN. phase carries two meanings -- the data-plane verdict AND whether
+	// the operator can converge the spec -- and while a managed write is being refused the
+	// second one wins the field and reports Error, because a spec the operator cannot apply
+	// has to be visible (ADR 0002 D3). Ready carries only the first, and keeps reporting
+	// the truth about the running cluster, because a rejected write says nothing about it
+	// (ADR 0002 D5). So `Ready=True` next to `phase=Error` means: your cluster is serving,
+	// and the operator cannot write something. Read status.message and ReconcileBlocked to
+	// find out what.
+	//
+	// It is a level, not an edge, with one carve-out: a pass with a rolling update in
+	// flight returns before updateStatus and writes its own phase, so during a roll Ready
+	// keeps its pre-roll value (ADR 0001 D4).
+	ConditionTypeReady ConditionType = "Ready"
+
 	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
 	// the sidecar container image has drifted from the desired version.
 	// Standalone pods are not automatically restarted for sidecar-only changes;
@@ -36,13 +55,22 @@ const (
 	// The operator will not resume until the user applies a new spec change.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
 
-	// ConditionTypeTopologyRestored reports whether the multi-replica rolling
-	// update managed to hand the master role back to pod-0. It is set to True
-	// once pod-0 has been promoted again, and to False when the operator gave up
-	// waiting for pod-0 to sync and left the promoted replica as master. The
-	// cluster is healthy in both cases -- the Services select the master by label,
-	// not by ordinal -- so the condition is the only durable record that the
-	// topology differs from the canonical one.
+	// ConditionTypeTopologyRestored reports whether the LAST data-tier rolling update of
+	// a multi-replica non-Sentinel cluster managed to hand the master role back to pod-0.
+	// It is set to True once pod-0 has been promoted again, and to False when the operator
+	// gave up waiting for pod-0 to sync and left the promoted replica as master. The
+	// cluster is healthy in both cases -- the Services select the master by label, not by
+	// ordinal.
+	//
+	// It is a one-shot verdict about that update, not a live statement about the topology
+	// now (ADR 0010 D15). Nothing outside a rolling update writes it, so a later
+	// steady-state adoption (ADR 0011) or no-master recovery moves the master without
+	// touching it, and a True can sit next to a non-pod-0 master indefinitely -- measured
+	// on a fleet, and the reason this sentence exists. **status.masterPod is the live
+	// answer** (ADR 0002 D11); this condition answers what the last update did.
+	//
+	// It is also never written on a Sentinel-enabled or single-replica cluster, and never
+	// cleared when a CR leaves that class.
 	ConditionTypeTopologyRestored ConditionType = "TopologyRestored"
 
 	// ConditionTypeReconcileBlocked is set when the operator could not write one of

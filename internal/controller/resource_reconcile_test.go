@@ -1425,6 +1425,7 @@ func TestIsObserverDeploymentReady(t *testing.T) {
 
 	t.Run("zero ready replicas is not ready", func(t *testing.T) {
 		deploy := builder.BuildObserverDeployment(v, "img")
+		controllerRefTo(v, deploy)
 		deploy.Status.ReadyReplicas = 0
 		r, _ := newTestReconciler(v, deploy)
 		assert.False(t, r.isObserverDeploymentReady(context.Background(), v))
@@ -1432,9 +1433,25 @@ func TestIsObserverDeploymentReady(t *testing.T) {
 
 	t.Run("one ready replica is ready", func(t *testing.T) {
 		deploy := builder.BuildObserverDeployment(v, "img")
+		// The ownerReference is stamped by reconcileObserverDeployment, not by the
+		// builder, so a fixture that skips it is a foreign Deployment as far as the
+		// reader is concerned.
+		controllerRefTo(v, deploy)
 		deploy.Status.ReadyReplicas = 1
 		r, _ := newTestReconciler(v, deploy)
 		assert.True(t, r.isObserverDeploymentReady(context.Background(), v))
+	})
+
+	// [REGRESSION] ADR 0020 for the read path: every write path onto the observer
+	// Deployment was guarded and this reader was not, so a stranger holding the generated
+	// name had its ready replica reported as our observer's readiness - while
+	// reconcileObserverDeployment was refusing to write and status.observerReady was
+	// supposed to be the record of that refusal.
+	t.Run("a foreign deployment is not ready", func(t *testing.T) {
+		deploy := builder.BuildObserverDeployment(v, "img")
+		deploy.Status.ReadyReplicas = 1
+		r, _ := newTestReconciler(v, deploy)
+		assert.False(t, r.isObserverDeploymentReady(context.Background(), v))
 	})
 }
 

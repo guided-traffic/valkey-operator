@@ -80,7 +80,7 @@ func TestSetSidecarUpdatePendingCondition_CarriesObservedGeneration(t *testing.T
 	r, c := newTestReconciler(v)
 	ctx := context.Background()
 
-	r.setSidecarUpdatePendingCondition(ctx, v, true)
+	r.setSidecarUpdatePendingCondition(ctx, v, v.Name+"-0")
 	cond := conditionOf(t, c, v, vkov1.ConditionTypeSidecarUpdatePending)
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
@@ -89,7 +89,7 @@ func TestSetSidecarUpdatePendingCondition_CarriesObservedGeneration(t *testing.T
 	// The sidecar image lands with the next spec edit: the cleared condition must
 	// name the generation that cleared it, not the one that first reported drift.
 	bumpGeneration(t, c, v, 5)
-	r.setSidecarUpdatePendingCondition(ctx, v, false)
+	r.setSidecarUpdatePendingCondition(ctx, v, "")
 	cond = conditionOf(t, c, v, vkov1.ConditionTypeSidecarUpdatePending)
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
@@ -292,13 +292,13 @@ func TestSetSidecarUpdatePendingCondition_NoWritePerPass(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		r.setSidecarUpdatePendingCondition(ctx, v, false)
+		r.setSidecarUpdatePendingCondition(ctx, v, "")
 	}
 	assert.Equal(t, 1, counter.writes,
 		"a standalone cluster without sidecar drift must not write its status on every pass")
 
 	// A real transition must still be reported.
-	r.setSidecarUpdatePendingCondition(ctx, v, true)
+	r.setSidecarUpdatePendingCondition(ctx, v, v.Name+"-0")
 	assert.Equal(t, 2, counter.writes)
 	cond := conditionOf(t, c, v, vkov1.ConditionTypeSidecarUpdatePending)
 	require.NotNil(t, cond)

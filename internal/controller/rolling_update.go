@@ -287,6 +287,24 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	// when no annotation is left, so the targets that already cleared their own
 	// state pay nothing for the second call.
 	if result.Completed {
+		// The second site that provably knows every pod matches the live template, and
+		// the one the early return above cannot reach: the pass that COMPLETES a roll got
+		// past that return precisely because a pod needed updating or state was recorded,
+		// so it never cleared the condition, and the completing pass schedules no
+		// follow-up either — the CR watch is generation-gated and there is no Pod watch,
+		// so the next guaranteed pass is the owned-object cache resync. Measured on wds18:
+		// 41 min 9 s between a completed roll and the clear on one cluster, and only
+		// because a chaos pod-kill supplied the event (ADR 0002 D10).
+		//
+		// The proof is updatedCount == totalPods, which countUpdatedPods evaluates as
+		// !needsUpdate && reachable() for every pod of the tier — not the Completed flag
+		// itself, because two of the completion sites inside verifyTopologyRestored are
+		// stalled completions that could not re-read the pods. Both are entered only
+		// through that same count, so the proof holds for them too.
+		//
+		// Before clearRollingUpdateState, so an annotation write that fails cannot skip
+		// it. Presence-guarded, so no CR gains a condition it never had.
+		r.clearSidecarUpdatePending(ctx, v)
 		if err := r.clearRollingUpdateState(ctx, v); err != nil {
 			return RollingUpdateResult{Error: err}
 		}
@@ -2854,7 +2872,10 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 	desiredImage := valkeyImageFromSts(currentSts)
 	sidecarImg := sidecarImageFromSts(currentSts)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
-	sidecarPending := false
+	// The pod whose sidecar update is deferred, empty when none is. Carrying the name
+	// rather than a flag is what lets the condition message say which pod it means
+	// (setSidecarUpdatePendingCondition).
+	sidecarPendingPod := ""
 	isTrueStandalone := v.Spec.Replicas <= 1
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -2880,7 +2901,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			if isTrueStandalone && isSidecarOnlyChange(pod, desiredImage, sidecarImg) {
 				logger.Info("Standalone pod has outdated sidecar; update deferred to next pod restart",
 					"pod", podName)
-				sidecarPending = true
+				sidecarPendingPod = podName
 				continue
 			}
 
@@ -2908,9 +2929,9 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 	}
 
 	// Reflect sidecar-pending state in the CR status conditions.
-	r.setSidecarUpdatePendingCondition(ctx, v, sidecarPending)
+	r.setSidecarUpdatePendingCondition(ctx, v, sidecarPendingPod)
 
-	if sidecarPending {
+	if sidecarPendingPod != "" {
 		// The sidecar update is deferred — no active rolling update in progress.
 		// Return empty result so the reconciler does not requeue but the condition
 		// remains set until the next natural pod restart clears it.

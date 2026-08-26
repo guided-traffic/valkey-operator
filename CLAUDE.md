@@ -164,6 +164,14 @@ The CRD status must be visible in Lens and show the current operator task per in
 - A short description of the current task otherwise (e.g., `Rolling Update 2/3`,
   `Sentinel Rolling Update 1/3`, `Syncing`, `Failover in progress`)
 
+**With one exception, and it is deliberate:** while a managed write is being refused, the
+phase reports `Error` even on a perfectly healthy cluster, because a spec the operator
+accepted and cannot apply has to be visible. `phase` therefore carries two meanings and the
+blocked pass wins the field; the **`Ready` condition** carries only the data-plane verdict
+and stays `True`. That pair is not a contradiction — it reads as "your cluster is serving,
+and the operator cannot write something".
+→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D3, D5, D5a, D12
+
 ## Testing
 
 - **Unit tests**: High coverage for all reconciliation logic
@@ -354,6 +362,37 @@ so the label used to resurrect the pod the operator had just demoted and deleted
 rolling update emits **zero** Warning Events on either topology, and an e2e subtest per
 topology says so.
 → [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+
+## Every condition is a level, an edge or history
+
+Adding a status condition means adding a row to `conditionRegistry`
+([`internal/controller/condition_registry.go`](internal/controller/condition_registry.go)) —
+the unit tier goes red otherwise, because the guard parses every `ConditionType` out of
+`api/v1` and demands exactly one row each. The row declares which of three things the
+condition is, and that decides what it owes: a **level** is re-measured every pass and owes
+exactly one evaluator; an **edge** records something and owes a clear at a site that
+*proves* the precondition is gone, plus a presence guard; **history** is a verdict about a
+completed operation and must never gain a clear.
+
+It is a test and not a convention because the convention was missed four times — the clear
+kept ending up behind the very code path whose absence caused the staleness — and writing
+the table down for the first time immediately found two more (`RollingUpdatePaused` on
+non-Sentinel topologies, `StorageSpecNotApplied` with two evaluators), both declared in the
+registry with their ticket reference rather than silently carried. **There is deliberately no
+central condition-GC pass**: the producer stays the one reporter, and a sweep would have to
+exclude `MultipleMasters` (a flip resets the `splitBrainWarnAfter` deadline) and
+`TopologyRestored` (history) on its first two rows. No condition is ever deleted, which is
+why the presence guard is the whole upgrade-neutrality story.
+→ [ADR 0027](docs/adr/0027-conditions-are-levels-edges-or-history.md)
+
+**`Ready` reports the data plane; `status.phase` also reports whether the operator can
+converge the spec.** On a blocked-but-healthy cluster the two disagree by design, and
+`Ready=True` next to `phase=Error` means "your cluster is serving, and the operator cannot
+write something" — read `status.message` and `ReconcileBlocked` for what. A status field that
+only *it* can change needs its assignment on the far side of the `prevStatus` capture, next
+to `OperatorVersion`: `observerReady` sat on the near side and was therefore compared against
+itself, frozen at whatever the last pass that changed something else had sampled.
+→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D5, D5a
 
 ## A pod being deleted is not available
 
