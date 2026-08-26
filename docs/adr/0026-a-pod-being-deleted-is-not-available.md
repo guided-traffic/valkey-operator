@@ -289,6 +289,21 @@ not resume. Rejected; what landed bounds the *observation* instead.
 * **D10 is not analysed.** The steady-state adoption path can still record a terminating pod as
   the master authority. A StatefulSet pod name is stable, so recording it *by name* still
   resolves to the pod that returns — whether that is right is the open item.
+* **The e2e cannot order its own delete against the operator's, and has to attribute instead.**
+  `TestE2E_RollingUpdate_NoSecondDeleteWhileAPodTerminates` injects a chaos delete on the very
+  event that unblocks the roll -- a replaced pod becoming Ready -- so operator and test race for
+  who deletes second, and the observed overlap alone says nothing about who caused it. Measured
+  in CI on 2026-08-26: the operator deleted its next candidate at 08:58:05 into a quiet tier,
+  logged `Waiting for the replaced pod to become available` on the very next pass, and the test
+  deleted its victim 0.6 s later -- a correct hold reported as a violation. `metav1.Time` has
+  second granularity, so the two deletions are not orderable from the objects either. The test
+  therefore records which pod it deleted and what was already terminating at that instant, and
+  excuses only that combination; a pod the operator puts on its way out *after* the injection is
+  still a violation. **Waiting for a quiet tier before injecting is not the fix** -- the operator
+  closes that window within the same second, so the injection would mostly not happen and the
+  test would silently stop testing. The residual hole is one API round trip: an operator delete
+  landing between the test's snapshot and its own delete is excused. That window is milliseconds
+  against a roll that deletes roughly three times in ninety seconds.
 * **The gate is not exercisable in envtest.** There is no kubelet, so a deleted pod never leaves
   `Terminating`. The unit fixtures build the state directly and the e2e is the only tier that
   sees a real one.
