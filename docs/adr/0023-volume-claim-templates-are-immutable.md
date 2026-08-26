@@ -4,11 +4,19 @@
 
 Accepted. Date: 2026-08-23.
 
+Amended 2026-08-26: D4 gains D4a. The Sentinel call site may report a claim conflict and
+may no longer clear one — the unconditional clear in the guard's `default:` arm erased
+the data tier's report on every pass of every Sentinel cluster that had a conflict.
+D4's "costs nothing" is marked superseded in place. Implemented and unit-verified; not
+run against a cluster.
+
 Implemented: `VolumeClaimTemplatesConflict` in the builder, `guardVolumeClaimTemplates`
 in both StatefulSet reconcilers, the `RecreateRequired` `ReconcileBlocked` reason, the
 `StorageSpecNotApplied` condition, and the two Warning Event reasons.
 
-Verified in a Kind cluster on 2026-08-23 (Kubernetes 1.36): a running three-replica
+Verified in a Kind cluster on 2026-08-23 (Kubernetes 1.36), on a **non-Sentinel**
+three-replica cluster — the topology on which the D4a defect is unreachable, which is why
+that verification passed while the defect stood: a running three-replica
 cluster that gains `spec.persistence` is refused — `ReconcileBlocked=True` and
 `StorageSpecNotApplied=True`, both with reason `RecreateRequired`, the StatefulSet
 untouched and no PersistentVolumeClaim created. The apiserver premises behind the
@@ -107,9 +115,65 @@ diagnosed as a storage conflict.
 
 **D4 — Both StatefulSet reconcilers call the same guard.** Sentinel keeps its state on
 an `emptyDir` and its builder writes no claims, so the call compares empty against
-empty and costs nothing. It is there because `reconcileSentinelStatefulSet` shares no
-code with the data one: a future Sentinel storage feature would otherwise reintroduce
-the trap in the half nobody thought to guard.
+empty ~~and costs nothing~~. It is there because `reconcileSentinelStatefulSet` shares
+no code with the data one: a future Sentinel storage feature would otherwise
+reintroduce the trap in the half nobody thought to guard.
+
+> **Amended 2026-08-26 by D4a.** "Costs nothing" was false, and the way it was false is
+> the defect D4a exists to fix. The call is kept; what it may do is narrowed.
+
+**D4a — Either tier may report a claim conflict; only the data tier may clear one.**
+Added 2026-08-26.
+
+`StorageSpecNotApplied` is one condition with two evaluators, and the Sentinel one runs
+second — `{name: "StatefulSet"}` is ordered before `{name: "Sentinel resources"}` in
+[`resourceReconcileSteps`](../../internal/controller/valkey_controller.go), and
+`runReconcileSteps` continues past a failing step by design (ADR 0001). The Sentinel
+guard therefore always landed in the `default:` arm and cleared what the data tier had
+just reported, and `writeStatusCondition` re-`Get`s the CR, so the presence guard did
+not stop it either: the condition flipped `True` → `False` on **every pass**, two status
+writes and two `LastTransitionTime` moves per reconcile, for as long as the conflict
+stood.
+
+The consequence was worst in the shape D2 leaves unblocked. On a parameter conflict the
+guard returns `nil`, nothing sets `ReconcileBlocked` and the phase stays `OK` — so the
+condition is the only durable statement the CR makes about its storage, which is exactly
+what D5 built it for, and it said the opposite of the truth.
+
+The rule going forward: `guardVolumeClaimTemplates` takes a `mayClear` argument, the data
+call site passes `true` and the Sentinel one `false`. **Reporting is not narrowed** — a
+Sentinel StatefulSet that somehow carries a claim still refuses and still reports under
+its own Event reason, which is what D4 is for. Clearing is narrowed to the tier whose
+builder writes the claims, because a tier that compares empty against empty has proven
+nothing about the tier that does not.
+
+The registry row records this as an ownership rule rather than as one evaluator
+([ADR 0027](0027-conditions-are-levels-edges-or-history.md) D1): two sites still compute
+a value and the last writer still owns `Reason` and `Message`, so claiming a single
+evaluator would be a statement the code contradicts.
+
+**The rule holds only while the data step runs first**, which nothing pinned before this
+change and which swapping two lines silently inverts.
+`TestResourceReconcileSteps_StatefulSetBeforeSentinelResources` is that pin.
+
+**Residual risks of D4a, stated rather than argued away:**
+
+* **A Sentinel-tier report has no clear owner.** If the Sentinel builder ever writes
+  claims, a conflict it reports is retracted by the data tier's clear on any pass where
+  the Sentinel step does not run — `reconcileSentinelResources` is a fail-fast chain, so
+  a failing Sentinel ConfigMap or headless Service skips the guard entirely. The clean
+  answer there is a second condition type, and it is deliberately not paid for a tier
+  that cannot conflict through any operator-written path today.
+* **A zero-evaluator pass leaves the last value standing.** `reconcileStatefulSet`
+  returns before the guard on a `Get` error and on a foreign StatefulSet, so on a
+  Sentinel CR whose data StatefulSet is foreign neither tier evaluates and a `True`
+  stands indefinitely. That is the level hazard ADR 0027 names, and it is unchanged by
+  this decision — non-Sentinel clusters have always behaved this way.
+* **Unit-verified only.** The tests are three unit tests: a full `reconcileResources`
+  pass on a Sentinel CR with a data-tier conflict (which is what pins the cross-step
+  rule), the single-step twin on `reconcileSentinelStatefulSet`, and the order pin. The
+  2026-08-23 Kind verification recorded in Status above ran on a **non-Sentinel**
+  cluster, which is precisely why this survived it; no cluster run covers D4a.
 
 **D5 — The fact is durable on the CR, not only in Events.** `StorageSpecNotApplied`
 answers "is the storage the spec asks for the storage that runs" and is True for both
@@ -168,8 +232,15 @@ holding the data. End state: a healthy-looking cluster, three bound claims,
 `phase=OK`, `DBSIZE=0` everywhere. The promotion path has
 `verifyPromotionCandidateHoldsData` for exactly this
 ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md)); this path
-has no equivalent. It is a defect in its own right and is not fixed here — this ADR
+has no equivalent. It is a defect in its own right ~~and is not fixed here~~ — this ADR
 only refuses to send anyone into it.
+
+> **Corrected 2026-08-26.** "Not fixed" stopped being true on 2026-08-26:
+> [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) is the fix. The
+> rolling-update resolver no longer trusts the recorded authority unconditionally — an
+> authority holding zero keys while the rogue holds some ends that demotion, and an
+> unreadable count is a refusal rather than a demotion. The refusal this ADR makes is
+> unchanged; only the sentence claiming nobody had addressed the demotion is.
 
 **D7 — The Event never promises that recreating changes existing storage, because it
 does not.** Claims are named `data-<statefulset>-<ordinal>` and are reused by name, so
@@ -285,7 +356,10 @@ write is the one the API server accepts.
   returns empty while a sidecar drain promoted someone else and a rolling update is in
   flight. A normal roll does not produce it — the operator records its own promotion
   first (ADR 0009) — but this migration does, and nothing establishes that it is the
-  only path. It needs its own ADR and its own fix.
+  only path. ~~It needs its own ADR and its own fix.~~ **Discharged 2026-08-26 by
+  [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md)**, which is that ADR
+  and that fix: a demotion may not discard the only dataset, and inside a roll only the
+  drain stamp and the dataset discriminate.
 - **The re-adoption assumption itself held.** ADR 0020 D1 records adoption as asserted
   from the API contract and never run; it now has been, and pods orphaned by
   `--cascade=orphan` were adopted by the recreated StatefulSet with its new UID. That
@@ -327,3 +401,7 @@ write is the one the API server accepts.
 - [`test/integration/volumeclaim_conflict_test.go`](../../test/integration/volumeclaim_conflict_test.go) — the apiserver premises, and the negative case an untouched persistent cluster must produce
 - [`test/e2e/persistence_migration_test.go`](../../test/e2e/persistence_migration_test.go) — the refusal on a running cluster, and why it stops before the migration
 - [ADR 0017](0017-test-and-ci-policy.md) — the tiers this is verified in
+- [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — the registry row D4a produced, and the ownership rule that makes two evaluators legal
+- [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) — the demotion defect D6 discovered and left open, now fixed
+- [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go) — the `StorageSpecNotApplied` row and its `ownershipRule`
+- [`internal/controller/reconcile_steps_test.go`](../../internal/controller/reconcile_steps_test.go) — `TestResourceReconcileSteps_StatefulSetBeforeSentinelResources`, the step order D4a depends on

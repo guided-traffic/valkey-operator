@@ -70,8 +70,20 @@ func recreateRequiredError(kind, name, detail string) error {
 // conflict does not: the pod template update is legal, unrelated to the claims and
 // carries the replica count with it, so holding it would wedge an atomic apply that
 // changes storage and image together for a difference no write can ever settle.
+//
+// mayClear is the ownership rule of ADR 0023 D4a: StorageSpecNotApplied is one
+// condition with two evaluators, so either tier may REPORT a conflict and only the
+// data tier may CLEAR. The Sentinel builder writes no claims, so its guard always
+// lands in the default arm below — and it runs second, so an unconditional clear
+// there erased the conflict the data tier had just reported, every pass. Because
+// writeStatusCondition re-Gets the CR, the presence guard did not stop it either:
+// the condition flipped True to False on every reconcile for as long as the
+// conflict stood.
+//
+// The rule holds only while the data step runs before the Sentinel one, which is
+// why TestResourceReconcileSteps_StatefulSetBeforeSentinelResources exists.
 func (r *ValkeyReconciler) guardVolumeClaimTemplates(ctx context.Context, v *vkov1.Valkey,
-	desired, current *appsv1.StatefulSet, eventReason string) error {
+	desired, current *appsv1.StatefulSet, eventReason string, mayClear bool) error {
 	const kind = "StatefulSet"
 	name := desired.Name
 
@@ -97,7 +109,12 @@ func (r *ValkeyReconciler) guardVolumeClaimTemplates(ctx context.Context, v *vko
 		return nil
 
 	default:
-		r.clearStorageSpecNotApplied(ctx, v)
+		// Only the tier that can prove agreement retracts the report. A tier whose
+		// builder writes no claims compares empty against empty and has proven
+		// nothing about the tier that does (ADR 0023 D4a).
+		if mayClear {
+			r.clearStorageSpecNotApplied(ctx, v)
+		}
 		return nil
 	}
 }
@@ -171,6 +188,10 @@ func (r *ValkeyReconciler) reportStorageSpecNotApplied(ctx context.Context, v *v
 // It writes only when the condition exists, so the vast majority of clusters —
 // which never had a conflict — carry no condition at all rather than a permanent
 // False one.
+//
+// The presence guard is not what keeps the Sentinel tier from clearing a data-tier
+// report: writeStatusCondition re-Gets the CR, so the condition IS present by the
+// time the second evaluator runs. That is the mayClear argument's job.
 func (r *ValkeyReconciler) clearStorageSpecNotApplied(ctx context.Context, v *vkov1.Valkey) {
 	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeStorageSpecNotApplied) == nil {
 		return

@@ -444,8 +444,17 @@ func TestStatefulSetImmutability_Integration(t *testing.T) {
 }
 
 // claimGuardCR builds a single-replica Valkey on the base image, with an optional
-// persistence block. Sentinel stays off: the guard under test is on the data
-// StatefulSet, and a Sentinel tier would only add objects to wait for.
+// persistence block. Sentinel stays off, and the reason has been narrowed since this
+// was written: what this tier verifies is what the API SERVER decides about an
+// immutable volumeClaimTemplates field, which is the same on either topology.
+//
+// The original reason -- "a Sentinel tier would only add objects to wait for" --
+// read as if the topology were irrelevant to the guard, and it was not: the
+// Sentinel StatefulSet reconciler is a second evaluator of StorageSpecNotApplied,
+// and until 2026-08-26 it cleared what the data tier had just reported, on every
+// pass (ADR 0023 D4a). That defect lived entirely on the Sentinel topology and this
+// file could not see it. What now covers it is the unit tier, where step order --
+// an operator decision, not an API server one -- belongs (ADR 0017).
 func claimGuardCR(name string, persistence *vkov1.PersistenceSpec) *vkov1.Valkey {
 	return &vkov1.Valkey{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},

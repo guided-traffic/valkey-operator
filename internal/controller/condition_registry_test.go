@@ -138,15 +138,41 @@ func TestConditionRegistryEdgesHaveAPresenceGuardedClear(t *testing.T) {
 // TestConditionRegistryLevelsHaveOneEvaluator guards the level-specific hazard. Two
 // independent evaluators of one level mean the last writer of a pass wins, and which one
 // is last is a function of step order rather than of anything about the cluster.
+//
+// More than one is legal only with an ownership rule that says which site decides. That
+// escape was described in the evaluators docstring from the day the registry was written
+// and implemented in 2026-08-26 with the T16 fix, which is the first row that needed it:
+// StorageSpecNotApplied is raised by either StatefulSet reconciler and retracted only by
+// the data one (ADR 0023 D4a, ADR 0027 D1).
 func TestConditionRegistryLevelsHaveOneEvaluator(t *testing.T) {
 	for _, row := range conditionRegistry {
 		if row.kind != conditionLevel || row.declaredGap != "" {
 			continue
 		}
+		if row.ownershipRule != "" {
+			continue
+		}
 		assert.Equalf(t, 1, row.evaluators,
-			"%q is a level with %d evaluators: the last one to run in a pass decides the stored value. "+
-				"Give it a single evaluator, or accumulate the verdicts and write once, or declare the "+
-				"gap with a ticket reference",
+			"%q is a level with %d evaluators and no ownership rule: the last one to run in a pass "+
+				"decides the stored value. Give it a single evaluator, or accumulate the verdicts and "+
+				"write once, or name the rule in ownershipRule, or declare the gap with a ticket reference",
+			row.conditionType, row.evaluators)
+	}
+}
+
+// TestConditionRegistryOwnershipRulesAreEarned keeps the escape from becoming a way to
+// silence the guard above, the same job TestConditionRegistryGapsAreTraceable does for
+// declaredGap. A rule on a row that has only one evaluator claims to resolve a race that
+// does not exist, and the next author reads it as licence to add a second site.
+func TestConditionRegistryOwnershipRulesAreEarned(t *testing.T) {
+	for _, row := range conditionRegistry {
+		if row.ownershipRule == "" {
+			continue
+		}
+		assert.Greaterf(t, row.evaluators, 1,
+			"%q names an ownership rule but declares %d evaluator(s): a rule that arbitrates "+
+				"between sites needs more than one site, and stating one here reads as permission "+
+				"to add another without re-checking the invariant",
 			row.conditionType, row.evaluators)
 	}
 }

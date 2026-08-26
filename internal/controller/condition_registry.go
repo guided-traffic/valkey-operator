@@ -57,6 +57,12 @@ type conditionOwnership struct {
 	// a race unless an ownership rule says which one is authoritative.
 	evaluators int
 
+	// ownershipRule is that rule, in prose, and it is what makes more than one
+	// evaluator legal. It has to name which site decides, not merely assert that one
+	// does — the reader next to the failure message is deciding whether a new call site
+	// may be added. Empty is the only legal value at a single evaluator.
+	ownershipRule string
+
 	// clearSite names the function that flips the condition to False, empty for history
 	// and for a declared gap. Prose, not a symbol: it is read by a human next to the
 	// failure message, and a symbol reference would not survive a rename any better than
@@ -111,11 +117,15 @@ var conditionRegistry = []conditionOwnership{
 		conditionType: vkov1.ConditionTypeStorageSpecNotApplied,
 		kind:          conditionLevel,
 		// The data StatefulSet and the Sentinel StatefulSet both call
-		// guardVolumeClaimTemplates, whose default arm clears unconditionally.
+		// guardVolumeClaimTemplates, so two sites still compute a value and the last
+		// writer still owns Reason and Message. What is no longer a race is the one
+		// that mattered: the Sentinel builder writes no claims, so its evaluator can
+		// only ever agree, and agreement from a tier that has nothing to compare is
+		// not evidence about the tier that does.
 		evaluators:      2,
-		clearSite:       "guardVolumeClaimTemplates, default arm",
+		ownershipRule:   "either tier may report a conflict; only the data tier may clear (mayClear), and only because it runs first",
+		clearSite:       "guardVolumeClaimTemplates default arm, data tier only",
 		presenceGuarded: true,
-		declaredGap:     "T16: the Sentinel StatefulSet has no volumeClaimTemplates, so its evaluator always clears - and it runs after the data one, so a data-tier conflict ends the pass reporting False",
 	},
 	{
 		conditionType:   vkov1.ConditionTypeSentinelUpdatePending,

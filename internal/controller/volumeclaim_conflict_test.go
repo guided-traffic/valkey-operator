@@ -339,8 +339,14 @@ func TestReconcileBlockedReason_RecreateRequiredRanksBetweenForeignObjectAndAdmi
 // It is partly a both-directions test (D8) and says so: the builder writes no
 // volumeClaimTemplates for Sentinel, so deleting the guard call outright leaves it
 // green. What it does catch, measured in the mutation audit, is a comparison that
-// reported a conflict on empty against empty and an unconditional clear — either
-// of which would touch the Sentinel StatefulSet of every HA cluster in the fleet.
+// reported a conflict on empty against empty, which would touch the Sentinel
+// StatefulSet of every HA cluster in the fleet.
+//
+// It used to claim the unconditional-clear half too. That half is gone: since
+// ADR 0023 D4a this call site passes mayClear=false, so no mutation of the clear
+// can reach it from here. TestReconcileSentinelStatefulSet_DoesNotClearAConflictItDidNotFind
+// is where that half lives now, and it needs a seeded condition to say anything —
+// which is exactly why this test could not carry it.
 func TestReconcileSentinelStatefulSet_ReportsNoConflictOnAHealthySentinelCluster(t *testing.T) {
 	v := newTestValkey("test", "default", haCluster)
 	live := sentinelStsFor(v)
@@ -398,4 +404,101 @@ func TestReconcileSentinelStatefulSet_RefusesAClaimTheSpecNoLongerAsksFor(t *tes
 	cond := findCondition(storedValkey(t, c, v), vkov1.ConditionTypeStorageSpecNotApplied)
 	require.NotNil(t, cond)
 	assert.Equal(t, vkov1.ReasonRecreateRequired, cond.Reason)
+}
+
+// --- two evaluators, one clear authority (T16) ---
+
+// [REGRESSION] The Sentinel StatefulSet has no volumeClaimTemplates, so its guard
+// call always lands in the default arm — and that arm used to clear. It runs after
+// the data one (resourceReconcileSteps), so on a Sentinel cluster whose data tier
+// had a claim conflict the pass reported the conflict and then erased it, and the
+// CR ended the pass with StorageSpecNotApplied=False.
+//
+// Worse than a stale value: writeStatusCondition re-Gets the CR, so the presence
+// guard in clearStorageSpecNotApplied found the True the data tier had just stored
+// and cleared it. The condition flipped True→False on every single pass, two status
+// writes and two LastTransitionTime moves per reconcile, for as long as the conflict
+// stood.
+//
+// Driving one reconcile step proves nothing here — the defect is which step runs
+// last — so this drives the whole resource pass. The pre-created Sentinel
+// StatefulSet is load-bearing: without it reconcileSentinelStatefulSet creates the
+// object and returns before ever reaching the guard, and the test is green on the
+// unfixed code (ADR 0017 D10).
+func TestReconcileResources_SentinelTierDoesNotClearTheDataTiersStorageConflict(t *testing.T) {
+	// The live cluster was created without persistence; the spec now asks for it.
+	live := stsForValkey(newTestValkey("test", "default", haCluster))
+
+	v := newTestValkey("test", "default", haCluster, persistenceEnabled("1Gi"))
+	sentinel := sentinelStsFor(v)
+	r, c := newTestReconciler(v, live, sentinel)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	require.True(t, builder.StatefulSetHasChanged(builder.BuildStatefulSet(v, testOperatorImage),
+		storedSts(t, c, live.Name, live.Namespace)),
+		"the fixture must present a real data-tier conflict, or the assertion below holds "+
+			"for a pass that had nothing to report (ADR 0017 D10)")
+	require.False(t, builder.SentinelStatefulSetHasChanged(builder.BuildSentinelStatefulSet(v), sentinel),
+		"the Sentinel StatefulSet must be the one the operator would write, so its guard "+
+			"reaches the default arm — which is the arm under test")
+
+	err := r.reconcileResources(context.Background(), v)
+
+	require.Error(t, err, "the data StatefulSet step refuses")
+	assert.ErrorIs(t, err, errRecreateRequired)
+
+	cond := findCondition(storedValkey(t, c, v), vkov1.ConditionTypeStorageSpecNotApplied)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status,
+		"the tier that has nothing to say must not be the last writer of a condition the "+
+			"other tier raised")
+	assert.Equal(t, vkov1.ReasonRecreateRequired, cond.Reason)
+}
+
+// The parameter-conflict shape is the one that matters most, and it is invisible
+// without this: guardVolumeClaimTemplates returns nil there, so nothing blocks the
+// reconcile, ReconcileBlocked stays False and the phase stays OK. The condition is
+// then the only durable statement the CR makes about its storage — outliving the
+// Warning Event is exactly what ADR 0023 D5 built it for — and it was wrong.
+func TestReconcileResources_SentinelTierDoesNotClearAParameterConflict(t *testing.T) {
+	live := stsForValkey(newTestValkey("test", "default", haCluster, persistenceEnabled("1Gi")))
+
+	v := newTestValkey("test", "default", haCluster, persistenceEnabled("2Gi"))
+	sentinel := sentinelStsFor(v)
+	r, c := newTestReconciler(v, live, sentinel)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+
+	err := r.reconcileResources(context.Background(), v)
+
+	require.NoError(t, err,
+		"a changed size leaves the pod template writable, so the pass is not blocked (ADR 0023 D2)")
+
+	cond := findCondition(storedValkey(t, c, v), vkov1.ConditionTypeStorageSpecNotApplied)
+	require.NotNil(t, cond, "with the reconcile unblocked this condition is the only durable signal")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonVolumeClaimTemplatesImmutable, cond.Reason)
+}
+
+// The same rule at the site it lives at, in twelve lines. The full pass above pins
+// the step order; this pins the guard itself, so a refactor that keeps the order
+// and drops the ownership rule still goes red.
+func TestReconcileSentinelStatefulSet_DoesNotClearAConflictItDidNotFind(t *testing.T) {
+	v := newTestValkey("test", "default", haCluster)
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:    vkov1.ConditionTypeStorageSpecNotApplied,
+		Status:  metav1.ConditionTrue,
+		Reason:  vkov1.ReasonRecreateRequired,
+		Message: "raised by the data tier in this pass",
+	})
+	r, c := newTestReconciler(v, sentinelStsFor(v))
+
+	require.NoError(t, r.reconcileSentinelStatefulSet(context.Background(), v))
+
+	cond := findCondition(storedValkey(t, c, v), vkov1.ConditionTypeStorageSpecNotApplied)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status,
+		"a tier whose builder writes no claims can never prove that the storage the spec "+
+			"asks for is the storage that runs")
 }

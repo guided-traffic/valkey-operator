@@ -1248,7 +1248,12 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	// difference between spec.persistence and the live claims is not drift the next
 	// pass converges. Checked before the drift detection, because the update the
 	// drift would trigger is the doomed one (ADR 0023).
-	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current, reasonStatefulSetRecreateRequired); err != nil {
+	//
+	// mayClear: this is the tier whose builder writes the claims, so it is the only
+	// one that can prove the storage the spec asks for is the storage that runs, and
+	// therefore the only one allowed to retract StorageSpecNotApplied (ADR 0023 D4a).
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
+		reasonStatefulSetRecreateRequired, true); err != nil {
 		return err
 	}
 
@@ -1369,11 +1374,17 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	}
 
 	// Sentinel keeps its state on an emptyDir and the builder writes no
-	// volumeClaimTemplates at all, so this compares empty against empty and costs
-	// nothing. It is here so that a future Sentinel storage feature cannot
-	// reintroduce the trap in a reconciler that shares no code with the data one
-	// (ADR 0023).
-	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current, reasonSentinelStatefulSetRecreateRequired); err != nil {
+	// volumeClaimTemplates at all, so this compares empty against empty. It is here
+	// so that a future Sentinel storage feature cannot reintroduce the trap in a
+	// reconciler that shares no code with the data one (ADR 0023 D4).
+	//
+	// mayClear=false, and the call does NOT cost nothing — that was the claim ADR
+	// 0023 D4 made and D4a withdraws. This step runs after the data one, so an
+	// unconditional clear here erased whatever the data tier had just reported, on
+	// every pass of every Sentinel cluster with a claim conflict. This tier may
+	// report; it may never retract.
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
+		reasonSentinelStatefulSetRecreateRequired, false); err != nil {
 		return err
 	}
 
