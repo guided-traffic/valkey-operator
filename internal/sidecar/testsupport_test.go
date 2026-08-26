@@ -162,6 +162,16 @@ func generateTestCerts(t *testing.T) testCerts {
 	return certs
 }
 
+// replaceCAWith overwrites the CA file of this mount with another mount's CA,
+// which is what a cert-manager rotation looks like from inside the pod: the same
+// paths, different bytes, no process restart.
+func (c testCerts) replaceCAWith(t *testing.T, other testCerts) {
+	t.Helper()
+	ca, err := os.ReadFile(other.caPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(c.caPath, ca, 0o600))
+}
+
 // serverTLSConfig builds a TLS server config from the generated certificate.
 func (c testCerts) serverTLSConfig(t *testing.T) *tls.Config {
 	t.Helper()

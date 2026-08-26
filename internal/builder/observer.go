@@ -287,7 +287,7 @@ func buildObserverVolumes(v *vkov1.Valkey) []corev1.Volume {
 	// verification — do not expose the private key unnecessarily.
 	if !v.IsObserverMTLSActive() {
 		secretVolume.Items = []corev1.KeyToPath{
-			{Key: "ca.crt", Path: "ca.crt"},
+			{Key: TLSCACertKey, Path: TLSCACertKey},
 		}
 	}
 

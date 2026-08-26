@@ -150,6 +150,24 @@ const (
 	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md).
 	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
 	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
+
+	// ConditionTypeTLSMaterialStale reports that at least one pod is still running
+	// with TLS material older than the one in the TLS Secret it mounts.
+	//
+	// It is True for the length of every ordinary certificate roll, which is why
+	// the alert over it is measured in days rather than minutes: cert-manager
+	// renews 30 days before expiry and the previously issued certificate keeps
+	// working for those 30 days, so nothing about this is urgent -- a roll that
+	// takes hours costs nothing. What the condition exists to catch is the roll
+	// that never starts, where no other signal fires at all: the operator missed
+	// the Secret event, could not write the StatefulSet, or is blocked for an
+	// unrelated reason, and the pods then keep the material they pinned at start
+	// until it expires and their long-lived processes go silent.
+	//
+	// It is written only on TLS clusters, and only for pods that already carry the
+	// fingerprint annotation; a pod created before the operator wrote fingerprints
+	// is not stale, it is unmeasured.
+	ConditionTypeTLSMaterialStale ConditionType = "TLSMaterialStale"
 )
 
 const (
@@ -234,6 +252,14 @@ const (
 	// ReasonPodTerminationCleared clears PodTerminationStalled once no pod of the
 	// tier carries a DeletionTimestamp any more.
 	ReasonPodTerminationCleared = "PodTerminationCleared"
+
+	// ReasonTLSMaterialRollPending is the TLSMaterialStale reason while pods still
+	// hold a superseded fingerprint. The message names them and their tier.
+	ReasonTLSMaterialRollPending = "TLSMaterialRollPending"
+
+	// ReasonTLSMaterialCurrent clears TLSMaterialStale once every measured pod
+	// carries the fingerprint of the Secret it mounts.
+	ReasonTLSMaterialCurrent = "TLSMaterialCurrent"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.

@@ -497,6 +497,13 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
 		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
 		{name: "monitoring", run: r.reconcileMonitoringResources},
+		// Last, and a report rather than a write: it measures the pods against the
+		// fingerprints the two StatefulSet steps above have just stamped. It lives
+		// among the resource steps and not in the workload pass because every one
+		// of those returns early while a rolling update is in flight, and a level
+		// condition that is not re-measured every pass is the staleness this repo
+		// has now fixed four times (ADR 0027).
+		{name: "TLS material", when: (*vkov1.Valkey).IsTLSEnabled, run: r.reportTLSMaterialStale},
 	}
 }
 
@@ -1204,6 +1211,9 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	logger := log.FromContext(ctx)
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	// The fingerprint is Secret content and the builder never sees it, so it is
+	// stamped here rather than folded into the pod-spec hash.
+	r.stampTLSMaterialHash(ctx, v, desired, builder.ValkeyTLSSecretName(v))
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on StatefulSet: %w", err)
@@ -1328,6 +1338,10 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelStatefulSet(v)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
+	// The Sentinel tier has no sidecar of ours at all -- its probes shell out to
+	// valkey-cli per exec -- so whether it can skip the roll is decided entirely by
+	// valkey-sentinel, which has never been measured. It carries the fingerprint.
+	r.stampTLSMaterialHash(ctx, v, desired, builder.SentinelTLSSecretName(v))
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Sentinel StatefulSet: %w", err)
@@ -2804,7 +2818,7 @@ func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.O
 	var requests []reconcile.Request
 	for i := range valkeyList.Items {
 		v := &valkeyList.Items[i]
-		if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secret.Name {
+		if secretConcernsValkey(v, secret.Name) {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      v.Name,
@@ -2820,4 +2834,23 @@ func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.O
 	}
 
 	return requests
+}
+
+// secretConcernsValkey reports whether a Secret change is one this Valkey has to
+// react to: the auth Secret it reads its password from, or either of the TLS
+// Secrets its pods mount.
+//
+// The TLS half was missing, and its absence is half of why a certificate
+// rotation was invisible to the operator: cert-manager rewrote the Secret, no CR
+// matched, nothing was enqueued, and the pods kept the material they had parsed
+// at startup. Matching the TLS names is what turns a rotation into a reconcile;
+// the fingerprint annotation is what turns that reconcile into a roll.
+func secretConcernsValkey(v *vkov1.Valkey, secretName string) bool {
+	if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secretName {
+		return true
+	}
+	if !v.IsTLSEnabled() {
+		return false
+	}
+	return secretName == builder.ValkeyTLSSecretName(v) || secretName == builder.SentinelTLSSecretName(v)
 }

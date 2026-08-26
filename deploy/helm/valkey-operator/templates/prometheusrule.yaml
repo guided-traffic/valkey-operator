@@ -121,6 +121,31 @@ spec:
               resource otherwise looks healthy - it is the only rule here that catches a
               resource the operator quietly stopped touching.
 
+        - alert: ValkeyTLSMaterialStale
+          expr: |
+            max by (namespace, name, reason) (
+              vko_valkey_status_condition{condition="TLSMaterialStale",status="True"}
+            ) == 1
+            and on () max(vko_valkey_collector_success) == 1
+          for: 72h
+          labels:
+            severity: warning
+          annotations:
+            summary: '{{ "{{ $labels.namespace }}/{{ $labels.name }}" }} has been running superseded TLS material for three days'
+            description: >-
+              At least one pod still holds the TLS material from before the last
+              certificate rotation. Long-lived processes inside those pods - valkey-server,
+              valkey-sentinel and the metrics exporter - parse their certificate once at
+              startup and cannot pick up a rotated one, so the operator replaces the pods
+              through the normal failover-aware rolling update. The threshold is three days
+              on purpose: cert-manager renews 30 days before expiry and the previous
+              certificate keeps working for those 30 days, so a roll that takes hours costs
+              nothing and a short threshold would page on every normal rotation. This firing
+              means the roll is not happening at all - check ReconcileBlocked, the phase, and
+              whether the StatefulSet pod template carries the current
+              vko.gtrfc.com/tls-material-hash. Left alone, the pods keep the old certificate
+              until it expires and their long-lived processes go silent.
+
         - alert: ValkeyMetricsCollectorFailing
           expr: max(vko_valkey_collector_success) == 0
           for: 15m

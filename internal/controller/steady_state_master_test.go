@@ -1259,9 +1259,9 @@ func TestPodNeedsUpdate_IgnoresTheDrainStamp(t *testing.T) {
 		}},
 	}
 
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:8.0", "", "cfg", "spec", nil),
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:8.0", "", "cfg", "spec", "", nil),
 		"an extra annotation is not spec drift")
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:8.0", "", "cfg", "other", nil),
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:8.0", "", "cfg", "other", "", nil),
 		"and the control: a changed pod-spec hash still is")
 }
 

@@ -2,11 +2,8 @@ package sidecar
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -17,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
@@ -156,39 +154,34 @@ func (l *Labeler) poll(ctx context.Context, logger interface {
 // --- valkeyRoleDetector ---
 
 // valkeyRoleDetector detects the role by calling INFO REPLICATION on the local Valkey.
+//
+// It holds the TLS reloader rather than a client, because a client holds a
+// *tls.Config and a *tls.Config holds the certificate that was on disk when it
+// was built. That is what broke the labeler on every TLS cluster whose pods
+// outlived a cert-manager rotation: the detector kept presenting an expired
+// client certificate once per second and the server kept rejecting it.
 type valkeyRoleDetector struct {
-	client *valkeyclient.Client
+	addr     string
+	password string
+	tlsSrc   *tlsmaterial.Reloader
 }
 
 func newValkeyRoleDetector(cfg Config) (*valkeyRoleDetector, error) {
-	var client *valkeyclient.Client
-
-	if cfg.TLSEnabled {
-		tlsCfg, err := buildSidecarTLSConfig(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("building TLS config: %w", err)
-		}
-		if cfg.Password != "" {
-			client = valkeyclient.NewTLSWithPassword(cfg.ValkeyAddr, tlsCfg, cfg.Password)
-		} else {
-			client = valkeyclient.NewTLS(cfg.ValkeyAddr, tlsCfg)
-		}
-	} else {
-		if cfg.Password != "" {
-			client = valkeyclient.NewWithPassword(cfg.ValkeyAddr, cfg.Password)
-		} else {
-			client = valkeyclient.New(cfg.ValkeyAddr)
-		}
+	tlsSrc, err := sidecarTLSReloader(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building TLS config: %w", err)
 	}
 
 	return &valkeyRoleDetector{
-		client: client,
+		addr:     cfg.ValkeyAddr,
+		password: cfg.Password,
+		tlsSrc:   tlsSrc,
 	}, nil
 }
 
 // DetectRole queries INFO REPLICATION and returns "master" or "replica".
 func (d *valkeyRoleDetector) DetectRole() (string, error) {
-	info, err := d.client.InfoReplication()
+	info, err := newValkeyClient(d.addr, d.tlsSrc, d.password).InfoReplication()
 	if err != nil {
 		return "", err
 	}
@@ -267,35 +260,40 @@ func (p *kubernetesPodPatcher) patchMetadata(ctx context.Context, namespace, nam
 	return nil
 }
 
-// buildSidecarTLSConfig builds a TLS config from the sidecar configuration.
-func buildSidecarTLSConfig(cfg Config) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+// sidecarTLSReloader builds the TLS material source shared by the three
+// collaborators the sidecar constructs at startup: the role detector, the
+// Sentinel cross-check querier and the drain handler's client factory. It
+// returns nil when TLS is disabled, which every caller reads as "plaintext".
+//
+// The reloader re-reads the mounted files, so all three keep working across a
+// cert-manager rotation instead of holding the material they parsed at process
+// start until it expires. Failing here still fails the process: material that
+// cannot be read at startup is a misconfiguration, not a rotation.
+func sidecarTLSReloader(cfg Config) (*tlsmaterial.Reloader, error) {
+	if !cfg.TLSEnabled {
+		return nil, nil
 	}
+	return tlsmaterial.New(cfg.TLSCACert, cfg.TLSCert, cfg.TLSKey)
+}
 
-	// Load CA cert if provided.
-	if cfg.TLSCACert != "" {
-		caCert, err := os.ReadFile(cfg.TLSCACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert %s: %w", cfg.TLSCACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA cert from %s", cfg.TLSCACert)
-		}
-		tlsCfg.RootCAs = pool
+// newValkeyClient builds a client for addr with the material that is on disk
+// now. Every caller builds one per command rather than keeping it: the client
+// holds no connection -- exec, ExecMulti and ExecGet each dial -- so building it
+// per call costs an allocation and is what makes the rotation visible to the
+// next handshake.
+//
+// tlsSrc is nil when TLS is disabled.
+func newValkeyClient(addr string, tlsSrc *tlsmaterial.Reloader, password string) *valkeyclient.Client {
+	switch {
+	case tlsSrc != nil && password != "":
+		return valkeyclient.NewTLSWithPassword(addr, tlsSrc.Config(), password)
+	case tlsSrc != nil:
+		return valkeyclient.NewTLS(addr, tlsSrc.Config())
+	case password != "":
+		return valkeyclient.NewWithPassword(addr, password)
+	default:
+		return valkeyclient.New(addr)
 	}
-
-	// Load client cert/key if provided.
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
-		if err != nil {
-			return nil, fmt.Errorf("loading client certificate: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	return tlsCfg, nil
 }
 
 // --- sentinelMasterQuerier ---
@@ -304,7 +302,7 @@ func buildSidecarTLSConfig(cfg Config) (*tls.Config, error) {
 type sentinelMasterQuerier struct {
 	addrs    []string
 	password string
-	tlsCfg   *tls.Config
+	tlsSrc   *tlsmaterial.Reloader
 }
 
 // newSentinelMasterQuerier creates a production querier from the sidecar config.
@@ -320,13 +318,11 @@ func newSentinelMasterQuerier(cfg Config) (*sentinelMasterQuerier, error) {
 		q.password = cfg.Password
 	}
 
-	if cfg.TLSEnabled {
-		tlsCfg, err := buildSidecarTLSConfig(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("building TLS config for sentinel querier: %w", err)
-		}
-		q.tlsCfg = tlsCfg
+	tlsSrc, err := sidecarTLSReloader(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building TLS config for sentinel querier: %w", err)
 	}
+	q.tlsSrc = tlsSrc
 
 	return q, nil
 }
@@ -335,19 +331,7 @@ func newSentinelMasterQuerier(cfg Config) (*sentinelMasterQuerier, error) {
 func (q *sentinelMasterQuerier) GetMasterAddress(monitor string) (string, error) {
 	var lastErr error
 	for _, addr := range q.addrs {
-		var client *valkeyclient.Client
-		switch {
-		case q.tlsCfg != nil && q.password != "":
-			client = valkeyclient.NewTLSWithPassword(addr, q.tlsCfg, q.password)
-		case q.tlsCfg != nil:
-			client = valkeyclient.NewTLS(addr, q.tlsCfg)
-		case q.password != "":
-			client = valkeyclient.NewWithPassword(addr, q.password)
-		default:
-			client = valkeyclient.New(addr)
-		}
-
-		info, err := client.SentinelMaster(monitor)
+		info, err := newValkeyClient(addr, q.tlsSrc, q.password).SentinelMaster(monitor)
 		if err != nil {
 			lastErr = err
 			continue

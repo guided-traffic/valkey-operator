@@ -160,6 +160,20 @@ var conditionRegistry = []conditionOwnership{
 		declaredGap:     "T15: pauseRollingUpdate is reachable on every topology but the only clear sits in finalizeRollingUpdate, which only the Sentinel dispatcher calls - so a non-Sentinel cluster keeps the condition for life",
 	},
 	{
+		conditionType: vkov1.ConditionTypeTLSMaterialStale,
+		kind:          conditionLevel,
+		// One evaluator, and it is a reconcile step rather than a workload one on
+		// purpose: runReconcileSteps runs every step of a pass, while every arm of
+		// reconcileWorkload returns early while a rolling update is in flight --
+		// which is precisely when this condition is True.
+		evaluators: 1,
+		clearSite:  "reportTLSMaterialStale, evaluated on every pass of a TLS cluster",
+		// A level needs no presence guard, and here the gate does the same job from
+		// the other side: the step carries when: IsTLSEnabled, so a cluster without
+		// TLS never gains the condition at all.
+		presenceGuarded: false,
+	},
+	{
 		conditionType: vkov1.ConditionTypeTopologyRestored,
 		kind:          conditionHistory,
 		evaluators:    1,

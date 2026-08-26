@@ -2,7 +2,6 @@ package sidecar
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
@@ -412,38 +412,31 @@ func splitHostPort(addr string) (string, string) {
 // --- Production ValkeyClientFactory ---
 
 // realValkeyClientFactory creates real Valkey clients with optional TLS and auth.
+//
+// It holds the TLS material source, not a parsed config: the drain promotion of
+// ADR 0012 is the one call this factory exists for, it happens once at the very
+// end of a pod's life, and a config parsed at process start is exactly the thing
+// that is stale by then on a cluster whose certificate rotated.
 type realValkeyClientFactory struct {
-	password  string
-	tlsConfig *tls.Config
+	password string
+	tlsSrc   *tlsmaterial.Reloader
 }
 
 // newRealValkeyClientFactory creates a factory from the sidecar config.
 func newRealValkeyClientFactory(cfg Config) (*realValkeyClientFactory, error) {
-	factory := &realValkeyClientFactory{
+	tlsSrc, err := sidecarTLSReloader(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building TLS config for drain handler: %w", err)
+	}
+	return &realValkeyClientFactory{
 		password: cfg.Password,
-	}
-	if cfg.TLSEnabled {
-		tlsCfg, err := buildSidecarTLSConfig(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("building TLS config for drain handler: %w", err)
-		}
-		factory.tlsConfig = tlsCfg
-	}
-	return factory, nil
+		tlsSrc:   tlsSrc,
+	}, nil
 }
 
 // NewClient creates a Valkey client for the given address, applying TLS and/or auth as configured.
 func (f *realValkeyClientFactory) NewClient(addr string) ValkeyCommander {
-	if f.tlsConfig != nil && f.password != "" {
-		return valkeyclient.NewTLSWithPassword(addr, f.tlsConfig, f.password)
-	}
-	if f.tlsConfig != nil {
-		return valkeyclient.NewTLS(addr, f.tlsConfig)
-	}
-	if f.password != "" {
-		return valkeyclient.NewWithPassword(addr, f.password)
-	}
-	return valkeyclient.New(addr)
+	return newValkeyClient(addr, f.tlsSrc, f.password)
 }
 
 // buildDrainHandler creates a DrainHandler from the sidecar Config with shared dependencies.

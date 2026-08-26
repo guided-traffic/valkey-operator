@@ -950,6 +950,7 @@ does not fit in five minutes.
 | `SentinelPeersStale` | At least one Sentinel knows more other Sentinels than the cluster has. Sentinel never forgets a peer it has seen, and the majority a failover leader needs is computed over that whole table — so the surplus is failover capacity that is already gone, not a display issue. The message names each pod and its count. Clear it with `SENTINEL RESET <cluster-name>` on one Sentinel at a time **while the master is healthy** (a reset with the master unreachable leaves that Sentinel knowing nothing and unable to rediscover), or leave it to the next Sentinel roll. Only written while all Valkey and Sentinel pods are Ready; a pass where no Sentinel answers leaves the previous value. A cluster reporting `True` is re-checked every 5 minutes, so a reset shows up as a cleared condition within the maintenance window rather than at the next cache resync. See [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md). |
 | `SentinelUpdatePending` | The Sentinel tier is being rolled: at least one Sentinel pod runs an outdated spec, or a replacement pod is not Ready yet. The `RollingUpdateComplete` event covers the **data tier only** and fires before the first Sentinel pod is replaced — the update as a whole is finished when this condition goes `False` with reason `Completed`, which is also the moment the `SentinelUpdateComplete` event is emitted. Reason `SentinelDisabled` means Sentinel was disabled while the condition stood (no completion event in that case). Written only on a cluster whose Sentinel tier actually rolled; clusters that never rolled carry no such condition. See [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md). |
 | `PodTerminationStalled` | A pod of the tier being rolled has been `Terminating` for more than two minutes past its own graceful deletion deadline, and the rolling update of that tier is holding: the operator never deletes a pod of a tier while another pod of that tier is on its way out. **The condition does not lift the hold and nothing resumes it** — deleting a second pod because the first is wedged is what the hold prevents. What it marks is that the operator stopped ending the reconcile pass on the wait, so the Sentinel roll, the no-master recovery, the steady-state split-brain check and the status write run again while the stall lasts. The message names the pod and how far past its deadline it is. Look at that pod: a `NodeNotReady` node, a stuck finalizer and a container ignoring SIGTERM are the usual causes. It clears itself with reason `PodTerminationCleared` once the pod is gone, and the roll continues on its own. No Event accompanies it. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md). |
+| `TLSMaterialStale` | At least one pod is still running the TLS material from before the last certificate rotation. **This is True for the length of every ordinary rotation roll and is not urgent**: cert-manager renews 30 days before expiry and the previous certificate keeps working for those 30 days, so the pods have a month of slack and the shipped alert waits three days before firing. The message names the pods and their tier. It clears itself with reason `TLSMaterialCurrent` once every measured pod carries the current fingerprint. What it exists to catch is the roll that **never starts** — the operator missed the Secret event, cannot write the StatefulSet, or is blocked for an unrelated reason — because no other signal fires in that case and the pods then keep the old certificate until it expires. Only written on TLS clusters, and only measured for pods that already carry the `vko.gtrfc.com/tls-material-hash` annotation; pods created by an older operator are unmeasured, not stale. See [Certificate rotation](#certificate-rotation). |
 | `MultipleMasters` | More than one data pod answered that it is the master while a rolling update was in flight. This is **not by itself a fault**: every controlled failover has a window in which the promoted pod and the outgoing one both answer master, and the operator closes it on the same pass. The reason tells the two apart — `MultipleMastersTransitional` is inside the 90 s bound and carries no Event, `MultipleMastersPersisted` is past it and is the moment the `SplitBrainDetected` **Warning** event fires. The message names the pods and the authority. It goes `False` with reason `SingleMaster` on the first pass that sees at most one master; a rolling update abandoned with rogue masters still present leaves it `True` until the next one, and so does a resolution the operator **refused** because demoting would have discarded the only dataset ([ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)) — a refusal carries no Event of its own, so a `MultipleMasters` that outlives the 90 s bound is how it surfaces. Written only during a rolling update — clusters that never saw two masters carry no such condition. See [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md). |
 
 #### Phase Values
@@ -997,6 +998,51 @@ When TLS is enabled (`spec.tls.enabled: true`):
 - Sentinel listens on TLS port `36379` (= 26379 + 10000, following Valkey's `+10000` convention)
 - All replication traffic is encrypted (`tls-replication yes`) regardless of `allowUnencrypted`
 - Probes use `valkey-cli --tls` with the mounted certificates
+
+### Certificate rotation
+
+**The operator replaces the pods whose TLS material they cannot reload, and only those.**
+
+A Kubernetes Secret volume is rewritten in place when cert-manager rotates the certificate
+it holds. A process that parsed the old bytes at startup keeps using them until it exits —
+so on a cluster whose pods outlive a rotation, those processes eventually present an expired
+certificate and are rejected, silently, with valid material sitting in the mount.
+
+Which processes can pick up new material on their own:
+
+| Process | Reloads? | Why |
+|---|---|---|
+| init containers | yes | they shell out to `valkey-cli` per invocation and read the files fresh |
+| the operator sidecar | yes | re-reads its material per command |
+| the cluster observer | yes | same, and it runs alone in its Deployment |
+| `valkey-server` | not verified | treated as pinning |
+| `valkey-sentinel` | not verified | treated as pinning |
+| `oliver006/redis_exporter` | no | third-party, long-lived, not the operator's to change |
+
+The restart unit is the pod, not the container, so one non-reloading process spends the
+whole pod's exemption. Both StatefulSets therefore carry a fingerprint of their TLS Secret
+in the pod template (`vko.gtrfc.com/tls-material-hash`), and a rotation changes it, which the
+**normal failover-aware rolling update** then acts on — the same controlled, one-pod-at-a-time
+replacement any other spec change gets. **The observer Deployment carries no fingerprint and is
+never restarted for a rotation.**
+
+The trigger is the rotation, not the expiry. cert-manager renews 30 days before expiry and
+the previous certificate stays valid for those 30 days, so the roll has a month of slack and
+nothing is time-critical; several clusters rotating in the same window simply queue behind
+`--max-concurrent-reconciles`. The `TLSMaterialStale` condition and the `ValkeyTLSMaterialStale`
+alert cover the one case the slack does not: a roll that never starts.
+
+**Upgrading to an operator version that has this mechanism rolls nothing.** A pod that does not
+carry the fingerprint annotation is never restarted for it, so existing pods adopt the
+fingerprint the next time they are replaced for another reason, and only rotations after that
+roll them.
+
+**On a single-replica cluster the roll is a restart of the only pod**, exactly like any other
+change to the pod spec or the generated config — brief downtime, and **data loss if
+`spec.persistence` is off**. That is unchanged from how this operator has always treated a
+standalone instance; it is called out here because a certificate rotation is the first thing
+that triggers it without anyone editing the CR. Turn on `spec.persistence` for standalone
+instances whose dataset matters.
 
 ### Port Summary
 
@@ -1232,12 +1278,17 @@ server and never converged — for example a field that is immutable on an alrea
 object. That is the shape of failure that can sit unnoticed for months, because the pods stay
 up and only the spec change is stuck.
 
-`prometheusRule.enabled: true` ships seven alerts over these series — `ValkeySpecNotObserved`,
+`prometheusRule.enabled: true` ships eight alerts over these series — `ValkeySpecNotObserved`,
 `ValkeyReconcileBlocked`, `ValkeyPhaseNotOK`, `ValkeyReplicasMissing`,
-`ValkeyOperatorVersionStale`, `ValkeyMetricsCollectorFailing` and `ValkeyMetricsAbsent`. Every
-rule is guarded on `vko_valkey_collector_success`, so a collector that cannot read reports
-"unknown" instead of "healthy". Thresholds are not exposed as values; replace the rule if they
-do not fit.
+`ValkeyOperatorVersionStale`, `ValkeyTLSMaterialStale`, `ValkeyMetricsCollectorFailing` and
+`ValkeyMetricsAbsent`. Every rule is guarded on `vko_valkey_collector_success`, so a collector
+that cannot read reports "unknown" instead of "healthy". Thresholds are not exposed as values;
+replace the rule if they do not fit.
+
+`ValkeyTLSMaterialStale` is the odd one out on timing: its `for:` is **72 hours**, not minutes,
+because the roll it watches is deliberately not time-critical (see
+[Certificate rotation](#certificate-rotation)). A short threshold would page on every normal
+rotation.
 
 Turning `serviceMonitor.enabled` on renders the Service as well — a ServiceMonitor selects
 Services, and one without the other scrapes nothing.

@@ -532,7 +532,7 @@ func TestRun_FailsFastOnAnInvalidTLSConfig(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating observer")
-	assert.Contains(t, err.Error(), "reading CA cert")
+	assert.Contains(t, err.Error(), "reading TLS material")
 }
 
 // httpGet returns the status code (0 when the request failed) and the body.

@@ -2,11 +2,13 @@ package observer
 
 import (
 	"context"
-	"crypto/tls"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 )
 
 // The tests in this file drive the individual checks against real RESP endpoints
@@ -582,21 +584,21 @@ func TestDiscoverMaster_SentinelFailurePropagates(t *testing.T) {
 // client during the handshake, and a plaintext endpoint cannot answer a TLS
 // ClientHello. Reaching the RESP layer proves which transport was really used.
 
-// trustingTLSConfig returns a client TLS config that trusts the given CA file.
-func trustingTLSConfig(t *testing.T, caPath string) *tls.Config {
+// trustingTLSSource returns a TLS material source that trusts the given CA file.
+func trustingTLSSource(t *testing.T, caPath string) *tlsmaterial.Reloader {
 	t.Helper()
-	cfg, err := buildTLSConfig(Config{TLSCACert: caPath}, false)
+	src, err := newTLSReloader(Config{TLSCACert: caPath}, false)
 	require.NoError(t, err)
-	return cfg
+	return src
 }
 
 func TestNewClient_TLSVariants(t *testing.T) {
 	caPath, certPath, keyPath := writeTestCerts(t)
-	tlsCfg := trustingTLSConfig(t, caPath)
+	tlsCfg := trustingTLSSource(t, caPath)
 
 	t.Run("TLS without password negotiates TLS", func(t *testing.T) {
 		ep := startFakeRESPTLS(t, newFakeValkeyNode().handle, certPath, keyPath)
-		obs := &Observer{cfg: Config{}, tlsConfig: tlsCfg}
+		obs := &Observer{cfg: Config{}, tlsSrc: tlsCfg}
 
 		require.NoError(t, obs.newClient(ep.addr, "").Ping())
 		assert.True(t, ep.sawCommand("PING"), "the PING must arrive through the TLS tunnel")
@@ -605,7 +607,7 @@ func TestNewClient_TLSVariants(t *testing.T) {
 
 	t.Run("TLS with password sends AUTH through the tunnel", func(t *testing.T) {
 		ep := startFakeRESPTLS(t, newFakeValkeyNode().handle, certPath, keyPath)
-		obs := &Observer{cfg: Config{}, tlsConfig: tlsCfg}
+		obs := &Observer{cfg: Config{}, tlsSrc: tlsCfg}
 
 		require.NoError(t, obs.newClient(ep.addr, "s3cret").Ping())
 		assert.Equal(t, []string{"AUTH", "s3cret"}, ep.findCommand("AUTH"))
@@ -636,11 +638,36 @@ func TestNewClient_TLSVariants(t *testing.T) {
 
 	t.Run("a TLS client never reaches a plaintext endpoint", func(t *testing.T) {
 		ep := startFakeRESP(t, newFakeValkeyNode().handle)
-		obs := &Observer{cfg: Config{}, tlsConfig: tlsCfg}
+		obs := &Observer{cfg: Config{}, tlsSrc: tlsCfg}
 
 		require.Error(t, obs.newClient(ep.addr, "s3cret").Ping())
 		assert.Empty(t, ep.findCommand("AUTH"), "the password must not leak into a failed handshake")
 	})
+}
+
+// The observer is the one workload the operator never restarts for a certificate
+// rotation, so its client has to survive one on its own. It runs alone in its
+// Deployment with no valkey-server and no third-party exporter beside it, which
+// is what makes that exemption safe -- and this is the test that keeps it true.
+func TestNewClient_RereadsTLSMaterialPerCall(t *testing.T) {
+	serverCA, certPath, keyPath := writeTestCerts(t)
+	mountCA, _, _ := writeTestCerts(t)
+
+	ep := startFakeRESPTLS(t, newFakeValkeyNode().handle, certPath, keyPath)
+
+	src, err := newTLSReloader(Config{TLSCACert: mountCA}, false)
+	require.NoError(t, err)
+	obs := &Observer{cfg: Config{}, tlsSrc: src}
+
+	require.Error(t, obs.newClient(ep.addr, "").Ping(),
+		"the mounted CA does not sign this server yet")
+
+	rotated, err := os.ReadFile(serverCA)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(mountCA, rotated, 0o600))
+
+	assert.NoError(t, obs.newClient(ep.addr, "").Ping(),
+		"the rotated CA must be picked up without the observer restarting")
 }
 
 // New only builds a Sentinel TLS config when spec.sentinel.enabled is set, so a
@@ -658,8 +685,8 @@ func TestNewSentinelClient_UsesValkeyConfigWhenSentinelConfigMissing(t *testing.
 			SentinelAddrList: []string{ep.addr},
 			Password:         "s3cret",
 		},
-		tlsConfig:         trustingTLSConfig(t, caPath),
-		sentinelTLSConfig: nil,
+		tlsSrc:         trustingTLSSource(t, caPath),
+		sentinelTLSSrc: nil,
 	}
 
 	require.NoError(t, obs.checkSentinelReachable(),
@@ -678,17 +705,17 @@ func TestNewSentinelClient_UsesValkeyConfigWhenSentinelConfigMissing(t *testing.
 func TestNewSentinelClient_PrefersTheSentinelTLSConfig(t *testing.T) {
 	caPath, certPath, keyPath := writeTestCerts(t)
 	foreignCA, _, _ := writeTestCerts(t)
-	trusting := trustingTLSConfig(t, caPath)
-	distrusting := trustingTLSConfig(t, foreignCA)
+	trusting := trustingTLSSource(t, caPath)
+	distrusting := trustingTLSSource(t, foreignCA)
 
 	ep := startFakeRESPTLS(t, newFakeSentinelNode("valkey-0.example.invalid", "6379").handle, certPath, keyPath)
 
-	obs := &Observer{cfg: Config{}, sentinelTLSConfig: trusting, tlsConfig: distrusting}
+	obs := &Observer{cfg: Config{}, sentinelTLSSrc: trusting, tlsSrc: distrusting}
 	require.NoError(t, obs.newSentinelClient(ep.addr, "s3cret").Ping(),
 		"only the Sentinel config trusts this endpoint, so the handshake proves it was used")
 
 	// Swapping the roles proves the success above was not an accident.
-	swapped := &Observer{cfg: Config{}, sentinelTLSConfig: distrusting, tlsConfig: trusting}
+	swapped := &Observer{cfg: Config{}, sentinelTLSSrc: distrusting, tlsSrc: trusting}
 	err := swapped.newSentinelClient(ep.addr, "s3cret").Ping()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TLS handshake")

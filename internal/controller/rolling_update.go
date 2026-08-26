@@ -213,6 +213,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	sidecarImg := sidecarImageFromSts(currentSts)
 	desiredConfigHash := configHashFromSts(currentSts)
 	desiredPodSpecHash := podSpecHashFromSts(currentSts)
+	desiredTLSHash := tlsMaterialHashFromSts(currentSts)
 	needsRollingUpdate := false
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
@@ -236,7 +237,8 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash, currentSts.Spec.Template.Spec.Containers) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash, desiredTLSHash,
+			currentSts.Spec.Template.Spec.Containers) {
 			needsRollingUpdate = true
 			break
 		}
@@ -331,7 +333,13 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 // AnnotationPodSpecHash annotation (created by an older operator version),
 // the function compares container resources directly so that spec changes
 // (e.g. resources.requests.cpu) are still detected.
-func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash, desiredPodSpecHash string, desiredContainers []corev1.Container) bool {
+//
+// desiredTLSHash adds the fourth input: the fingerprint of the TLS Secret the
+// pods mount. Its whole purpose is to replace processes that cannot re-read
+// rotated material, so it has no fallback -- a pod without the annotation is
+// unmeasured and is left alone.
+func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash,
+	desiredPodSpecHash, desiredTLSHash string, desiredContainers []corev1.Container) bool {
 	if len(pod.Spec.Containers) == 0 {
 		return false
 	}
@@ -341,7 +349,24 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 	if podAnnotationHashChanged(pod, desiredConfigHash) {
 		return true
 	}
+	if podTLSMaterialHashChanged(pod, desiredTLSHash) {
+		return true
+	}
 	return podSpecHashChanged(pod, desiredPodSpecHash, desiredContainers)
+}
+
+// podTLSMaterialHashChanged returns true when the pod carries a TLS material
+// fingerprint that differs from desiredHash. Returns false when the pod lacks
+// the annotation or desiredHash is empty -- the same presence rule the config
+// hash uses, and the whole of the upgrade-neutrality story for this mechanism:
+// pods created before the operator wrote fingerprints are never restarted for
+// one (ADR 0005).
+func podTLSMaterialHashChanged(pod *corev1.Pod, desiredHash string) bool {
+	if desiredHash == "" {
+		return false
+	}
+	podHash := pod.Annotations[builder.AnnotationTLSMaterialHash]
+	return podHash != "" && podHash != desiredHash
 }
 
 // podImageChanged returns true if any container image on the pod differs from
@@ -466,6 +491,18 @@ func valkeyImageFromSts(sts *appsv1.StatefulSet) string {
 // recreated pod can converge on.
 func configHashFromSts(sts *appsv1.StatefulSet) string {
 	return sts.Spec.Template.Annotations[builder.AnnotationConfigHash]
+}
+
+// tlsMaterialHashFromSts reads the TLS material fingerprint off the persisted
+// StatefulSet template, for the same reason the other three inputs come from
+// there: the rolling update compares pods against the template that was actually
+// written, so a StatefulSet write the operator could not complete can never turn
+// a rotation into a pod-delete loop.
+func tlsMaterialHashFromSts(sts *appsv1.StatefulSet) string {
+	if sts == nil {
+		return ""
+	}
+	return sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash]
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -1630,7 +1667,9 @@ func (r *ValkeyReconciler) collectPodStates(ctx context.Context, v *vkov1.Valkey
 		} else {
 			ps.pod = pod
 			ps.exists = true
-			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts), configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers)
+			ps.needsUpdate = podNeedsUpdate(pod, desiredImage, sidecarImageFromSts(currentSts),
+				configHashFromSts(currentSts), podSpecHashFromSts(currentSts), tlsMaterialHashFromSts(currentSts),
+				currentSts.Spec.Template.Spec.Containers)
 			ps.readyCondition = isPodReady(pod)
 			if pod.DeletionTimestamp != nil {
 				ps.terminating = true
@@ -3111,7 +3150,9 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
 		}
 
-		if podNeedsUpdate(pod, desiredImage, sidecarImg, configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
+		if podNeedsUpdate(pod, desiredImage, sidecarImg, configHashFromSts(currentSts),
+			podSpecHashFromSts(currentSts), tlsMaterialHashFromSts(currentSts),
+			currentSts.Spec.Template.Spec.Containers) {
 			// For sidecar-only changes in true standalone mode (single replica),
 			// defer the update to the next natural pod restart rather than
 			// auto-deleting the only instance.
@@ -3629,7 +3670,8 @@ func (r *ValkeyReconciler) handlePostManualFailover(ctx context.Context, v *vkov
 	// (docs/adr/0007-failover-aware-rolling-update.md, D4). The image check is not dropped, it is
 	// subsumed: podNeedsUpdate compares the Valkey and sidecar images first.
 	if podNeedsUpdate(masterPod, valkeyImageFromSts(currentSts), sidecarImageFromSts(currentSts),
-		configHashFromSts(currentSts), podSpecHashFromSts(currentSts), currentSts.Spec.Template.Spec.Containers) {
+		configHashFromSts(currentSts), podSpecHashFromSts(currentSts), tlsMaterialHashFromSts(currentSts),
+		currentSts.Spec.Template.Spec.Containers) {
 		logger.Info("Master pod does not match the StatefulSet template yet, waiting for replacement",
 			"pod", masterPodName)
 		return r.waitOrAbandonManualFailover(ctx, v,
@@ -4163,7 +4205,10 @@ func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateS
 			return true
 		}
 	}
-	return false
+	// Check the TLS material fingerprint. Sentinel runs no process of ours, so
+	// whether it survives a rotation is valkey-sentinel's answer alone and has
+	// never been measured -- the tier is rolled.
+	return podTLSMaterialHashChanged(pod, desiredTemplate.Annotations[builder.AnnotationTLSMaterialHash])
 }
 
 // sentinelScan is one sweep over the Sentinel tier: everything

@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
@@ -220,37 +221,39 @@ func (o *Observer) checkSentinelQuorumAndFlags() (quorumOK, flagsOK bool, err er
 }
 
 // newClient creates a valkeyclient.Client with appropriate TLS/auth config.
+//
+// The TLS config is taken from the reloader per call, never stored: the client
+// holds no connection, so the next command handshakes with whatever material is
+// on disk at that moment.
 func (o *Observer) newClient(addr, password string) *valkeyclient.Client {
-	if o.tlsConfig != nil && password != "" {
-		return valkeyclient.NewTLSWithPassword(addr, o.tlsConfig, password)
-	}
-	if o.tlsConfig != nil {
-		return valkeyclient.NewTLS(addr, o.tlsConfig)
-	}
-	if password != "" {
-		return valkeyclient.NewWithPassword(addr, password)
-	}
-	return valkeyclient.New(addr)
+	return newTLSAwareClient(addr, o.tlsSrc, password)
 }
 
 // newSentinelClient creates a valkeyclient.Client for Sentinel connections.
-// When TLS is enabled it uses the CA-only TLS config (no client certs / no mTLS),
-// falling back to the full TLS config if no sentinel-specific config was built.
+// When TLS is enabled it uses the Sentinel material source (CA-only unless
+// sentinel mTLS was opted into), falling back to the Valkey one if no
+// sentinel-specific source was built.
 func (o *Observer) newSentinelClient(addr, password string) *valkeyclient.Client {
-	tlsCfg := o.sentinelTLSConfig
-	if tlsCfg == nil {
-		tlsCfg = o.tlsConfig
+	src := o.sentinelTLSSrc
+	if src == nil {
+		src = o.tlsSrc
 	}
-	if tlsCfg != nil && password != "" {
-		return valkeyclient.NewTLSWithPassword(addr, tlsCfg, password)
-	}
-	if tlsCfg != nil {
-		return valkeyclient.NewTLS(addr, tlsCfg)
-	}
-	if password != "" {
+	return newTLSAwareClient(addr, src, password)
+}
+
+// newTLSAwareClient builds a client for addr, reading the current TLS material
+// from src. A nil src means TLS is disabled.
+func newTLSAwareClient(addr string, src *tlsmaterial.Reloader, password string) *valkeyclient.Client {
+	switch {
+	case src != nil && password != "":
+		return valkeyclient.NewTLSWithPassword(addr, src.Config(), password)
+	case src != nil:
+		return valkeyclient.NewTLS(addr, src.Config())
+	case password != "":
 		return valkeyclient.NewWithPassword(addr, password)
+	default:
+		return valkeyclient.New(addr)
 	}
-	return valkeyclient.New(addr)
 }
 
 // checkSentinelMasterHostname queries all Sentinels and verifies the master address

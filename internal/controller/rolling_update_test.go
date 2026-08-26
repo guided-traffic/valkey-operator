@@ -78,7 +78,7 @@ func TestPodNeedsUpdate_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
@@ -89,12 +89,12 @@ func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyContainers(t *testing.T) {
 	pod := &corev1.Pod{}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
@@ -108,7 +108,7 @@ func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
 		},
 	}
 	// Valkey image matches, but sidecar image changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
@@ -121,7 +121,7 @@ func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
@@ -134,7 +134,7 @@ func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
 		},
 	}
 	// Empty desiredSidecarImage → sidecar check skipped.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: config hash checks ---
@@ -153,7 +153,7 @@ func TestPodNeedsUpdate_ConfigHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different hash → allowUnencrypted was toggled → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
@@ -169,7 +169,7 @@ func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
@@ -182,7 +182,7 @@ func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
@@ -199,7 +199,7 @@ func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
 		},
 	}
 	// Empty desired hash → skip config hash check entirely.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: pod spec hash checks ---
@@ -218,7 +218,7 @@ func TestPodNeedsUpdate_PodSpecHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different pod spec hash → resources changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344", "", nil))
 }
 
 func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
@@ -234,7 +234,7 @@ func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", "", nil))
 }
 
 func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
@@ -246,7 +246,7 @@ func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
@@ -262,7 +262,7 @@ func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: resource fallback for pods without hash annotation ---
@@ -296,7 +296,7 @@ func TestPodNeedsUpdate_NoAnnotation_ResourceChanged_TriggersUpdate(t *testing.T
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_ResourceUnchanged_NoUpdate(t *testing.T) {
@@ -328,7 +328,7 @@ func TestPodNeedsUpdate_NoAnnotation_ResourceUnchanged_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_LimitsChanged_TriggersUpdate(t *testing.T) {
@@ -358,7 +358,7 @@ func TestPodNeedsUpdate_NoAnnotation_LimitsChanged_TriggersUpdate(t *testing.T) 
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_WithAnnotation_IgnoresContainersFallback(t *testing.T) {
@@ -396,7 +396,7 @@ func TestPodNeedsUpdate_WithAnnotation_IgnoresContainersFallback(t *testing.T) {
 		},
 	}
 	// Hash matches → no update, even though resources differ.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "samehash", desiredContainers))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "samehash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_NilDesiredContainers_SkipsFallback(t *testing.T) {
@@ -416,7 +416,7 @@ func TestPodNeedsUpdate_NoAnnotation_NilDesiredContainers_SkipsFallback(t *testi
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", nil))
 }
 
 // --- containersResourceChanged ---

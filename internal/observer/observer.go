@@ -4,10 +4,7 @@ package observer
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -16,6 +13,8 @@ import (
 	"go.uber.org/zap/zapcore"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 )
 
 const (
@@ -96,26 +95,33 @@ type CheckResult struct {
 }
 
 // Observer runs periodic health checks against a Valkey cluster.
+//
+// The two TLS fields are material sources, not parsed configs. The observer is a
+// long-lived process in a Deployment of its own, and a config parsed once at
+// startup keeps presenting the certificate -- and trusting the CA -- that was on
+// disk then, until the process exits. Because the observer runs alone in its pod
+// and re-reads its material, it is the one workload the operator never has to
+// restart when cert-manager rotates.
 type Observer struct {
-	cfg               Config
-	tlsConfig         *tls.Config
-	sentinelTLSConfig *tls.Config
-	mu                sync.RWMutex
-	result            CheckResult
-	metrics           *observerMetrics
+	cfg            Config
+	tlsSrc         *tlsmaterial.Reloader
+	sentinelTLSSrc *tlsmaterial.Reloader
+	mu             sync.RWMutex
+	result         CheckResult
+	metrics        *observerMetrics
 }
 
 // New creates a new Observer with the given configuration.
 func New(cfg Config) (*Observer, error) {
-	var tlsCfg, sentinelTLSCfg *tls.Config
+	var tlsSrc, sentinelTLSSrc *tlsmaterial.Reloader
 	if cfg.TLSEnabled {
 		var err error
-		tlsCfg, err = buildTLSConfig(cfg, cfg.ValkeyMTLS)
+		tlsSrc, err = newTLSReloader(cfg, cfg.ValkeyMTLS)
 		if err != nil {
 			return nil, fmt.Errorf("building TLS config: %w", err)
 		}
 		if cfg.SentinelEnabled {
-			sentinelTLSCfg, err = buildTLSConfig(cfg, cfg.SentinelMTLS)
+			sentinelTLSSrc, err = newTLSReloader(cfg, cfg.SentinelMTLS)
 			if err != nil {
 				return nil, fmt.Errorf("building sentinel TLS config: %w", err)
 			}
@@ -123,9 +129,9 @@ func New(cfg Config) (*Observer, error) {
 	}
 
 	return &Observer{
-		cfg:               cfg,
-		tlsConfig:         tlsCfg,
-		sentinelTLSConfig: sentinelTLSCfg,
+		cfg:            cfg,
+		tlsSrc:         tlsSrc,
+		sentinelTLSSrc: sentinelTLSSrc,
 		result: CheckResult{
 			Ready:  false,
 			Checks: make(map[string]bool),
@@ -383,34 +389,19 @@ func (o *Observer) setResult(ready bool, checks map[string]bool, message string,
 	o.metrics.updateGauges(checks, ready)
 }
 
-// buildTLSConfig builds a TLS config for the observer.
+// newTLSReloader builds the observer's TLS material source.
 // When withClientCert is true, the client certificate and key are loaded
 // for mutual TLS (mTLS). When false, only the CA certificate is loaded
-// for server-only verification.
-func buildTLSConfig(cfg Config, withClientCert bool) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+// for server-only verification -- which is what both mTLS switches default to,
+// so an observer that was never opted in re-reads its CA and nothing else.
+//
+// The source re-reads the mounted files, so a rotated leaf certificate and a
+// rotated CA are both picked up on the next check cycle. Material that cannot be
+// read at startup still fails the process.
+func newTLSReloader(cfg Config, withClientCert bool) (*tlsmaterial.Reloader, error) {
+	certFile, keyFile := "", ""
+	if withClientCert {
+		certFile, keyFile = cfg.TLSCert, cfg.TLSKey
 	}
-
-	if cfg.TLSCACert != "" {
-		caCert, err := os.ReadFile(cfg.TLSCACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert: %w", err)
-		}
-		certPool := x509.NewCertPool()
-		if !certPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA certificate")
-		}
-		tlsCfg.RootCAs = certPool
-	}
-
-	if withClientCert && cfg.TLSCert != "" && cfg.TLSKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
-		if err != nil {
-			return nil, fmt.Errorf("loading client certificate: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	return tlsCfg, nil
+	return tlsmaterial.New(cfg.TLSCACert, certFile, keyFile)
 }

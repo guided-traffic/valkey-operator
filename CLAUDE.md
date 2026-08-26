@@ -520,6 +520,47 @@ from the `SENTINEL MASTER` reply the health pass already asks for, and cleared b
 or by the next Sentinel roll.
 → [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md)
 
+## Rotating certificates rotate the instances that cannot reload them
+
+A Secret volume is rewritten in place when cert-manager rotates the certificate it holds, and a
+process that parsed the old bytes at startup keeps presenting them until it exits. Measured on
+a live fleet: the sidecar labeler, the Sentinel cross-check and the **ADR 0012 drain promotion**
+died on every TLS cluster whose pods outlived a rotation - silently, with valid material sitting
+in the mount, `Ready` still True and `phase` still `OK`, because the reconciler and the health
+checker read the Secret per call and present no client certificate at all.
+
+Two halves, and the split is the rule: **a long-lived process this repo owns re-reads its
+material and earns an exemption; every other process rides a roll.**
+
+- The sidecar and the observer take their `*tls.Config` from
+  [`internal/tlsmaterial`](internal/tlsmaterial/reloader.go) per dial - CA **and** keypair,
+  compared on bytes, keeping the last config that worked so a half-swapped mount costs one
+  degraded call instead of an outage. **A new long-lived client of ours inherits that, not an
+  exemption**: `valkeyclient.Client` holds no connection, so building one per command is an
+  allocation and nothing else.
+- Everything else is replaced. The reconciler stamps `vko.gtrfc.com/tls-material-hash` - a
+  fingerprint of `ca.crt`/`tls.crt`/`tls.key`, Secret *content* the builders never see - onto
+  both StatefulSet pod templates, so a rotation rides the ordinary failover-aware rolling
+  update. `valkey-server` and `valkey-sentinel` are treated as pinning because nobody has
+  measured otherwise; the third-party exporter provably is, and the restart unit is the pod, so
+  one non-reloading container spends the whole pod's exemption. The observer Deployment carries
+  no fingerprint and is never restarted for a rotation.
+
+**The trigger is the rotation, not the expiry.** That buys the full 30-day cert-manager grace
+window, so the roll is never time-critical and needs neither scheduling nor stampede control -
+the ADR 0019 concurrency cap is the only pacing there is, and the shipped
+`ValkeyTLSMaterialStale` alert waits **72 h** rather than minutes. The one thing the window does
+not cover is a roll that never starts, and that is what the `TLSMaterialStale` level reports.
+Upgrade neutrality is the presence guard the other hashes already use: a pod without the
+annotation is never restarted for one.
+
+**ADR owed, deliberately deferred (`ADR spaeter, erst Code`, decided 2026-08-26):** ADR 0030,
+plus amendments to ADR 0016 (its "whether the running server reloads the new material is not
+verified" residual risk has now fired, on the client side, and is measured) and ADR 0012 (the
+drain promotion gains the precondition that its Valkey client holds usable TLS material), plus
+`SECURITY_ARCHITECTURE.md` sections 2/6 and the hardening checklist. Until that lands, those
+documents are knowingly stale.
+
 ## Metrics / Exporter
 
 `spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on

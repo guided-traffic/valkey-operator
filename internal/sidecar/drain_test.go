@@ -1175,7 +1175,7 @@ func TestRealValkeyClientFactory_TLSVariants(t *testing.T) {
 				Password:   password,
 			})
 			require.NoError(t, err)
-			require.NotNil(t, factory.tlsConfig)
+			require.NotNil(t, factory.tlsSrc)
 
 			require.NoError(t, factory.NewClient(addr).Ping())
 			assert.NotEmpty(t, received())
@@ -1183,11 +1183,36 @@ func TestRealValkeyClientFactory_TLSVariants(t *testing.T) {
 	}
 }
 
+// The third collaborator, and the one with the ADR 0012 contract on it: the
+// drain promotion happens once, at the very end of a pod's life, which is
+// exactly when material parsed at process start is most likely to be stale.
+func TestRealValkeyClientFactory_RereadsTLSMaterialPerClient(t *testing.T) {
+	server := generateTestCerts(t)
+	mount := generateTestCerts(t)
+
+	addr, received := recordedFakeValkey(t, server.serverTLSConfig(t))
+	factory, err := newRealValkeyClientFactory(Config{
+		TLSEnabled: true,
+		TLSCACert:  mount.caPath,
+	})
+	require.NoError(t, err)
+
+	require.Error(t, factory.NewClient(addr).Ping())
+	require.Empty(t, received())
+
+	mount.replaceCAWith(t, server)
+
+	require.NoError(t, factory.NewClient(addr).Ping(),
+		"the drain must reach the local Valkey with the material that is on disk now")
+	assert.NotEmpty(t, received())
+}
+
 func TestRealValkeyClientFactory_TLSConfigError(t *testing.T) {
 	_, err := newRealValkeyClientFactory(Config{TLSEnabled: true, TLSCACert: filepath.Join(t.TempDir(), "absent.crt")})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "building TLS config for drain handler")
+	assert.Contains(t, err.Error(), "reading TLS material")
 }
 
 func TestBuildDrainHandler_CopiesConfigAndDerivesPort(t *testing.T) {

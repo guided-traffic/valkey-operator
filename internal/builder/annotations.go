@@ -91,3 +91,22 @@ func NudgePatch(now time.Time) []byte {
 	return []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`,
 		AnnotationNudge, now.UTC().Format(time.RFC3339)))
 }
+
+// AnnotationTLSMaterialHash is the annotation key used to store a fingerprint of
+// the TLS Secret contents a pod was created with. Unlike the config and pod-spec
+// hashes it is not computed by a builder: the fingerprint is Secret *content*,
+// and buildPodSpec only ever sees the Valkey CR, which names the Secret and never
+// its data. The reconciler stamps it onto the pod template instead.
+//
+// It exists because nothing else makes a certificate rotation visible to a pod.
+// The Secret is remounted in place, and processes that parsed their TLS material
+// at startup -- valkey-server, valkey-sentinel and the third-party metrics
+// exporter -- keep using the material they parsed until they exit. A changed
+// fingerprint changes the pod template, which the failover-aware rolling update
+// then acts on, so those processes are replaced while the previous certificate is
+// still valid.
+//
+// The operator's own long-lived processes are exempt from this mechanism by being
+// able to re-read their material (internal/tlsmaterial); the observer Deployment
+// therefore carries no fingerprint at all.
+const AnnotationTLSMaterialHash = "vko.gtrfc.com/tls-material-hash"
