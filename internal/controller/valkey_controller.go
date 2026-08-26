@@ -2632,6 +2632,53 @@ func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vko
 	r.setSidecarUpdatePendingCondition(ctx, v, "")
 }
 
+// clearRollingUpdatePaused resolves the paused report on a CR that carries one.
+//
+// It is the third instance of the ADR 0002 D10 shape and the one that took longest
+// to find, because the clear existed: it sat inside finalizeRollingUpdate, which
+// only the Sentinel dispatch arm calls. A multi-replica cluster without Sentinel
+// could reach pauseRollingUpdate through three chains and had no code path that
+// ever cleared, so the condition stood for the life of the cluster — and the
+// collector exports it, so a stale True is a permanently firing series rather than
+// a stale row in kubectl.
+//
+// Presence-guarded, like every other clear here: meta.SetStatusCondition ADDS an
+// absent condition and reports a change, so the unguarded write this replaces had
+// already stamped RollingUpdatePaused=False onto every Sentinel CR that ever
+// completed a roll.
+//
+// The reason is a parameter because the two call sites prove different things. See
+// ReasonRollingUpdateCompleted and ReasonRollingUpdateConverged.
+func (r *ValkeyReconciler) clearRollingUpdatePaused(ctx context.Context, v *vkov1.Valkey,
+	reason, message string) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeRollingUpdatePaused) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeRollingUpdatePaused,
+		metav1.ConditionFalse, reason, message)
+}
+
+// clearRollingUpdatePausedIfConverged is the guarded half, called from the
+// converged early return of checkAndHandleRollingUpdate.
+//
+// "No pod needs updating" is not the same statement as "the tier converged". The
+// ordinal loop skips a pod that does not exist, and a pod recreated on the current
+// template is up to date the moment it appears — both of which happen in the middle
+// of a replacement the operator is still waiting on. Clearing there would turn a
+// permanently stale True into a permanently wrong False, which is the worse of the
+// two failures: it says a stuck roll is fine.
+//
+// The count is the branch, so the caller stays a plain statement — the loop it sits
+// in is at the cyclomatic limit the repo enforces.
+func (r *ValkeyReconciler) clearRollingUpdatePausedIfConverged(ctx context.Context, v *vkov1.Valkey,
+	readyPods, tierSize int) {
+	if readyPods != tierSize {
+		return
+	}
+	r.clearRollingUpdatePaused(ctx, v, vkov1.ReasonRollingUpdateConverged,
+		"Every pod of the data tier matches the live StatefulSet template and is Ready")
+}
+
 // clearSentinelUpdatePending flips SentinelUpdatePending to False on a CR whose
 // Sentinel is disabled, but only for a CR that actually carries the condition —
 // the same presence guard as clearSidecarUpdatePending, and for the same reason:

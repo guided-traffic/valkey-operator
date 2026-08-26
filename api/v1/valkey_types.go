@@ -50,9 +50,19 @@ const (
 	// the update will occur on the next pod restart (manual delete or image change).
 	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
 
-	// ConditionTypeRollingUpdatePaused is set when a rolling update is paused
-	// because a replaced pod failed to sync within the configured timeout.
-	// The operator will not resume until the user applies a new spec change.
+	// ConditionTypeRollingUpdatePaused is set when a rolling update stopped waiting
+	// because a replaced pod failed to sync within spec.rollingUpdate.syncTimeout.
+	//
+	// It reports that the wait expired, not that the operator stopped: the pause
+	// clears the rolling-update state, so a later pass that still finds outdated
+	// pods dispatches again on a fresh syncTimeout budget and sets this condition
+	// again. A spec change restarts the roll from the beginning rather than
+	// resuming it.
+	//
+	// It goes False with reason Completed once a roll finishes, and with reason
+	// Converged when there is no roll left to run — the usual cause being a spec
+	// put back to what the pods already run. It is written only on a cluster that
+	// paused; clusters that never did carry no such condition.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
 
 	// ConditionTypeTopologyRestored reports whether the LAST data-tier rolling update of
@@ -227,6 +237,20 @@ const (
 	// was disabled while the condition stood — disabling is not completing, so no
 	// SentinelUpdateComplete event accompanies it.
 	ReasonSentinelDisabled = "SentinelDisabled"
+
+	// ReasonRollingUpdateCompleted clears RollingUpdatePaused from the completion
+	// branch of checkAndHandleRollingUpdate: every pod of the data tier matches the
+	// live StatefulSet template and the dispatch target reported the roll finished.
+	// The value is unchanged from the write this clear replaced, so a CR already
+	// carrying it does not see a spurious transition.
+	ReasonRollingUpdateCompleted = "Completed"
+
+	// ReasonRollingUpdateConverged clears RollingUpdatePaused from the converged
+	// early return, where there is no roll left to run at all — the usual cause
+	// being a spec put back to what the pods already run. Distinct from
+	// ReasonRollingUpdateCompleted on purpose: nothing completed here, and a CR
+	// that says otherwise is making a claim the operator cannot support.
+	ReasonRollingUpdateConverged = "Converged"
 
 	// ReasonMultipleMastersTransitional is the MultipleMasters reason while the
 	// double-master window is younger than splitBrainWarnAfter. Every controlled

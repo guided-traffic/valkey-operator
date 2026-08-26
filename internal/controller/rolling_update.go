@@ -215,6 +215,12 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 	desiredPodSpecHash := podSpecHashFromSts(currentSts)
 	desiredTLSHash := tlsMaterialHashFromSts(currentSts)
 	needsRollingUpdate := false
+	// Counted here because the loop below already Gets every ordinal and then throws
+	// both facts away. It is what tells the converged early return apart from a
+	// replacement in flight: a pod that does not exist is skipped rather than
+	// reported as outdated, and a pod recreated on the current template is up to date
+	// the instant it appears (clearRollingUpdatePausedIfConverged).
+	readyPods := 0
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -236,6 +242,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		if !podIsOurs(pod, currentSts) {
 			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
 		}
+		readyPods += readyOne(pod)
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg, desiredConfigHash, desiredPodSpecHash, desiredTLSHash,
 			currentSts.Spec.Template.Spec.Containers) {
@@ -254,11 +261,17 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		// Proceed to handleRollingUpdate so the updatedCount == totalPods check
 		// triggers finalizeRollingUpdate and cleans up the state.
 		if r.getRollingUpdateState(v) == "" {
-			// The one place that provably knows every pod matches the live template, and therefore the only
-			// place a deferred sidecar update can be declared applied
-			// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D10). It is a no-op for every CR that
-			// does not carry the condition.
+			// One of the two places that provably know every pod matches the live template,
+			// and therefore that a deferred sidecar update can be declared applied
+			// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D10). The other is
+			// the completion branch below, added in 2026-08-26 — this comment said "the one
+			// place" until then. It is a no-op for every CR that does not carry the
+			// condition.
 			r.clearSidecarUpdatePending(ctx, v)
+			// And the same site for the paused report, with one extra condition: a
+			// deferred sidecar update is answered by the templates matching, a pause is
+			// not. The helper carries that test (ADR 0002 D10b).
+			r.clearRollingUpdatePausedIfConverged(ctx, v, readyPods, int(*currentSts.Spec.Replicas))
 			return RollingUpdateResult{} // No rolling update needed.
 		}
 		logger.Info("All pods updated but rolling update state still present, finalizing")
@@ -298,15 +311,31 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		// 41 min 9 s between a completed roll and the clear on one cluster, and only
 		// because a chaos pod-kill supplied the event (ADR 0002 D10).
 		//
-		// The proof is updatedCount == totalPods, which countUpdatedPods evaluates as
-		// !needsUpdate && reachable() for every pod of the tier — not the Completed flag
-		// itself, because two of the completion sites inside verifyTopologyRestored are
-		// stalled completions that could not re-read the pods. Both are entered only
-		// through that same count, so the proof holds for them too.
+		// The proof for the sidecar clear is updatedCount == totalPods, which
+		// countUpdatedPods evaluates as !needsUpdate && reachable() for every pod of the
+		// tier — not the Completed flag itself, because two of the completion sites
+		// inside verifyTopologyRestored are stalled completions that could not re-read
+		// the pods.
+		//
+		// That proof does NOT cover every path here, and the claim that it did stood in
+		// this comment and in ADR 0002 D10 until 2026-08-26. verifyTopologyRestored has
+		// two callers: one inside the `updatedCount == totalPods` branch of
+		// handleMultiReplicaRollingUpdate, and one in dispatchMultiReplicaState, whose
+		// only caller sits AFTER that branch closes — so Completed is reachable with
+		// updatedCount != totalPods. The clears below are kept at this site anyway: the
+		// dispatch target declaring the roll finished is the strongest statement
+		// available, and both clears are presence-guarded, so the cost of the weaker
+		// proof is a report retracted one pass early rather than a condition invented.
 		//
 		// Before clearRollingUpdateState, so an annotation write that fails cannot skip
 		// it. Presence-guarded, so no CR gains a condition it never had.
 		r.clearSidecarUpdatePending(ctx, v)
+		// The paused report ends here too, and unguarded by convergence: the dispatch
+		// target has just declared the roll finished, which is the strongest statement
+		// available. It used to be cleared inside finalizeRollingUpdate, one arm down,
+		// where the other two topologies never reached it (ADR 0002 D10b).
+		r.clearRollingUpdatePaused(ctx, v, vkov1.ReasonRollingUpdateCompleted,
+			"Rolling update completed successfully")
 		if err := r.clearRollingUpdateState(ctx, v); err != nil {
 			return RollingUpdateResult{Error: err}
 		}
@@ -515,6 +544,17 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
+// readyOne is isPodReady as an addend rather than a branch. It exists because its
+// only caller is the ordinal loop of checkAndHandleRollingUpdate, which measures
+// exactly at the cyclomatic limit the repo enforces (make cyclo, gocyclo -over 15),
+// so an inline `if` there — or a `&&` — turns CI red for a counter.
+func readyOne(pod *corev1.Pod) int {
+	if isPodReady(pod) {
+		return 1
+	}
+	return 0
+}
+
 // handleRollingUpdate orchestrates a controlled rolling update for an HA Valkey cluster.
 // It is called from the main Reconcile loop when an image change is detected.
 //
@@ -712,12 +752,12 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
 	}
-	// Clear the paused condition if it was set by a previous failed attempt.
-	r.setStatusCondition(ctx, v,
-		vkov1.ConditionTypeRollingUpdatePaused,
-		metav1.ConditionFalse,
-		"Completed",
-		"Rolling update completed successfully")
+	// The paused condition is NOT cleared here any more. This site is reachable only
+	// from the Sentinel dispatch arm, which is why the other two topologies kept the
+	// condition forever, and the write was unguarded, which is why every Sentinel CR
+	// that completed a roll gained a condition it never had. Both are fixed one frame
+	// up, in the completion branch of checkAndHandleRollingUpdate, which every
+	// dispatch target reports through (ADR 0002 D10).
 	return RollingUpdateResult{Completed: true}
 }
 
@@ -2051,9 +2091,20 @@ func (r *ValkeyReconciler) verifyReplacedReplicasSynced(ctx context.Context, v *
 	return nil
 }
 
-// pauseRollingUpdate pauses the rolling update by setting a status condition
-// and recording a warning event. The operator will not resume until the user
-// applies a new spec change.
+// pauseRollingUpdate reports that the rolling update stopped waiting: it sets
+// RollingUpdatePaused, writes the phase and records a Warning Event.
+//
+// It does NOT halt anything, and the sentence that said so was wrong in four
+// tracked places until 2026-08-26. It clears the rolling-update state below, which
+// drops the sync-wait annotation and the in-memory bound, so the next pass that
+// finds outdated pods dispatches again, arms a FRESH syncTimeout budget, waits it
+// out and pauses again — re-emitting the Event each cycle. What a spec change buys
+// is a roll that starts from the beginning, not a resume.
+//
+// Making the pause a state the operator actually holds is filed as its own item
+// (T23): it needs a re-decision on whether a state that ends only at a spec change
+// is bounded in the sense of
+// docs/adr/0010-every-rolling-update-wait-is-bounded.md at all.
 func (r *ValkeyReconciler) pauseRollingUpdate(ctx context.Context, v *vkov1.Valkey, reason string) *RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	logger.Info("Pausing rolling update due to sync failure", "reason", reason)
@@ -2069,12 +2120,16 @@ func (r *ValkeyReconciler) pauseRollingUpdate(ctx context.Context, v *vkov1.Valk
 
 	r.recordEvent(v, corev1.EventTypeWarning, "RollingUpdatePaused", reason)
 
-	// Clear rolling update state so the next spec change triggers a fresh start.
+	// Clear rolling update state so a later pass starts the state machine from the
+	// beginning. It also drops the sync-wait bound, which is why the next pass gets a
+	// full syncTimeout rather than an already-expired one.
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return &RollingUpdateResult{Error: err}
 	}
 
-	// Return completed=false, no requeue — the operator waits for a new spec change.
+	// Return completed=false and no requeue. That ends THIS pass without a wait — it
+	// does not end the roll: any later pass that finds an outdated pod dispatches
+	// again on a fresh budget (see the function comment).
 	return &RollingUpdateResult{}
 }
 

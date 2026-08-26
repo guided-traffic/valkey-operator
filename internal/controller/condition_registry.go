@@ -164,10 +164,14 @@ var conditionRegistry = []conditionOwnership{
 		conditionType: vkov1.ConditionTypeRollingUpdatePaused,
 		kind:          conditionEdge,
 		evaluators:    1,
-		clearSite:     "finalizeRollingUpdate - Sentinel dispatch only",
-		// The False write at that site is not presence-guarded either.
-		presenceGuarded: false,
-		declaredGap:     "T15: pauseRollingUpdate is reachable on every topology but the only clear sits in finalizeRollingUpdate, which only the Sentinel dispatcher calls - so a non-Sentinel cluster keeps the condition for life",
+		// Two sites, one frame above the dispatch, so every topology reaches them --
+		// the clear used to sit inside finalizeRollingUpdate, which only the Sentinel
+		// arm calls. The converged one is additionally gated on tier convergence: a
+		// pod that does not exist is skipped by the ordinal loop and a replacement is
+		// up to date the instant it appears, so "no pod needs updating" is not "the
+		// tier converged" (ADR 0002 D10b).
+		clearSite:       "clearRollingUpdatePaused, from the converged early return (tier-converged) and from the completion branch of checkAndHandleRollingUpdate",
+		presenceGuarded: true,
 	},
 	{
 		conditionType: vkov1.ConditionTypeTLSMaterialStale,

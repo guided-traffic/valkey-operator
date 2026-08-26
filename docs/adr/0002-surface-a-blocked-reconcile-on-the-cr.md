@@ -23,6 +23,14 @@ in this repository: `make test-unit`, `make lint` and `make cyclo` are green, an
 regression test was confirmed to fail against the pre-fix code. No e2e or integration suite
 was run for this amendment.
 
+Amended again 2026-08-26: **D10b**, the third instance of the D10 shape, closes the
+`RollingUpdatePaused` clear gap D10 named as a separate open item — and D10's own
+convergence proof is marked **corrected in place**, because the claim that both
+`verifyTopologyRestored` completion sites are entered through `updatedCount == totalPods`
+is false. Implemented and verified in this repository: `make test-unit`, `make lint` and
+`make cyclo` green, three of the six new probes confirmed to fail against the pre-fix code.
+No e2e or integration suite was run.
+
 Amended 2026-08-22: D7 keeps its rule for the conditions this ADR is about, and gains an
 exception. `setStatusCondition` is now a logging wrapper around `writeStatusCondition`,
 which returns the error and retries a conflict against a freshly read CR; a caller whose
@@ -219,17 +227,67 @@ The clear is therefore also called from the `result.Completed` branch of
 write cannot skip it. The convergence proof there is `updatedCount == totalPods`, which
 `countUpdatedPods` evaluates as `!needsUpdate && reachable()` over the whole tier — not the
 `Completed` flag itself, because two of the completion sites inside
-`verifyTopologyRestored` are stalled completions that could not re-read the pods; both are
-entered only through that same count, so the proof holds for them too. Guarded by
+`verifyTopologyRestored` are stalled completions that could not re-read the pods; ~~both are
+entered only through that same count, so the proof holds for them too~~. Guarded by
 `TestCheckAndHandleRollingUpdate_CompletionClearsSidecarUpdatePending`
 ([`internal/controller/sidecar_pending_condition_test.go`](../../internal/controller/sidecar_pending_condition_test.go)),
 confirmed to fail without the call.
 
+> **Corrected 2026-08-26.** The struck sentence is false and was false when it was written.
+> `verifyTopologyRestored` has two callers: one inside the `updatedCount == totalPods`
+> branch of `handleMultiReplicaRollingUpdate`, and one in `dispatchMultiReplicaState`,
+> whose only caller sits **after** that branch closes — so `Completed: true` is reachable
+> with `updatedCount != totalPods`. The site is kept: the dispatch target declaring the
+> roll finished is the strongest statement available, and every clear here is
+> presence-guarded, so the cost of the weaker proof is a report retracted one pass early
+> rather than a condition invented. The same correction is made in the code comment at
+> that site.
+
 Clearing from inside `clearRollingUpdateState` instead — one site covering all eight of its
 callers — was considered and **rejected**: two of those callers clear state *mid-roll*
 without proving convergence, so it would erase a `True` that is still accurate. The same
-trap makes it the wrong site for `RollingUpdatePaused`, whose own clear gap is a separate
-open item.
+trap makes it the wrong site for `RollingUpdatePaused`, ~~whose own clear gap is a separate
+open item~~ — closed 2026-08-26 by D10b.
+
+**D10b — `RollingUpdatePaused` is cleared from the same two sites, and the converged one
+is gated.** Added 2026-08-26, the third instance of this shape.
+
+The condition had exactly one clear, inside `finalizeRollingUpdate`, which only the Sentinel
+dispatch arm calls. `pauseRollingUpdate` is reachable on two of the three topologies — the
+`default:` arm (`replicas <= 1` without Sentinel) has no pause site in its call graph — so a
+**multi-replica cluster without Sentinel** could set the condition and had no code path that
+ever cleared it. The collector exports every condition as `vko_valkey_status_condition`
+([ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) D1), so that is a
+permanently firing series rather than a stale row.
+
+The second half ran the other way and was already on the fleet rather than waiting to
+happen: that `False` write was **not** presence-guarded, and `meta.SetStatusCondition` adds
+an absent condition, so every Sentinel CR that ever completed a roll *gained* a condition it
+never had. The write is deleted, not moved.
+
+Both clears now sit in `checkAndHandleRollingUpdate`, presence-guarded, next to the
+`SidecarUpdatePending` ones — but the converged early return is **gated on tier
+convergence**, and that asymmetry is the decision. "No pod needs updating" is not "the tier
+converged": the ordinal loop skips a pod that does not exist, and a pod recreated on the
+current template is up to date the instant it appears — both of which happen in the middle
+of a replacement the operator is still waiting on. A deferred sidecar update is answered by
+the templates matching; a pause is not. Clearing ungated there was measured to write `False`
+onto a stuck roll, which turns a permanently stale `True` into a permanently wrong `False` —
+the worse failure, because it says a stuck roll is fine.
+
+The two sites carry different reasons on purpose: `Completed` where a dispatch target
+reported the roll finished, `Converged` where there was no roll left to run at all. Saying
+"completed" on a spec that was simply put back would be a claim the operator cannot support.
+
+Guarded by six probes in
+[`internal/controller/rolling_update_paused_condition_test.go`](../../internal/controller/rolling_update_paused_condition_test.go),
+three of which fail without the change; the gate is what the two "a pod is missing" and "a
+pod is not Ready" probes exist for. **Not verified:** whether the shape those two describe
+occurs on a real cluster — it was produced in a fixture. The gate is taken anyway because it
+costs two lines.
+
+`pauseRollingUpdate` still halts nothing, and the four places that said it did are corrected
+in the same change. That is a separate item (T23), not part of D10b.
 
 **D10a — The condition names the pod and the number the decision was made on.** Added
 2026-08-26. The message was the fixed string "Standalone pod has an outdated sidecar image",
@@ -427,7 +485,9 @@ after that.
 ## References
 
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) — `setReconcileBlockedCondition`, `isAdmissionRejection`, `withBlockedPass`, `passIsBlocked`, `compactErrorMessage`, `truncateConditionMessage`
-* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `setStatusCondition`, `persistStatus`, `writePhase`, `currentMasterPod`, `clearSidecarUpdatePending`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `setStatusCondition`, `persistStatus`, `writePhase`, `currentMasterPod`, `clearSidecarUpdatePending`, `clearRollingUpdatePaused`, `clearRollingUpdatePausedIfConverged`
+* [`internal/controller/rolling_update_paused_condition_test.go`](../../internal/controller/rolling_update_paused_condition_test.go) — the six D10b probes, including the two the convergence gate exists for
+* [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — the registry that declared this gap and the row D10b closes
 * [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) — why the pass reaches the status write at all
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the failure mode this condition deliberately does not cover
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — why split-brain paths requeue instead of ending the pass
