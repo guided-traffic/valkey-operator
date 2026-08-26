@@ -1142,14 +1142,7 @@ func countMasters(pods []podState) int {
 func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vkov1.Valkey, pods []podState, masterIdx int, knownMaster string) ([]podState, int) {
 	logger := log.FromContext(ctx)
 
-	// Count pods reporting as master.
-	var masterIndices []int
-	for i, ps := range pods {
-		if ps.isMaster {
-			masterIndices = append(masterIndices, i)
-		}
-	}
-
+	masterIndices := mastersAmong(pods)
 	if len(masterIndices) <= 1 {
 		return pods, masterIdx // No split-brain.
 	}
@@ -1157,50 +1150,216 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 	logger.Info("Split-brain detected: multiple masters found",
 		"masterCount", len(masterIndices), "masterIndices", masterIndices)
 
-	// Determine the real master from the authoritative name, if one was given.
+	// Rule 1, evidence first: the drain stamp. Ambiguous evidence ends the
+	// resolution rather than falling through to the annotation
+	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D10).
+	stamped := r.stampedMastersAmong(ctx, v, pods, masterIndices)
+	if len(stamped) > 1 {
+		logger.Info("Split-brain resolution refused: more than one drain-promoted master confirms the role",
+			"stamped", podNamesAt(pods, stamped))
+		return pods, masterIdx
+	}
+
 	realMasterIdx := -1
-	var rogueIndices []int
-
-	if knownMaster != "" {
-		for _, idx := range masterIndices {
-			if pods[idx].name == knownMaster {
-				realMasterIdx = idx
-			} else {
-				rogueIndices = append(rogueIndices, idx)
-			}
+	if len(stamped) == 1 {
+		var ok bool
+		if realMasterIdx, ok = r.adoptStampedMaster(ctx, v, pods[stamped[0]], stamped[0]); !ok {
+			return pods, masterIdx
 		}
 	}
 
-	// Fallback: if no authority names one of them, prefer the one with the
-	// most connected slaves (the one actively serving replicas has the real data).
+	// Rule 2: the authority the caller named, if it names one of the masters.
 	if realMasterIdx < 0 {
-		checker := r.getInstanceChecker()
-		bestIdx := masterIndices[0]
-		bestSlaves := -1
-		for _, idx := range masterIndices {
-			info, err := checker.GetReplicationInfo(ctx, v, pods[idx].name)
-			if err != nil {
-				continue
-			}
-			if info.ConnectedSlaves > bestSlaves {
-				bestSlaves = info.ConnectedSlaves
-				bestIdx = idx
-			}
-		}
-		realMasterIdx = bestIdx
-		rogueIndices = nil
-		for _, idx := range masterIndices {
-			if idx != realMasterIdx {
-				rogueIndices = append(rogueIndices, idx)
-			}
-		}
+		realMasterIdx = indexOfName(pods, masterIndices, knownMaster)
 	}
 
+	// Rule 3: no evidence and no authority -- prefer the master with the most
+	// connected slaves (the one actively serving replicas has the real data).
+	if realMasterIdx < 0 {
+		realMasterIdx = r.mostConnectedMaster(ctx, v, pods, masterIndices)
+	}
+
+	rogueIndices := indicesExcept(masterIndices, realMasterIdx)
 	logger.Info("Split-brain resolution: identified real master",
 		"realMaster", pods[realMasterIdx].name, "rogueCount", len(rogueIndices))
 
-	// Demote all rogue masters via REPLICAOF.
+	r.demoteRogues(ctx, v, pods, realMasterIdx, rogueIndices)
+	return pods, realMasterIdx
+}
+
+// mastersAmong returns the indices of the pods that report the master role.
+func mastersAmong(pods []podState) []int {
+	var indices []int
+	for i, ps := range pods {
+		if ps.isMaster {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// podNamesAt resolves a list of pod indices to their names, for log lines.
+func podNamesAt(pods []podState, indices []int) []string {
+	names := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		names = append(names, pods[idx].name)
+	}
+	return names
+}
+
+// indexOfName returns the index among candidates whose pod carries name, or -1.
+// An empty name matches nothing, which is how "no authority was given" arrives here.
+func indexOfName(pods []podState, candidates []int, name string) int {
+	if name == "" {
+		return -1
+	}
+	for _, idx := range candidates {
+		if pods[idx].name == name {
+			return idx
+		}
+	}
+	return -1
+}
+
+// indicesExcept returns every entry of candidates other than keep.
+func indicesExcept(candidates []int, keep int) []int {
+	var rest []int
+	for _, idx := range candidates {
+		if idx != keep {
+			rest = append(rest, idx)
+		}
+	}
+	return rest
+}
+
+// stampedMastersAmong returns the indices of the reported masters that carry a
+// drain-promotion stamp. The stamp is already on the Pod object podState holds, so
+// the healthy case -- no split brain at all -- never reaches this and the split-brain
+// case costs no connection.
+//
+// It is the one signal that still discriminates inside a rolling update. Every
+// structural or temporal rule the steady-state resolver uses fires on states the
+// operator itself produces here: the pod it just promoted is legitimately the younger
+// object, and the replica it is about to demote legitimately could not have
+// self-elected. The stamp cannot be one of those states, because recordPromotedMaster
+// clears every stamp of the cluster at the moment the operator records a promotion of
+// its own (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D16),
+// so a stamp still present during a roll is a promotion that happened AFTER the last
+// one the operator recorded.
+//
+// Unlike the steady-state stampedMasters this does not re-probe the role: podState
+// was built from a live INFO in collectPodStates moments ago, which is the same
+// confirmation.
+func (r *ValkeyReconciler) stampedMastersAmong(ctx context.Context, v *vkov1.Valkey,
+	pods []podState, masterIndices []int) []int {
+	sts, err := r.ownedDataStatefulSet(ctx, v)
+	if err != nil {
+		log.FromContext(ctx).Info("Cannot prove the data StatefulSet is ours; ignoring drain stamps this pass",
+			"error", err)
+		return nil
+	}
+
+	var stamped []int
+	for _, idx := range masterIndices {
+		pod := pods[idx].pod
+		// A pod this cluster's StatefulSet did not create proves nothing, and this
+		// signal may adopt (docs/adr/0020-write-only-what-the-operator-owns.md, D9).
+		if pod == nil || !podIsOurs(pod, sts) {
+			continue
+		}
+		if hasDrainStamp(pod) {
+			stamped = append(stamped, idx)
+		}
+	}
+	return stamped
+}
+
+// adoptStampedMaster records the drain-promoted pod as the known master and reports
+// the index the resolution should use.
+//
+// Recording comes first and gates the rest, exactly as adoptAndConsolidate does in
+// steady state: an unrecorded promotion is not an authority
+// (docs/adr/0009-an-unrecorded-promotion-is-not-a-promotion.md), and demoting toward a
+// pod the CR does not name would have the next pass read the old annotation back and
+// undo the consolidation. A failed record therefore resolves nothing this pass; the
+// next one retries with the stamp still in place.
+//
+// It leaves vko.gtrfc.com/promoted-pod alone. That annotation is the state machine's
+// own bookkeeping and the switch in handleMultiReplicaRollingUpdate is the single
+// place its authority role is decided
+// (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D11); rewriting
+// it from here would put a second writer on it. The price is recorded in ADR 0028.
+func (r *ValkeyReconciler) adoptStampedMaster(ctx context.Context, v *vkov1.Valkey,
+	promoted podState, promotedIdx int) (int, bool) {
+	logger := log.FromContext(ctx)
+
+	if promoted.name == knownMasterPodName(v) {
+		return promotedIdx, true // Already recorded; nothing to write.
+	}
+
+	host := fmt.Sprintf("%s.%s.%s.svc.cluster.local", promoted.name,
+		common.HeadlessServiceName(v, common.ComponentValkey), v.Namespace)
+	previous := knownMasterPodName(v)
+	if err := r.recordPromotedMaster(ctx, v, host); err != nil {
+		logger.Info("Could not record the drain-promoted master; resolving nothing this pass",
+			"pod", promoted.name, "knownMaster", previous, "error", err)
+		return -1, false
+	}
+
+	logger.Info("Adopted a drain promotion the operator did not perform",
+		"pod", promoted.name, "previousKnownMaster", previous, "evidence", evidenceDrainStamp)
+	return promotedIdx, true
+}
+
+// mostConnectedMaster picks the master serving the most replicas. It is the last
+// resort: with a shrunken cluster every master reports zero connected slaves and the
+// tie falls to the lowest ordinal
+// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D3), which is
+// why the demotion it feeds is still gated by the dataset veto.
+func (r *ValkeyReconciler) mostConnectedMaster(ctx context.Context, v *vkov1.Valkey,
+	pods []podState, masterIndices []int) int {
+	checker := r.getInstanceChecker()
+	bestIdx := masterIndices[0]
+	bestSlaves := -1
+	for _, idx := range masterIndices {
+		info, err := checker.GetReplicationInfo(ctx, v, pods[idx].name)
+		if err != nil {
+			continue
+		}
+		if info.ConnectedSlaves > bestSlaves {
+			bestSlaves = info.ConnectedSlaves
+			bestIdx = idx
+		}
+	}
+	return bestIdx
+}
+
+// demoteRogues sends REPLICAOF to every rogue master the dataset veto does not
+// protect.
+//
+// A vetoed rogue keeps isMaster set. That is the deadlock the unconditional clear
+// below exists to break, deliberately re-entered: the rolling update then makes no
+// further progress on that pod until the bound of its state expires, and every state
+// that reaches here with a named authority has one
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md). Two masters a human can see
+// beat one dataset silently discarded.
+//
+// No Event. The refusal is already legible: resolveSplitBrain carries the level in the
+// MultipleMasters condition and emits SplitBrainDetected once the window outlives
+// splitBrainWarnAfter, and a per-pass Event here would rebuild exactly the Warning
+// noise ADR 0025 removed.
+func (r *ValkeyReconciler) demoteRogues(ctx context.Context, v *vkov1.Valkey,
+	pods []podState, realMasterIdx int, rogueIndices []int) {
+	logger := log.FromContext(ctx)
+	keys := r.dbSizeReader(ctx, v)
+
 	for _, rogueIdx := range rogueIndices {
+		if reason := demotionRefusalReason(keys, pods[realMasterIdx], pods[rogueIdx]); reason != "" {
+			logger.Info("Refusing to demote a rogue master: the demotion would discard the only dataset",
+				"roguePod", pods[rogueIdx].name, "realMaster", pods[realMasterIdx].name, "reason", reason)
+			continue
+		}
+
 		if err := r.demoteRogueMaster(ctx, v, pods[rogueIdx], pods[realMasterIdx].name); err != nil {
 			logger.Info("Failed to demote rogue master (will retry next reconcile)",
 				"pod", pods[rogueIdx].name, "error", err)
@@ -1211,8 +1370,66 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 		// container queries Sentinel for the correct role.
 		pods[rogueIdx].isMaster = false
 	}
+}
 
-	return pods, realMasterIdx
+// dbSizeReader returns a function that reads DBSIZE from a pod of this cluster, or
+// nil when the connection parameters cannot be built at all. Built once per
+// resolution so a three-master pass pays for one TLS config and one Secret read.
+func (r *ValkeyReconciler) dbSizeReader(ctx context.Context, v *vkov1.Valkey) func(string) (int, error) {
+	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
+	if err != nil {
+		log.FromContext(ctx).Info("Could not build TLS config for the pre-demotion key counts", "error", err)
+		return nil
+	}
+	password := r.readValkeyPassword(ctx, v)
+	port := int(builder.ServicePort(v))
+	return func(podName string) (int, error) {
+		addr := health.PodAddressForComponent(v, podName, common.ComponentValkey, port)
+		return r.newValkeyClient(addr, password, tlsConfig).DBSize()
+	}
+}
+
+// demotionRefusalReason reports why demoting rogue toward authority must not happen,
+// or an empty string when it may.
+//
+// It is verifyPromotionCandidateHoldsData pointed at the destructive direction. A
+// REPLICAOF discards the demoted pod's dataset, so an authority that holds no keys
+// while the rogue holds some is the one shape that cannot be a state the operator
+// produced: the operator never promotes an empty candidate over a non-empty master.
+// What it usually is instead is a recorded master that was deleted and came back on a
+// volume that lost the data -- and the record is what made it a master again, because
+// the replica ConfigMap names it and the init script hands it the self-claim
+// (docs/adr/0008-known-master-annotation-is-the-recorded-authority.md, D8, D9).
+//
+// Fail-closed, and the asymmetry with the promotion path is deliberate rather than
+// overlooked. There an unreadable count costs a wait while the master keeps serving;
+// here it costs a growing divergence between two masters that both accept writes. The
+// trade is still one-sided: the divergence is bounded, visible and repairable by a
+// human, and a wrong REPLICAOF is none of the three
+// (docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md, D3).
+func demotionRefusalReason(keys func(string) (int, error), authority, rogue podState) string {
+	if keys == nil {
+		return "the key counts are unavailable"
+	}
+
+	authorityKeys, err := keys(authority.name)
+	if err != nil {
+		return fmt.Sprintf("the key count of %s is unavailable: %v", authority.name, err)
+	}
+	if authorityKeys > 0 {
+		// The authority holds data of its own; this is not the shape.
+		return ""
+	}
+
+	rogueKeys, err := keys(rogue.name)
+	if err != nil {
+		return fmt.Sprintf("the key count of %s is unavailable: %v", rogue.name, err)
+	}
+	if rogueKeys == 0 {
+		// Both empty: nothing to lose, and an empty cluster is a legitimate state.
+		return ""
+	}
+	return fmt.Sprintf("%s holds no keys while %s holds %d", authority.name, rogue.name, rogueKeys)
 }
 
 // getSentinelMasterPodName queries Sentinel for the authoritative master and
@@ -3207,6 +3424,30 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 // and a successful write here still leaves the ADR 0008 D10, D11 window open. Closing that would
 // require persisting before promoting, which the state machine does not support.
 func (r *ValkeyReconciler) persistManualFailoverState(ctx context.Context, v *vkov1.Valkey, promotedPodName, promotedHost string) error {
+	if err := r.writeManualFailoverState(ctx, v, promotedPodName, promotedHost); err != nil {
+		return err
+	}
+
+	// The write above IS a record of a promotion, so every drain stamp still on a pod
+	// of this cluster is now spent evidence. recordPromotedMaster clears them for the
+	// promotions that go through it; this path writes the known master directly and
+	// was the site ADR 0011 D16 names as covered only at clearRollingUpdateState -- at
+	// the END of the roll. Harmless while the rolling-update resolver ignored stamps;
+	// once it reads them (ADR 0028 D2), a stamp from an earlier drain in the same roll
+	// would outrank the promotion this function just recorded and demote a pod the
+	// operator verified holds data.
+	//
+	// A failed clear is logged and nothing else, for the reason ADR 0011 D18 gives:
+	// the promotion is already recorded, and aborting here would trade a possible
+	// wrong adoption later for a certainly inconsistent state now.
+	r.clearDrainStamps(ctx, v)
+	return nil
+}
+
+// writeManualFailoverState performs the annotation write of persistManualFailoverState,
+// with the bounded conflict retry. Split out so the stamp clear above runs exactly once,
+// on the success of either the direct write or the retry.
+func (r *ValkeyReconciler) writeManualFailoverState(ctx context.Context, v *vkov1.Valkey, promotedPodName, promotedHost string) error {
 	// The fourth annotation is the bound of the state this write enters
 	// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D6). It is armed once, before the first
 	// attempt, so a conflict retry re-applies the same deadline rather than handing the state a fresh

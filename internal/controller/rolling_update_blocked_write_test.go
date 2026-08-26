@@ -67,10 +67,9 @@ func podFromStsTemplate(v *vkov1.Valkey, sts *appsv1.StatefulSet, ordinal int) *
 			Name:        fmt.Sprintf("%s-%d", sts.Name, ordinal),
 			Namespace:   v.Namespace,
 			Annotations: annotations,
-			Labels: map[string]string{
-				common.LabelInstance:  v.Name,
-				common.LabelComponent: common.ComponentValkey,
-			},
+			// The full selector set, as the StatefulSet stamps it -- see the note on
+			// createPodForSts for what a missing LabelManagedBy silently hid.
+			Labels: common.SelectorLabels(v, common.ComponentValkey),
 		},
 		Spec: corev1.PodSpec{Containers: containers},
 		Status: corev1.PodStatus{

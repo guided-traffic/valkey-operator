@@ -67,6 +67,7 @@ A reader must never find the old rule stated as current.
 | [0024](0024-the-sentinel-tier-reports-its-own-completion.md) | The Sentinel tier reports its own completion — RollingUpdateComplete means the data tier |
 | [0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) | A Warning named split-brain means one that did not resolve itself |
 | [0026](0026-a-pod-being-deleted-is-not-available.md) | A pod being deleted is not available — readiness answers reachability, never spendability |
+| [0028](0028-a-demotion-may-not-discard-the-only-dataset.md) | A demotion may not discard the only dataset — the roll resolver gets the drain stamp and a key-count veto |
 
 ### Security and API surface
 

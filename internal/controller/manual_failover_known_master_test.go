@@ -36,6 +36,16 @@ import (
 // the failover path (REPLICAOF, WAIT) succeeds in a unit test.
 func fakeValkeyServer(t *testing.T) string {
 	t.Helper()
+	return fakeValkeyServerWithKeys(t, 4711)
+}
+
+// fakeValkeyServerWithKeys is fakeValkeyServer with the DBSIZE reply under the test's
+// control. The count is what the pre-promotion guard (ADR 0007 D10) and the
+// pre-demotion dataset veto (ADR 0028 D1) both read, and the two disagree about which
+// answer is safe -- so a fixture that hardcoded one number could only ever exercise one
+// of them.
+func fakeValkeyServerWithKeys(t *testing.T, keys int) string {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -63,7 +73,7 @@ func fakeValkeyServer(t *testing.T) string {
 				case strings.Contains(request, "WAIT"):
 					_, _ = conn.Write([]byte(":1\r\n"))
 				case strings.Contains(request, "DBSIZE"):
-					_, _ = conn.Write([]byte(":4711\r\n"))
+					_, _ = fmt.Fprintf(conn, ":%d\r\n", keys)
 				default:
 					_, _ = conn.Write([]byte("+OK\r\n"))
 				}
@@ -236,12 +246,10 @@ func TestHandleMultiReplicaRollingUpdate_DoesNotDemotePromotedPod(t *testing.T) 
 
 	r, _ := newTestReconciler(v, sts, replicaCM, pods[0].pod, pods[1].pod)
 
-	var contacted []string
-	addr := fakeValkeyServer(t)
-	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
-		contacted = append(contacted, target)
-		return valkeyclient.New(addr)
-	}
+	// Asserted on the command the promoted pod received, not on whether it was
+	// contacted at all: the resolver reads a key count from the pod it is protecting
+	// (ADR 0028 D1), so a probe of test-1 is now expected and only a REPLICAOF is not.
+	fleet := newValkeyFleet(t, r, map[string]int{"test-0": 4711, "test-1": 4711})
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
 			return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
@@ -250,10 +258,8 @@ func TestHandleMultiReplicaRollingUpdate_DoesNotDemotePromotedPod(t *testing.T) 
 
 	r.handleMultiReplicaRollingUpdate(context.Background(), v, sts)
 
-	for _, target := range contacted {
-		assert.NotContains(t, target, "test-1.",
-			"the promoted pod must not be demoted while the failover is in flight")
-	}
+	assert.False(t, fleet.sawReplicaOf("test-1"),
+		"the promoted pod must not be demoted while the failover is in flight")
 }
 
 // --- ADR 0009 D2, D3: the write that records the promotion gets a bounded conflict retry ---

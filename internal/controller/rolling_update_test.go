@@ -725,10 +725,11 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: v.Namespace,
-			Labels: map[string]string{
-				common.LabelInstance:  v.Name,
-				common.LabelComponent: common.ComponentValkey,
-			},
+			// The full selector set, as the StatefulSet stamps it. LabelManagedBy was
+			// missing here, so every List(MatchingLabels(SelectorLabels)) -- the drain
+			// stamp clear among them -- matched nothing in a unit test and silently
+			// looked like a no-op that succeeded.
+			Labels: common.SelectorLabels(v, common.ComponentValkey),
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -4069,6 +4070,10 @@ func TestDetectAndResolveSplitBrain_TwoMasters_FallbackToConnectedSlaves(t *test
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	// Mock: pod-0 reports master with 0 slaves, pod-1 reports master with 1 slave.
 	// Sentinel is unreachable (unit test, no real sentinel), so fallback to slave count.
 	r.InstanceChecker = &mockInstanceChecker{
@@ -4118,6 +4123,10 @@ func TestDetectAndResolveSplitBrain_SentinelBasedResolution(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
@@ -4149,6 +4158,10 @@ func TestDetectAndResolveSplitBrain_ThreeMasters(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4195,6 +4208,10 @@ func TestDetectAndResolveSplitBrain_ReplicationInfoUnavailable(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	// All replication info calls fail — fallback picks the first master index.
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
@@ -4233,6 +4250,10 @@ func TestDetectAndResolveSplitBrain_RoguePodNotReady(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			if podName == "test-1" {
@@ -4306,6 +4327,10 @@ func TestHandleRollingUpdate_HA_SplitBrain_BreaksDeadlock(t *testing.T) {
 	pod2 := createPodForSts(v, 2, "valkey/valkey:9.0", true)
 
 	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the deadlock
+	// rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4408,14 +4433,14 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 
 	r, _ := newTestReconciler(v, sts, pod0, pod1, pod2)
 
-	// A server that answers REPLICAOF, so the demotion is exercised for real instead
-	// of dying on a refused connection.
-	addr := fakeValkeyServer(t)
-	var demoted []string
-	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
-		demoted = append(demoted, target)
-		return valkeyclient.New(addr)
-	}
+	// One server per pod, each answering REPLICAOF and a non-empty DBSIZE, so the
+	// demotion is exercised for real and the dataset veto (ADR 0028 D1) stays inert.
+	// The assertion is on the command each pod received, not on which pod was
+	// contacted: the resolver reads a key count from the master it is protecting, so
+	// being contacted no longer means being demoted.
+	fleet := newValkeyFleet(t, r, map[string]int{
+		"mr-split-0": 4711, "mr-split-1": 4711, "mr-split-2": 4711,
+	})
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4438,8 +4463,8 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 
 	// The master without connected slaves is the rogue one and the only pod that may
 	// be demoted — demoting pod-1 would point the data it serves at an empty master.
-	require.Len(t, demoted, 1, "exactly one pod must be demoted")
-	assert.Contains(t, demoted[0], "mr-split-0.", "the rogue master must be the demoted pod")
+	assert.True(t, fleet.sawReplicaOf("mr-split-0"), "the rogue master must be the demoted pod")
+	assert.False(t, fleet.sawReplicaOf("mr-split-1"), "the master serving replicas must not be demoted")
 }
 
 // --- Two-phase handleTopologyRestoration ---

@@ -255,20 +255,22 @@ func TestVerifyTopologyRestored_PrefersKnownMasterOverLowestOrdinal(t *testing.T
 		},
 	}
 
-	addr := fakeValkeyServer(t)
-	var demoted []string
-	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
-		demoted = append(demoted, target)
-		return valkeyclient.New(addr)
-	}
+	// Both masters hold keys, so the dataset veto (ADR 0028 D1) stays inert and the
+	// subject of the test remains the authority. The assertion is on the command each
+	// pod received rather than on which pod was contacted: the resolver now reads a key
+	// count from the master it is protecting.
+	fleet := newValkeyFleet(t, r, map[string]int{
+		name + "-0": 4711, name + "-1": 4711, name + "-2": 4711,
+	})
 
 	result := r.verifyTopologyRestored(context.Background(), v, sts)
 
 	require.Nil(t, result.Error)
 	assert.True(t, result.NeedsRequeue)
-	require.Len(t, demoted, 1, "exactly one of the two masters may be demoted")
-	assert.Contains(t, demoted[0], name+"-0.",
+	assert.True(t, fleet.sawReplicaOf(name+"-0"),
 		"the known master holds the data; pod-0 is the rogue one")
+	assert.False(t, fleet.sawReplicaOf(name+"-1"),
+		"the pod the known-master annotation names must not be demoted")
 }
 
 // TestVerifyTopologyRestored_CompletesWhenPodLookupKeepsFailing bounds the one

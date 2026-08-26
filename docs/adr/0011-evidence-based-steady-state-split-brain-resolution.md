@@ -9,6 +9,10 @@ the shared `demoteRogueMaster` helper (D20) emits `SplitBrainResolved` as a **No
 and the Consequence about status invisibility is narrowed to this check. Both are marked in
 place below.
 
+Amended 2026-08-26 by [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md): D3's
+premise about what the operator knows inside a rolling update, and D16's list of stamp-clearing
+sites. Both are marked in place below.
+
 Supersedes two earlier shapes of the same check, both written and discarded during
 development on this branch. **Neither shipped, and neither is reproducible from git:**
 `internal/controller/steady_state_master.go` has exactly one commit in the whole history
@@ -71,10 +75,18 @@ state annotation is set. The healthy case costs no connection at all.
 
 **D3 — It never tie-breaks.** `detectAndResolveSplitBrain` is deliberately **not** reused,
 so the "most connected slaves" fallback stays unreachable from outside a rolling update.
-Inside an update the operator knows which pod it promoted; in steady state it does not,
+~~Inside an update the operator knows which pod it promoted; in steady state it does not,~~
 and that fallback ties at zero in a shrunken cluster and picks the lowest ordinal — the
 exact mechanism that destroyed a promoted pod's data (the loss was observed on a cluster;
 what is checkable in this repository is the tie-at-zero fallback itself).
+
+*Amended 2026-08-26 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D9).*
+The struck premise holds for the operator's **own** promotions and not for a sidecar drain
+that lands mid-roll: that promotion is recorded on the pod, not on the CR, so inside an
+update the operator knows which pod *it* promoted and nothing more. ADR 0028 closes the gap
+at the other site rather than here — the non-reuse itself stands, and its argument is now
+stronger: both branches of `refuseDemotion` fire on states a rolling update produces on
+purpose, so porting them would refuse every normal failover and every topology restoration.
 
 **D4 — The contract on the annotation, sharpened rather than widened:**
 
@@ -225,7 +237,14 @@ blocked the managed-resource writes can also reject those two; that failure is l
 next pass retries, and `persistKnownMaster` restores the in-memory value it could not write,
 leaving nothing half-applied.
 
-**D16 — The stamp has a lifecycle, and clearing it is correctness, not hygiene.** A stamp
+**D16 — The stamp has a lifecycle, and clearing it is correctness, not hygiene.**
+
+*Amended 2026-08-26 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D7).*
+~~The two clearing sites are `recordPromotedMaster` and `clearRollingUpdateState`.~~ There
+are three: `persistManualFailoverState` clears them too. It writes the known master
+directly, and covering it only at `clearRollingUpdateState` left a stale stamp in place for
+the whole roll — harmless while the roll resolver ignored stamps, and a wrong demotion once
+it reads them. A stamp
 means "a promotion nobody recorded", so once the operator records one the stamp is **spent
 evidence** — and evidence beats the annotation on the next pass (rule 1 is evidence-first),
 so a leftover stamp would have the operator adopt the stale pod and `REPLICAOF` the master

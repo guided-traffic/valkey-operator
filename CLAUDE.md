@@ -431,10 +431,10 @@ standing constraint on new code**, not a one-time audit. The same ADR carries th
 depends on which pod replied first.
 → [ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)
 
-## The non-Sentinel master authority, in five rules
+## The non-Sentinel master authority, in six rules
 
 Without Sentinel nothing external arbitrates who the master is, and every mistake in this area
-is a `REPLICAOF` that discards a dataset. Five ADRs carry the design; the load-bearing
+is a `REPLICAOF` that discards a dataset. Six ADRs carry the design; the load-bearing
 sentences are repeated here so nothing is changed without them.
 
 1. **`vko.gtrfc.com/known-master` is the operator's recorded master authority.** It feeds the
@@ -468,6 +468,18 @@ sentences are repeated here so nothing is changed without them.
    to `Handle` inherits that contract: every exit path releases the marker, or every pod
    deletion in the fleet pays the 60 s bound.
    → [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+6. **A demotion may not discard the only dataset.** The rolling-update resolver stopped
+   trusting the named authority unconditionally: an authority holding zero keys while the rogue
+   holds some ends that demotion, and an unreadable count is a refusal, not a demotion. Both
+   empty is not a refusal. **Inside a roll only two signals discriminate — the drain stamp and
+   the dataset** — because every structural or temporal signal is a state the operator itself
+   produces: the pod it just promoted is legitimately the younger object, and the replica it is
+   about to demote legitimately could not have self-elected. One stamped master is adopted and
+   recorded before anything is demoted; two are ambiguous and demote nobody. A refusal emits no
+   Event — `MultipleMasters` and the 90 s `SplitBrainDetected` already carry it — and it
+   deliberately re-enters the deadlock the resolver exists to break, which is safe only because
+   every state that names an authority is bounded.
+   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)
 
 ## Provenance before every write and every delete
 
