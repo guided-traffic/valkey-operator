@@ -854,16 +854,46 @@ jobs:
           echo "📊 Combined Coverage: ${TOTAL_COVERAGE}%"
           echo "========================================"
 
-          # Extract coverage by package for detailed report
-          echo "## Coverage by Package" > coverage/summary.txt
-          grep -v "total:" coverage/coverage.txt | awk '{printf "- **%s**: %s\n", $1, $3}' >> coverage/summary.txt || true
+          # Coverage per package, aggregated from the profile rather than from the
+          # per-function report. The previous version awk'd coverage.txt, which has one
+          # line per *function* -- 660 lines and 62 KB despite being called "by package",
+          # and an unweighted mean would have been wrong anyway. Aggregating statements
+          # out of the profile gives one line per package (14) and the correct number.
+          #
+          # Blocks are deduplicated by location before summing: the merge above simply
+          # concatenates the unit and integration profiles, so every block that both runs
+          # touched appears twice. Under "mode: set" a block counts as covered when any
+          # run covered it, which is the max of the two counts.
+          python3 - <<'PY' > coverage/summary.txt
+          import collections
 
-          # Store coverage text for PR comment
-          {
-            echo "coverage_text<<EOF"
-            cat coverage/coverage.txt
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+          blocks = {}
+          with open("coverage-merged.out") as fh:
+              next(fh, None)  # drop the "mode:" line
+              for line in fh:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  loc, num_stmt, count = line.rsplit(" ", 2)
+                  prev = blocks.get(loc)
+                  count = int(count)
+                  if prev is None or count > prev[1]:
+                      blocks[loc] = (int(num_stmt), count)
+
+          per_pkg = collections.defaultdict(lambda: [0, 0])
+          for loc, (num_stmt, count) in blocks.items():
+              pkg = loc.rsplit(":", 1)[0].rsplit("/", 1)[0]
+              per_pkg[pkg][0] += num_stmt
+              if count > 0:
+                  per_pkg[pkg][1] += num_stmt
+
+          print("| Package | Coverage | Statements |")
+          print("|---|---:|---:|")
+          for pkg in sorted(per_pkg):
+              total, covered = per_pkg[pkg]
+              pct = (100.0 * covered / total) if total else 0.0
+              print(f"| `{pkg}` | {pct:.1f}% | {covered}/{total} |")
+          PY
 
           # Add to step summary
           echo "## Combined Coverage Report" >> $GITHUB_STEP_SUMMARY
@@ -975,7 +1005,24 @@ jobs:
         if: github.event_name == 'pull_request'
         id: coverage-summary
         run: |
-          # Create a formatted summary
+          # A with: input reaches the action as a single environment variable, and Linux
+          # caps one of those at MAX_ARG_STRLEN = 131072 bytes. Exceeding it does not
+          # truncate anything -- execve fails and the step dies with "Argument list too
+          # long", which is how this job broke on 2026-08-26 once the per-function body
+          # had grown to ~135 KB.
+          #
+          # The package table is ~1 KB, so this cap never fires in normal operation. It
+          # exists so that an unexpected growth degrades into a truncated comment that
+          # names where the full data is, instead of a failed job.
+          MAX_BYTES=50000
+          if [ "$(wc -c < coverage/summary.txt)" -gt "$MAX_BYTES" ]; then
+            echo "Coverage summary is $(wc -c < coverage/summary.txt) bytes; truncating to ${MAX_BYTES}."
+            head -c "$MAX_BYTES" coverage/summary.txt > coverage/summary-capped.txt
+            printf '\n\n_Truncated. The full report is in the job summary and the `coverage-combined` artifact._\n' \
+              >> coverage/summary-capped.txt
+            mv coverage/summary-capped.txt coverage/summary.txt
+          fi
+
           echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_ENV
           cat coverage/summary.txt >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
@@ -993,22 +1040,16 @@ jobs:
             **Difference:** ${{ steps.coverage-diff.outputs.emoji }} `${{ steps.coverage-diff.outputs.diff }}%`
 
             <details>
-            <summary>📁 Coverage by Package</summary>
+            <summary>📁 Coverage by package</summary>
 
             ${{ env.COVERAGE_SUMMARY }}
 
             </details>
 
-            <details>
-            <summary>📄 Full Coverage Report</summary>
-
-            ```
-            ${{ steps.merge-coverage.outputs.coverage_text }}
-            ```
-
-            </details>
-
-            > Coverage is calculated from unit tests + integration tests combined.
+            > Unit and integration tests combined. The full per-function report is in this
+            > job's summary and in the `coverage-combined` artifact — it is deliberately not
+            > inlined here, because a `with:` input travels to the action as one environment
+            > variable and Linux caps that at 131072 bytes.
 
   container-malware-scan:
     name: Container Malware Scan
