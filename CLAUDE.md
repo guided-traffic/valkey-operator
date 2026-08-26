@@ -374,11 +374,22 @@ exactly one evaluator; an **edge** records something and owes a clear at a site 
 *proves* the precondition is gone, plus a presence guard; **history** is a verdict about a
 completed operation and must never gain a clear.
 
+A **level** may have more than one evaluator only with a declared `ownershipRule` naming
+which site decides — the loosening `StorageSpecNotApplied` earned when its two StatefulSet
+reconcilers stopped racing: either tier may report a claim conflict, only the data tier may
+clear one, and that holds only while the data step runs first
+([ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md) D4a).
+
 It is a test and not a convention because the convention was missed four times — the clear
 kept ending up behind the very code path whose absence caused the staleness — and writing
 the table down for the first time immediately found two more (`RollingUpdatePaused` on
 non-Sentinel topologies, `StorageSpecNotApplied` with two evaluators), both declared in the
-registry with their ticket reference rather than silently carried. **There is deliberately no
+registry with their ticket reference rather than silently carried, and **both fixed on
+2026-08-26** — one by narrowing an evaluator, one by moving the clear up one frame to the
+two sites every dispatch target reaches and deleting the unguarded `False` write that had
+stamped the condition onto the whole Sentinel fleet
+([ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10b). The one gap left
+is `Ready`/T18, an open re-decision rather than a defect. **There is deliberately no
 central condition-GC pass**: the producer stays the one reporter, and a sweep would have to
 exclude `MultipleMasters` (a flip resets the `splitBrainWarnAfter` deadline) and
 `TopologyRestored` (history) on its first two rows. No condition is ever deleted, which is

@@ -4,6 +4,12 @@
 
 Accepted. Date: 2026-08-26.
 
+Amended 2026-08-26, same day: **D1 and D2 gain the ownership rule** as the second legal
+answer for a level with more than one evaluator, and **D4's two declared gaps are closed**
+(ADR 0023 D4a, ADR 0002 D10b). `conditionOwnership` gains an `ownershipRule` field and the
+registry gains `TestConditionRegistryOwnershipRulesAreEarned`. `make test-unit`, `make lint`
+and `make cyclo` green; no e2e or integration suite was run.
+
 Implemented as [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go)
 and guarded by [`condition_registry_test.go`](../../internal/controller/condition_registry_test.go).
 The registry is read by nothing in the reconcile path; its only consumer is that test.
@@ -31,18 +37,30 @@ Writing the full inventory down for the first time — eleven condition types, i
 of analysing a stale-status ticket — immediately produced two more instances that no
 incident had surfaced:
 
-* `RollingUpdatePaused` is set by `pauseRollingUpdate`, which is reachable on every
-  topology, and cleared only by `finalizeRollingUpdate`, which only the Sentinel dispatcher
-  calls. A non-Sentinel cluster that hits `syncTimeout` therefore carries the condition for
-  the life of the cluster, and the obvious fix is a trap: `pauseRollingUpdate` calls
-  `clearRollingUpdateState` itself, so a clear placed there would erase the report in the
-  same pass that made it.
+* `RollingUpdatePaused` is set by `pauseRollingUpdate`, which is reachable on ~~every
+  topology~~ **two of the three** — the `default:` arm (`replicas <= 1` without Sentinel)
+  has no pause site in its call graph — and ~~cleared only by `finalizeRollingUpdate`, which
+  only the Sentinel dispatcher calls~~. A non-Sentinel multi-replica cluster that hits
+  `syncTimeout` therefore carried the condition for the life of the cluster, and the obvious
+  fix is a trap: `pauseRollingUpdate` calls `clearRollingUpdateState` itself, so a clear
+  placed there would erase the report in the same pass that made it.
 * `StorageSpecNotApplied` is written by two independent evaluators — the data StatefulSet
   and the Sentinel StatefulSet both call `guardVolumeClaimTemplates`, whose `default` arm
-  clears unconditionally. Step order is fixed and the Sentinel StatefulSet has no
-  `volumeClaimTemplates` at all, so on a Sentinel cluster with a data-tier claim conflict
-  the pass reports the conflict and then clears it. Last writer wins, and the last writer
-  is the one that never has anything to say.
+  ~~clears unconditionally~~ cleared unconditionally. Step order is fixed and the Sentinel
+  StatefulSet has no `volumeClaimTemplates` at all, so on a Sentinel cluster with a
+  data-tier claim conflict the pass reported the conflict and then cleared it. Last writer
+  wins, and the last writer is the one that never has anything to say.
+
+> **Both closed 2026-08-26**, and the strikethroughs above mark what stopped being true.
+> `RollingUpdatePaused` is now cleared from the two sites in `checkAndHandleRollingUpdate`
+> that every dispatch target reaches, the converged one gated on tier convergence, and the
+> unguarded `False` write inside `finalizeRollingUpdate` is deleted
+> ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D10b).
+> `StorageSpecNotApplied` keeps both evaluators and gains an ownership rule: either tier may
+> report a conflict, only the data tier may clear one
+> ([ADR 0023](0023-volume-claim-templates-are-immutable.md) D4a). The paragraph is left
+> standing because it is the argument for the registry existing at all — these two were
+> found by writing a table, not by an incident, and that is still the point.
 
 Two defects found by writing a table, against four found by incidents, is the argument. A
 convention that has been missed this often is not a convention.
@@ -59,7 +77,7 @@ decides what it owes.**
 
 | Kind | Meaning | Owes |
 |---|---|---|
-| **level** | re-measured from live state on every pass that reaches its evaluator | exactly one evaluator; no clear site, because it corrects itself |
+| **level** | re-measured from live state on every pass that reaches its evaluator | exactly one evaluator — or several plus a declared **ownership rule** naming which one decides; no clear site, because it corrects itself |
 | **edge** | records that something happened, or that work is deferred | a clear at a site that *proves* the precondition is gone, and a presence guard |
 | **history** | a verdict about a completed operation | nothing — and it must **never** gain a clear |
 
@@ -68,13 +86,31 @@ enough. A level's hazard is an evaluator that is not reached, or two evaluators 
 be last. An edge's hazard is the missing clear. History's hazard is the opposite: a
 well-meaning cleanup that discards the record.
 
+**Amended 2026-08-26: the ownership rule is the second legal answer for a level.** The
+`evaluators` docstring described this escape from the day the registry was written and
+nothing implemented it, so the only way to keep a two-evaluator level in the table was to
+declare a gap. `StorageSpecNotApplied` is the first row that earned it: both StatefulSet
+reconcilers genuinely evaluate the condition and both may raise it, and pretending
+otherwise by recounting them as one authoritative evaluator would state something the code
+contradicts — both sites still call `reportStorageSpecNotApplied`, and the last writer still
+owns `Reason` and `Message`. What removes the race is not the count but the rule: only the
+data tier may clear (ADR 0023 D4a). A rule that names no site, or that sits on a row with a
+single evaluator, fails `TestConditionRegistryOwnershipRulesAreEarned` — the same
+traceability the ticket reference gives a declared gap.
+
+**A rule is not a proof.** Nothing verifies that the code obeys the rule the row states,
+exactly as nothing verifies the `evaluators` count. What the registry buys here is that the
+next author adding a third call site reads the rule next to the failure message instead of
+discovering it.
+
 **D2 — The classification is declared in a registry, and a test enforces what it can.**
 `conditionRegistry` names, per type: the owner site, the kind, the number of evaluators, the
-clear site, whether that clear is presence-guarded, and any field of the stored condition
-that something reads as *data* rather than as a report. The tests assert that every
-`ConditionType` declared in `api/v1` appears exactly once, that every edge has a
-presence-guarded clear, that every level has one evaluator, and that no history row has a
-clear site.
+ownership rule when there is more than one, the clear site, whether that clear is
+presence-guarded, and any field of the stored condition that something reads as *data*
+rather than as a report. The tests assert that every `ConditionType` declared in `api/v1`
+appears exactly once, that every edge has a presence-guarded clear, that every level has one
+evaluator **or an ownership rule**, that an ownership rule is only claimed where there is
+more than one evaluator, and that no history row has a clear site.
 
 This is the [ADR 0014](0014-rbac-lives-in-three-places.md) idiom: RBAC drift is caught by a
 test rather than by a convention because the convention had been missed. Same reasoning,
@@ -88,11 +124,18 @@ the identifier prefix — so a constant someone names `ConditionTypeSomething` w
 it the type is not silently accepted as covered.
 
 **D4 — A declared gap suppresses the invariants, and must name the ticket item that owns
-the decision.** `RollingUpdatePaused` and `StorageSpecNotApplied` are in the registry today
-with their gaps declared, because the fixes are decisions that have not been taken. A gap
-with no `T<number>` reference fails the test: otherwise the escape hatch becomes a way to
-silence the guard, and a suppressed invariant is indistinguishable from a broken one with a
-comment on it.
+the decision.** ~~`RollingUpdatePaused` and `StorageSpecNotApplied` are in the registry
+today with their gaps declared, because the fixes are decisions that have not been taken.~~
+Both were fixed on 2026-08-26 and their gaps are gone; the one gap left is `Ready`/T18,
+which is a re-decision request rather than a defect (ADR 0001 D4 decides the current
+behaviour). A gap with no `T<number>` reference fails the test: otherwise the escape hatch
+becomes a way to silence the guard, and a suppressed invariant is indistinguishable from a
+broken one with a comment on it.
+
+The two gaps this ADR shipped with are the evidence for the mechanism rather than a
+footnote: both were closed within a day of being written down, one by narrowing an
+evaluator (ADR 0023 D4a) and one by moving a clear up one frame and deleting an unguarded
+write (ADR 0002 D10b). Neither had an incident behind it.
 
 **D5 — `Ready` is a `ConditionType` in `api/v1` like every other condition.** It moved out
 of `internal/controller`, which is what makes D3's enumeration complete, and it carries the
@@ -130,9 +173,15 @@ CR in the fleet on the first upgraded pass
 * The table has to be kept current, which is the same discipline the ADRs already demand
   and the same way it can rot. The membership half is enforced; see Residual risks for the
   half that is not.
-* Two known defects are now declared in code rather than living only in a ticket. That is
+* ~~Two known defects are now declared in code rather than living only in a ticket. That is
   more honest and slightly worse-looking: `conditionRegistry` reads as a list of two
-  admissions. Both are traceable to their items.
+  admissions. Both are traceable to their items.~~ **Both were fixed on 2026-08-26**, within
+  a day of being written down. What remains declared is `Ready`/T18, which is an open
+  re-decision rather than a defect. The mechanism worked in the direction it was built for:
+  the declaration was a to-do with a test behind it, not a permanent excuse.
+* A level may now have more than one evaluator, which is a real loosening. The
+  compensating rule is that the loosening has to be *stated* — an ownership rule naming
+  which site decides — and stating one on a single-evaluator row fails its own test.
 * The four write styles the inventory found (in-memory batched via `persistStatus`;
   `setStatusCondition`; `writeStatusCondition` with the caller consuming `(changed, err)`;
   the presence-guarded clear wrapper) are **not** consolidated. Each is deliberate and
@@ -162,10 +211,12 @@ one.
 
 ### Fix the two found defects and skip the registry
 
-Rejected as insufficient rather than wrong. Both fixes are still owed and are tracked as
-their own items; what this ADR adds is the reason the *next* one gets found by a test
-instead of by a fleet audit. Per-site fixes have a perfect record of being correct and a
-perfect record of not preventing the next instance.
+Rejected as insufficient rather than wrong. ~~Both fixes are still owed and are tracked as
+their own items~~ — both landed on 2026-08-26 (ADR 0023 D4a, ADR 0002 D10b); what this ADR
+adds is the reason the *next* one gets found by a test instead of by a fleet audit. Per-site
+fixes have a perfect record of being correct and a perfect record of not preventing the next
+instance. The fixes themselves are the evidence for that: neither would have been written
+without the table, and one of them needed a new registry field to be expressible at all.
 
 ### Enforce the classification, not just the membership
 
@@ -182,14 +233,19 @@ a test's clothes.
   function which no longer clears anything — the field is prose, not a symbol reference, so
   a rename leaves it silently stale. That half stays a review question, which is stated here
   rather than implied.
-* **`evaluators` is a hand-maintained count.** Nothing verifies it against the code. A
-  second evaluator added without touching the registry is exactly the
-  `StorageSpecNotApplied` defect, and the registry would not catch its recurrence.
-* **The two declared gaps are open defects, not accepted designs.** `RollingUpdatePaused`
-  standing forever on a non-Sentinel cluster is user-visible and wrong; the
-  `StorageSpecNotApplied` race means a Sentinel cluster can report `False` while its data
-  tier has an unappliable storage spec. Both are latent on the fleet that was inspected —
-  no cluster currently carries either — but latent is not fixed.
+* **`evaluators` is a hand-maintained count, and so is `ownershipRule`.** Nothing verifies
+  either against the code. A second evaluator added without touching the registry is exactly
+  the `StorageSpecNotApplied` defect, and the registry would not catch its recurrence; a rule
+  that says the data tier clears while the code clears from both is equally invisible here.
+  The tests that do enforce it are the three unit tests ADR 0023 D4a names, one of which
+  exists only to pin the step order the rule rests on.
+* ~~**The two declared gaps are open defects, not accepted designs.**~~ **Both were fixed on
+  2026-08-26** — `RollingUpdatePaused` by ADR 0002 D10b, `StorageSpecNotApplied` by ADR 0023
+  D4a. The one row still carrying a `declaredGap` is `Ready`/T18, and that one genuinely is
+  an accepted design pending a re-decision (ADR 0001 D4), not a defect.
+* **A row can pass every test and still be wrong about the fleet.** Neither fix was verified
+  against a cluster: both are unit-verified, and one of the `RollingUpdatePaused` probes
+  guards a shape that was reproduced in a fixture and never observed in production.
 * **`MultipleMasters` standing stale outside a rolling update is accepted** by
   [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)'s own
   Residual risks, and the registry deliberately does not flag it. Anything that later

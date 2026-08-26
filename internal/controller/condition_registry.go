@@ -7,13 +7,15 @@ import vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 // TestConditionRegistryCoversEveryConditionType and its siblings
 // (condition_registry_test.go), which is the point.
 //
-// It exists because one failure shape has now been fixed four times at four different
+// It exists because one failure shape has now been fixed six times at six different
 // sites: a condition whose clear sits behind the very code path whose absence caused the
 // staleness. ADR 0002 D10 fixed it for SidecarUpdatePending, ADR 0024 D6 for
 // SentinelUpdatePending, ADR 0026 D5 for PodTerminationStalled, and ADR 0002 D10 again in
 // 2026-08-26 for the completing pass. Two more instances (RollingUpdatePaused,
-// StorageSpecNotApplied) were found by writing this table down rather than by an
-// incident, and are recorded below as declared gaps rather than silently carried.
+// StorageSpecNotApplied) were found by writing this table down rather than by an incident,
+// were carried here as declared gaps rather than silently, and were fixed on 2026-08-26 --
+// ADR 0002 D10b and ADR 0023 D4a. The one gap left is Ready/T18, which is an open
+// re-decision and not a defect.
 //
 // The registry is the ADR 0014 idiom applied to conditions: a convention that has been
 // missed this often is encoded as a test, not restated. Adding a condition type without a
