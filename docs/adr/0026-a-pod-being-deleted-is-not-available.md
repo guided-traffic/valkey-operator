@@ -4,6 +4,21 @@
 
 Accepted. Date: 2026-08-25.
 
+Amended 2026-08-27: **adopting a pod as the master authority is a site that spends it, and
+it was missing from the rule.** Measured in CI (single-node-valkey9): a chaos delete took
+the recorded master in the same second the roll deleted the outgoing one, the dying pod's
+drain stamped the peer that was itself already terminating, both split-brain resolvers
+would adopt the stamp — the pod answers `role:master` for its whole termination, which is
+this ADR's own founding measurement — and the fleet consolidated toward a pod that returned
+on an empty volume: every pod ended at `dbsize=0`. The fix is the rule, applied: the roll
+resolver selects its authority (stamp, named authority, connected-slaves tie-break) only
+among non-terminating masters and refuses when none is left; the steady-state evidence scan
+skips a terminating stamped pod; and `confirmedMasterAuthority` refuses a recorded master
+whose Pod object provably carries a `DeletionTimestamp` — positive evidence only, an
+unreadable Pod object refuses nothing. Demotion of a terminating master stays allowed: that
+is the `reachable()` carve-out, and it is the *direction* that was wrong, not the contact.
+This closes the measured half of T13.
+
 Implemented: the `available()` / `reachable()` split on `podState` with the per-site answers of
 D1–D4, the delete gate of D5, the tier definition of D7, the bounded stall observation and the
 `PodTerminationStalled` condition of D5, and the Sentinel counters of D6. Unit coverage in

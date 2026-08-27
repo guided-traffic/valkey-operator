@@ -241,6 +241,17 @@ func (r *ValkeyReconciler) adoptUnrecordedPromotion(ctx context.Context, v *vkov
 		return
 	}
 
+	// A terminating pod is never adopted as the authority, whatever evidence it
+	// carries (ADR 0028 D5a, ADR 0026): its dataset dies with it, and adopting
+	// it republishes the replica ConfigMap toward the empty volume it returns
+	// on. The refusal is bounded by the termination itself -- the pass after it
+	// sees the survivors.
+	if pod.DeletionTimestamp != nil {
+		logger.Info("Sole master-labeled pod is terminating; refusing to adopt a dying authority",
+			"pod", pod.Name, "knownMaster", recorded)
+		return
+	}
+
 	info, err := r.getInstanceChecker().GetReplicationInfo(ctx, v, pod.Name)
 	if err != nil {
 		logger.Info("Sole master-labeled pod is unreachable; leaving the known master untouched",
@@ -509,6 +520,14 @@ func (r *ValkeyReconciler) stampedMasters(ctx context.Context, v *vkov1.Valkey,
 		if !hasDrainStamp(pod) {
 			continue
 		}
+		// A terminating pod is never an adoptable authority, stamp or no stamp:
+		// its dataset dies with it, and consolidating toward it full-resyncs the
+		// survivors to the empty volume it returns on (ADR 0026 -- adoption
+		// spends a pod, and spending requires available()). Measured on the roll
+		// resolver in CI, 2026-08-27.
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
 		info, err := r.getInstanceChecker().GetReplicationInfo(ctx, v, pod.Name)
 		if err != nil || info.Role != common.RoleMaster {
 			continue
@@ -534,6 +553,21 @@ func (r *ValkeyReconciler) confirmedMasterAuthority(ctx context.Context, v *vkov
 	if name == "" {
 		logger.Info("No known-master annotation; refusing to pick a master by tie-break",
 			"cluster", v.Name)
+		return "", false
+	}
+
+	// A recorded master that is terminating cannot be the authority the fleet is
+	// consolidated toward: it keeps answering role:master for the whole of its
+	// termination (ADR 0026) and then returns empty, so every replica pointed at
+	// it full-resyncs the dataset away (T13, the gap this function was filed
+	// for). Like the creation-order rule, this guard may only refuse on positive
+	// evidence -- a Pod object that could not be read proves nothing, and the
+	// authority is confirmed by its own answer below either way.
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: v.Namespace}, pod); err == nil &&
+		pod.DeletionTimestamp != nil {
+		logger.Info("Known master is terminating; a dying pod cannot be the consolidation authority",
+			"pod", name)
 		return "", false
 	}
 

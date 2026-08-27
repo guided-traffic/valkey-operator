@@ -15,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -383,4 +384,130 @@ func TestPersistManualFailoverState_ClearsTheDrainStamps(t *testing.T) {
 		types.NamespacedName{Name: "test-0", Namespace: v.Namespace}, stale))
 	assert.NotContains(t, stale.Annotations, common.AnnotationDrainPromotedAt,
 		"this write records a promotion, so every stamp of the cluster is spent evidence")
+}
+
+// --- a terminating master is never the adopted authority ---------------------------
+//
+// Measured in CI (2026-08-27, single-node-valkey9): the roll deleted the outgoing
+// master in the same second a chaos delete took the recorded one, the drain of the
+// dying recorded master stamped the pod that was itself already terminating, the
+// resolver adopted the stamp, and the fleet consolidated toward a pod that came
+// back on an empty volume -- every pod ended at dbsize=0. Adoption spends a pod,
+// and spending requires available(), not reachable() (ADR 0026).
+
+func TestDetectAndResolveSplitBrain_ATerminatingStampedMasterIsNotAdopted(t *testing.T) {
+	v, sts, pods := rollSplitBrainFixture(t)
+	// test-0 is the CI shape: stamped by the dying pod's drain, and itself
+	// already terminating. test-2 is the live data holder the record names.
+	stampPod(pods[0].pod, time.Now())
+	pods[0].terminating = true
+	v.Annotations = map[string]string{builder.AnnotationKnownMaster: knownMasterHost(v, "test-2")}
+
+	r, c := newTestReconciler(v, sts, pods[0].pod, pods[1].pod, pods[2].pod)
+	fleet := newValkeyFleet(t, r, map[string]int{"test-0": nonEmptyKeyCount, "test-2": nonEmptyKeyCount})
+
+	result, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 0, "test-2")
+
+	assert.Equal(t, 2, masterIdx, "the live recorded master wins, not the dying stamped one")
+	assert.True(t, result[2].isMaster)
+	assert.False(t, fleet.sawReplicaOf("test-2"),
+		"the pod whose dataset survives the pass must not be demoted toward a dying pod")
+
+	current := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, current))
+	assert.Equal(t, knownMasterHost(v, "test-2"), current.Annotations[builder.AnnotationKnownMaster],
+		"the terminating pod must not be recorded as the authority")
+}
+
+func TestDetectAndResolveSplitBrain_RefusesWhenEveryMasterIsTerminating(t *testing.T) {
+	v, sts, pods := rollSplitBrainFixture(t)
+	pods[0].terminating = true
+	pods[2].terminating = true
+
+	r, _ := newTestReconciler(v, sts, pods[0].pod, pods[1].pod, pods[2].pod)
+	fleet := newValkeyFleet(t, r, map[string]int{"test-0": nonEmptyKeyCount, "test-2": nonEmptyKeyCount})
+
+	result, _ := r.detectAndResolveSplitBrain(context.Background(), v, pods, 0, "test-0")
+
+	assert.True(t, result[0].isMaster)
+	assert.True(t, result[2].isMaster, "with no live candidate nothing is resolved this pass")
+	assert.False(t, fleet.sawReplicaOf("test-0"))
+	assert.False(t, fleet.sawReplicaOf("test-2"))
+}
+
+// The steady-state twin of the same rule: a stamped pod that is terminating is
+// skipped by the evidence scan, so rule 2 (the confirmed annotation) decides.
+func TestStampedMasters_SkipsATerminatingPod(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	r, _ := newTestReconciler(v)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: common.RoleMaster}, nil
+		},
+	}
+
+	dying := createPodForSts(v, 0, "valkey/valkey:8.0", true)
+	stampPod(dying, time.Now())
+	due := metav1.NewTime(time.Now().Add(30 * time.Second))
+	dying.DeletionTimestamp = &due
+
+	live := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	stampPod(live, time.Now())
+
+	found := r.stampedMasters(context.Background(), v, []corev1.Pod{*dying, *live})
+
+	require.Len(t, found, 1)
+	assert.Equal(t, "test-1", found[0].Name)
+}
+
+// And the annotation half of T13: a recorded master whose pod is provably
+// terminating is not a confirmable authority. Only positive evidence refuses --
+// an unreadable Pod object still falls through to the role probe.
+func TestConfirmedMasterAuthority_ATerminatingRecordedPodIsRefused(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	v.Annotations = map[string]string{builder.AnnotationKnownMaster: knownMasterHost(v, "test-1")}
+
+	dying := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	terminatingFor(dying, 60*time.Second, 5*time.Second)
+
+	r, _ := newTestReconciler(v, dying)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: common.RoleMaster}, nil
+		},
+	}
+
+	name, ok := r.confirmedMasterAuthority(context.Background(), v)
+
+	assert.False(t, ok, "a dying pod cannot be the consolidation authority")
+	assert.Empty(t, name)
+}
+
+// The single-master adoption door of the same rule: a sole labeled master that is
+// terminating is not adopted, stamp or no stamp -- adopting it would republish
+// the replica ConfigMap toward the empty volume it returns on.
+func TestAdoptUnrecordedPromotion_ATerminatingSoleMasterIsNotAdopted(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	v.Annotations = map[string]string{builder.AnnotationKnownMaster: knownMasterHost(v, "test-0")}
+
+	dying := createPodForSts(v, 1, "valkey/valkey:8.0", true)
+	stampPod(dying, time.Now())
+	terminatingFor(dying, 60*time.Second, 5*time.Second)
+
+	r, c := newTestReconciler(v, dying)
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(string) (*valkeyclient.ReplicationInfo, error) {
+			return &valkeyclient.ReplicationInfo{Role: common.RoleMaster}, nil
+		},
+	}
+
+	r.adoptUnrecordedPromotion(context.Background(), v, dying)
+
+	current := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, current))
+	assert.Equal(t, knownMasterHost(v, "test-0"),
+		current.Annotations[builder.AnnotationKnownMaster],
+		"the record must not move to a dying pod")
 }

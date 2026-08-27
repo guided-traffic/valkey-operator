@@ -138,6 +138,18 @@ StatefulSet did not create is not evidence either
 ([ADR 0020](0020-write-only-what-the-operator-owns.md) D9) — the rule may adopt, so it fails
 closed on an unproven pod.
 
+**D5a — A terminating master is never the selected authority, whatever the evidence says.**
+Added 2026-08-27, after CI measured the gap this closes: the resolver adopted a stamped pod
+that was already terminating — its stamp was genuine, its `role:master` answer was genuine
+for the whole termination ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)) — and
+the fleet consolidated toward a pod that returned empty, `dbsize=0` on every pod. The
+dataset veto could not fire, because at demotion time both masters still held the keys; the
+loss happened when the adopted pod finished dying. All three selection rules therefore draw
+from the non-terminating masters only, and a split brain whose every master is terminating
+resolves nothing that pass — bounded by the termination itself, since the next pass sees the
+survivors. Demoting a terminating rogue stays allowed and wanted: refusing it would leave it
+accepting writes for the rest of its termination.
+
 **D6 — A refusal emits no Event, and the resolver still reports nothing.** The level is already
 carried: `resolveSplitBrain` writes `MultipleMasters` and emits `SplitBrainDetected` once the
 window outlives `splitBrainWarnAfter` = 90 s

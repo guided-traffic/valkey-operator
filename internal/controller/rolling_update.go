@@ -1250,10 +1250,28 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 	logger.Info("Split-brain detected: multiple masters found",
 		"masterCount", len(masterIndices), "masterIndices", masterIndices)
 
+	// A terminating master may be demoted but never adopted: its dataset dies
+	// with it, so recording it as the authority points the fleet at a pod that
+	// returns empty and full-resyncs the survivors to nothing. Measured in CI
+	// (2026-08-27, single-node-valkey9): the test deleted the recorded master in
+	// the same second the roll deleted the outgoing one, the drain stamped the
+	// already-terminating pod, the resolver adopted it, and every pod ended at
+	// dbsize=0. Adoption is a site that *spends* a pod, and spending requires
+	// available(), not reachable() (ADR 0026); demotion of the dying pod stays
+	// allowed -- it keeps accepting writes for the rest of its termination
+	// otherwise. All three selection rules below draw from this candidate set;
+	// the rogue set deliberately does not.
+	candidates := nonTerminatingAmong(pods, masterIndices)
+	if len(candidates) == 0 {
+		logger.Info("Split-brain resolution refused: every reported master is terminating",
+			"masters", podNamesAt(pods, masterIndices))
+		return pods, masterIdx
+	}
+
 	// Rule 1, evidence first: the drain stamp. Ambiguous evidence ends the
 	// resolution rather than falling through to the annotation
 	// (docs/adr/0011-evidence-based-steady-state-split-brain-resolution.md, D10).
-	stamped := r.stampedMastersAmong(ctx, v, pods, masterIndices)
+	stamped := r.stampedMastersAmong(ctx, v, pods, candidates)
 	if len(stamped) > 1 {
 		logger.Info("Split-brain resolution refused: more than one drain-promoted master confirms the role",
 			"stamped", podNamesAt(pods, stamped))
@@ -1268,15 +1286,15 @@ func (r *ValkeyReconciler) detectAndResolveSplitBrain(ctx context.Context, v *vk
 		}
 	}
 
-	// Rule 2: the authority the caller named, if it names one of the masters.
+	// Rule 2: the authority the caller named, if it names one of the candidates.
 	if realMasterIdx < 0 {
-		realMasterIdx = indexOfName(pods, masterIndices, knownMaster)
+		realMasterIdx = indexOfName(pods, candidates, knownMaster)
 	}
 
 	// Rule 3: no evidence and no authority -- prefer the master with the most
 	// connected slaves (the one actively serving replicas has the real data).
 	if realMasterIdx < 0 {
-		realMasterIdx = r.mostConnectedMaster(ctx, v, pods, masterIndices)
+		realMasterIdx = r.mostConnectedMaster(ctx, v, pods, candidates)
 	}
 
 	rogueIndices := indicesExcept(masterIndices, realMasterIdx)
@@ -1296,6 +1314,18 @@ func mastersAmong(pods []podState) []int {
 		}
 	}
 	return indices
+}
+
+// nonTerminatingAmong filters indices down to the pods that carry no
+// DeletionTimestamp -- the only pods the resolver may select as the authority.
+func nonTerminatingAmong(pods []podState, indices []int) []int {
+	var out []int
+	for _, idx := range indices {
+		if !pods[idx].terminating {
+			out = append(out, idx)
+		}
+	}
+	return out
 }
 
 // podNamesAt resolves a list of pod indices to their names, for log lines.

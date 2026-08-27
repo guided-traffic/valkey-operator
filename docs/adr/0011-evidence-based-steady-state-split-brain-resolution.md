@@ -9,6 +9,15 @@ the shared `demoteRogueMaster` helper (D20) emits `SplitBrainResolved` as a **No
 and the Consequence about status invisibility is narrowed to this check. Both are marked in
 place below.
 
+Amended 2026-08-27 by [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D5a
+and the [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) amendment of the same day:
+**a terminating pod is never the adopted or confirmed authority**, whatever evidence it
+carries — its dataset dies with it, measured in CI as a full-fleet `dbsize=0`. The guard
+binds every adoption and confirmation door of this check (`stampedMasters`,
+`confirmedMasterAuthority`, `adoptUnrecordedPromotion`) and refuses only on positive
+evidence: an unreadable Pod object refuses nothing, the same one-sided reading the
+creation-order rule already has. Demoting a terminating rogue stays allowed (D20 carve-out).
+
 Amended 2026-08-26 by [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md): D3's
 premise about what the operator knows inside a rolling update, and D16's list of stamp-clearing
 sites. Both are marked in place below.
