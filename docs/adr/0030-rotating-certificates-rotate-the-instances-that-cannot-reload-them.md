@@ -24,6 +24,12 @@ the key made the pod unmeasured and switched the roll off. It is now the
 refuses to change. The digest, the trigger, the presence rule and the rolling update are
 unchanged. The T25 residual below is closed with the two corrections it earned.
 
+Also amended 2026-08-27: **the hostile Secret writer is accepted rather than left open.** D11
+now records the decision and the reason — a strong digest closes the collision and leaves a
+substitution indistinguishable from a legitimate rotation — and corrects the framing of the
+password brake, which five documents phrased in terms of digest width when the parameter is the
+entropy of the input.
+
 Also amended 2026-08-27: certificate rotation gained end-to-end coverage, which it had none of
 when this ADR was written — `TestE2E_TLS_CertificateRotation_RollsTheFleet`
 ([`test/e2e/tls_rotation_test.go`](../../test/e2e/tls_rotation_test.go)) deletes the Secret so
@@ -239,10 +245,17 @@ material.** [ADR 0016](0016-authentication-and-tls-posture.md) D12 states that S
 propagate and Secret *values* do not, and gives the reason: hashing the name keeps secret
 material out of the pod template and out of every hash the operator publishes. D4 breaks that
 for TLS, knowingly. It is acceptable **here** because the digested material is a private key —
-high-entropy, not guessable, so a 32-bit digest of it confirms nothing an attacker does not
-already have. It would **not** be acceptable for the auth password, where a 32-bit digest of a
-low-entropy secret is a brute-forceable oracle. **The password rotation gap therefore stays
-open and must not be closed by copying this mechanism.**
+high-entropy, not guessable, so a published digest of it confirms nothing an attacker does not
+already have.
+
+**The security parameter is the entropy of the input, not the width of the digest.** That
+sentence is a correction, made 2026-08-27: this decision and four other documents used to
+phrase the refusal as *"a 32-bit digest of a low-entropy secret is a brute-forceable oracle"*,
+which reads as though a wider or cryptographic digest would make the password case safe. It
+would not. An attacker who holds a published digest of a password guesses candidates and hashes
+them, and SHA-256 obliges as readily as FNV-1a — faster hardware, same game. What makes the TLS
+case safe is that nobody can enumerate 2048-bit RSA keys. **The password rotation gap therefore
+stays open and must not be closed by copying this mechanism at any digest strength.**
 
 **And it is a change detector, not an integrity control.** FNV-1a is non-cryptographic, the
 digest is 32 bits, and `tls.key` is hashed last — trailing bytes after a PEM block are ignored
@@ -251,6 +264,29 @@ swap the material and keep the fingerprint. That principal can replace the clust
 identity anyway, so what this buys is evasion of the *report*, not new access; the rule that
 follows is that neither `TLSMaterialStale` nor the alert may ever be presented as evidence that
 the material is unchanged. They answer "did the roll happen", nothing more.
+
+**Amended 2026-08-27: that is accepted permanently, and the reason is worth writing down so the
+question stops coming back.** A wide cryptographic digest *would* close the substitution — the
+collision is what makes the swap silent, and 128 bits of SHA-256 is not searchable. It was
+still not taken, because of what it buys: the attacker loses the ability to swap **silently**,
+and gains a swap that is **indistinguishable from a legitimate rotation**. Both produce one
+fleet roll and one `TLSMaterialStale` transition. There is no observer for whom those two
+differ, so the detection has no consumer.
+
+Two arguments that have been made against the strong digest and do **not** hold, recorded so
+they are not reused: that writing the previous Secret content back defeats every hash — it
+does, but that is a *denial of rotation*, in which the fingerprint is telling the truth about a
+mount that really was reverted, and no content digest can ever detect it (that needs `notAfter`,
+which D7 refuses); and that the migration is prohibitive — changing the digest changes every
+recorded value, which would roll the whole fleet including the Sentinel tier, but versioning the
+record and treating a previous-generation value as *unmeasured* rather than stale is the same
+presence-rule widening [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) D5
+already ships.
+
+What would actually raise the ceiling is not a better digest but a **trust anchor outside the
+Secret** — comparing the served leaf against the issuer this operator asked for, rather than
+against the bytes the Secret happens to hold. Nothing here does that, and no decision has been
+taken to.
 
 ## Consequences
 
@@ -354,11 +390,12 @@ measurement, and in that order.
   Alternatives Considered in [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md),
   which is the decision they were alternatives to.
 
-  Still open, and a different problem: **the Secret writer.** A principal that can write the
-  Secret can replace the material and keep the fingerprint identical — by collision against a
-  32-bit digest, or simply by writing the previous bytes back, which defeats every hash
-  function. D11 already says this report answers "did the roll happen" and never "is the
-  material unchanged".
+  **Accepted, not open: the Secret writer.** A principal that can write the Secret can replace
+  the material and keep the fingerprint identical, by collision against a 32-bit digest.
+  Decided 2026-08-27 to leave it: closing it would turn a silent substitution into one that
+  looks exactly like a legitimate rotation, which no observer can act on. D11 carries the full
+  reasoning and the two arguments against the strong digest that do **not** hold — one of them
+  written into this file earlier the same day and corrected there.
 * **A freshly created TLS cluster is never rolled by a rotation (T27, open, measured
   2026-08-27).** The Certificate and the StatefulSet are created in the same pass, so
   cert-manager has not issued when the template is first written and the record is correctly
@@ -410,7 +447,8 @@ measurement, and in that order.
   confirms nothing useful (see D11). **Not verified:** whether this project considers a 4-byte
   confirmation oracle over high-entropy material acceptable at all — no prior decision addresses
   it, and D11 is the first. The danger is not this use; it is the next author extending the
-  same helper to a low-entropy secret.
+  same helper to a low-entropy secret, **which no digest strength makes safe** — see the
+  entropy correction in D11.
 * **The overlap the slack argument rests on is the issuer's, and on the measured fleet it was
   days rather than the cert-manager default of 30 (D7).** Nothing in this repository sets or
   reads it. **Not verified:** what that fleet's issuer was configured with.

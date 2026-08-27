@@ -148,10 +148,13 @@ cheap attack was never forging the value but *deleting* it: both consumers skip 
 that carries no record, so one merge patch setting the key to `null` switched the roll
 off. The superseded `vko.gtrfc.com/tls-material-hash` annotation is still read for pods
 written before that date and is never written again
-([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)). The same construction over the **password** would
-be a brute-forceable oracle, and
+([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)).
+
+The same construction over the **password** would be a brute-forceable oracle, and
 [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
-D11 refuses it there for that reason.
+D11 refuses it there — **at any digest strength**, because what makes the TLS case safe is that
+nobody enumerates 2048-bit RSA keys, not that FNV-1a is narrow. A wider hash of a password is a
+marginally slower oracle, not a safe one.
 
 **It is a change detector, not an integrity control, and must not be read as one.**
 FNV-1a is non-cryptographic and 32 bits wide, and `tls.key` is hashed last, so trailing
@@ -161,6 +164,14 @@ material while keeping the fingerprint identical, and neither the rolling update
 `TLSMaterialStale` would notice. That principal can already replace the cluster's TLS
 identity outright, so this buys evasion of the report rather than new access — but the
 report must not be presented as evidence that the material is unchanged.
+
+**Decided 2026-08-27: this stays.** A wide cryptographic digest would remove the collision and
+therefore the silence, and it was still not taken, because of what remains afterwards: the
+attacker loses the silent swap and gains one **indistinguishable from a legitimate rotation** —
+same fleet roll, same condition transition, no observer for whom the two differ. What would
+raise the ceiling is a trust anchor outside the Secret, not a better hash over it, and nothing
+here has one. ADR 0030 D11 carries the reasoning and the two counter-arguments that do not
+hold.
 
 **The record used to be writable from inside a data pod, and is not any more.** The sidecar
 Role grants `pods: patch` on this cluster's data pods. Until 2026-08-27 the fingerprint was a
@@ -770,18 +781,26 @@ analysis.
       `PrometheusRule` is **default off**, so this entry stays unchecked until it is
       enabled. Read it as a liveness check on the roll, **not** as an integrity check on
       the material: the fingerprint it compares is forgeable by whoever can write
-      the Secret — by collision, or simply by writing the previous bytes back
-      (see section 2). See
-      [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md).
+      the Secret, by collision against a 32-bit digest (see section 2). That is
+      **accepted permanently** as of 2026-08-27 — a wide digest would remove the
+      collision and leave a substitution indistinguishable from a legitimate
+      rotation, which no observer can act on. See
+      [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D11.
 
-- [ ] **Do not extend the TLS material fingerprint to low-entropy secrets.** The
-      `VKO_TLS_MATERIAL_HASH` record is a 32-bit FNV-1a digest of Secret content,
-      published on the pod template and readable with `get pods`. Over a
-      private key that is harmless; over the cluster password it would be a
-      brute-forceable oracle. Moving the carrier into the pod spec
+- [ ] **Do not extend the TLS material fingerprint to low-entropy secrets — at any
+      digest strength.** The `VKO_TLS_MATERIAL_HASH` record is a digest of Secret
+      content, published on the pod template and readable with `get pods`. Over a
+      private key that is harmless, because nobody can enumerate 2048-bit RSA keys;
+      over the cluster password it would be a brute-forceable oracle, because an
+      attacker holding the digest guesses candidates and hashes them. **The security
+      parameter is the entropy of the input, not the width of the digest** — this row
+      used to say "32-bit", which read as though SHA-256 would make the password case
+      safe. It would not; it would only make the guessing marginally slower. Moving
+      the carrier into the pod spec
       ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md))
-      changed who can *write* it and nothing about who can read it. ADR 0030 D11 bounds the exception to TLS material, and
-      the password rotation gap in section 6 must not be closed by copying it.
+      changed who can *write* it and nothing about who can read it. ADR 0030 D11
+      bounds the exception to TLS material, and the password rotation gap in
+      section 6 must not be closed by copying it.
 
 - [ ] **Require client certificates where the deployment can.**
       `tls-auth-clients optional` means TLS authenticates the server only.

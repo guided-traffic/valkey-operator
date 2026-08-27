@@ -133,16 +133,31 @@ non-goal.
 
 ## Alternatives Considered
 
-**A stronger digest (SHA-256, or an HMAC keyed by an operator-held secret).** Rejected on
-three independent grounds, any one sufficient. It does not touch the deletion attack, which is
-hash-agnostic. It does not touch the Secret writer either, because writing the previous
-content back byte-identical satisfies every hash function. And at full width it would roll the
-Sentinel tier on a plain operator upgrade while reporting a fleet-wide false `TLSMaterialStale`
-in the same pass, because the presence guard exempts pods with *no* record, not pods carrying
-a previous-generation one. The HMAC variant additionally costs a key that must survive
-restarts and leader election — worth remembering the day someone wants a *password* rotation
-fingerprint, because it is the construction that would make that safe, and it is precisely
-what ADR 0030 D11 forbids doing with an unkeyed digest.
+**A stronger digest (SHA-256, or an HMAC keyed by an operator-held secret).** Not taken, and
+the reason is narrower than it first looked.
+
+It is **irrelevant to this decision**: the attack this ADR closes is deletion of the record,
+which is hash-agnostic — a pod carrying nothing is unmeasured whatever the digest would have
+been. A strong digest is an answer to a different question, the one about a hostile *Secret
+writer*, and that question is settled in
+[ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D11:
+accepted, permanently, because the collision is what makes a substitution silent and removing
+it only buys a substitution indistinguishable from a legitimate rotation.
+
+**Two arguments made against it here on 2026-08-27 were wrong and are corrected in place rather
+than deleted.** The first was that writing the previous Secret content back byte-identical
+satisfies every hash function, so a strong digest closes nothing: it does satisfy every hash
+function, but that is a *denial of rotation* and not a forged fingerprint — the material really
+was reverted and the digest really does say so. The second was that the migration is
+prohibitive because a changed digest function makes every recorded value differ, rolling the
+fleet and lighting up `TLSMaterialStale` on the Sentinel tier: real, and solvable with the same
+presence-rule widening D5 above already ships — version the record and treat a
+previous-generation value as unmeasured rather than stale.
+
+The HMAC variant additionally costs a key that must survive restarts and leader election —
+worth remembering the day someone wants a *password* rotation fingerprint, because it is the
+construction that would make that safe, and an unkeyed digest is what ADR 0030 D11 forbids
+there **at any width**.
 
 **An operator-held record compared against the pod's `creationTimestamp`.** The unforgeability
 premise holds — `creationTimestamp` is in apimachinery's immutable ObjectMeta set — and the
@@ -178,10 +193,11 @@ so it is opt-in or a floor bump. Filed, not taken here.
 
 ## Residual risks
 
-* **The Secret writer is untouched.** Anyone who can write the TLS Secret can replace the
-  material and keep the fingerprint identical, by collision or by writing the previous bytes
-  back. This ADR is about who can lie about the *record*, not about who can change the
-  *material*. ADR 0030 D11 and `SECURITY_ARCHITECTURE.md` section 2 state that plainly.
+* **The Secret writer is untouched, and accepted.** Anyone who can write the TLS Secret can
+  replace the material and hit the 32-bit digest by search, so the swap is silent. This ADR is
+  about who can lie about the *record*, not about who can change the *material*. Decided
+  2026-08-27 to leave it: closing it costs a wide digest and buys a substitution that looks
+  exactly like a legitimate rotation. ADR 0030 D11 carries the reasoning.
 
 * **`config-hash` and `pod-spec-hash` are still in metadata** (D6, Consequences). Reachable by
   a compromised sidecar container only, since ADR 0012 D8 step 4.

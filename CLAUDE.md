@@ -569,10 +569,24 @@ record is never restarted for one.
 day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether
 **`valkey-server`** reloads, and that is *still* unmeasured — what fired and was measured is the
 same shape on the **client** side, ours. ADR 0030 D6 treats an unmeasured process as pinning so
-that nobody has to find out, and D11 bounds the content-fingerprint exception to TLS material:
-a 32-bit digest of a private key confirms nothing, the same digest of the auth password would
-be a brute-forceable oracle, so **the password rotation gap stays open and must not be closed
-by copying this mechanism**.
+that nobody has to find out, and D11 bounds the content-fingerprint exception to TLS material.
+**The security parameter there is the entropy of the input, not the width of the digest** - a
+published digest of a private key confirms nothing because nobody enumerates 2048-bit RSA keys,
+while a published digest of the auth password is a brute-forceable oracle **at any digest
+strength**, since the attacker guesses candidates and hashes them. So **the password rotation
+gap stays open and must not be closed by copying this mechanism, and reaching for SHA-256 does
+not change that** - five documents used to phrase the refusal as "a 32-bit digest of ...",
+corrected 2026-08-27.
+
+**The Secret writer is accepted, permanently.** Whoever can write the TLS Secret can hit the
+32-bit digest by search and swap the material silently. A wide cryptographic digest would close
+exactly that and was still not taken, because what is left afterwards is a substitution
+**indistinguishable from a legitimate rotation** - same roll, same condition transition, no
+observer for whom the two differ. Raising the ceiling needs a trust anchor outside the Secret,
+not a better hash over it. Two arguments against the strong digest are recorded in ADR 0030 D11
+as **not holding**, so they are not reused: writing the previous content back is a denial of
+rotation and not a forged fingerprint, and the migration cost is solvable by versioning the
+record the same way ADR 0031 D5 already widens the presence rule.
 
 ## A record the operator trusts lives in pod spec, and a token goes to one container
 

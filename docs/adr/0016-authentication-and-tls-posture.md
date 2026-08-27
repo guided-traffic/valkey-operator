@@ -159,8 +159,12 @@ operator publishes.~~
 > ([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) — because a long-lived process
 > that parsed a certificate at startup keeps presenting it until it exits, and rotation had to
 > reach those processes somehow. **D12 stands unchanged for the auth password**, and ADR 0030
-> D11 states why the exception must not be extended to it: a 32-bit digest of a high-entropy
-> private key confirms nothing, a 32-bit digest of a password is a brute-forceable oracle.
+> D11 states why the exception must not be extended to it, and the reason is the entropy of the
+> input rather than the width of the digest: a published digest of a high-entropy private key
+> confirms nothing, because nobody enumerates 2048-bit RSA keys, while a published digest of a
+> password is a brute-forceable oracle **at any digest strength**. This sentence used to say
+> "32-bit" on both halves, which read as though a wider hash would make the password case safe;
+> corrected 2026-08-27.
 > The password rotation gap of section 6 therefore stays open.
 
 **D13 — Password rotation is a documented manual procedure, stated precisely rather than
