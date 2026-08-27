@@ -160,8 +160,9 @@ func TestTLSMaterialRotation_ReachesThePodTemplate_Integration(t *testing.T) {
 }
 
 // A cluster without TLS must never gain the condition, which is the upgrade-
-// neutrality half of the level: the reconcile step is gated on IsTLSEnabled, so
-// nothing is written rather than a False being stamped across the fleet.
+// neutrality half of the level: the evaluator handles the non-TLS case itself
+// (it only ever retracts a standing True there, T24(d)), so nothing is written
+// rather than a False being stamped across the fleet.
 func TestTLSMaterialStale_NonTLSClusterIsNeverMeasured_Integration(t *testing.T) {
 	ctx := testCtx
 	crName := "tls-rotation-plain"
@@ -181,6 +182,53 @@ func TestTLSMaterialStale_NonTLSClusterIsNeverMeasured_Integration(t *testing.T)
 	current := &vkov1.Valkey{}
 	require.NoError(t, k8sClient.Get(ctx, key, current))
 	assert.Nil(t, meta.FindStatusCondition(current.Status.Conditions, vkov1.ConditionTypeTLSMaterialStale))
+}
+
+// The create gate of ADR 0030 D12, against a real API server and the real work
+// queue: a TLS cluster whose Secret does not exist yet gets no StatefulSet, and
+// the StatefulSet that appears once the Secret does carries the fingerprint from
+// birth. What is under test beyond the unit tier is the progress wiring -- the
+// Secret create is the only event between "refused" and "created", so the
+// StatefulSet appearing proves the watch (or the bounded recheck) re-enters the
+// pass without anyone touching the CR.
+func TestTLSMaterialGate_TheStatefulSetWaitsForTheSecret_Integration(t *testing.T) {
+	ctx := testCtx
+	crName := "tls-gate-test"
+	secretName := crName + "-provided-tls"
+	key := types.NamespacedName{Name: crName, Namespace: "default"}
+
+	v := &vkov1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: "default"},
+		Spec: vkov1.ValkeySpec{
+			Replicas: 1,
+			Image:    "valkey/valkey:8.0",
+			TLS:      &vkov1.TLSSpec{Enabled: true, SecretName: secretName},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, v))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, v) })
+
+	// The refusal holds while the Secret is missing. Three seconds of settled
+	// absence is the strongest "never" an integration test can afford.
+	require.Never(t, func() bool {
+		sts := &appsv1.StatefulSet{}
+		return k8sClient.Get(ctx, key, sts) == nil
+	}, 3*time.Second, tlsRotationInterval,
+		"no StatefulSet may be created before its template can be armed")
+
+	secret := tlsMaterialSecret(secretName, "1")
+	require.NoError(t, k8sClient.Create(ctx, secret))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, secret) })
+
+	awaitTLSRotation(t, "the StatefulSet must appear once the Secret exists, armed from birth",
+		func(ctx context.Context) (bool, string) {
+			sts := &appsv1.StatefulSet{}
+			if err := k8sClient.Get(ctx, key, sts); err != nil {
+				return false, err.Error()
+			}
+			return templateFingerprint(sts) == builder.ComputeTLSMaterialHash(secret),
+				"fingerprint " + templateFingerprint(sts)
+		})
 }
 
 // awaitTLSRotation polls check until it reports true, failing with the last

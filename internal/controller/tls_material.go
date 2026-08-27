@@ -52,37 +52,67 @@ import (
 //
 // Two things the mechanism does not cover, both recorded rather than glossed:
 //
-//   - A pod carrying no record is unmeasured, never stale. That is the whole of
-//     the upgrade-neutrality story (ADR 0005), and it is also why the pods of a
-//     freshly created TLS cluster -- built from the template written before
-//     cert-manager issued -- are never rolled by a rotation until something else
-//     replaces them (T27, open, measured 2026-08-27).
+//   - A pod created before this operator version carries no record and is
+//     unmeasured, never stale. That is the whole of the upgrade-neutrality story
+//     (ADR 0005). It is only the legacy population: the operator never persists
+//     a TLS pod template without a record (ADR 0030 D12), so every pod it
+//     creates from here on is measurable from birth.
 //   - The fingerprint answers "did the roll happen" and never "is the material
 //     unchanged": whoever can write the Secret can keep the digest identical
 //     (ADR 0030 D11).
 
-// stampTLSMaterialHash writes the fingerprint of the TLS Secret named by
-// secretName onto the pod template of sts, so a rotation reaches the pods
-// through the same rolling update every other pod-template change rides.
+// ensureTLSMaterialRecord stamps the fingerprint of the TLS Secret named by
+// secretName onto the pod template of desired and reports whether that template
+// may be persisted. The invariant it enforces is ADR 0030 D12: the operator
+// never persists a TLS pod template without a material record, because every pod
+// built from a record-less template is permanently exempt from rotation rolls --
+// the presence rule cannot tell it from a pre-mechanism pod (T27).
 //
 // The record goes into the env of carrierContainer -- the sidecar on the data
 // tier, the sentinel container on the Sentinel tier -- and not into the template
 // annotations, because a pod can patch its own metadata and cannot patch its own
 // spec (ADR 0031).
 //
-// It is deliberately silent and never fails the step. A Secret that is absent
-// (cert-manager has not issued yet) or unreadable leaves the record off the
-// template, and a pod without the record is never restarted for it -- the same
-// presence rule the config and pod-spec hashes use, which is what makes the
-// operator upgrade that introduces this mechanism roll nothing (ADR 0005).
-func (r *ValkeyReconciler) stampTLSMaterialHash(
-	ctx context.Context, v *vkov1.Valkey, sts *appsv1.StatefulSet, secretName, carrierContainer string,
-) {
+// Three cases, over what is known rather than over lifecycle phase:
+//
+//  1. The Secret is readable: its fingerprint is stamped. The only case that
+//     existed before D12, byte-identical to it.
+//  2. The Secret is unreadable and the persisted template carries a record: that
+//     record is stamped onto desired. An unreadable Secret never erases a
+//     record -- without this, one blind pass strips the fingerprint off the live
+//     template and every pod recreated in that window comes back unmeasurable
+//     (T24(c)). current is read only after reconcileStatefulSet proved
+//     ownership, because provenance of the object is not provenance of the
+//     field (ADR 0020 D10); on the create path there is no current.
+//  3. Neither is known: the write is refused. False, not an error -- the pass
+//     goes on and asks to be re-entered, and the Secret watch re-triggers the
+//     moment cert-manager issues, so on the ordinary create path the
+//     StatefulSet appears seconds after the CR. A Secret that never appears
+//     leaves the tier unprovisioned (create) or its template unwritten
+//     (update), which is the state TLS itself would be in: a pod from that
+//     template could not mount its material either.
+func (r *ValkeyReconciler) ensureTLSMaterialRecord(
+	ctx context.Context, v *vkov1.Valkey, desired, current *appsv1.StatefulSet,
+	secretName, carrierContainer string,
+) bool {
 	if !v.IsTLSEnabled() {
-		return
+		return true
 	}
 
-	builder.StampTLSMaterialHash(sts, carrierContainer, r.tlsMaterialHash(ctx, v, secretName))
+	hash := r.tlsMaterialHash(ctx, v, secretName)
+	if hash == "" && current != nil {
+		hash = tlsMaterialHashFromSts(current)
+	}
+	if hash == "" {
+		log.FromContext(ctx).Info(
+			"refusing to persist a TLS pod template without a material record; waiting for the Secret",
+			"statefulset", desired.Name, "secret", secretName)
+		requestRecheck(ctx, foreignObjectRecheckInterval)
+		return false
+	}
+
+	builder.StampTLSMaterialHash(desired, carrierContainer, hash)
+	return true
 }
 
 // tlsMaterialHash reads the TLS Secret and returns its fingerprint, or the empty
@@ -116,12 +146,22 @@ type staleTLSPod struct {
 // measured", never "everything is current" -- overwriting a True on the strength
 // of a failed Get would clear exactly the signal an operator is meant to act on.
 func (r *ValkeyReconciler) reportTLSMaterialStale(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.IsTLSEnabled() {
+		r.clearTLSMaterialStaleOnDisable(ctx, v)
+		return nil
+	}
+
 	stale, measured, err := r.scanTLSMaterial(ctx, v)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("could not measure TLS material staleness", "error", err.Error())
 		return nil
 	}
-	if !measured {
+	// A tier that could not be measured suppresses the all-clear, never a
+	// finding: stale pods in the tier that was readable are reported either way,
+	// but "every pod is current" is only written when every tier was actually
+	// inspected. Absorbing an unreadable tier into the affirmative sentence is
+	// T24(a), and it contradicted this function's own stated rule.
+	if len(stale) == 0 && !measured {
 		return nil
 	}
 
@@ -150,6 +190,24 @@ func (r *ValkeyReconciler) reportTLSMaterialStale(ctx context.Context, v *vkov1.
 	return nil
 }
 
+// clearTLSMaterialStaleOnDisable retracts a standing True on a cluster that has
+// turned TLS off. Without it the condition has no writer once TLS is disabled,
+// so a True carried into the switch stays True for the life of the CR and the
+// shipped ValkeyTLSMaterialStale alert fires on it indefinitely (T24(d)).
+//
+// It is presence-guarded in both directions: a cluster that never carried the
+// condition never gains one here (ADR 0005), and a standing False is left
+// untouched -- it alerts nobody, and rewriting its reason would reset a
+// LastTransitionTime for a cluster nothing changed on.
+func (r *ValkeyReconciler) clearTLSMaterialStaleOnDisable(ctx context.Context, v *vkov1.Valkey) {
+	existing := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeTLSMaterialStale)
+	if existing == nil || existing.Status != metav1.ConditionTrue {
+		return
+	}
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeTLSMaterialStale, metav1.ConditionFalse,
+		vkov1.ReasonTLSMaterialNotApplicable, "TLS is disabled; there is no material left to be stale")
+}
+
 // staleTLSMessage renders the condition message. The pods are already in ordinal
 // order per tier and the tiers are visited in a fixed order, so the message is
 // stable across passes -- one that reordered itself would rewrite the status on
@@ -170,9 +228,10 @@ func staleTLSMessage(stale []staleTLSPod) string {
 // scanTLSMaterial walks both StatefulSet tiers and returns the pods whose
 // recorded fingerprint differs from the one in the Secret they mount.
 //
-// The second return value reports whether anything was measurable at all: no
-// tier with a readable Secret and an owned StatefulSet means there is nothing to
-// say, which is different from "nothing is stale".
+// The second return value reports whether every tier was measurable. It is an
+// AND across the tiers, not an OR: one readable tier says nothing about the
+// other, and the caller writes the all-clear only over a complete measurement
+// (T24(a)).
 func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey) ([]staleTLSPod, bool, error) {
 	if !v.IsTLSEnabled() {
 		return nil, false, nil
@@ -192,13 +251,13 @@ func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey)
 	}
 
 	var stale []staleTLSPod
-	measured := false
+	measured := true
 	for _, tier := range tiers {
 		tierStale, tierMeasured, err := r.scanTierTLSMaterial(ctx, v, tier.component, tier.secret)
 		if err != nil {
 			return nil, false, err
 		}
-		measured = measured || tierMeasured
+		measured = measured && tierMeasured
 		stale = append(stale, tierStale...)
 	}
 

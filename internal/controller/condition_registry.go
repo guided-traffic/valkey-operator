@@ -183,10 +183,12 @@ var conditionRegistry = []conditionOwnership{
 		// reconcileWorkload returns early while a rolling update is in flight --
 		// which is precisely when this condition is True.
 		evaluators: 1,
-		clearSite:  "reportTLSMaterialStale, evaluated on every pass of a TLS cluster",
-		// A level needs no presence guard, and here the gate does the same job from
-		// the other side: the step carries when: IsTLSEnabled, so a cluster without
-		// TLS never gains the condition at all.
+		clearSite:  "reportTLSMaterialStale, evaluated on every pass of every cluster",
+		// The step deliberately carries no when: IsTLSEnabled gate -- that gate
+		// silenced the condition's only writer the moment TLS was turned off, so a
+		// True froze forever with the alert firing on it (T24(d)). The evaluator
+		// handles the disabled case itself, presence-guarded: only a standing True
+		// is retracted, a cluster that never carried the condition never gains one.
 		presenceGuarded: false,
 	},
 	{

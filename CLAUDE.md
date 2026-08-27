@@ -565,6 +565,16 @@ not cover is a roll that never starts, and that is what the `TLSMaterialStale` l
 Upgrade neutrality is the presence guard the other hashes already use: a pod without the
 record is never restarted for one.
 
+**The operator never persists a TLS pod template without a material record** (ADR 0030 D12,
+closing T27): the Secret fingerprint is stamped when readable, inherited from the persisted
+template when it is not — an unreadable Secret never erases a record — and a template with
+neither is refused without failing the pass; the Secret watch re-enters it. A fresh TLS
+cluster therefore gets its StatefulSet a few seconds after the CR, once cert-manager has
+issued, and every pod it ever boots is measurable from birth. The refusal is the fix for the
+pods that used to be built from a record-less template and were then exempt from every
+rotation forever. `TLSMaterialStale` writes its all-clear only over a complete two-tier
+measurement and retracts a standing True when TLS is turned off (T24).
+
 **The ADR debt is paid** (deferred 2026-08-26 as `ADR spaeter, erst Code`, discharged the same
 day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether
 **`valkey-server`** reloads, and that is *still* unmeasured — what fired and was measured is the

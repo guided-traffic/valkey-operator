@@ -281,6 +281,13 @@ const (
 	// hold a superseded fingerprint. The message names them and their tier.
 	ReasonTLSMaterialRollPending = "TLSMaterialRollPending"
 
+	// ReasonTLSMaterialNotApplicable clears a standing TLSMaterialStale=True on a
+	// cluster that has turned TLS off: there is no material left to be stale, and
+	// without the retraction the shipped alert would fire on the frozen True for
+	// the life of the CR. Written only over an existing True, never onto a
+	// cluster that does not carry the condition.
+	ReasonTLSMaterialNotApplicable = "TLSMaterialNotApplicable"
+
 	// ReasonTLSMaterialCurrent clears TLSMaterialStale once every measured pod
 	// carries the fingerprint of the Secret it mounts.
 	ReasonTLSMaterialCurrent = "TLSMaterialCurrent"

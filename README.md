@@ -885,8 +885,12 @@ their reproductions, are in
 [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md).
 
 Reverting `spec.persistence` to what the StatefulSet was created with clears the
-block at once, touches no pod and costs nothing — the right move whenever the change
-was not deliberate.
+block at once — the right move whenever the change was not deliberate. It touches
+no pod only when the operator's rendering of the pod template matches what the
+StatefulSet already carries; on a cluster whose StatefulSet predates the running
+operator version that is usually not the case, and the revert then rides an
+ordinary failover-aware rolling update (measured 2026-08-26: reverting
+persistence on a live cluster replaced all three data pods, losslessly).
 
 **Recreating does not resize or reclass the volumes that already exist.** The
 claims are named `data-<name>-<ordinal>` and are reused by name, so a recreated
@@ -953,7 +957,7 @@ does not fit in five minutes.
 | `SentinelPeersStale` | At least one Sentinel knows more other Sentinels than the cluster has. Sentinel never forgets a peer it has seen, and the majority a failover leader needs is computed over that whole table — so the surplus is failover capacity that is already gone, not a display issue. The message names each pod and its count. Clear it with `SENTINEL RESET <cluster-name>` on one Sentinel at a time **while the master is healthy** (a reset with the master unreachable leaves that Sentinel knowing nothing and unable to rediscover), or leave it to the next Sentinel roll. Only written while all Valkey and Sentinel pods are Ready; a pass where no Sentinel answers leaves the previous value. A cluster reporting `True` is re-checked every 5 minutes, so a reset shows up as a cleared condition within the maintenance window rather than at the next cache resync. See [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md). |
 | `SentinelUpdatePending` | The Sentinel tier is being rolled: at least one Sentinel pod runs an outdated spec, or a replacement pod is not Ready yet. The `RollingUpdateComplete` event covers the **data tier only** and fires before the first Sentinel pod is replaced — the update as a whole is finished when this condition goes `False` with reason `Completed`, which is also the moment the `SentinelUpdateComplete` event is emitted. Reason `SentinelDisabled` means Sentinel was disabled while the condition stood (no completion event in that case). Written only on a cluster whose Sentinel tier actually rolled; clusters that never rolled carry no such condition. See [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md). |
 | `PodTerminationStalled` | A pod of the tier being rolled has been `Terminating` for more than two minutes past its own graceful deletion deadline, and the rolling update of that tier is holding: the operator never deletes a pod of a tier while another pod of that tier is on its way out. **The condition does not lift the hold and nothing resumes it** — deleting a second pod because the first is wedged is what the hold prevents. What it marks is that the operator stopped ending the reconcile pass on the wait, so the Sentinel roll, the no-master recovery, the steady-state split-brain check and the status write run again while the stall lasts. The message names the pod and how far past its deadline it is. Look at that pod: a `NodeNotReady` node, a stuck finalizer and a container ignoring SIGTERM are the usual causes. It clears itself with reason `PodTerminationCleared` once the pod is gone, and the roll continues on its own. No Event accompanies it. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md). |
-| `TLSMaterialStale` | At least one pod is still running the TLS material from before the last certificate rotation. **This is True for the length of every ordinary rotation roll and is not urgent**: cert-manager renews 30 days before expiry and the previous certificate keeps working for those 30 days, so the pods have a month of slack and the shipped alert waits three days before firing. The message names the pods and their tier. It clears itself with reason `TLSMaterialCurrent` once every measured pod carries the current fingerprint. What it exists to catch is the roll that **never starts** — the operator missed the Secret event, cannot write the StatefulSet, or is blocked for an unrelated reason — because no other signal fires in that case and the pods then keep the old certificate until it expires. Only written on TLS clusters, and only measured for pods that already carry the fingerprint (`VKO_TLS_MATERIAL_HASH` on the sidecar container, or the superseded `vko.gtrfc.com/tls-material-hash` annotation on pods from before 2026-08-27); pods created by an older operator are unmeasured, not stale. See [Certificate rotation](#certificate-rotation). |
+| `TLSMaterialStale` | At least one pod is still running the TLS material from before the last certificate rotation. **This is True for the length of every ordinary rotation roll and is not urgent**: cert-manager renews 30 days before expiry and the previous certificate keeps working for those 30 days, so the pods have a month of slack and the shipped alert waits three days before firing. The message names the pods and their tier. It clears itself with reason `TLSMaterialCurrent` once every measured pod carries the current fingerprint. What it exists to catch is the roll that **never starts** — the operator missed the Secret event, cannot write the StatefulSet, or is blocked for an unrelated reason — because no other signal fires in that case and the pods then keep the old certificate until it expires. Only written on TLS clusters (a cluster that turns TLS off has a standing `True` retracted once, with reason `TLSMaterialNotApplicable`), and only measured for pods that already carry the fingerprint (`VKO_TLS_MATERIAL_HASH` on the sidecar container, or the superseded `vko.gtrfc.com/tls-material-hash` annotation on pods from before 2026-08-27); pods created by an older operator are unmeasured, not stale. The all-clear is only written when **both** tiers could be measured; stale pods are reported even while the other tier cannot be. See [Certificate rotation](#certificate-rotation). |
 | `MultipleMasters` | More than one data pod answered that it is the master while a rolling update was in flight. This is **not by itself a fault**: every controlled failover has a window in which the promoted pod and the outgoing one both answer master, and the operator closes it on the same pass. The reason tells the two apart — `MultipleMastersTransitional` is inside the 90 s bound and carries no Event, `MultipleMastersPersisted` is past it and is the moment the `SplitBrainDetected` **Warning** event fires. The message names the pods and the authority. It goes `False` with reason `SingleMaster` on the first pass that sees at most one master; a rolling update abandoned with rogue masters still present leaves it `True` until the next one, and so does a resolution the operator **refused** because demoting would have discarded the only dataset ([ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)) — a refusal carries no Event of its own, so a `MultipleMasters` that outlives the 90 s bound is how it surfaces. Written only during a rolling update — clusters that never saw two masters carry no such condition. See [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md). |
 
 #### Phase Values
@@ -1037,15 +1041,14 @@ nothing is time-critical; several clusters rotating in the same window simply qu
 `--max-concurrent-reconciles`. The `TLSMaterialStale` condition and the `ValkeyTLSMaterialStale`
 alert cover the one case the slack does not: a roll that never starts.
 
-> **Known gap, measured 2026-08-27: a TLS cluster that has never been changed since it was
-> created is not covered.** The operator creates the cert-manager `Certificate` and the
-> StatefulSet in the same pass, so the first pod template is written before cert-manager has
-> issued and carries no fingerprint — and the pods are built from that template. They are then
-> *unmeasured* rather than stale, so a rotation moves the template and replaces nothing, and
-> `TLSMaterialStale` stays `False`. It resolves the first time anything else replaces the pods,
-> which an operator upgrade does for the data tier. Until it is fixed, force one roll on a new
-> TLS cluster — any spec change does — or delete its data pods once
-> `kubectl get sts <name> -o yaml` shows `VKO_TLS_MATERIAL_HASH` on the `sidecar` container.
+**A fresh TLS cluster is covered from birth.** The operator refuses to create a StatefulSet
+whose TLS material it cannot fingerprint yet, so the StatefulSet appears a few seconds after
+the CR — once cert-manager has issued — and every pod carries the fingerprint from its first
+start. (Before 2026-08-27 the StatefulSet was created alongside the `Certificate`, its first
+pods carried no fingerprint, and a rotation never rolled a cluster that had not been changed
+since creation.) The one operational consequence: with a user-provided `spec.tls.secretName`,
+the Secret has to exist — until it does, no data plane is provisioned and the CR stays in
+`Provisioning` with "Waiting for StatefulSet creation".
 
 **Upgrading to an operator version that has this mechanism rolls nothing.** A pod that does not
 carry the fingerprint is never restarted for it, so existing pods adopt the

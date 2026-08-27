@@ -502,8 +502,11 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		// among the resource steps and not in the workload pass because every one
 		// of those returns early while a rolling update is in flight, and a level
 		// condition that is not re-measured every pass is the staleness this repo
-		// has now fixed four times (ADR 0027).
-		{name: "TLS material", when: (*vkov1.Valkey).IsTLSEnabled, run: r.reportTLSMaterialStale},
+		// has now fixed four times (ADR 0027). Deliberately no when: IsTLSEnabled
+		// gate -- the evaluator itself handles the disabled case, because a gate
+		// here silences the condition's only writer the moment TLS is turned off
+		// and freezes a True forever (T24(d), the T15 shape again).
+		{name: "TLS material", run: r.reportTLSMaterialStale},
 	}
 }
 
@@ -1211,10 +1214,6 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	logger := log.FromContext(ctx)
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
-	// The fingerprint is Secret content and the builder never sees it, so it is
-	// stamped here rather than folded into the pod-spec hash. The sidecar container
-	// carries it: it is the one container of the data pod that is ours.
-	r.stampTLSMaterialHash(ctx, v, desired, builder.ValkeyTLSSecretName(v), builder.SidecarContainerName)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on StatefulSet: %w", err)
@@ -1223,6 +1222,14 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	current := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// The fingerprint is Secret content and the builder never sees it, so it
+		// is stamped here rather than folded into the pod-spec hash. The sidecar
+		// container carries it: the one container of the data pod that is ours.
+		// A template it cannot arm is not created -- ADR 0030 D12.
+		if !r.ensureTLSMaterialRecord(ctx, v, desired, nil,
+			builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
+			return nil
+		}
 		logger.Info("Creating StatefulSet", "name", desired.Name)
 		return r.Create(ctx, desired)
 	}
@@ -1256,6 +1263,16 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
 		reasonStatefulSetRecreateRequired, true); err != nil {
 		return err
+	}
+
+	// After the ownership proof, because case 2 reads the record off current
+	// (ADR 0020 D10), and before the drift detection, which compares the stamped
+	// template. A refusal leaves the live template untouched: the window where
+	// this tier has neither a readable Secret nor a recorded fingerprint is the
+	// window in which every created pod would be permanently unmeasurable.
+	if !r.ensureTLSMaterialRecord(ctx, v, desired, current,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
+		return nil
 	}
 
 	// Detect drift and update.
@@ -1344,10 +1361,6 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelStatefulSet(v)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
-	// The Sentinel tier has no sidecar of ours at all -- its probes shell out to
-	// valkey-cli per exec -- so whether it can skip the roll is decided entirely by
-	// valkey-sentinel, which has never been measured. It carries the fingerprint.
-	r.stampTLSMaterialHash(ctx, v, desired, builder.SentinelTLSSecretName(v), builder.SentinelContainerName)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Sentinel StatefulSet: %w", err)
@@ -1356,6 +1369,15 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	current := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// The Sentinel tier has no sidecar of ours at all -- its probes shell out
+		// to valkey-cli per exec -- so whether it can skip the roll is decided
+		// entirely by valkey-sentinel, which has never been measured. It carries
+		// the fingerprint, and a template it cannot arm is not created (ADR 0030
+		// D12).
+		if !r.ensureTLSMaterialRecord(ctx, v, desired, nil,
+			builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
+			return nil
+		}
 		logger.Info("Creating Sentinel StatefulSet", "name", desired.Name)
 		return r.Create(ctx, desired)
 	}
@@ -1387,6 +1409,14 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
 		reasonSentinelStatefulSetRecreateRequired, false); err != nil {
 		return err
+	}
+
+	// Same placement and same rule as the data tier: after the ownership proof
+	// (ADR 0020 D10), before the drift detection, and a refusal leaves the live
+	// template untouched (ADR 0030 D12).
+	if !r.ensureTLSMaterialRecord(ctx, v, desired, current,
+		builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
+		return nil
 	}
 
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {

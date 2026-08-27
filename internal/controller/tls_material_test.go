@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -118,7 +119,7 @@ func tlsTierPodLegacy(v *vkov1.Valkey, component string, ordinal int, hash strin
 	return pod
 }
 
-// --- stampTLSMaterialHash ---
+// --- ensureTLSMaterialRecord ---
 
 // recordedOn returns the fingerprint the pod template carries, read the way every
 // consumer reads it.
@@ -126,28 +127,28 @@ func recordedOn(sts *appsv1.StatefulSet) string {
 	return builder.RecordedTLSMaterialHash(&sts.Spec.Template.Spec, sts.Spec.Template.Annotations)
 }
 
-func TestStampTLSMaterialHash_WritesTheFingerprintOfTheMountedSecret(t *testing.T) {
+func TestEnsureTLSMaterialRecord_WritesTheFingerprintOfTheMountedSecret(t *testing.T) {
 	v := certManagerValkey("test")
 	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
 	r, _ := newTestReconciler(v, secret)
 
 	sts := builder.BuildStatefulSet(v, "operator:test")
-	r.stampTLSMaterialHash(context.Background(), v, sts,
-		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName)
+	assert.True(t, r.ensureTLSMaterialRecord(context.Background(), v, sts, nil,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
 
 	assert.Equal(t, builder.ComputeTLSMaterialHash(secret), recordedOn(sts))
 }
 
 // The record goes into the pod spec and never into pod metadata: metadata is what
 // a compromised container can patch (ADR 0031).
-func TestStampTLSMaterialHash_RecordsInTheSpecAndNotInMetadata(t *testing.T) {
+func TestEnsureTLSMaterialRecord_RecordsInTheSpecAndNotInMetadata(t *testing.T) {
 	v := certManagerValkey("test")
 	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
 	r, _ := newTestReconciler(v, secret)
 
 	sts := builder.BuildStatefulSet(v, "operator:test")
-	r.stampTLSMaterialHash(context.Background(), v, sts,
-		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName)
+	assert.True(t, r.ensureTLSMaterialRecord(context.Background(), v, sts, nil,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
 
 	assert.NotContains(t, sts.Spec.Template.Annotations, builder.AnnotationTLSMaterialHash,
 		"the annotation is superseded and must not be written any more")
@@ -186,28 +187,77 @@ func TestStampTLSMaterialHash_RotationReplacesTheRecord(t *testing.T) {
 	assert.Equal(t, "bbbb", recordedOn(sts))
 }
 
-func TestStampTLSMaterialHash_SkipsClustersWithoutTLS(t *testing.T) {
+func TestEnsureTLSMaterialRecord_SkipsClustersWithoutTLS(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, _ := newTestReconciler(v, tlsSecret("test-tls", "default", "1"))
 
 	sts := builder.BuildStatefulSet(v, "operator:test")
-	r.stampTLSMaterialHash(context.Background(), v, sts, "test-tls", builder.SidecarContainerName)
+	assert.True(t, r.ensureTLSMaterialRecord(context.Background(), v, sts, nil,
+		"test-tls", builder.SidecarContainerName))
 
 	assert.Empty(t, recordedOn(sts))
 }
 
-// cert-manager has not issued yet. Leaving the record off is what keeps the
-// StatefulSet writable in that window, and a pod without the record is never
-// restarted for one.
-func TestStampTLSMaterialHash_AbsentSecretLeavesNoRecord(t *testing.T) {
+// cert-manager has not issued yet and there is no persisted template to inherit
+// a record from. The template must not be persisted: every pod built from it
+// would be permanently exempt from rotation rolls (T27, ADR 0030 D12).
+func TestEnsureTLSMaterialRecord_AbsentSecretRefusesTheRecordlessTemplate(t *testing.T) {
 	v := certManagerValkey("test")
 	r, _ := newTestReconciler(v)
 
 	sts := builder.BuildStatefulSet(v, "operator:test")
-	r.stampTLSMaterialHash(context.Background(), v, sts,
-		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName)
+	assert.False(t, r.ensureTLSMaterialRecord(context.Background(), v, sts, nil,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
 
 	assert.Empty(t, recordedOn(sts))
+}
+
+// An unreadable Secret never erases a record: the desired template inherits the
+// fingerprint the persisted one carries, so a blind pass cannot strip it and
+// every pod recreated in that window stays measurable (T24(c), ADR 0030 D12
+// case 2).
+func TestEnsureTLSMaterialRecord_UnreadableSecretKeepsTheRecordedFingerprint(t *testing.T) {
+	v := certManagerValkey("test")
+	r, _ := newTestReconciler(v)
+
+	current := builder.BuildStatefulSet(v, "operator:test")
+	builder.StampTLSMaterialHash(current, builder.SidecarContainerName, "aaaa1111")
+
+	desired := builder.BuildStatefulSet(v, "operator:test")
+	assert.True(t, r.ensureTLSMaterialRecord(context.Background(), v, desired, current,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
+
+	assert.Equal(t, "aaaa1111", recordedOn(desired))
+}
+
+// The legacy annotation carrier counts as a record too: a template written
+// before the carrier moved into the spec keeps its fingerprint through a blind
+// pass the same way.
+func TestEnsureTLSMaterialRecord_UnreadableSecretKeepsTheLegacyAnnotationRecord(t *testing.T) {
+	v := certManagerValkey("test")
+	r, _ := newTestReconciler(v)
+
+	current := builder.BuildStatefulSet(v, "operator:test")
+	current.Spec.Template.Annotations = map[string]string{builder.AnnotationTLSMaterialHash: "bbbb2222"}
+
+	desired := builder.BuildStatefulSet(v, "operator:test")
+	assert.True(t, r.ensureTLSMaterialRecord(context.Background(), v, desired, current,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
+
+	assert.Equal(t, "bbbb2222", recordedOn(desired))
+}
+
+// A serving cluster whose template never carried a record (spec.tls.enabled
+// flipped on, Secret not yet issued) refuses the template write instead of
+// persisting a record-less one -- the update-path door of T27.
+func TestEnsureTLSMaterialRecord_RecordlessCurrentAndAbsentSecretRefuses(t *testing.T) {
+	v := certManagerValkey("test")
+	r, _ := newTestReconciler(v)
+
+	current := builder.BuildStatefulSet(v, "operator:test")
+	desired := builder.BuildStatefulSet(v, "operator:test")
+	assert.False(t, r.ensureTLSMaterialRecord(context.Background(), v, desired, current,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName))
 }
 
 // --- the Secret watch ---
@@ -506,6 +556,94 @@ func TestReportTLSMaterialStale_NonTLSClusterIsNeverMeasured(t *testing.T) {
 	assert.Nil(t, staleCondition(t, r, v))
 }
 
+// One readable tier says nothing about the other: an unreadable Sentinel Secret
+// must suppress the all-clear instead of being absorbed into it (T24(a)).
+func TestReportTLSMaterialStale_UnreadableSentinelSecretSuppressesTheAllClear(t *testing.T) {
+	v := certManagerValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	dataSecret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
+	dataHash := builder.ComputeTLSMaterialHash(dataSecret)
+
+	r, _ := newTestReconciler(v, dataSecret,
+		tlsTierSts(v, common.ComponentValkey, 1, dataHash),
+		tlsTierPod(v, common.ComponentValkey, 0, dataHash),
+		tlsTierSts(v, common.ComponentSentinel, 1, "whatever"),
+		tlsTierPod(v, common.ComponentSentinel, 0, "whatever"),
+	)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	assert.Nil(t, staleCondition(t, r, v),
+		"an affirmative all-clear about a tier nothing inspected must not be written")
+}
+
+// The suppression works one way only: stale pods in the readable tier are
+// reported even while the other tier cannot be measured.
+func TestReportTLSMaterialStale_StalePodsAreReportedDespiteAnUnmeasurableTier(t *testing.T) {
+	v := certManagerValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	dataSecret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "2")
+	dataHash := builder.ComputeTLSMaterialHash(dataSecret)
+
+	r, _ := newTestReconciler(v, dataSecret,
+		tlsTierSts(v, common.ComponentValkey, 1, dataHash),
+		tlsTierPod(v, common.ComponentValkey, 0, "stale"),
+		tlsTierSts(v, common.ComponentSentinel, 1, "whatever"),
+	)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	cond := staleCondition(t, r, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Contains(t, cond.Message, "test-0")
+}
+
+// Turning TLS off retracts a standing True: without the retraction the condition
+// has no writer left and the shipped alert fires on the frozen True for the life
+// of the CR (T24(d)).
+func TestReportTLSMaterialStale_DisablingTLSRetractsAStandingTrue(t *testing.T) {
+	v := newTestValkey("test", "default")
+	v.Status.Conditions = []metav1.Condition{{
+		Type:               vkov1.ConditionTypeTLSMaterialStale,
+		Status:             metav1.ConditionTrue,
+		Reason:             vkov1.ReasonTLSMaterialRollPending,
+		Message:            "carried into the switch",
+		LastTransitionTime: metav1.Now(),
+	}}
+	r, _ := newTestReconciler(v)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	cond := staleCondition(t, r, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonTLSMaterialNotApplicable, cond.Reason)
+}
+
+// The retraction is presence-guarded in both directions: a standing False stays
+// byte-identical, and a cluster without the condition never gains one.
+func TestReportTLSMaterialStale_DisablingTLSLeavesAStandingFalseUntouched(t *testing.T) {
+	transition := metav1.Now()
+	v := newTestValkey("test", "default")
+	v.Status.Conditions = []metav1.Condition{{
+		Type:               vkov1.ConditionTypeTLSMaterialStale,
+		Status:             metav1.ConditionFalse,
+		Reason:             vkov1.ReasonTLSMaterialCurrent,
+		Message:            "from before the switch",
+		LastTransitionTime: transition,
+	}}
+	r, _ := newTestReconciler(v)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	cond := staleCondition(t, r, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, vkov1.ReasonTLSMaterialCurrent, cond.Reason, "a harmless False is not rewritten")
+}
+
 // --- the full path, from a rotated Secret to a changed pod template ---
 
 func TestReconcileStatefulSet_RotationChangesThePodTemplateFingerprint(t *testing.T) {
@@ -535,4 +673,79 @@ func TestReconcileStatefulSet_RotationChangesThePodTemplateFingerprint(t *testin
 	after := recordedOn(sts)
 	assert.NotEqual(t, before, after, "the rotation must reach the pod template")
 	assert.Equal(t, after, tlsMaterialHashFromSts(sts))
+}
+
+// The create path of ADR 0030 D12: no material, no StatefulSet. The refusal is
+// not an error -- the Secret watch re-enters the pass the moment cert-manager
+// issues, and the StatefulSet then appears with the record already on it, so no
+// pod of a fresh TLS cluster is ever built from a record-less template (T27).
+func TestReconcileStatefulSet_WaitsForTheTLSMaterialBeforeCreating(t *testing.T) {
+	v := certManagerValkey("test")
+	r, c := newTestReconciler(v)
+	ctx := context.Background()
+	stsKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentValkey), Namespace: v.Namespace}
+
+	require.NoError(t, r.reconcileStatefulSet(ctx, v), "the refusal must not fail the pass")
+	sts := &appsv1.StatefulSet{}
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, stsKey, sts)),
+		"no StatefulSet may exist before its template can be armed")
+
+	// cert-manager issues.
+	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
+	require.NoError(t, c.Create(ctx, secret))
+
+	require.NoError(t, r.reconcileStatefulSet(ctx, v))
+	require.NoError(t, c.Get(ctx, stsKey, sts))
+	assert.Equal(t, builder.ComputeTLSMaterialHash(secret), recordedOn(sts),
+		"the first template a pod is ever built from carries the record")
+}
+
+// The same rule on the Sentinel tier, which has no container of ours at all and
+// would otherwise stay unmeasurable until the user's next spec change.
+func TestReconcileSentinelStatefulSet_WaitsForTheTLSMaterialBeforeCreating(t *testing.T) {
+	v := certManagerValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	r, c := newTestReconciler(v)
+	ctx := context.Background()
+	stsKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentSentinel), Namespace: v.Namespace}
+
+	require.NoError(t, r.reconcileSentinelStatefulSet(ctx, v))
+	sts := &appsv1.StatefulSet{}
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, stsKey, sts)))
+
+	secret := tlsSecret(builder.SentinelTLSSecretName(v), v.Namespace, "1")
+	require.NoError(t, c.Create(ctx, secret))
+
+	require.NoError(t, r.reconcileSentinelStatefulSet(ctx, v))
+	require.NoError(t, c.Get(ctx, stsKey, sts))
+	assert.Equal(t, builder.ComputeTLSMaterialHash(secret), recordedOn(sts))
+}
+
+// The update path of T24(c): a pass that cannot read the Secret used to strip
+// the record off the live template, and every pod recreated in that window came
+// back permanently unmeasurable. Now the desired template inherits the persisted
+// record instead.
+func TestReconcileStatefulSet_UnreadableSecretDoesNotStripTheRecord(t *testing.T) {
+	v := certManagerValkey("test")
+	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
+	r, c := newTestReconciler(v, secret)
+	ctx := context.Background()
+	stsKey := types.NamespacedName{Name: common.StatefulSetName(v, common.ComponentValkey), Namespace: v.Namespace}
+
+	require.NoError(t, r.reconcileStatefulSet(ctx, v))
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, c.Get(ctx, stsKey, sts))
+	before := recordedOn(sts)
+	require.NotEmpty(t, before)
+
+	// The Secret goes briefly missing; something else changes the spec.
+	require.NoError(t, c.Delete(ctx, secret))
+	v.Spec.PodLabels = map[string]string{"changed": "yes"}
+
+	require.NoError(t, r.reconcileStatefulSet(ctx, v))
+	require.NoError(t, c.Get(ctx, stsKey, sts))
+	assert.Equal(t, before, recordedOn(sts), "a blind pass must not erase the record")
+	assert.Equal(t, "yes", sts.Spec.Template.Labels["changed"],
+		"the template write itself goes through -- only the record is inherited")
 }

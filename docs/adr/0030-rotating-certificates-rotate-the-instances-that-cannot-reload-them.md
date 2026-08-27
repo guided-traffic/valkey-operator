@@ -36,6 +36,14 @@ when this ADR was written — `TestE2E_TLS_CertificateRotation_RollsTheFleet`
 cert-manager reissues, then asserts the template moves, every data pod is replaced, the
 dataset survives and the condition clears.
 
+Also amended 2026-08-27 (second pass): **D12 is new — the operator never persists a TLS pod
+template without a material record.** The e2e above immediately measured what shipping without
+that rule costs: the pods of a freshly created TLS cluster carried no fingerprint and were
+therefore exempt from every rotation forever (T27). D8's "an unreadable Secret leaves the
+record off the template" is superseded in place by D12's three cases; the D9 defect paragraph
+(per-pass, not per-tier measurability) and the no-writer-once-disabled gap are fixed in the
+same change, and four residual risks below are closed with their strikes.
+
 Not implemented, deliberately: nothing parses `notAfter`, nothing schedules, and the operator
 never issues a certificate. `valkey-server` and `valkey-sentinel` are still **unmeasured** and
 covered by D6 rather than by verification.
@@ -205,11 +213,15 @@ five-day one. If an issuer with a short overlap is in use, that threshold is the
 lower, not this decision.
 
 **D8 — Upgrade neutrality is the presence guard the other hashes already use.** A pod without
-the annotation is never restarted for one, and contributes no staleness. The operator upgrade
+the record is never restarted for one, and contributes no staleness. The operator upgrade
 that introduces this mechanism therefore rolls nothing and lights up nothing
-([ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md)). A Secret that is absent or
+([ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md)). ~~A Secret that is absent or
 unreadable leaves the annotation off the template rather than stamping an empty value; the
-stamp never fails a reconcile step.
+stamp never fails a reconcile step.~~ **Superseded 2026-08-27 by D12:** leaving the record off
+the template is exactly what made every pod built from that template permanently exempt (T27),
+and one blind pass stripped the record off a live template and produced the same population
+through a different door (T24(c)). The stamp still never fails a step — a template that cannot
+be armed is refused without an error, not persisted bare.
 
 **The two tiers do not pay the same price for that guard, and the difference is not one
 upgrade.** A data pod carries a container of ours, so the next operator upgrade rolls it and it
@@ -229,12 +241,17 @@ rolling update is in flight, which is precisely when this condition is True
 *not measured*, never *everything is current* — overwriting a `True` on the strength of a
 failed `Get` would clear the one signal an operator is meant to act on.
 
-**That rule holds per pass, and not yet per tier**, which is a defect this ADR records rather
-than claims: measurability is OR-ed across the two tiers, so a Sentinel Secret that cannot be
-read while the data one can leaves the CR reporting `False` with the message "Every pod runs
-the TLS material currently in its Secret" — an all-clear covering a tier nothing inspected. The
-un-annotated Sentinel pods of D8 land in the same message for the same reason. Both are in the
-residual risks with their ticket reference.
+**Since 2026-08-27 that rule holds per tier, not only per pass.** Measurability is AND-ed
+across the two tiers, one way: stale pods in a readable tier are reported even while the other
+tier cannot be measured, but the affirmative "every pod runs the TLS material currently in its
+Secret" is only written over a complete measurement (T24(a); it used to be OR-ed, an all-clear
+covering a tier nothing inspected). The evaluator also owns the disabled case itself instead of
+sitting behind a `when: IsTLSEnabled` step gate: a standing `True` carried into `tls.enabled:
+false` is retracted with reason `TLSMaterialNotApplicable`, presence-guarded in both directions
+(T24(d) — the gate had silenced the condition's only writer, freezing the `True` with the alert
+firing on it for the life of the CR). The one population still absorbed into an honest `False`
+is the record-less legacy pod — unmeasured is not stale, per D8 — and that is in the residual
+risks with its ticket reference.
 
 **D10 — The Secret watch matches every Secret the fingerprint reads.** Both tiers, the unified
 certificate and a user-provided Secret name. Before `0aaf79d` the predicate matched auth
@@ -287,6 +304,49 @@ What would actually raise the ceiling is not a better digest but a **trust ancho
 Secret** — comparing the served leaf against the issuer this operator asked for, rather than
 against the bytes the Secret happens to hold. Nothing here does that, and no decision has been
 taken to.
+
+**D12 — The operator never persists a TLS pod template without a material record.** Added
+2026-08-27, superseding the D8 rule that an unreadable Secret leaves the record off the
+template. The reason is T27, measured on a cluster: the Certificate and the StatefulSet are
+created in the same pass, cert-manager has not issued when the template is first written, and
+the StatefulSet controller builds the pods from that bare template — after which the D8
+presence guard exempts them from every rotation permanently, because it cannot tell "never had
+a record" from "predates the mechanism" and must keep exempting the second. The same bare
+template reached pods through two more doors: `spec.tls.enabled: false → true` on a serving
+cluster, and any pass that could not read the Secret, which overwrote the live template
+without the record so that every pod recreated in the window came back unmeasurable (T24(c)).
+
+`ensureTLSMaterialRecord` ([`internal/controller/tls_material.go`](../../internal/controller/tls_material.go))
+enforces the invariant at both StatefulSet reconcilers, both tiers, with three cases over what
+is known rather than over lifecycle phase:
+
+1. **The Secret is readable → its fingerprint is stamped.** The only case that existed before
+   this decision, byte-identical to it.
+2. **The Secret is unreadable and the persisted template carries a record → that record is
+   inherited.** An unreadable Secret never erases a record. The persisted value is read only
+   after the ownership proof, because provenance of the object is not provenance of the field
+   ([ADR 0020](0020-write-only-what-the-operator-owns.md) D10), and the legacy annotation
+   carrier counts as a record — a pre-[ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)
+   template keeps its fingerprint through a blind pass the same way.
+3. **Neither is known → the write is refused.** Not an error and not a failed pass: the step
+   returns clean, asks for a bounded re-entry, and D10's Secret watch re-triggers the pass the
+   moment the Secret appears — so on the ordinary create path the StatefulSet materialises
+   seconds after the CR, armed from birth. The refusal never touches a live template: on the
+   update path it leaves the persisted one standing, on the create path there is nothing to
+   leave.
+
+Two consequences worth naming. A fresh TLS cluster is now created *after* its material exists
+instead of alongside it — no pod ever blocks on a missing Secret volume, and there is no
+arming roll: the alternative design (stamping an explicit `unarmed` sentinel and rolling the
+pods once the real digest arrives) was rejected because it converts every cluster creation
+into an immediate two-tier roll and every TLS enablement into a double replacement. And a TLS
+Secret that **never** appears now parks the tier silently — create path: no StatefulSet, phase
+`Provisioning`/"Waiting for StatefulSet creation"; update path (a `tls.enabled` flip whose
+Secret never comes): the flip simply does not converge while the cluster keeps serving its old
+configuration, and only the operator log names the wait. That silence is a known cost,
+recorded in the residual risks; the pre-D12 behaviour for the same misconfiguration was a pod
+wedged in `ContainerCreating` on a missing volume, louder and strictly worse for a serving
+cluster.
 
 ## Consequences
 
@@ -396,35 +456,40 @@ measurement, and in that order.
   looks exactly like a legitimate rotation, which no observer can act on. D11 carries the full
   reasoning and the two arguments against the strong digest that do **not** hold — one of them
   written into this file earlier the same day and corrected there.
-* **A freshly created TLS cluster is never rolled by a rotation (T27, open, measured
+* ~~**A freshly created TLS cluster is never rolled by a rotation (T27, open, measured
   2026-08-27).** The Certificate and the StatefulSet are created in the same pass, so
   cert-manager has not issued when the template is first written and the record is correctly
   omitted (D8) — but the StatefulSet controller creates the pods from *that* template. The
-  presence guard then exempts them permanently. Measured on a live cluster: three `2/2 Running`
-  pods of a TLS cluster with `phase: OK`, none of which carries a fingerprint, so a rotation
-  moves the template and replaces nothing while `TLSMaterialStale` reports
-  `TLSMaterialCurrent`. It ends the first time anything else replaces the pods — an operator
-  upgrade does, per [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11, but
-  only for the data tier. **This is the largest hole in this ADR's mechanism and it is not the
-  one D11 warns about.** The fix is a decision about the presence rule, not a bug fix: it
-  cannot currently tell "never had a record" from "predates the mechanism", and it must keep
-  exempting the second. Found by the e2e this ADR shipped without.
-* **An unreadable Secret does more than skip the stamp (T24, open).** Pod-template annotations
-  are compared by full equality, so a desired template *without* the annotation is drift: the
-  live template is overwritten without it, an in-flight rotation roll stops seeing work, and the
-  same pass reports nothing because the tier is unmeasurable. This is the only conditionally
-  present pod-template annotation — the config and pod-spec hashes are always written, which is
-  why the pattern is safe for them and not for this one.
-* **`TLSMaterialStale` has no writer once TLS is disabled (T24, open).** The step carries
-  `when: IsTLSEnabled`, which keeps a non-TLS cluster from ever gaining the condition — and also
-  means a cluster that had it `True` and then turns TLS off keeps it, with the shipped alert
-  firing on it indefinitely. The registry row calls the gate a substitute for a presence guard;
-  it is one in the first direction only.
-* **The all-clear message can cover a tier nobody looked at (T24, open).** `scanTLSMaterial`
-  OR-s measurability across the two tiers, so an unreadable Sentinel Secret plus a readable data
-  one yields `TLSMaterialStale=False` with "Every pod runs the TLS material currently in its
-  Secret". The verdict should be per tier, or the message should name the tiers it covers.
-  Found by adversarial review of this ADR, not by an incident.
+  presence guard then exempts them permanently.~~ **(Closed 2026-08-27 by D12.)** The
+  StatefulSet is no longer created before its template can be armed, the same refusal covers
+  the `tls.enabled` flip on a serving cluster, and case 2 stops a blind pass from stripping a
+  live template. Verified per tier by unit tests, against a real API server and work queue by
+  `TestTLSMaterialGate_TheStatefulSetWaitsForTheSecret_Integration`, and the rotation e2e now
+  asserts the pods of a fresh cluster carry the record **without** the test arming them first.
+  What D12 does not cover is retroactive: a record-less pod that exists today stays exempt
+  until something replaces it — that is the row below.
+* ~~**An unreadable Secret does more than skip the stamp (T24, open).** A desired template
+  without the record is drift: the live template is overwritten without it, an in-flight
+  rotation roll stops seeing work, and the same pass reports nothing because the tier is
+  unmeasurable.~~ **(Closed 2026-08-27 by D12 case 2.)** The desired template inherits the
+  persisted record on a pass that cannot read the Secret, so the record is no longer the only
+  conditionally present template input.
+* ~~**`TLSMaterialStale` has no writer once TLS is disabled (T24, open).** The step carries
+  `when: IsTLSEnabled`, which keeps a non-TLS cluster from ever gaining the condition — and
+  also means a cluster that had it `True` and then turns TLS off keeps it, with the shipped
+  alert firing on it indefinitely.~~ **(Closed 2026-08-27.)** The step gate is gone; the
+  evaluator retracts a standing `True` with `TLSMaterialNotApplicable` and touches nothing
+  else — see D9.
+* ~~**The all-clear message can cover a tier nobody looked at (T24, open).** `scanTLSMaterial`
+  OR-s measurability across the two tiers.~~ **(Closed 2026-08-27.)** Measurability is AND-ed,
+  one way — see D9.
+* **A TLS Secret that never appears parks the tier silently (new with D12, accepted).** No
+  StatefulSet on the create path, a non-converging flip on the update path, and nothing on the
+  CR names TLS as the reason — the phase reads `Provisioning`/"Waiting for StatefulSet
+  creation" or stays `OK`, and only the operator log carries the refusal. Reporting the wait as
+  a condition is the surviving half of T27 option C and was deliberately not built here; the
+  pre-D12 behaviour for the same misconfiguration was a pod wedged in `ContainerCreating`,
+  which is not better, only louder.
 * **A pre-upgrade Sentinel pod is exempt until the user changes something (T24, open).** D8
   explains the mechanism; the consequence is that the Sentinel tier of an upgraded cluster can
   hold pinned material across arbitrarily many rotations while the CR reports `False`. The data

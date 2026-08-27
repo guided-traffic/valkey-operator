@@ -108,19 +108,24 @@ func TestE2E_TLS_CertificateRotation_RollsTheFleet(t *testing.T) {
 	tc.waitForStatefulSetReady(t, ns, name, replicas)
 	tc.waitForValkeyPhase(t, ns, name, "OK")
 
-	// The pods of a *freshly created* TLS cluster carry no fingerprint at all, and
-	// this test measured that rather than assuming it: the operator creates the
-	// Certificate and the StatefulSet in the same pass, cert-manager has not issued
-	// yet, so the template is written without a record and the pods are created from
-	// it. The presence rule then exempts them forever. Pre-existing, not introduced
-	// by the carrier move -- the annotation behaved identically -- and filed as T27.
-	//
-	// Arming them is what any real cluster does the first time anything changes. The
-	// test does it by deleting the pods once the template carries the record, which
-	// is the same replacement the rolling update performs and takes one pod lifetime
-	// instead of two rolls.
+	// The pods of a freshly created TLS cluster used to carry no fingerprint at
+	// all -- measured by an earlier version of this test, filed as T27: the
+	// StatefulSet was created before cert-manager issued, so the first pods were
+	// built from a record-less template and the presence rule exempted them from
+	// every rotation forever. ADR 0030 D12 closed it by refusing to create the
+	// StatefulSet until the material can be fingerprinted, so the pods a fresh
+	// cluster boots are armed from birth -- which is exactly what the subtest
+	// below asserts, with no help from the test.
 	tc.awaitTemplateFingerprint(t, ns, name)
-	tc.armPodsWithTheTemplateRecord(t, ns, name, replicas)
+
+	t.Run("the pods of a fresh cluster are armed from birth", func(t *testing.T) {
+		template := templateMaterialHash(tc.getStatefulSet(t, ns, name).Spec.Template.Spec.Containers)
+		require.NotEmpty(t, template)
+		for _, pod := range tc.listComponentPods(t, ns, name, "valkey") {
+			assert.Equal(t, template, recordedMaterialHash(&pod),
+				"pod %s was created by the StatefulSet and must already carry the record (ADR 0030 D12)", pod.Name)
+		}
+	})
 
 	master := tc.masterPodName(t, ns, name)
 	tc.valkeyTLSExec(t, ns, master, tlsValkeyPort, "SET", "rotation-canary", "before")
@@ -219,10 +224,6 @@ func TestE2E_TLS_CertificateRotation_RollsTheFleet(t *testing.T) {
 
 	t.Run("the roll emitted no Warning events", func(t *testing.T) {
 		// ADR 0025 D7: a clean roll is silent, and a rotation roll is an ordinary roll.
-		//
-		// Scoped to events after the rotation started. Arming the pods by hand is not
-		// part of the mechanism under test, and holding it to the same bar would be
-		// asserting something this test does not claim.
 		tc.requireNoWarningEventsSince(t, ns, name, rotationStarted)
 	})
 }
@@ -241,42 +242,6 @@ func (tc *testClients) awaitTemplateFingerprint(t *testing.T, namespace, name st
 		})
 	require.NoError(t, err, "the pod template of %s/%s never gained a TLS material fingerprint", namespace, name)
 	return recorded
-}
-
-// armPodsWithTheTemplateRecord replaces the data pods so they carry whatever the
-// template records now. See the call site for why a fresh TLS cluster needs it.
-//
-// One pod at a time, waiting for the cluster to be whole again in between. All
-// three at once would put a multi-replica non-Sentinel cluster through three
-// simultaneous drains and leave it briefly without a master -- which is the
-// operator working as designed and is exactly the noise this test must not
-// generate before it starts measuring.
-func (tc *testClients) armPodsWithTheTemplateRecord(t *testing.T, namespace, name string, replicas int) {
-	t.Helper()
-
-	for i := 0; i < replicas; i++ {
-		podName := fmt.Sprintf("%s-%d", name, i)
-		pod := tc.getPod(t, namespace, podName)
-		require.NoError(t, tc.kube.CoreV1().Pods(namespace).Delete(
-			context.Background(), podName, metav1.DeleteOptions{}))
-		tc.waitForPodRecreated(t, namespace, podName, pod.UID)
-		tc.waitForStatefulSetReady(t, namespace, name, int32(replicas))
-	}
-
-	require.NoError(t, wait.PollUntilContextTimeout(context.Background(), pollInterval, testTimeout, true,
-		func(_ context.Context) (bool, error) {
-			records := tc.dataPodMaterialRecords(t, namespace, name, replicas)
-			if len(records.hashes) != replicas {
-				return false, nil
-			}
-			for _, hash := range records.hashes {
-				if hash == "" {
-					return false, nil
-				}
-			}
-			return true, nil
-		}), "every data pod must carry the template's record after being recreated from it")
-	tc.waitForValkeyPhaseAfterRollingUpdate(t, namespace, name, "OK")
 }
 
 // requireNoWarningEventsSince fails on any Warning Event about this Valkey that was
