@@ -565,12 +565,18 @@ not cover is a roll that never starts, and that is what the `TLSMaterialStale` l
 Upgrade neutrality is the presence guard the other hashes already use: a pod without the
 annotation is never restarted for one.
 
-**ADR owed, deliberately deferred (`ADR spaeter, erst Code`, decided 2026-08-26):** ADR 0030,
-plus amendments to ADR 0016 (its "whether the running server reloads the new material is not
-verified" residual risk has now fired, on the client side, and is measured) and ADR 0012 (the
-drain promotion gains the precondition that its Valkey client holds usable TLS material), plus
-`SECURITY_ARCHITECTURE.md` sections 2/6 and the hardening checklist. Until that lands, those
-documents are knowingly stale.
+**The ADR debt is paid** (deferred 2026-08-26 as `ADR spaeter, erst Code`, discharged the same
+day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether
+**`valkey-server`** reloads, and that is *still* unmeasured — what fired and was measured is the
+same shape on the **client** side, ours. ADR 0030 D6 treats an unmeasured process as pinning so
+that nobody has to find out, and D11 bounds the content-fingerprint exception to TLS material:
+a 32-bit digest of a private key confirms nothing, the same digest of the auth password would
+be a brute-forceable oracle, so **the password rotation gap stays open and must not be closed
+by copying this mechanism**.
+→ [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md),
+amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
+residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+D11, and `SECURITY_ARCHITECTURE.md` sections 2, 6 and 9.
 
 ## Metrics / Exporter
 

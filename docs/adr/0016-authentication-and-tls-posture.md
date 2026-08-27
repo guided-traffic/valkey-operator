@@ -5,8 +5,14 @@
 Accepted. Date: 2026-08-21.
 
 Implemented and documented in [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md)
-sections 2 and 6. Four items stay open — see Residual risks; two of them carry an unchecked
-entry on that document's hardening checklist (section 9).
+sections 2 and 6. ~~Four~~ **Three** items stay open — see Residual risks; two of them carry an
+unchecked entry on that document's hardening checklist (section 9).
+
+Amended 2026-08-26 by [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md):
+**D12 no longer holds for TLS material.** The cert-manager residual risk fired — measured on a
+live fleet, on the client side — and is rewritten rather than ticked off: the half about
+`valkey-server` is still unmeasured and is now covered by replacement instead of by
+verification.
 
 ## Context
 
@@ -141,9 +147,19 @@ reachability of the path** — and the zero-rollout-window shape is pinned by it
 `spec.image`, resources, probes and config changes alter the pod-spec or config hash and ride
 the failover-aware rolling update. Changing `spec.auth.secretName` or `spec.tls.secretName` to
 a **different Secret** propagates, because the name is part of the pod spec. Changing the
-password **inside** the auth Secret does not. Hashing the referenced name rather than the
+password **inside** the auth Secret does not. ~~Hashing the referenced name rather than the
 resolved value is what keeps secret material out of the pod template and out of every hash the
-operator publishes.
+operator publishes.~~
+
+> **Amended 2026-08-26 — the second sentence is now false for TLS, and deliberately so.**
+> [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D4
+> stamps `vko.gtrfc.com/tls-material-hash` — a fingerprint of the **content** of `ca.crt`,
+> `tls.crt` and `tls.key` — onto both StatefulSet pod templates, because a long-lived process
+> that parsed a certificate at startup keeps presenting it until it exits, and rotation had to
+> reach those processes somehow. **D12 stands unchanged for the auth password**, and ADR 0030
+> D11 states why the exception must not be extended to it: a 32-bit digest of a high-entropy
+> private key confirms nothing, a 32-bit digest of a password is a brute-forceable oracle.
+> The password rotation gap of section 6 therefore stays open.
 
 **D13 — Password rotation is a documented manual procedure, stated precisely rather than
 glossed.** The Secret **is** watched and a change does enqueue a reconcile, so:
@@ -241,9 +257,17 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
   certificates where the deployment can" is on the hardening checklist.
 * **Nothing in the operator expires or warns about a downgrade switch left enabled (open).**
   Enforcement of D9 is a documented human checklist item only.
-* **cert-manager renewal is only partially covered:** the Secret content changes and the mount
+* ~~**cert-manager renewal is only partially covered:** the Secret content changes and the mount
   follows it, but **whether the running `valkey-server` reloads the new material is not
-  verified in this repository.**
+  verified in this repository.**~~ **Fired 2026-08-26, and rewritten rather than closed.** The
+  risk was real and it was measured — on the **client** side, not the server one: every
+  long-lived process of ours that had parsed its certificate at startup kept presenting it
+  until it expired, which killed the sidecar labeler, the Sentinel cross-check and the ADR 0012
+  drain promotion on every TLS cluster whose pods outlived a rotation. The answer is
+  [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md):
+  processes this repository owns re-read their material, everything else is replaced by a
+  rolling update the rotation triggers. **Whether `valkey-server` itself reloads is still not
+  verified** — ADR 0030 D6 treats it as pinning precisely so that nobody has to find out.
 * `protected-mode no` is rendered unconditionally, so Valkey's own last-resort refusal to serve
   unauthenticated external clients is removed even on clusters with auth off.
 
@@ -258,4 +282,7 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) — why none of these defaults is the secure one
 * [ADR 0006](0006-delete-only-what-the-operator-owns.md) — the provenance gate on the legacy cleanup
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the surrounding trust model
+* [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) — how a rotated certificate reaches a running process, and the bounded exception to D12
+* [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — the reload half
+* [`internal/builder/tls_material.go`](../../internal/builder/tls_material.go), [`internal/controller/tls_material.go`](../../internal/controller/tls_material.go) — the fingerprint half
 * [ADR 0015](0015-one-crd-validated-by-schema-only.md) — why the two TLS sources are not mutually exclusive at admission

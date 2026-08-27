@@ -122,8 +122,52 @@ Two mutually exclusive sources ([`TLSSpec`](api/v1/valkey_types.go)):
 - `spec.tls.secretName` — a Secret the user provides (`tls.crt`, `tls.key`, `ca.crt`).
 - `spec.tls.certManager` — the operator creates a **cert-manager `Certificate`**
   (`unstructured`, no typed dependency) and cert-manager issues the Secret. The
-  operator never holds a private key; it mounts the Secret into the pods and reads
-  it to build its own client TLS config.
+  operator never writes a private key and never persists one of its own. It does **hold**
+  them: the manager cache backs an unfiltered Secret informer, so every watched Secret —
+  `tls.key` and every cluster password included — is resident in operator memory for the
+  process lifetime. That is not new with the fingerprint, and it is what the `secrets` scope
+  item on the hardening checklist is about.
+
+**Two different consumers read that Secret, and they read different parts of it.**
+
+| Consumer | Reads | Why |
+|---|---|---|
+| the reconciler's and the health checker's own client config | `ca.crt` only | they verify the server and present **no client certificate**, so a rotation never breaks them |
+| the material fingerprint (`ComputeTLSMaterialHash`) | `ca.crt`, `tls.crt`, `tls.key` | it has to notice that the *content* changed, which is what triggers the roll |
+
+The fingerprint is a 32-bit FNV-1a digest, stamped as
+`vko.gtrfc.com/tls-material-hash` on both StatefulSet pod templates and therefore
+**readable by anyone with `get pods` or `get statefulsets`**. It is derived from a
+private key, which is high-entropy and not guessable, so the digest confirms nothing
+an attacker does not already hold. The same construction over the **password** would
+be a brute-forceable oracle, and
+[ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
+D11 refuses it there for that reason.
+
+**It is a change detector, not an integrity control, and must not be read as one.**
+FNV-1a is non-cryptographic and 32 bits wide, and `tls.key` is hashed last, so trailing
+bytes appended after the PEM block — which every PEM parser ignores — let a chosen digest
+be hit by search. Anyone who can **write** the TLS Secret can therefore replace the
+material while keeping the fingerprint identical, and neither the rolling update nor
+`TLSMaterialStale` would notice. That principal can already replace the cluster's TLS
+identity outright, so this buys evasion of the report rather than new access — but the
+report must not be presented as evidence that the material is unchanged.
+
+**The annotation is also writable from inside a data pod.** The sidecar Role grants
+`pods: patch` on this cluster's data pods, and data pods mount that ServiceAccount token
+(only the observer sets `automountServiceAccountToken: false`), so `valkey-server` and the
+third-party exporter carry it too. Patching the annotation to the current desired value
+suppresses both the roll and the staleness report. This is the **third** field a
+compromised data-pod container can forge, next to `instanceRole` and the drain stamp
+listed in section 3.
+
+**Who reloads and who is replaced.** A process that parsed a certificate at startup
+keeps presenting it until it exits — measured on a live fleet, it killed the sidecar
+labeler, the Sentinel cross-check and the drain promotion of
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) on
+every TLS cluster whose pods outlived a rotation, silently. The rule that follows is
+in section 6 and in ADR 0030: **a long-lived process this repository owns re-reads its
+material; every other process is replaced by a rolling update the rotation triggers.**
 
 Server-side settings the operator renders
 ([`configmap.go:80-93`](internal/builder/configmap.go)):
@@ -418,13 +462,16 @@ What that means in practice:
 | Change | Propagates? | Mechanism |
 |---|---|---|
 | `spec.image`, resources, probes, config | Yes | Pod-spec hash / config hash on the pod template, failover-aware rolling update ([`ComputePodSpecHash`](internal/builder/statefulset.go), `ComputeConfigHash`) |
-| cert-manager certificate renewal | Partially | The Secret content changes and the mount follows it; **whether the running `valkey-server` reloads the new material is not verified in this repo** |
+| cert-manager certificate renewal | **Yes**, since 2026-08-26 | The Secret content changes, the mount follows it, and a fingerprint of that content (`vko.gtrfc.com/tls-material-hash`) on both StatefulSet pod templates makes the rotation ride the failover-aware rolling update. Processes this repo owns re-read their material instead and are exempt. **Whether `valkey-server` itself reloads is still not verified** — it is treated as pinning so that nobody has to find out ([ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)) |
 | `spec.tls.secretName` (different Secret) | Yes | The name is part of the pod spec, so the hash changes and the pods roll |
 | **Password change inside the auth Secret** | **No** | See below |
 | `spec.auth.secretName` (different Secret) | Yes | Same reason as the TLS Secret name |
 
 **The password rotation gap, stated precisely.** The Secret is watched
-([`findValkeyForSecret`, `valkey_controller.go:1919`](internal/controller/valkey_controller.go))
+([`findValkeyForSecret`, `valkey_controller.go:2861`](internal/controller/valkey_controller.go),
+whose predicate `secretConcernsValkey` matches the auth Secret **and** the TLS Secrets of
+both tiers, unified and user-provided — until 2026-08-26 it matched auth Secrets only, so a
+certificate rotation enqueued nothing at all)
 and a change does enqueue a reconcile — but the password reaches the pods as an
 `env.valueFrom.secretKeyRef`, which Kubernetes resolves **once, at pod start**, and
 the pod-spec hash covers the *reference*, not the value. So after `kubectl edit
@@ -549,7 +596,9 @@ analysis.
 
 - [ ] **Scope the operator away from `secrets: get,list` on everything.** It needs
       the auth Secret and the TLS Secret of the namespaces it serves, not the
-      cluster's Secrets. Options: a namespaced Role per watched namespace, or a
+      cluster's Secrets. Since 2026-08-26 the TLS Secret is read on **every pass** of
+      every TLS cluster, for the material fingerprint, so a filtered cache has one
+      more consumer to satisfy. Options: a namespaced Role per watched namespace, or a
       cache filtered by label with the ClusterRole narrowed to match. Cost: the
       operator stops being install-and-forget for new namespaces.
 - [ ] **Re-examine `roles: escalate` + `rolebindings` + `serviceaccounts: create`.**
@@ -645,6 +694,25 @@ analysis.
       move it out of the pod — a design change, not a flag.
 - [ ] **Add egress NetworkPolicies.** Today's policies are ingress-only, so a
       compromised data pod can talk to anything, the API server included.
+- [ ] **Watch for a certificate roll that never starts.** A rotation is propagated by
+      replacing the pods that cannot reload their material, and the previous
+      certificate stays valid for the cert-manager overlap — 30 days at defaults — so
+      the roll is never urgent. What that window does not cover is a roll that does not
+      happen at all. The `TLSMaterialStale` condition reports it per cluster and the
+      shipped `ValkeyTLSMaterialStale` alert fires after **72 h**; the chart's
+      `PrometheusRule` is **default off**, so this entry stays unchecked until it is
+      enabled. Read it as a liveness check on the roll, **not** as an integrity check on
+      the material: the fingerprint it compares is forgeable both by whoever can write
+      the Secret and by any container in a data pod (see section 2). See
+      [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md).
+
+- [ ] **Do not extend the TLS material fingerprint to low-entropy secrets.** The
+      `vko.gtrfc.com/tls-material-hash` annotation is a 32-bit FNV-1a digest of Secret
+      content, published on the pod template and readable with `get pods`. Over a
+      private key that is harmless; over the cluster password it would be a
+      brute-forceable oracle. ADR 0030 D11 bounds the exception to TLS material, and
+      the password rotation gap in section 6 must not be closed by copying it.
+
 - [ ] **Require client certificates where the deployment can.**
       `tls-auth-clients optional` means TLS authenticates the server only.
 - [ ] **Do not leave `spec.sentinel.disableAuth` or either `allowUnencrypted` on

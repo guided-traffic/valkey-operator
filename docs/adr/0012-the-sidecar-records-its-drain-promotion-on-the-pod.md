@@ -54,6 +54,16 @@ end-to-end proof that the drain promotes at all is
 `TestE2E_NoSentinel_MasterKill_NoSplitBrain`, which since the same date asserts the promotion
 directly instead of inferring it from the resulting topology.
 
+Amended 2026-08-26: **D11 is new, and it closes the second way D10's premise fails.** D10
+assumed the only reason the drain handler cannot talk to its local Valkey is that Valkey
+exited first. It can also be that the handler's own TLS material is stale: a `*tls.Config`
+parsed at process start keeps presenting a certificate that a cert-manager rotation has
+already superseded, and on a live fleet it did — the drain promotion died silently on every
+TLS cluster whose pods outlived a rotation. Same fail-open consequence, different mechanism.
+The client the drain uses now takes its config from
+[`internal/tlsmaterial`](../../internal/tlsmaterial/reloader.go) per dial
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)).
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -235,6 +245,28 @@ version of it. Init containers with `restartPolicy: Always` are terminated *afte
 regular containers, so Valkey would be guaranteed to be gone before the drain starts. That
 converts the race into a certainty.
 
+**D11 — The drain client holds the TLS material source, not a parsed config.** Added
+2026-08-26. D10's premise — "the drain handler can talk to the local Valkey" — fails a second
+way, and this one is not a race: on a TLS cluster the handler's `*tls.Config` was built at
+process start, and a cert-manager rotation makes it stale weeks before anything notices. The
+pod that is draining is by definition one that has been running a while, so it is the pod most
+likely to hold superseded material. Measured on a live fleet: the promotion died on every TLS
+cluster whose pods outlived a rotation, with the same signature D10 describes — no promotion,
+no stamp, no Event.
+
+`realValkeyClientFactory` ([`internal/sidecar/drain.go`](../../internal/sidecar/drain.go))
+therefore stores a `*tlsmaterial.Reloader` and asks it for a config **per dial**, not a
+`*tls.Config`. The precondition this buys is precise and worth stating exactly: the material
+was usable **when the sidecar started** — a `Reloader` that cannot be constructed fails
+sidecar startup rather than the drain — and it is **re-read at drain time**. It is *not* "the
+material is provably current": `Config()` returns the last config that worked rather than an
+error, which is the right trade for a call that happens once, at the end of a pod's life, when
+failing is indistinguishable from doing nothing
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D2).
+
+This changes nothing about D2 or D3: the stamp, its ordering and its best-effort nature are
+untouched. What changes is whether the promotion the stamp records can happen at all.
+
 ## Consequences
 
 * **The operator must infer, from indirect evidence, promotions it did not perform**, and
@@ -335,6 +367,12 @@ costs the injection seam the sidecar tests rely on.
   a dataset when it is wrong, and one that D10 makes unnecessary for the observed failure.
   What stays uncovered: a Valkey that dies *despite* the hook, for instance by crashing
   rather than by SIGTERM.
+* **(Closed 2026-08-26) Stale TLS material was a second uncovered case of the same shape.**
+  Until D11 the drain handler could reach a live Valkey and still fail to authenticate to it,
+  with the same fail-open outcome. It is now re-read per dial. What stays uncovered in that
+  direction: material that was never usable at all fails the sidecar at startup, so the pod
+  runs without a labeler and without a drain, and the operator sees a pod that is simply not
+  Ready.
 * **A pod whose sidecar cannot write the marker is slow to delete, fleet-wide (D10).** A
   broken sidecar image, a volume that failed to mount, a sidecar OOM-killed before SIGTERM:
   each costs 60 s per pod deletion, and nothing surfaces the cause on the CR. The kubelet
@@ -404,3 +442,5 @@ costs the injection seam the sidecar tests rely on.
 * [`internal/common/annotations.go`](../../internal/common/annotations.go) — `AnnotationDrainPromotedAt`
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — how the stamp is consumed, cleared and outranked
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the surrounding privilege model
+* [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) — D11, and why a process of ours re-reads its TLS material instead of being replaced
+* [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — the material source the drain client holds (D11)

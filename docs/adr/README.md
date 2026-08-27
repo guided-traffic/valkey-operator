@@ -79,6 +79,7 @@ A reader must never find the old rule stated as current.
 | [0015](0015-one-crd-validated-by-schema-only.md) | One CRD, validated by schema only — no admission webhook |
 | [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture |
 | [0020](0020-write-only-what-the-operator-owns.md) | Write only what the operator can prove it owns, and grant only to a subject it owns |
+| [0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) | Rotating certificates rotate the instances that cannot reload them — ours re-read their material, everything else rides a roll |
 
 ### Process
 
@@ -91,5 +92,5 @@ A reader must never find the old rule stated as current.
 ## Related documents
 
 * [README.md](../../README.md) — user-facing reference
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the privilege footprint and hardening checklist ([ADR 0013](0013-operator-is-cluster-wide-privileged.md), [ADR 0014](0014-rbac-lives-in-three-places.md), [ADR 0016](0016-authentication-and-tls-posture.md))
+* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the privilege footprint and hardening checklist ([ADR 0013](0013-operator-is-cluster-wide-privileged.md), [ADR 0014](0014-rbac-lives-in-three-places.md), [ADR 0016](0016-authentication-and-tls-posture.md), [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md))
 * [CLAUDE.md](../../CLAUDE.md) — project conventions and the ADR obligation
