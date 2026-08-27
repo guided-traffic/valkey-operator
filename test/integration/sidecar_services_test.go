@@ -300,8 +300,10 @@ func TestSidecarServicesRouting_Integration(t *testing.T) {
 			Name: "sc-ha-svc-sidecar", Namespace: "default",
 		}, role))
 		require.Len(t, role.Rules, 1)
-		assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs,
-			"patch is the only verb the sidecar calls; get/list were dropped (ADR 0012 D8)")
+		assert.Equal(t, []string{"get", "patch"}, role.Rules[0].Verbs,
+			"get and patch are the only verbs the sidecar calls: patch for its labels and "+
+				"the drain stamp, get for the drain handler checking whether a promotion "+
+				"candidate is terminating (ADR 0012 D8, ADR 0028 D5a); list stays dropped")
 		assert.Contains(t, role.Rules[0].Resources, "pods")
 		assert.Equal(t, []string{"sc-ha-svc-0", "sc-ha-svc-1", "sc-ha-svc-2"},
 			role.Rules[0].ResourceNames,

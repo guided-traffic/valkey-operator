@@ -164,7 +164,7 @@ func TestE2E_Upgrade_RBACDrift(t *testing.T) {
 		// proven by the labeling assertions in sidecar_test.go, which run against
 		// this same Role on a real cluster.
 		require.Len(t, role.Rules, 1)
-		assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+		assert.Equal(t, []string{"get", "patch"}, role.Rules[0].Verbs)
 		assert.Equal(t, []string{fmt.Sprintf("%s-0", name)}, role.Rules[0].ResourceNames,
 			"a single-replica cluster grants patch on pod 0 and no other pod")
 	})
