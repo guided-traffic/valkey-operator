@@ -1914,11 +1914,54 @@ func (r *ValkeyReconciler) terminationWait(ctx context.Context, v *vkov1.Valkey,
 func (r *ValkeyReconciler) holdDeleteWhileTerminating(ctx context.Context, v *vkov1.Valkey,
 	tier string, t terminatingPod) *RollingUpdateResult {
 	if t.name == "" {
-		r.clearPodTerminationStalled(ctx, v)
-		return nil
+		// The pod states were collected at the top of the pass, and the cache they
+		// came from is allowed to lag. A chaos delete that lands in between leaves
+		// the gate looking at a quiet tier while a pod is already on its way out --
+		// measured in CI as two data pods terminating at once. So the last look
+		// before a delete bypasses the cache; a live check that cannot be
+		// performed changes nothing, because the cached answer was already "quiet"
+		// and a gate must not manufacture a hold out of ignorance.
+		if live, ok := r.liveTerminatingPod(ctx, v, tier); ok {
+			t = live
+		} else {
+			r.clearPodTerminationStalled(ctx, v)
+			return nil
+		}
 	}
 	return r.terminationWait(ctx, v, tier, t,
 		"Waiting for a pod to finish terminating before deleting the next one")
+}
+
+// liveTerminatingPod re-reads the tier straight from the API server and reports
+// the first pod carrying a DeletionTimestamp, if any. Only the delete gate calls
+// it, and only on the pass that is about to delete -- a handful of uncached GETs
+// per pod replacement, not per pass. The tier is the ordinal range
+// [0, *sts.Spec.Replicas), the same range the cached sweep uses (ADR 0026 D5).
+func (r *ValkeyReconciler) liveTerminatingPod(ctx context.Context, v *vkov1.Valkey,
+	tier string) (terminatingPod, bool) {
+	if r.APIReader == nil {
+		return terminatingPod{}, false
+	}
+
+	stsName := common.StatefulSetName(v, tier)
+	sts := &appsv1.StatefulSet{}
+	if err := r.APIReader.Get(ctx,
+		types.NamespacedName{Name: stsName, Namespace: v.Namespace}, sts); err != nil || sts.Spec.Replicas == nil {
+		return terminatingPod{}, false
+	}
+
+	for i := int32(0); i < *sts.Spec.Replicas; i++ {
+		pod := &corev1.Pod{}
+		if err := r.APIReader.Get(ctx, types.NamespacedName{
+			Name: fmt.Sprintf("%s-%d", stsName, i), Namespace: v.Namespace,
+		}, pod); err != nil {
+			continue
+		}
+		if pod.DeletionTimestamp != nil && podIsOurs(pod, sts) {
+			return terminatingPod{name: pod.Name, since: pod.DeletionTimestamp.Time}, true
+		}
+	}
+	return terminatingPod{}, false
 }
 
 // recreationWait is the wait a deleted pod that has not been recreated earns,

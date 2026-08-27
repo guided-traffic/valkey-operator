@@ -80,6 +80,16 @@ type ValkeyReconciler struct {
 	OperatorImage     string
 	OperatorNamespace string
 	OperatorVersion   string
+
+	// APIReader reads straight from the API server, bypassing the manager cache.
+	// It exists for exactly one class of read: the delete gate's last look at the
+	// tier immediately before a pod delete (ADR 0026 D5). The cache is allowed to
+	// be a few hundred milliseconds behind, and that lag was measured turning
+	// into a double termination: a chaos delete landed after the pass collected
+	// its pod states, the gate saw a quiet tier, and the roll deleted its next
+	// candidate on top of the terminating one. Every other read stays on the
+	// cache. Nil in tests that do not wire it; the gate then skips the live look.
+	APIReader client.Reader
 	// NewValkeyClientFn overrides the default Valkey client factory.
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client

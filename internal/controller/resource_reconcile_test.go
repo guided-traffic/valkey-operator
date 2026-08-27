@@ -1476,7 +1476,7 @@ func TestReconcileSidecarRole_GrantsPatchOnThisClustersPodsOnly(t *testing.T) {
 		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
 	}, role))
 	require.Len(t, role.Rules, 1)
-	assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+	assert.Equal(t, []string{"get", "patch"}, role.Rules[0].Verbs)
 	assert.Equal(t, []string{"test-0", "test-1", "test-2"}, role.Rules[0].ResourceNames,
 		"a namespace-wide patch grant lets one cluster's sidecar token stamp another "+
 			"cluster's pods, and the operator consumes that stamp as promotion evidence")
@@ -1527,7 +1527,7 @@ func TestReconcileSidecarRole_NarrowsALegacyNamespaceWideRole(t *testing.T) {
 		Name: builder.SidecarServiceAccountName(v), Namespace: "default",
 	}, role))
 	require.Len(t, role.Rules, 1)
-	assert.Equal(t, []string{"patch"}, role.Rules[0].Verbs)
+	assert.Equal(t, []string{"get", "patch"}, role.Rules[0].Verbs)
 	assert.Equal(t, []string{"test-0", "test-1"}, role.Rules[0].ResourceNames,
 		"an existing cluster must narrow on its next reconcile, with no migration step")
 }

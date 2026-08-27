@@ -1392,3 +1392,101 @@ func TestDrainHandler_GenuineDrainStillPromotesAndStamps(t *testing.T) {
 	assert.Equal(t, "test-1", patcher.annotationPatches[0].name)
 	assert.Equal(t, common.AnnotationDrainPromotedAt, patcher.annotationPatches[0].key)
 }
+
+// A terminating peer is out of the running entirely, however synced it answers:
+// it returns on an empty volume, so promoting it forwards the drain window into
+// nothing (ADR 0028 D5a, the CI-measured shape: the roll deleted test-1 in the
+// same second this drain ran, and the old code promoted it anyway).
+func TestDrainHandler_ManualFailoverSkipsATerminatingPeer(t *testing.T) {
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{terminating: map[string]bool{"test-1": true}}
+
+	dyingSynced := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"},
+	}
+	liveSynced := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"},
+	}
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"test-1.test-headless.default.svc.cluster.local:6379": dyingSynced,
+			"test-2.test-headless.default.svc.cluster.local:6379": liveSynced,
+		},
+	}
+	handler := newTestDrainHandler(detector, patcher, factory)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetRole(common.RoleReplica)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, handler.Handle(ctx))
+
+	for _, call := range dyingSynced.replicaOfCalls {
+		assert.NotEqual(t, "NO", call.host, "the terminating peer must not be promoted")
+	}
+	require.NotEmpty(t, liveSynced.replicaOfCalls, "the live synced peer is the candidate")
+	assert.Equal(t, "NO", liveSynced.replicaOfCalls[0].host)
+}
+
+// A terminating peer answering role:master must not end the drain as "a master
+// is already present" either -- that master is dying, and deferring to it leaves
+// the tier with nothing once it finishes.
+func TestDrainHandler_ATerminatingMasterDoesNotCountAsPresent(t *testing.T) {
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{terminating: map[string]bool{"test-1": true}}
+
+	dyingMaster := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{Role: common.RoleMaster},
+	}
+	liveSynced := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"},
+	}
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"test-1.test-headless.default.svc.cluster.local:6379": dyingMaster,
+			"test-2.test-headless.default.svc.cluster.local:6379": liveSynced,
+		},
+	}
+	handler := newTestDrainHandler(detector, patcher, factory)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetRole(common.RoleReplica)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, handler.Handle(ctx))
+
+	require.NotEmpty(t, liveSynced.replicaOfCalls, "the drain promotes past the dying master")
+	assert.Equal(t, "NO", liveSynced.replicaOfCalls[0].host)
+}
+
+// Ignorance refuses nothing: an API error on the terminating check keeps the
+// peer in the running -- an API blip must not fail a drain that has one bounded
+// chance to run.
+func TestDrainHandler_UnreadableTerminationCheckKeepsThePeer(t *testing.T) {
+	detector := &changingRoleDetector{role: common.RoleMaster}
+	patcher := &mockPodPatcher{terminatingErr: errors.New("apiserver unavailable")}
+
+	synced := &mockValkeyCommander{
+		infoResult: &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"},
+	}
+	factory := &mockValkeyClientFactory{
+		clients: map[string]*mockValkeyCommander{
+			"test-1.test-headless.default.svc.cluster.local:6379": synced,
+			"test-2.test-headless.default.svc.cluster.local:6379": synced,
+		},
+	}
+	handler := newTestDrainHandler(detector, patcher, factory)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		detector.SetRole(common.RoleReplica)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, handler.Handle(ctx))
+	assert.NotEmpty(t, synced.replicaOfCalls, "unknown reads as alive; the drain still promotes")
+}

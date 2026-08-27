@@ -64,9 +64,12 @@ func BuildSidecarRole(v *vkov1.Valkey, livePodNames []string) *rbacv1.Role {
 
 	role.Rules = []rbacv1.PolicyRule{
 		{
-			APIGroups:     []string{""},
-			Resources:     []string{"pods"},
-			Verbs:         []string{"patch"},
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			// get exists for exactly one read: the drain handler checking whether a
+			// promotion candidate is terminating before it forwards the drain
+			// window to it (ADR 0028 D5a). Same named pods as the patch.
+			Verbs:         []string{"get", "patch"},
 			ResourceNames: names,
 		},
 	}

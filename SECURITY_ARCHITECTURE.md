@@ -419,15 +419,20 @@ pods), so the narrower alternative (dropping `escalate`) is worth testing.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["patch"]
+    verbs: ["get", "patch"]
     resourceNames: ["<cr-name>-0", "<cr-name>-1", "<cr-name>-2"]   # example: replicas 3
 ```
 
-What the sidecar actually calls: **`Pods(ns).Patch` and nothing else.** Verified
-by grep over `internal/sidecar` and `cmd/sidecar` — the only clientset call site is
-`patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
+What the sidecar actually calls: **`Pods(ns).Patch` and `Pods(ns).Get`, nothing
+else.** Verified by grep over `internal/sidecar` and `cmd/sidecar` — the clientset
+call sites are `patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
 used by `PatchLabel` (own pod, `instanceRole`) and `PatchAnnotation` (the peer pod
-the drain handler promoted). The grant matches that exactly: one verb, and only the
+the drain handler promoted), and `IsTerminating` (same file), the drain handler
+reading whether a promotion candidate carries a `DeletionTimestamp` before it
+forwards the drain window to it (added 2026-08-27, ADR 0028 D5a — promoting a
+terminating peer was measured wiping the fleet). `get` on the same named pods
+reveals pod specs of this cluster only; the Secrets those pods use are mounted,
+never inlined, so the read exposes no credential material. The grant matches that exactly: one verb, and only the
 pods of this cluster. `TestBuildSidecarRole` pins verb set and name list together,
 and the operator rewrites the Role on every reconcile, so existing clusters narrow
 on their next pass with no migration step.

@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
@@ -1167,4 +1168,45 @@ func TestFirstTerminatingPod_ReadsTheFlagNotThePodObject(t *testing.T) {
 		assert.Equal(t, "n-1", firstTerminatingPod(pods).name)
 	})
 	assert.Empty(t, firstTerminatingPod([]podState{{name: "n-0"}}).name)
+}
+
+// The delete gate's last look bypasses the cache (ADR 0026 D5, hardened
+// 2026-08-27): a chaos delete that lands between the pass's pod sweep and its
+// delete leaves the cached view quiet while a pod is already terminating --
+// measured in CI as two data pods terminating at once. Simulated here with two
+// diverging clients: the cached one is quiet, the API reader sees the
+// termination.
+func TestHoldDeleteWhileTerminating_TheLastLookBypassesTheCache(t *testing.T) {
+	v := newTestValkey("live-gate", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	sts := stsForValkey(v)
+	quiet0 := podFromStsTemplate(v, sts, 0)
+	quiet1 := podFromStsTemplate(v, sts, 1)
+	dying2 := podFromStsTemplate(v, sts, 2)
+	terminatingFor(dying2, 60*time.Second, 5*time.Second)
+
+	// The reconciler's own client never sees the termination; the API reader does.
+	r, _ := newTestReconciler(v, sts, quiet0, quiet1)
+	scheme := testScheme()
+	r.APIReader = fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sts, quiet0, quiet1, dying2).
+		WithInterceptorFuncs(withStatefulSetUID(interceptor.Funcs{})).Build()
+
+	result := r.holdDeleteWhileTerminating(context.Background(), v,
+		common.ComponentValkey, terminatingPod{})
+
+	require.NotNil(t, result, "the live look must catch what the cache has not seen yet")
+	assert.True(t, result.NeedsRequeue)
+}
+
+// A live look that cannot be performed changes nothing: the cached answer was
+// already quiet, and a gate must not manufacture a hold out of ignorance.
+func TestHoldDeleteWhileTerminating_NoReaderKeepsTheCachedAnswer(t *testing.T) {
+	v := newTestValkey("live-gate-nil", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
+	r, _ := newTestReconciler(v)
+	r.APIReader = nil
+
+	result := r.holdDeleteWhileTerminating(context.Background(), v,
+		common.ComponentValkey, terminatingPod{})
+
+	assert.Nil(t, result)
 }

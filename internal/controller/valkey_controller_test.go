@@ -95,6 +95,7 @@ func newTestReconcilerWithInterceptor(funcs interceptor.Funcs, objs ...client.Ob
 
 	return &ValkeyReconciler{
 		Client:          fakeClient,
+		APIReader:       fakeClient,
 		Scheme:          s,
 		InstanceChecker: &mockInstanceChecker{},
 		OperatorImage:   "ghcr.io/guided-traffic/valkey-operator:test",

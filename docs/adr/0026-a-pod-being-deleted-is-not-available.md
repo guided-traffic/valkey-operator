@@ -19,6 +19,17 @@ unreadable Pod object refuses nothing. Demotion of a terminating master stays al
 is the `reachable()` carve-out, and it is the *direction* that was wrong, not the contact.
 This closes the measured half of T13.
 
+Second amendment the same day, out of the same CI window: **the delete gate's last look
+bypasses the cache.** The gate is check-then-act over pod states collected at the top of the
+pass, and the cache those states come from is allowed to lag — a chaos delete landing in
+between left the gate looking at a quiet tier while a pod was already terminating, measured
+as two data pods terminating at once. `holdDeleteWhileTerminating` now re-reads the tier
+through an uncached `APIReader` immediately before permitting a delete (a handful of GETs
+per pod replacement, not per pass). A live look that cannot be performed changes nothing:
+the cached answer was already "quiet", and a gate must not manufacture a hold out of
+ignorance. The window is narrowed to the single read-to-delete gap, not closed — nothing
+short of an API-server-side transaction could close it.
+
 Implemented: the `available()` / `reachable()` split on `podState` with the per-site answers of
 D1–D4, the delete gate of D5, the tier definition of D7, the bounded stall observation and the
 `PodTerminationStalled` condition of D5, and the Sentinel counters of D6. Unit coverage in

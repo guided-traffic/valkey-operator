@@ -65,7 +65,7 @@ func TestBuildSidecarRole(t *testing.T) {
 	rule := role.Rules[0]
 	assert.Equal(t, []string{""}, rule.APIGroups)
 	assert.Equal(t, []string{"pods"}, rule.Resources)
-	assert.Equal(t, []string{"patch"}, rule.Verbs)
+	assert.Equal(t, []string{"get", "patch"}, rule.Verbs)
 	assert.Equal(t, []string{"my-valkey-0", "my-valkey-1", "my-valkey-2"}, rule.ResourceNames)
 }
 

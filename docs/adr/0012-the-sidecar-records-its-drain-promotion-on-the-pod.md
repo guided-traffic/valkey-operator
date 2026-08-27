@@ -9,6 +9,16 @@ repairing it.** The sidecar stays the only writer of `instanceRole`; what change
 its collective failure is no longer invisible on the CR (T7): a settled cluster with no
 master-labeled pod now carries the `RWServiceEmpty` condition.
 
+Also amended 2026-08-27: **the sidecar Role gains `get`, and the drain skips terminating
+peers.** D8's narrowing direction stands — this is the one deliberate widening it has, added
+because CI measured the drain of a dying master promoting the peer the rolling update had
+deleted in the same second, which consolidated the fleet toward an empty reborn pod
+([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D5a). `IsTerminating` reads
+the candidate pod's `DeletionTimestamp` through the same named-pod grant the patches use;
+unknown reads as alive, so an API blip cannot fail a drain. The security cost is bounded and
+stated in `SECURITY_ARCHITECTURE.md` section 4.2: `get` on this cluster's own data pods,
+whose Secrets are mounted rather than inlined.
+
 The stamp and the `findSyncedReplica` fix are implemented on branch `feat/support-pdb` —
 both in commit `cc7e034` — and covered by
 [`internal/sidecar/drain_test.go`](../../internal/sidecar/drain_test.go). Revert-verified by

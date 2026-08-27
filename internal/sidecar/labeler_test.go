@@ -39,6 +39,17 @@ type mockPodPatcher struct {
 	// onAnnotation runs inside PatchAnnotation, before it returns. Tests use it
 	// to observe what has and has not happened yet at stamping time.
 	onAnnotation func()
+	// terminating names the pods IsTerminating answers true for; terminatingErr
+	// makes every IsTerminating call fail instead.
+	terminating    map[string]bool
+	terminatingErr error
+}
+
+func (m *mockPodPatcher) IsTerminating(_ context.Context, _ string, name string) (bool, error) {
+	if m.terminatingErr != nil {
+		return false, m.terminatingErr
+	}
+	return m.terminating[name], nil
 }
 
 type patchRecord struct {

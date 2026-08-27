@@ -92,6 +92,7 @@ func managerOptions(f *operatorFlags) ctrl.Options {
 func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string) *controller.ValkeyReconciler {
 	return &controller.ValkeyReconciler{
 		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
 		Scheme:                  mgr.GetScheme(),
 		Recorder:                mgr.GetEventRecorder("valkey-operator"),
 		OperatorImage:           f.operatorImage,

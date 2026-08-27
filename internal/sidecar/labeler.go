@@ -39,6 +39,14 @@ type PodPatcher interface {
 	// The pod may be a peer, not the local one - the drain handler stamps the pod
 	// it promoted.
 	PatchAnnotation(ctx context.Context, namespace, name, key, value string) error
+	// IsTerminating reports whether the named pod carries a DeletionTimestamp.
+	// The drain handler consults it before promoting a peer: a terminating pod
+	// answers role queries for the whole of its termination and then returns on
+	// an empty volume, so promoting it forwards the drain window into nothing
+	// (ADR 0028 D5a, measured in CI 2026-08-27). An error means "unknown", and
+	// the caller treats unknown as alive -- refusing candidates on ignorance
+	// would turn an API blip into a failed drain.
+	IsTerminating(ctx context.Context, namespace, name string) (bool, error)
 }
 
 // SentinelMasterQuerier queries Sentinel for the current master address.
@@ -225,6 +233,17 @@ func (p *kubernetesPodPatcher) PatchLabel(ctx context.Context, namespace, name, 
 // PatchAnnotation performs a merge patch on the pod to update an annotation.
 func (p *kubernetesPodPatcher) PatchAnnotation(ctx context.Context, namespace, name, key, value string) error {
 	return p.patchMetadata(ctx, namespace, name, "annotations", key, value)
+}
+
+// IsTerminating reads the pod and reports whether it carries a DeletionTimestamp.
+// The read rides the same named-pod grant the patches use (get, added with this
+// method -- see SECURITY_ARCHITECTURE.md section 4.2).
+func (p *kubernetesPodPatcher) IsTerminating(ctx context.Context, namespace, name string) (bool, error) {
+	pod, err := p.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return pod.DeletionTimestamp != nil, nil
 }
 
 // patchMetadata merge-patches a single key inside metadata.labels or

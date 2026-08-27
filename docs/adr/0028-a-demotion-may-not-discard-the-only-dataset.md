@@ -150,6 +150,18 @@ resolves nothing that pass — bounded by the termination itself, since the next
 survivors. Demoting a terminating rogue stays allowed and wanted: refusing it would leave it
 accepting writes for the rest of its termination.
 
+**The same rule binds the drain handler, which is where the CI shape actually started.** The
+sidecar of the dying recorded master picked its promotion candidate by ordinal and promoted
+the peer the rolling update had deleted in the same second — the resolver guard then held
+correctly, and the loss still happened, because the terminating pod had already been made
+master and its replicas followed it into the empty volume it returned on.
+`findSyncedReplica` now skips a peer that provably carries a `DeletionTimestamp`, both as a
+promotion candidate and as a "master already present" answer; everything short of that proof
+(an unreadable Pod object, an API error) reads as alive, because a drain has one bounded
+chance to run and must not fail on an API blip. The read is the one `get` the sidecar Role
+grants ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8,
+`SECURITY_ARCHITECTURE.md` section 4.2).
+
 **D6 — A refusal emits no Event, and the resolver still reports nothing.** The level is already
 carried: `resolveSplitBrain` writes `MultipleMasters` and emits `SplitBrainDetected` once the
 window outlives `splitBrainWarnAfter` = 90 s
