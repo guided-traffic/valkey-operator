@@ -36,6 +36,11 @@ when this ADR was written — `TestE2E_TLS_CertificateRotation_RollsTheFleet`
 cert-manager reissues, then asserts the template moves, every data pod is replaced, the
 dataset survives and the condition clears.
 
+Also amended 2026-08-27 (third pass): **the unmeasured population is reported.** D9 gained
+the `TLSMaterialUnmeasured` reason — no measured pod stale, some pods record-less — closing
+the silence half of the T24(b) residual while keeping the exemption itself. This is the
+surviving, retroactive half of what the T27 analysis called option C.
+
 Also amended 2026-08-27 (second pass): **D12 is new — the operator never persists a TLS pod
 template without a material record.** The e2e above immediately measured what shipping without
 that rule costs: the pods of a freshly created TLS cluster carried no fingerprint and were
@@ -249,9 +254,15 @@ covering a tier nothing inspected). The evaluator also owns the disabled case it
 sitting behind a `when: IsTLSEnabled` step gate: a standing `True` carried into `tls.enabled:
 false` is retracted with reason `TLSMaterialNotApplicable`, presence-guarded in both directions
 (T24(d) — the gate had silenced the condition's only writer, freezing the `True` with the alert
-firing on it for the life of the CR). The one population still absorbed into an honest `False`
-is the record-less legacy pod — unmeasured is not stale, per D8 — and that is in the residual
-risks with its ticket reference.
+firing on it for the life of the CR). And the record-less legacy pod is **named, not
+absorbed** (T24(b), closed later the same day): when no measured pod is stale but some pods
+record no fingerprint, the condition stays `False` — unmeasured is not stale, per D8, and the
+shipped alert matches `True` only — with reason `TLSMaterialUnmeasured` and a message naming
+the pods a rotation will never replace. Precedence is fixed: stale outranks unmeasured
+outranks current, so an in-flight roll is never demoted to an unmeasured report. The reason
+flip on existing clusters that carry legacy pods is the one deliberate
+[ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D10 exception of that fix —
+status-neutral, alert-neutral, reason-visible — decided explicitly rather than slipped in.
 
 **D10 — The Secret watch matches every Secret the fingerprint reads.** Both tiers, the unified
 certificate and a user-provided Secret name. Before `0aaf79d` the predicate matched auth
@@ -490,10 +501,15 @@ measurement, and in that order.
   a condition is the surviving half of T27 option C and was deliberately not built here; the
   pre-D12 behaviour for the same misconfiguration was a pod wedged in `ContainerCreating`,
   which is not better, only louder.
-* **A pre-upgrade Sentinel pod is exempt until the user changes something (T24, open).** D8
+* ~~**A pre-upgrade Sentinel pod is exempt until the user changes something (T24, open).** D8
   explains the mechanism; the consequence is that the Sentinel tier of an upgraded cluster can
-  hold pinned material across arbitrarily many rotations while the CR reports `False`. The data
-  tier does not have this shape, because the next operator upgrade rolls it.
+  hold pinned material across arbitrarily many rotations while the CR reports `False`.~~
+  **(Half-closed 2026-08-27: the silence is gone, the exemption stands.)** The exemption is
+  deliberate and stays — rolling a pod for a record it never had is exactly the fleet-wide
+  upgrade roll D8 exists to prevent — but the CR no longer reports an all-clear over it:
+  reason `TLSMaterialUnmeasured` names the pods (see D9). What remains open is only that
+  nothing *rolls* them; they arm on the next replacement, which for the data tier is the next
+  operator upgrade and for the Sentinel tier the next user change.
 * **`valkey-server` and `valkey-sentinel` are still unmeasured.** D6 makes that safe, not
   answered. If either reloads, every TLS cluster with metrics disabled is rolling for nothing.
   Nobody has run the experiment.

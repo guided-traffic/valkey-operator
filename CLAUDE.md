@@ -573,7 +573,9 @@ cluster therefore gets its StatefulSet a few seconds after the CR, once cert-man
 issued, and every pod it ever boots is measurable from birth. The refusal is the fix for the
 pods that used to be built from a record-less template and were then exempt from every
 rotation forever. `TLSMaterialStale` writes its all-clear only over a complete two-tier
-measurement and retracts a standing True when TLS is turned off (T24).
+measurement, retracts a standing True when TLS is turned off, and names the record-less
+legacy pods a rotation will never replace (`False`/`TLSMaterialUnmeasured` — status- and
+alert-neutral, the reason is the signal) instead of absorbing them into the all-clear (T24).
 
 **The ADR debt is paid** (deferred 2026-08-26 as `ADR spaeter, erst Code`, discharged the same
 day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether

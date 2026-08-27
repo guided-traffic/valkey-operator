@@ -473,7 +473,12 @@ func TestReportTLSMaterialStale_CoversTheSentinelTier(t *testing.T) {
 	assert.Contains(t, cond.Message, common.ComponentSentinel)
 }
 
-// The upgrade that ships this mechanism must not light up the fleet.
+// The upgrade that ships this mechanism must not light up the fleet: status
+// stays False for the record-less legacy population. Since T24(b) that
+// population is named rather than silently absorbed into the all-clear -- the
+// reason flips to TLSMaterialUnmeasured, which is the one deliberate
+// non-neutrality of that fix (the shipped alert matches True only, so nothing
+// fires).
 func TestReportTLSMaterialStale_PodsWithoutTheAnnotationAreUnmeasured(t *testing.T) {
 	v := certManagerValkey("test")
 	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
@@ -490,6 +495,61 @@ func TestReportTLSMaterialStale_PodsWithoutTheAnnotationAreUnmeasured(t *testing
 	cond := staleCondition(t, r, v)
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonTLSMaterialUnmeasured, cond.Reason)
+	assert.Contains(t, cond.Message, "test-0")
+	assert.Contains(t, cond.Message, "test-1")
+}
+
+// The T24(b) shape proper: a fully measured, current data tier next to a legacy
+// Sentinel tier. The old code reported "Every pod runs the TLS material
+// currently in its Secret" about pods nothing had measured -- on the one tier
+// no operator upgrade ever rolls.
+func TestReportTLSMaterialStale_LegacySentinelPodsAreNamedNotAbsorbed(t *testing.T) {
+	v := certManagerValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	dataSecret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "1")
+	sentinelSecret := tlsSecret(builder.SentinelTLSSecretName(v), v.Namespace, "1")
+	dataHash := builder.ComputeTLSMaterialHash(dataSecret)
+	sentinelHash := builder.ComputeTLSMaterialHash(sentinelSecret)
+
+	r, _ := newTestReconciler(v, dataSecret, sentinelSecret,
+		tlsTierSts(v, common.ComponentValkey, 1, dataHash),
+		tlsTierPod(v, common.ComponentValkey, 0, dataHash),
+		tlsTierSts(v, common.ComponentSentinel, 1, sentinelHash),
+		tlsTierPod(v, common.ComponentSentinel, 0, ""),
+	)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	cond := staleCondition(t, r, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonTLSMaterialUnmeasured, cond.Reason)
+	assert.Contains(t, cond.Message, "test-sentinel-0")
+	assert.NotContains(t, cond.Message, "test-0 ", "the measured, current data pod is not on the list")
+}
+
+// Reason precedence is fixed: a stale pod outranks the unmeasured population, so
+// an in-flight rotation roll is never demoted to an unmeasured report.
+func TestReportTLSMaterialStale_AStalePodOutranksTheUnmeasuredPopulation(t *testing.T) {
+	v := certManagerValkey("test")
+	secret := tlsSecret(builder.ValkeyTLSSecretName(v), v.Namespace, "2")
+	hash := builder.ComputeTLSMaterialHash(secret)
+
+	r, _ := newTestReconciler(v, secret,
+		tlsTierSts(v, common.ComponentValkey, 2, hash),
+		tlsTierPod(v, common.ComponentValkey, 0, "stale"),
+		tlsTierPod(v, common.ComponentValkey, 1, ""),
+	)
+
+	require.NoError(t, r.reportTLSMaterialStale(context.Background(), v))
+
+	cond := staleCondition(t, r, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonTLSMaterialRollPending, cond.Reason)
+	assert.Contains(t, cond.Message, "test-0")
 }
 
 // A Secret that cannot be read is "not measured", never "everything is current":

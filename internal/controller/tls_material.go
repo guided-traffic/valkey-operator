@@ -131,10 +131,24 @@ func (r *ValkeyReconciler) tlsMaterialHash(ctx context.Context, v *vkov1.Valkey,
 	return builder.ComputeTLSMaterialHash(secret)
 }
 
-// staleTLSPod is one pod running material the operator has already superseded.
+// staleTLSPod is one pod running material the operator has already superseded,
+// or one it cannot measure at all -- which list it is on says which.
 type staleTLSPod struct {
 	component string
 	name      string
+}
+
+// tlsMaterialScan is the verdict of one walk over both StatefulSet tiers.
+//
+// stale and unmeasured are disjoint: a pod is stale when its recorded
+// fingerprint differs from the Secret it mounts, and unmeasured when it records
+// nothing at all -- the legacy population from before the mechanism, which a
+// rotation will never replace (ADR 0005, ADR 0030 D8). measured reports whether
+// every tier could be inspected; it gates the all-clear, never a finding.
+type tlsMaterialScan struct {
+	stale      []staleTLSPod
+	unmeasured []staleTLSPod
+	measured   bool
 }
 
 // reportTLSMaterialStale re-measures, on every pass, whether any pod still runs
@@ -151,7 +165,7 @@ func (r *ValkeyReconciler) reportTLSMaterialStale(ctx context.Context, v *vkov1.
 		return nil
 	}
 
-	stale, measured, err := r.scanTLSMaterial(ctx, v)
+	scan, err := r.scanTLSMaterial(ctx, v)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("could not measure TLS material staleness", "error", err.Error())
 		return nil
@@ -161,16 +175,27 @@ func (r *ValkeyReconciler) reportTLSMaterialStale(ctx context.Context, v *vkov1.
 	// but "every pod is current" is only written when every tier was actually
 	// inspected. Absorbing an unreadable tier into the affirmative sentence is
 	// T24(a), and it contradicted this function's own stated rule.
-	if len(stale) == 0 && !measured {
+	if len(scan.stale) == 0 && !scan.measured {
 		return nil
 	}
 
+	// Reason precedence is fixed: a stale pod outranks an unmeasured one, and
+	// both outrank the all-clear. The identical-write guard below compares the
+	// reason, so a precedence that flapped would rewrite the status every pass.
 	status, reason, message := metav1.ConditionFalse,
 		vkov1.ReasonTLSMaterialCurrent,
 		"Every pod runs the TLS material currently in its Secret"
-	if len(stale) > 0 {
+	switch {
+	case len(scan.stale) > 0:
 		status, reason, message = metav1.ConditionTrue,
-			vkov1.ReasonTLSMaterialRollPending, staleTLSMessage(stale)
+			vkov1.ReasonTLSMaterialRollPending, staleTLSMessage(scan.stale)
+	case len(scan.unmeasured) > 0:
+		// T24(b): the record-less legacy population used to be absorbed into the
+		// affirmative sentence, on the one tier no operator upgrade ever rolls.
+		// Status stays False -- unmeasured is not stale, and the shipped alert
+		// matches status="True" only -- but the reason and the names stop the CR
+		// claiming a coverage it does not have.
+		reason, message = vkov1.ReasonTLSMaterialUnmeasured, unmeasuredTLSMessage(scan.unmeasured)
 	}
 
 	// Guarded on the condition already stored, the way setReconcileBlockedCondition
@@ -225,16 +250,33 @@ func staleTLSMessage(stale []staleTLSPod) string {
 		strings.Join(parts, ", "))
 }
 
+// unmeasuredTLSMessage renders the T24(b) verdict: no measured pod is stale, but
+// the named pods record no fingerprint and a rotation will not replace them.
+// Same ordering contract as staleTLSMessage.
+func unmeasuredTLSMessage(unmeasured []staleTLSPod) string {
+	parts := make([]string, 0, len(unmeasured))
+	for _, p := range unmeasured {
+		parts = append(parts, fmt.Sprintf("%s (%s)", p.name, p.component))
+	}
+	return fmt.Sprintf(
+		"No measured pod runs superseded TLS material, but %s predate the material fingerprint "+
+			"and cannot be measured: a certificate rotation will not replace them. They arm "+
+			"themselves the next time they are replaced for any other reason; to close the gap now, "+
+			"delete them one at a time or make any pod-template change",
+		strings.Join(parts, ", "))
+}
+
 // scanTLSMaterial walks both StatefulSet tiers and returns the pods whose
-// recorded fingerprint differs from the one in the Secret they mount.
+// recorded fingerprint differs from the one in the Secret they mount, the pods
+// that record nothing and cannot be measured at all, and whether every tier was
+// measurable.
 //
-// The second return value reports whether every tier was measurable. It is an
-// AND across the tiers, not an OR: one readable tier says nothing about the
-// other, and the caller writes the all-clear only over a complete measurement
-// (T24(a)).
-func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey) ([]staleTLSPod, bool, error) {
+// measured is an AND across the tiers, not an OR: one readable tier says nothing
+// about the other, and the caller writes the all-clear only over a complete
+// measurement (T24(a)).
+func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey) (tlsMaterialScan, error) {
 	if !v.IsTLSEnabled() {
-		return nil, false, nil
+		return tlsMaterialScan{}, nil
 	}
 
 	tiers := []struct {
@@ -250,18 +292,18 @@ func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey)
 		}{common.ComponentSentinel, builder.SentinelTLSSecretName(v)})
 	}
 
-	var stale []staleTLSPod
-	measured := true
+	scan := tlsMaterialScan{measured: true}
 	for _, tier := range tiers {
-		tierStale, tierMeasured, err := r.scanTierTLSMaterial(ctx, v, tier.component, tier.secret)
+		tierScan, err := r.scanTierTLSMaterial(ctx, v, tier.component, tier.secret)
 		if err != nil {
-			return nil, false, err
+			return tlsMaterialScan{}, err
 		}
-		measured = measured && tierMeasured
-		stale = append(stale, tierStale...)
+		scan.measured = scan.measured && tierScan.measured
+		scan.stale = append(scan.stale, tierScan.stale...)
+		scan.unmeasured = append(scan.unmeasured, tierScan.unmeasured...)
 	}
 
-	return stale, measured, nil
+	return scan, nil
 }
 
 // scanTierTLSMaterial compares the pods of one tier against the fingerprint of
@@ -274,25 +316,25 @@ func (r *ValkeyReconciler) scanTLSMaterial(ctx context.Context, v *vkov1.Valkey)
 // not a write.
 func (r *ValkeyReconciler) scanTierTLSMaterial(
 	ctx context.Context, v *vkov1.Valkey, component, secretName string,
-) ([]staleTLSPod, bool, error) {
+) (tlsMaterialScan, error) {
 	sts := &appsv1.StatefulSet{}
 	name := types.NamespacedName{Name: common.StatefulSetName(v, component), Namespace: v.Namespace}
 	if err := r.Get(ctx, name, sts); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, false, nil
+			return tlsMaterialScan{}, nil
 		}
-		return nil, false, err
+		return tlsMaterialScan{}, err
 	}
 	if !metav1.IsControlledBy(sts, v) || sts.Spec.Replicas == nil {
-		return nil, false, nil
+		return tlsMaterialScan{}, nil
 	}
 
 	desired := r.tlsMaterialHash(ctx, v, secretName)
 	if desired == "" {
-		return nil, false, nil
+		return tlsMaterialScan{}, nil
 	}
 
-	var stale []staleTLSPod
+	scan := tlsMaterialScan{measured: true}
 	for i := int32(0); i < *sts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sts.Name, i)
 		pod := &corev1.Pod{}
@@ -300,19 +342,27 @@ func (r *ValkeyReconciler) scanTierTLSMaterial(
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, false, err
+			return tlsMaterialScan{}, err
 		}
 		if !podIsOurs(pod, sts) {
 			continue
 		}
 		// A pod carrying no record predates the fingerprint and is unmeasured, not
-		// stale. Reporting it would make the operator upgrade that introduces this
-		// mechanism light up the whole fleet.
-		if recorded := builder.RecordedTLSMaterialHash(&pod.Spec, pod.Annotations); recorded != "" && recorded != desired {
-			stale = append(stale, staleTLSPod{component: component, name: podName})
+		// stale -- reporting it as stale would make the operator upgrade that
+		// introduces this mechanism light up the whole fleet. Since D12 the
+		// operator writes no record-less pod, so this is the legacy population,
+		// and it is *named* rather than silently absorbed into the all-clear
+		// (T24(b)): a rotation will never replace these pods, and the tier that
+		// matters is the Sentinel one, which no operator upgrade rolls either.
+		switch recorded := builder.RecordedTLSMaterialHash(&pod.Spec, pod.Annotations); {
+		case recorded == "":
+			scan.unmeasured = append(scan.unmeasured, staleTLSPod{component: component, name: podName})
+		case recorded != desired:
+			scan.stale = append(scan.stale, staleTLSPod{component: component, name: podName})
 		}
 	}
 
-	sort.Slice(stale, func(i, j int) bool { return stale[i].name < stale[j].name })
-	return stale, true, nil
+	sort.Slice(scan.stale, func(i, j int) bool { return scan.stale[i].name < scan.stale[j].name })
+	sort.Slice(scan.unmeasured, func(i, j int) bool { return scan.unmeasured[i].name < scan.unmeasured[j].name })
+	return scan, nil
 }

@@ -281,6 +281,15 @@ const (
 	// hold a superseded fingerprint. The message names them and their tier.
 	ReasonTLSMaterialRollPending = "TLSMaterialRollPending"
 
+	// ReasonTLSMaterialUnmeasured is the TLSMaterialStale reason when no measured
+	// pod is stale but some pods record no fingerprint at all -- the legacy
+	// population from before the mechanism, which a certificate rotation will
+	// never replace. Status stays False (unmeasured is not stale, and the shipped
+	// alert matches True only); the reason and the message stop the CR claiming a
+	// coverage it does not have. The pods leave the list the next time anything
+	// replaces them.
+	ReasonTLSMaterialUnmeasured = "TLSMaterialUnmeasured"
+
 	// ReasonTLSMaterialNotApplicable clears a standing TLSMaterialStale=True on a
 	// cluster that has turned TLS off: there is no material left to be stale, and
 	// without the retraction the shipped alert would fire on the frozen True for
