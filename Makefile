@@ -363,7 +363,7 @@ GOLANGCI_LINT_VERSION ?= v2.13.1
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.28.0
+GOSEC_VERSION ?= v2.29.0
 
 # gosec defaults its concurrency to the CPU count and lets the Go toolchain fan
 # out one compiler per core while loading the (large) k8s dependency graph. On
