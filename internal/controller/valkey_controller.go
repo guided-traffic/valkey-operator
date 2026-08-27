@@ -1212,8 +1212,9 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 	// The fingerprint is Secret content and the builder never sees it, so it is
-	// stamped here rather than folded into the pod-spec hash.
-	r.stampTLSMaterialHash(ctx, v, desired, builder.ValkeyTLSSecretName(v))
+	// stamped here rather than folded into the pod-spec hash. The sidecar container
+	// carries it: it is the one container of the data pod that is ours.
+	r.stampTLSMaterialHash(ctx, v, desired, builder.ValkeyTLSSecretName(v), builder.SidecarContainerName)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on StatefulSet: %w", err)
@@ -1346,7 +1347,7 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	// The Sentinel tier has no sidecar of ours at all -- its probes shell out to
 	// valkey-cli per exec -- so whether it can skip the roll is decided entirely by
 	// valkey-sentinel, which has never been measured. It carries the fingerprint.
-	r.stampTLSMaterialHash(ctx, v, desired, builder.SentinelTLSSecretName(v))
+	r.stampTLSMaterialHash(ctx, v, desired, builder.SentinelTLSSecretName(v), builder.SentinelContainerName)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference on Sentinel StatefulSet: %w", err)

@@ -62,12 +62,14 @@ func TestBuildStatefulSet_Standalone(t *testing.T) {
 	assert.Equal(t, []string{"valkey-cli", "ping"}, container.ReadinessProbe.Exec.Command)
 	assert.Equal(t, []string{"valkey-cli", "ping"}, container.LivenessProbe.Exec.Command)
 
-	// Volumes — config + emptyDir data (no persistence).
-	require.Len(t, sts.Spec.Template.Spec.Volumes, 2)
+	// Volumes — config + the sidecar token projection + emptyDir data (no persistence).
+	require.Len(t, sts.Spec.Template.Spec.Volumes, 3)
 	assert.Equal(t, ConfigVolumeName, sts.Spec.Template.Spec.Volumes[0].Name)
-	assert.Equal(t, DataVolumeName, sts.Spec.Template.Spec.Volumes[1].Name)
+	assert.Equal(t, SidecarTokenVolumeName, sts.Spec.Template.Spec.Volumes[1].Name)
+	assert.Equal(t, DataVolumeName, sts.Spec.Template.Spec.Volumes[2].Name)
 	assert.NotNil(t, sts.Spec.Template.Spec.Volumes[0].ConfigMap)
-	assert.NotNil(t, sts.Spec.Template.Spec.Volumes[1].EmptyDir)
+	assert.NotNil(t, sts.Spec.Template.Spec.Volumes[1].Projected)
+	assert.NotNil(t, sts.Spec.Template.Spec.Volumes[2].EmptyDir)
 
 	// No PVC templates.
 	assert.Empty(t, sts.Spec.VolumeClaimTemplates)
@@ -819,8 +821,9 @@ func TestBuildStatefulSet_SidecarContainer(t *testing.T) {
 	assert.True(t, hasPodName, "sidecar must have POD_NAME from Downward API")
 	assert.True(t, hasPodNamespace, "sidecar must have POD_NAMESPACE from Downward API")
 
-	// No TLS volume mounts in non-TLS mode.
-	assert.Empty(t, sidecar.VolumeMounts)
+	// The token projection is the only mount in non-TLS mode.
+	require.Len(t, sidecar.VolumeMounts, 1)
+	assert.Equal(t, SidecarTokenVolumeName, sidecar.VolumeMounts[0].Name)
 }
 
 func TestBuildStatefulSet_SidecarWithTLS(t *testing.T) {
@@ -839,11 +842,12 @@ func TestBuildStatefulSet_SidecarWithTLS(t *testing.T) {
 	assert.Contains(t, sidecar.Args, "--tls-cert=/tls/tls.crt")
 	assert.Contains(t, sidecar.Args, "--tls-key=/tls/tls.key")
 
-	// Should have TLS volume mount.
-	require.Len(t, sidecar.VolumeMounts, 1)
-	assert.Equal(t, TLSVolumeName, sidecar.VolumeMounts[0].Name)
-	assert.Equal(t, TLSMountPath, sidecar.VolumeMounts[0].MountPath)
-	assert.True(t, sidecar.VolumeMounts[0].ReadOnly)
+	// Should have TLS volume mount, next to the token projection.
+	require.Len(t, sidecar.VolumeMounts, 2)
+	assert.Equal(t, SidecarTokenVolumeName, sidecar.VolumeMounts[0].Name)
+	assert.Equal(t, TLSVolumeName, sidecar.VolumeMounts[1].Name)
+	assert.Equal(t, TLSMountPath, sidecar.VolumeMounts[1].MountPath)
+	assert.True(t, sidecar.VolumeMounts[1].ReadOnly)
 }
 
 func TestBuildStatefulSet_SidecarWithAuth(t *testing.T) {

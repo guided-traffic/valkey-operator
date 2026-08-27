@@ -153,8 +153,10 @@ operator publishes.~~
 
 > **Amended 2026-08-26 — the second sentence is now false for TLS, and deliberately so.**
 > [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D4
-> stamps `vko.gtrfc.com/tls-material-hash` — a fingerprint of the **content** of `ca.crt`,
-> `tls.crt` and `tls.key` — onto both StatefulSet pod templates, because a long-lived process
+> stamps a fingerprint of the **content** of `ca.crt`, `tls.crt` and `tls.key` onto both
+> StatefulSet pod templates — as the `VKO_TLS_MATERIAL_HASH` env var of the tier's carrier
+> container since 2026-08-27
+> ([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) — because a long-lived process
 > that parsed a certificate at startup keeps presenting it until it exits, and rotation had to
 > reach those processes somehow. **D12 stands unchanged for the auth password**, and ADR 0030
 > D11 states why the exception must not be extended to it: a 32-bit digest of a high-entropy

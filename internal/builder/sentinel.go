@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/common"
@@ -366,7 +367,13 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 
 	spec := corev1.PodSpec{
 		ServiceAccountName: DefaultServiceAccountName,
-		Affinity:           BuildPodAntiAffinity(v, common.ComponentSentinel),
+		// Sentinel never calls the Kubernetes API -- the container runs
+		// valkey-sentinel and the init container shells out to valkey-cli -- so it
+		// gets no token. The namespace "default" ServiceAccount usually carries no
+		// RBAC, but its token is still a valid cluster identity and an unmounted one
+		// cannot be stolen out of a compromised Sentinel pod (ADR 0012 D8 step 4).
+		AutomountServiceAccountToken: ptr.To(false),
+		Affinity:                     BuildPodAntiAffinity(v, common.ComponentSentinel),
 		// Init container copies the sentinel config to a writable volume.
 		// Sentinel needs to rewrite its config file at runtime.
 		InitContainers: []corev1.Container{

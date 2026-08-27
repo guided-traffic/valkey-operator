@@ -80,6 +80,7 @@ A reader must never find the old rule stated as current.
 | [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture |
 | [0020](0020-write-only-what-the-operator-owns.md) | Write only what the operator can prove it owns, and grant only to a subject it owns |
 | [0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) | Rotating certificates rotate the instances that cannot reload them — ours re-read their material, everything else rides a roll |
+| [0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) | A per-pod record the operator trusts lives in pod spec, not pod metadata — a pod can patch its own metadata |
 
 ### Process
 

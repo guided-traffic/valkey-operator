@@ -385,16 +385,21 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 }
 
 // podTLSMaterialHashChanged returns true when the pod carries a TLS material
-// fingerprint that differs from desiredHash. Returns false when the pod lacks
-// the annotation or desiredHash is empty -- the same presence rule the config
-// hash uses, and the whole of the upgrade-neutrality story for this mechanism:
-// pods created before the operator wrote fingerprints are never restarted for
-// one (ADR 0005).
+// fingerprint that differs from desiredHash. Returns false when the pod carries
+// no record or desiredHash is empty -- the same presence rule the config hash
+// uses, and the whole of the upgrade-neutrality story for this mechanism: pods
+// created before the operator wrote fingerprints are never restarted for one
+// (ADR 0005).
+//
+// The record is read from the pod spec, with the superseded annotation as a
+// fallback for pods that predate the move (ADR 0031). The presence rule is also
+// why the move was necessary: a merge patch setting the carrier to null makes the
+// pod unmeasured, so a carrier a pod can patch is a roll a pod can switch off.
 func podTLSMaterialHashChanged(pod *corev1.Pod, desiredHash string) bool {
 	if desiredHash == "" {
 		return false
 	}
-	podHash := pod.Annotations[builder.AnnotationTLSMaterialHash]
+	podHash := builder.RecordedTLSMaterialHash(&pod.Spec, pod.Annotations)
 	return podHash != "" && podHash != desiredHash
 }
 
@@ -531,7 +536,7 @@ func tlsMaterialHashFromSts(sts *appsv1.StatefulSet) string {
 	if sts == nil {
 		return ""
 	}
-	return sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash]
+	return builder.RecordedTLSMaterialHash(&sts.Spec.Template.Spec, sts.Spec.Template.Annotations)
 }
 
 // isPodReady returns true if the pod has the Ready condition set to True.
@@ -4263,7 +4268,8 @@ func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateS
 	// Check the TLS material fingerprint. Sentinel runs no process of ours, so
 	// whether it survives a rotation is valkey-sentinel's answer alone and has
 	// never been measured -- the tier is rolled.
-	return podTLSMaterialHashChanged(pod, desiredTemplate.Annotations[builder.AnnotationTLSMaterialHash])
+	return podTLSMaterialHashChanged(pod,
+		builder.RecordedTLSMaterialHash(&desiredTemplate.Spec, desiredTemplate.Annotations))
 }
 
 // sentinelScan is one sweep over the Sentinel tier: everything

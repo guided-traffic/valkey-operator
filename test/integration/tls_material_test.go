@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/builder"
@@ -37,11 +38,22 @@ import (
 // is why it asserts on the StatefulSet template rather than on a roll: the
 // rolling update is ordinary machinery driven by a template change, and the
 // template change is the part this mechanism adds.
+//
+// Since 2026-08-27 the record lives in the pod spec rather than in the template
+// annotations (ADR 0031), and the API server is the authority on the half that
+// makes the move worth making: env is not one of the fields a pod update may
+// change. templateFingerprint reads it the way every consumer does.
 
 const (
 	tlsRotationInterval = 250 * time.Millisecond
 	tlsRotationTimeout  = 60 * time.Second
 )
+
+// templateFingerprint reads the fingerprint off a StatefulSet template the way
+// the rolling update and the staleness report read it.
+func templateFingerprint(sts *appsv1.StatefulSet) string {
+	return builder.RecordedTLSMaterialHash(&sts.Spec.Template.Spec, sts.Spec.Template.Annotations)
+}
 
 func tlsMaterialSecret(name, revision string) *corev1.Secret {
 	return &corev1.Secret{
@@ -88,8 +100,8 @@ func TestTLSMaterialRotation_ReachesThePodTemplate_Integration(t *testing.T) {
 			if err := k8sClient.Get(ctx, key, sts); err != nil {
 				return false, err.Error()
 			}
-			before = sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash]
-			return before != "", fmt.Sprintf("annotations %v", sts.Spec.Template.Annotations)
+			before = templateFingerprint(sts)
+			return before != "", fmt.Sprintf("containers %v", sts.Spec.Template.Spec.Containers)
 		})
 
 	stored := &corev1.Secret{}
@@ -116,7 +128,7 @@ func TestTLSMaterialRotation_ReachesThePodTemplate_Integration(t *testing.T) {
 				if err := k8sClient.Get(ctx, key, sts); err != nil {
 					return false, err.Error()
 				}
-				got := sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash]
+				got := templateFingerprint(sts)
 				return got != "" && got != before, "fingerprint " + got
 			})
 
@@ -124,8 +136,7 @@ func TestTLSMaterialRotation_ReachesThePodTemplate_Integration(t *testing.T) {
 		require.NoError(t, k8sClient.Get(ctx, secretKey, rotated))
 		sts := &appsv1.StatefulSet{}
 		require.NoError(t, k8sClient.Get(ctx, key, sts))
-		assert.Equal(t, builder.ComputeTLSMaterialHash(rotated),
-			sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash])
+		assert.Equal(t, builder.ComputeTLSMaterialHash(rotated), templateFingerprint(sts))
 	})
 
 	t.Run("a cluster with no pods carries the condition as False", func(t *testing.T) {
@@ -164,7 +175,7 @@ func TestTLSMaterialStale_NonTLSClusterIsNeverMeasured_Integration(t *testing.T)
 	t.Cleanup(func() { _ = k8sClient.Delete(ctx, v) })
 
 	sts := waitForStatefulSet(t, crName, tlsRotationTimeout)
-	assert.NotContains(t, sts.Spec.Template.Annotations, builder.AnnotationTLSMaterialHash,
+	assert.Empty(t, templateFingerprint(sts),
 		"a cluster without TLS mounts no material and must carry no fingerprint")
 
 	current := &vkov1.Valkey{}
@@ -185,4 +196,63 @@ func awaitTLSRotation(t *testing.T, what string, check func(context.Context) (bo
 			return ok, nil
 		})
 	require.NoErrorf(t, err, "%s (last observed: %s)", what, last)
+}
+
+// The whole reason the fingerprint left pod metadata: the API server refuses a
+// change to pod env and accepts any change to pod annotations. That is a claim
+// about kube-apiserver, so it is settled here and nowhere else.
+//
+// The pod is created directly rather than by a StatefulSet. envtest runs no
+// kubelet, so it stays Pending forever -- which is all this test needs, because
+// admission and validation have already run by then.
+func TestTLSMaterialCarrier_TheAPIServerRefusesToChangeIt_Integration(t *testing.T) {
+	ctx := testCtx
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "tls-carrier-immutability",
+			Namespace:   "default",
+			Annotations: map[string]string{builder.AnnotationTLSMaterialHash: "aaaa"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  builder.SidecarContainerName,
+				Image: "example.invalid/sidecar:test",
+				Env:   []corev1.EnvVar{{Name: builder.TLSMaterialHashEnvName, Value: "aaaa"}},
+			}},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, pod))
+	t.Cleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+	t.Run("the superseded annotation carrier is forgeable", func(t *testing.T) {
+		patch := []byte(`{"metadata":{"annotations":{"vko.gtrfc.com/tls-material-hash":"forged"}}}`)
+		require.NoError(t, k8sClient.Patch(ctx, pod.DeepCopy(), rawMergePatch(patch)),
+			"anything holding pods: patch can set the annotation to any value")
+
+		nulled := []byte(`{"metadata":{"annotations":{"vko.gtrfc.com/tls-material-hash":null}}}`)
+		require.NoError(t, k8sClient.Patch(ctx, pod.DeepCopy(), rawMergePatch(nulled)),
+			"and can delete it, which is the cheaper attack: a pod with no record is unmeasured")
+	})
+
+	t.Run("the spec carrier is not", func(t *testing.T) {
+		patch := []byte(`{"spec":{"containers":[{"name":"sidecar","env":[{"name":"VKO_TLS_MATERIAL_HASH","value":"forged"}]}]}}`)
+		err := k8sClient.Patch(ctx, pod.DeepCopy(), rawMergePatch(patch))
+		require.Error(t, err, "env is not one of the pod spec fields an update may change")
+		assert.Contains(t, err.Error(), "spec: Forbidden")
+	})
+
+	t.Run("what survived is what the operator wrote", func(t *testing.T) {
+		stored := &corev1.Pod{}
+		require.NoError(t, k8sClient.Get(ctx,
+			types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, stored))
+
+		assert.Equal(t, "aaaa",
+			builder.RecordedTLSMaterialHash(&stored.Spec, stored.Annotations),
+			"the annotation was forged and then deleted; the record read is the one in the spec")
+	})
+}
+
+// rawMergePatch wraps a literal JSON merge patch for the typed client.
+func rawMergePatch(data []byte) client.Patch {
+	return client.RawPatch(types.MergePatchType, data)
 }

@@ -143,8 +143,8 @@ spec:
               nothing and a short threshold would page on every normal rotation. This firing
               means the roll is not happening at all - check ReconcileBlocked, the phase, and
               whether the StatefulSet pod template carries the current
-              vko.gtrfc.com/tls-material-hash. Left alone, the pods keep the old certificate
-              until it expires and their long-lived processes go silent.
+              VKO_TLS_MATERIAL_HASH on its carrier container. Left alone, the pods keep
+              the old certificate until it expires and their long-lived processes go silent.
 
         - alert: ValkeyMetricsCollectorFailing
           expr: max(vko_valkey_collector_success) == 0

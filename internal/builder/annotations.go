@@ -92,21 +92,17 @@ func NudgePatch(now time.Time) []byte {
 		AnnotationNudge, now.UTC().Format(time.RFC3339)))
 }
 
-// AnnotationTLSMaterialHash is the annotation key used to store a fingerprint of
-// the TLS Secret contents a pod was created with. Unlike the config and pod-spec
-// hashes it is not computed by a builder: the fingerprint is Secret *content*,
-// and buildPodSpec only ever sees the Valkey CR, which names the Secret and never
-// its data. The reconciler stamps it onto the pod template instead.
+// AnnotationTLSMaterialHash is the **superseded** carrier of the TLS material
+// fingerprint, kept because pods created before 2026-08-27 still hold it.
 //
-// It exists because nothing else makes a certificate rotation visible to a pod.
-// The Secret is remounted in place, and processes that parsed their TLS material
-// at startup -- valkey-server, valkey-sentinel and the third-party metrics
-// exporter -- keep using the material they parsed until they exit. A changed
-// fingerprint changes the pod template, which the failover-aware rolling update
-// then acts on, so those processes are replaced while the previous certificate is
-// still valid.
+// The operator no longer writes it. It carried a value the operator then trusted,
+// and pod metadata is patchable by anything holding the sidecar token, so a
+// single merge patch setting the key to null made the pod unmeasured -- no
+// collision needed, and no digest strength would have helped. The fingerprint
+// moved into the pod spec, which the API server refuses to change after creation
+// (TLSMaterialHashEnvName, ADR 0031).
 //
-// The operator's own long-lived processes are exempt from this mechanism by being
-// able to re-read their material (internal/tlsmaterial); the observer Deployment
-// therefore carries no fingerprint at all.
+// RecordedTLSMaterialHash is the only reader left, and it consults this key only
+// for a pod that carries no env. That fallback is self-extinguishing: a pod it
+// fires on is a pod the roll then replaces with one that carries the env.
 const AnnotationTLSMaterialHash = "vko.gtrfc.com/tls-material-hash"

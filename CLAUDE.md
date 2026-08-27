@@ -549,10 +549,10 @@ material and earns an exemption; every other process rides a roll.**
   degraded call instead of an outage. **A new long-lived client of ours inherits that, not an
   exemption**: `valkeyclient.Client` holds no connection, so building one per command is an
   allocation and nothing else.
-- Everything else is replaced. The reconciler stamps `vko.gtrfc.com/tls-material-hash` - a
+- Everything else is replaced. The reconciler stamps `VKO_TLS_MATERIAL_HASH` - a
   fingerprint of `ca.crt`/`tls.crt`/`tls.key`, Secret *content* the builders never see - onto
-  both StatefulSet pod templates, so a rotation rides the ordinary failover-aware rolling
-  update. `valkey-server` and `valkey-sentinel` are treated as pinning because nobody has
+  the carrier container of both StatefulSet pod templates, so a rotation rides the ordinary
+  failover-aware rolling update. `valkey-server` and `valkey-sentinel` are treated as pinning because nobody has
   measured otherwise; the third-party exporter provably is, and the restart unit is the pod, so
   one non-reloading container spends the whole pod's exemption. The observer Deployment carries
   no fingerprint and is never restarted for a rotation.
@@ -563,7 +563,7 @@ the ADR 0019 concurrency cap is the only pacing there is, and the shipped
 `ValkeyTLSMaterialStale` alert waits **72 h** rather than minutes. The one thing the window does
 not cover is a roll that never starts, and that is what the `TLSMaterialStale` level reports.
 Upgrade neutrality is the presence guard the other hashes already use: a pod without the
-annotation is never restarted for one.
+record is never restarted for one.
 
 **The ADR debt is paid** (deferred 2026-08-26 as `ADR spaeter, erst Code`, discharged the same
 day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether
@@ -573,6 +573,41 @@ that nobody has to find out, and D11 bounds the content-fingerprint exception to
 a 32-bit digest of a private key confirms nothing, the same digest of the auth password would
 be a brute-forceable oracle, so **the password rotation gap stays open and must not be closed
 by copying this mechanism**.
+
+## A record the operator trusts lives in pod spec, and a token goes to one container
+
+Both halves land on 2026-08-27, out of the adversarial review of ADR 0030, and the finding that
+reordered the whole option list is that **deleting a record beats forging one**. Every consumer
+of a pod-template hash carries a presence rule - a pod with no record is *unmeasured*, which is
+the only reason an operator upgrade rolls nothing - so one merge patch setting the key to `null`
+switches the roll off. No collision needed, and no digest strength touches it. That kills every
+scheme that keeps the carrier in pod `metadata`.
+
+- **The TLS fingerprint moved into the pod spec.** `VKO_TLS_MATERIAL_HASH` on the sidecar
+  container (data tier) and the sentinel container (Sentinel tier), stamped *after*
+  `BuildStatefulSet` so `ComputePodSpecHash` does not move with it - one rotation, one signal.
+  `env` is not in the API server's `updatablePodSpecFields`, so the record is refused to every
+  principal including the operator. The superseded `vko.gtrfc.com/tls-material-hash` annotation
+  is **read and never written**: the fallback is self-extinguishing and exists because Sentinel
+  pods never roll on a plain upgrade (ADR 0005 D11), so without it that tier would go silently
+  unmeasured. **`config-hash` and `pod-spec-hash` are still in metadata** - a filed follow-up,
+  not a decided non-goal.
+- **The data pod hands its ServiceAccount token to the sidecar container alone.**
+  `automountServiceAccountToken: false` plus a hand-declared projected volume at
+  `/var/run/secrets/kubernetes.io/serviceaccount`; the volume name must **not** start with
+  `kube-api-access-`, which is the prefix the ServiceAccount admission plugin adopts and mounts
+  everywhere. Sentinel pods set the flag and project nothing. The claim that Kubernetes does not
+  offer a per-container split - carried in three places in this repository - was **false**; the
+  pattern is GA since 1.20. A new container in a data pod inherits no token, and a new
+  `AutomountServiceAccountToken` needs its own line in `podSpecChanged`, because the volume list
+  carries the introduction but nothing carries a flip back.
+
+→ [ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md),
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4,
+amending [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
+D4, [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D10 and
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D2, which had never registered
+`tlsMaterialHashFromSts` among its inputs.
 → [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md),
 amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
 residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)

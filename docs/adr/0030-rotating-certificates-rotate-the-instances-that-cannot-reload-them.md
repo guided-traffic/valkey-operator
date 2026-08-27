@@ -12,9 +12,23 @@ the same change as the behaviour it describes, and it is recorded here rather th
 away.
 
 Implemented: [`internal/tlsmaterial`](../../internal/tlsmaterial/reloader.go) and its three
-sidecar consumers plus the observer; `vko.gtrfc.com/tls-material-hash` on both StatefulSet pod
+sidecar consumers plus the observer; the material fingerprint on both StatefulSet pod
 templates; the `TLSMaterialStale` condition and the `ValkeyTLSMaterialStale` alert; the Secret
 watch predicate.
+
+Amended 2026-08-27: **D4's carrier moved out of pod metadata.** The fingerprint was a pod
+annotation, and pod metadata is patchable by anything holding the sidecar token — so deleting
+the key made the pod unmeasured and switched the roll off. It is now the
+`VKO_TLS_MATERIAL_HASH` env var of the tier's carrier container
+([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)), which the API server
+refuses to change. The digest, the trigger, the presence rule and the rolling update are
+unchanged. The T25 residual below is closed with the two corrections it earned.
+
+Also amended 2026-08-27: certificate rotation gained end-to-end coverage, which it had none of
+when this ADR was written — `TestE2E_TLS_CertificateRotation_RollsTheFleet`
+([`test/e2e/tls_rotation_test.go`](../../test/e2e/tls_rotation_test.go)) deletes the Secret so
+cert-manager reissues, then asserts the template moves, every data pod is replaced, the
+dataset survives and the condition clears.
 
 Not implemented, deliberately: nothing parses `notAfter`, nothing schedules, and the operator
 never issues a certificate. `valkey-server` and `valkey-sentinel` are still **unmeasured** and
@@ -119,7 +133,7 @@ ours that dials Valkey takes its `*tls.Config` from the `Reloader` per dial. A p
 cannot is a process that has to say why, in an amendment to this ADR.
 
 **D4 — Everything else rides the ordinary failover-aware rolling update, driven by a
-fingerprint of the Secret's *content* on the pod template.** `vko.gtrfc.com/tls-material-hash`
+fingerprint of the Secret's *content* on the pod template.** The fingerprint
 ([`internal/builder/tls_material.go`](../../internal/builder/tls_material.go)) is a
 length-prefixed FNV-1a digest of `ca.crt`, `tls.crt` and `tls.key`, stamped by the reconciler —
 not by a builder, because a builder never sees Secret content
@@ -127,6 +141,17 @@ not by a builder, because a builder never sees Secret content
 fingerprint is pod-template drift like any other and is replaced by the rolling update of
 [ADR 0007](0007-failover-aware-rolling-update.md), with its failover, its sync waits and its
 bounds. **No new replacement mechanism was introduced, and none may be.**
+
+> **Amended 2026-08-27 — the carrier changed, the mechanism did not.** This decision
+> originally named the ~~`vko.gtrfc.com/tls-material-hash` pod annotation~~ as the carrier.
+> Pod metadata is patchable by anything holding `pods: patch` on the pod, and because both
+> consumers carry a presence rule, *deleting* the key was cheaper than forging it: the pod
+> becomes unmeasured, the roll skips it and the condition stays quiet. The fingerprint now
+> lives in the `VKO_TLS_MATERIAL_HASH` env var of the tier's carrier container, which the API
+> server refuses to change after creation
+> ([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)). The digest, the
+> stamping site, the presence rule and the rolling update are unchanged. The annotation is
+> read as a fallback for pods written before that date and is never written again.
 
 **D5 — The restart unit is the pod, so one non-reloading container spends the whole pod's
 exemption.** A TLS data pod holds `valkey-server`, our sidecar and, with metrics enabled, the
@@ -303,13 +328,50 @@ measurement, and in that order.
 
 ## Residual risks
 
-* **The trigger and its detector read the same attacker-writable field (T25, open).** The
+* ~~**The trigger and its detector read the same attacker-writable field (T25, open).** The
   sidecar Role grants `pods: patch` on this cluster's data pods and those pods mount the token —
   only the observer sets `automountServiceAccountToken: false` — so `valkey-server` and the
   third-party exporter carry it. Patching the annotation to the desired value suppresses the
   roll and the report together. It is the third forgeable field of that grant, next to
   `instanceRole` and the drain stamp, and the enumeration in `SECURITY_ARCHITECTURE.md` did not
-  have it until this ADR was reviewed.
+  have it until this ADR was reviewed.~~
+
+  **(Closed 2026-08-27, in two moves, and two claims above were wrong.)** The trigger and the
+  detector still read the same field — that part was never the defect. What was, is that the
+  field was writable by the pod. It is not any more:
+  [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 takes the
+  token away from `valkey-server`, both init containers and the exporter, and
+  [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) moves the record into pod
+  `spec`, which the API server refuses to change for any principal — including a compromised
+  sidecar, the one container step 4 cannot help. The corrections: **forging was never the
+  cheap attack** — a merge patch setting the key to `null` makes the pod unmeasured under the
+  presence rule, which no digest strength addresses — and it was **not the third** forgeable
+  field of that grant but one of nine. `SECURITY_ARCHITECTURE.md` section 3 now
+  enumerates them instead of counting.
+
+  **The two rejected repairs are recorded where they can be found again** — a stronger or
+  keyed digest, and an operator-held record compared against an unforgeable timestamp — under
+  Alternatives Considered in [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md),
+  which is the decision they were alternatives to.
+
+  Still open, and a different problem: **the Secret writer.** A principal that can write the
+  Secret can replace the material and keep the fingerprint identical — by collision against a
+  32-bit digest, or simply by writing the previous bytes back, which defeats every hash
+  function. D11 already says this report answers "did the roll happen" and never "is the
+  material unchanged".
+* **A freshly created TLS cluster is never rolled by a rotation (T27, open, measured
+  2026-08-27).** The Certificate and the StatefulSet are created in the same pass, so
+  cert-manager has not issued when the template is first written and the record is correctly
+  omitted (D8) — but the StatefulSet controller creates the pods from *that* template. The
+  presence guard then exempts them permanently. Measured on a live cluster: three `2/2 Running`
+  pods of a TLS cluster with `phase: OK`, none of which carries a fingerprint, so a rotation
+  moves the template and replaces nothing while `TLSMaterialStale` reports
+  `TLSMaterialCurrent`. It ends the first time anything else replaces the pods — an operator
+  upgrade does, per [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11, but
+  only for the data tier. **This is the largest hole in this ADR's mechanism and it is not the
+  one D11 warns about.** The fix is a decision about the presence rule, not a bug fix: it
+  cannot currently tell "never had a record" from "predates the mechanism", and it must keep
+  exempting the second. Found by the e2e this ADR shipped without.
 * **An unreadable Secret does more than skip the stamp (T24, open).** Pod-template annotations
   are compared by full equality, so a desired template *without* the annotation is drift: the
   live template is overwritten without it, an in-flight rotation roll stops seeing work, and the
@@ -366,7 +428,8 @@ measurement, and in that order.
 
 * [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — `Reloader`, `New`, `Config`, the byte comparison and the last-good config
 * [`internal/controller/tls_material.go`](../../internal/controller/tls_material.go) — `stampTLSMaterialHash`, `reportTLSMaterialStale`, `scanTLSMaterial`, and the reload/pins table
-* [`internal/builder/tls_material.go`](../../internal/builder/tls_material.go) — `ComputeTLSMaterialHash` and the length-prefixed digest
+* [`internal/builder/tls_material.go`](../../internal/builder/tls_material.go) — `ComputeTLSMaterialHash` and the length-prefixed digest; `StampTLSMaterialHash` and `RecordedTLSMaterialHash`, the carrier of [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)
+* [`test/e2e/tls_rotation_test.go`](../../test/e2e/tls_rotation_test.go) — the rotation, the roll and the dataset, on a live cluster
 * [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `tlsMaterialHashFromSts`, `podTLSMaterialHashChanged`
 * [`internal/sidecar/drain.go`](../../internal/sidecar/drain.go) — `realValkeyClientFactory`, which holds the material source rather than a parsed config
 * [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `sidecarTLSReloader` and its three consumers

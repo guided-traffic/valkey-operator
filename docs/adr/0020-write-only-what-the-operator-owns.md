@@ -461,6 +461,25 @@ no extra read; every filtering path stays quiet. The rolling update emits no Eve
 its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
 message — so a collision produces one Event series per pass, the same rule D8 sets.
 
+**D10 — A value the operator writes onto a pod and later trusts is not protected by D9.**
+*(2026-08-27.)* D9 answers "is this pod ours". It does not answer "did we write what this pod
+says", and until 2026-08-27 those were being conflated: a pod provably ours could be carrying
+a fingerprint its own containers had patched, because pod metadata is writable by anything
+holding the sidecar token and every container held that token. Two changes close it, and the
+rule they leave behind belongs to this family:
+
+**Provenance of an object is not provenance of a field.** Where the operator writes a record
+onto a pod and reads it back as an input, the record goes into pod `spec` — which the API
+server refuses to change after creation — and not into pod `metadata`
+([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)). Where a container never
+needed the token that makes such a patch possible, it does not get one
+([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4).
+
+Not everything the operator reads off a pod is such a record. The `instanceRole` label and the
+drain stamp are *written by the sidecar on purpose* and read as evidence; they cannot move,
+and ADR 0011 and ADR 0028 are the design that reasons from evidence rather than trusting them.
+The distinction is who the writer is meant to be.
+
 **Two things D9 deliberately does not do.** The `resourceNames` of the sidecar Role keep the
 *desired* half, `<cr>-0..N-1` derived from `spec.replicas` before those pods exist; that half
 is load-bearing for scale-up (D3, and the comment on `SidecarRolePodNames`), and a name under

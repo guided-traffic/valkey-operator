@@ -49,32 +49,40 @@ import (
 // no stampede control -- the concurrency cap of ADR 0019 is the only pacing
 // there is. What the slack does not cover is a roll that never starts, and that
 // is what the TLSMaterialStale condition reports.
+//
+// Two things the mechanism does not cover, both recorded rather than glossed:
+//
+//   - A pod carrying no record is unmeasured, never stale. That is the whole of
+//     the upgrade-neutrality story (ADR 0005), and it is also why the pods of a
+//     freshly created TLS cluster -- built from the template written before
+//     cert-manager issued -- are never rolled by a rotation until something else
+//     replaces them (T27, open, measured 2026-08-27).
+//   - The fingerprint answers "did the roll happen" and never "is the material
+//     unchanged": whoever can write the Secret can keep the digest identical
+//     (ADR 0030 D11).
 
 // stampTLSMaterialHash writes the fingerprint of the TLS Secret named by
 // secretName onto the pod template of sts, so a rotation reaches the pods
 // through the same rolling update every other pod-template change rides.
 //
+// The record goes into the env of carrierContainer -- the sidecar on the data
+// tier, the sentinel container on the Sentinel tier -- and not into the template
+// annotations, because a pod can patch its own metadata and cannot patch its own
+// spec (ADR 0031).
+//
 // It is deliberately silent and never fails the step. A Secret that is absent
-// (cert-manager has not issued yet) or unreadable leaves the annotation off the
-// template, and a pod without the annotation is never restarted for it -- the
-// same presence rule the config and pod-spec hashes use, which is what makes the
+// (cert-manager has not issued yet) or unreadable leaves the record off the
+// template, and a pod without the record is never restarted for it -- the same
+// presence rule the config and pod-spec hashes use, which is what makes the
 // operator upgrade that introduces this mechanism roll nothing (ADR 0005).
 func (r *ValkeyReconciler) stampTLSMaterialHash(
-	ctx context.Context, v *vkov1.Valkey, sts *appsv1.StatefulSet, secretName string,
+	ctx context.Context, v *vkov1.Valkey, sts *appsv1.StatefulSet, secretName, carrierContainer string,
 ) {
 	if !v.IsTLSEnabled() {
 		return
 	}
 
-	hash := r.tlsMaterialHash(ctx, v, secretName)
-	if hash == "" {
-		return
-	}
-
-	if sts.Spec.Template.Annotations == nil {
-		sts.Spec.Template.Annotations = map[string]string{}
-	}
-	sts.Spec.Template.Annotations[builder.AnnotationTLSMaterialHash] = hash
+	builder.StampTLSMaterialHash(sts, carrierContainer, r.tlsMaterialHash(ctx, v, secretName))
 }
 
 // tlsMaterialHash reads the TLS Secret and returns its fingerprint, or the empty
@@ -238,10 +246,10 @@ func (r *ValkeyReconciler) scanTierTLSMaterial(
 		if !podIsOurs(pod, sts) {
 			continue
 		}
-		// A pod without the annotation predates the fingerprint and is unmeasured,
-		// not stale. Reporting it would make the operator upgrade that introduces
-		// this mechanism light up the whole fleet.
-		if recorded := pod.Annotations[builder.AnnotationTLSMaterialHash]; recorded != "" && recorded != desired {
+		// A pod carrying no record predates the fingerprint and is unmeasured, not
+		// stale. Reporting it would make the operator upgrade that introduces this
+		// mechanism light up the whole fleet.
+		if recorded := builder.RecordedTLSMaterialHash(&pod.Spec, pod.Annotations); recorded != "" && recorded != desired {
 			stale = append(stale, staleTLSPod{component: component, name: podName})
 		}
 	}

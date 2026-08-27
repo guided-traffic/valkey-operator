@@ -64,6 +64,17 @@ The client the drain uses now takes its config from
 [`internal/tlsmaterial`](../../internal/tlsmaterial/reloader.go) per dial
 ([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)).
 
+Amended 2026-08-27: **D8 gains step 4, and it retracts this ADR's own last residual.**
+That residual read *"a token-projection split that Kubernetes does not offer per container
+-- it is a pod-level field. Accepted."* The first half is false. `automountServiceAccountToken`
+is indeed pod-level, but declaring a projected volume by hand and mounting it into one
+container is a supported pattern and has been GA since Kubernetes 1.20. The data pod now
+sets the flag to `false` and hands the token to the sidecar alone; the Sentinel pod sets it
+too and hands it to nobody. The superseded residual is marked in place below rather than
+deleted, because the claim travelled into
+[`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and a reader has to be able to
+find where it came from.
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -178,8 +189,58 @@ grep over both packages, not assumed. The order is:
    ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)); a name leaves the grant
    when its pod is gone, not when the spec stops asking for it.
 
+4. then take the token away from every container that is not the sidecar — **done
+   2026-08-27**. The data pod sets `automountServiceAccountToken: false` and declares the
+   projection by hand: a `projected` volume with a `serviceAccountToken` source and the
+   namespace `kube-root-ca.crt` ConfigMap, mounted at
+   `/var/run/secrets/kubernetes.io/serviceaccount` into the **sidecar container only**
+   (`sidecarTokenVolume`,
+   [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go)). The Sentinel
+   pod sets the same flag and declares no projection at all — it runs `valkey-sentinel` and
+   `valkey-cli`, never the Kubernetes API.
+
 Dropping `list` was a **hard precondition** for step 3: `resourceNames` is incompatible with
 `list` in Kubernetes RBAC.
+
+**Step 4 shrinks the trust set instead of hardening a field inside it.** The grant is the
+same; who holds it is not. Before, `valkey-server` — which terminates client traffic — both
+init containers and the third-party `redis_exporter` all carried a token good for
+`pods: patch` on `<cr>-0 … <cr>-N`, and that one verb reaches at least eight things a
+compromised container could rewrite: the `instanceRole` label the `-rw` Service selects on,
+the D6 drain stamp the operator consumes as promotion evidence, all three pod-template hashes
+(`config-hash`, `pod-spec-hash`, `tls-material-hash`), `metadata.ownerReferences`,
+`metadata.finalizers` and `spec.containers[*].image` — the last of which is one of the five
+entries in the API server's `updatablePodSpecFields`. None of the six are in apimachinery's
+immutable ObjectMeta set. Step 4 removes all of it from those containers in one move, which
+no per-field hardening can do.
+
+Four properties hold it together:
+
+* **Nothing but the sidecar needed the token.** `internal/sidecar` and `cmd/sidecar` make
+  exactly one API call (D8's opening paragraph, re-verified); both init containers shell out
+  to `valkey-cli` only and `RequiredImageTools` names no `kubectl`; the preStop drain hook is
+  a filesystem poll; the exporter speaks to Valkey.
+* **The mount path is not ours to choose.** `rest.InClusterConfig` reads `token` and `ca.crt`
+  under `/var/run/secrets/kubernetes.io/serviceaccount`, hard-coded. Getting it wrong is
+  loud, not silent: the client fails to build, `sidecar.Run` errors and the readiness probe
+  never passes.
+* **The volume name must not start with `kube-api-access-`.** The ServiceAccount admission
+  plugin *adopts* the first volume carrying that prefix as the pod's token volume and mounts
+  it into every container. The `false` flag already stops the plugin from running; the naming
+  rule is what keeps that flag being lost from silently reinstating the leak.
+* **The flag needs its own comparison.** The introduction converges because the volume list
+  grows, but flipping `automountServiceAccountToken` back to `true` on a live StatefulSet
+  changes no volume and no container. `podSpecChanged` compares it — the same hole
+  `ObserverDeploymentHasChanged` had to close for step 2.
+
+The cost is one data-tier roll on the operator upgrade, which
+[ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11 already declares the
+baseline, plus **one Sentinel-tier roll** — the pod class D11 records as the one a plain
+upgrade does not touch. That is a deliberate exception, taken once, for a token the tier
+never uses. Single-replica clusters do not get the change on that upgrade at all:
+`handleStandaloneRollingUpdate` defers when the only difference is the sidecar image
+(`isSidecarOnlyChange`), and the pod-spec change rides that same image bump. Their blast
+radius is one pod whose sidecar Role names only itself.
 
 Three properties of step 3 hold it together, each with its own guard:
 
@@ -426,10 +487,23 @@ costs the injection seam the sidecar tests rely on.
   object holding it was granted `pods: patch` on this cluster's own pods — the label the
   `-rw` Service selects on and the drain stamp this ADR's D6 has the operator consume as
   evidence.
-* **The valkey and exporter containers still carry the sidecar token.** The grant is now
+* ~~**The valkey and exporter containers still carry the sidecar token.** The grant is now
   per-pod-name, but it is mounted into every container of the data pod, not only into the
   sidecar. Closing that means a second ServiceAccount and a token-projection split that
-  Kubernetes does not offer per container — it is a pod-level field. Accepted.
+  Kubernetes does not offer per container — it is a pod-level field. Accepted.~~
+
+  **(Closed 2026-08-27, and the reasoning above was wrong.)** Kubernetes offers exactly that
+  split: `automountServiceAccountToken: false` plus a hand-declared projected volume mounted
+  into one container, GA since 1.20. No second ServiceAccount is involved. D8 step 4 ships
+  it. The false half of the claim had also been copied into
+  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and is corrected there too.
+
+* **The sidecar container itself still holds the grant, and must.** Step 4 shrinks who
+  carries the token; it cannot shrink what the token permits, because `PatchLabel` and
+  `PatchAnnotation` are the writes the sidecar exists to make (D8). A compromised **sidecar**
+  binary can still forge `instanceRole`, the drain stamp and any pod metadata on its own
+  cluster's pods. What changed is that reaching it now requires compromising the operator
+  image rather than `valkey-server` or a third-party exporter.
 
 ## References
 
@@ -438,6 +512,9 @@ costs the injection seam the sidecar tests rely on.
 * [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `patchMetadata`, `PatchLabel`, `PatchAnnotation`
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarRole`, `BuildSidecarServiceAccount`, `SidecarRolePodNames` (D8 step 3)
 * [`internal/builder/observer.go`](../../internal/builder/observer.go) — `BuildObserverServiceAccount`, the observer pod identity (D8 step 2)
+* [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `sidecarTokenVolume`, `SidecarTokenVolumeName`, the `AutomountServiceAccountToken` flag and its comparison in `podSpecChanged` (D8 step 4)
+* [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — the Sentinel pod carries no token (D8 step 4)
+* [`internal/builder/token_projection_test.go`](../../internal/builder/token_projection_test.go) — the invariant: the token reaches the sidecar and nothing else, on every topology
 * [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — operator-side `promoteAndRedirect`, `waitForWriteSync` (D9)
 * [`internal/common/annotations.go`](../../internal/common/annotations.go) — `AnnotationDrainPromotedAt`
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — how the stamp is consumed, cleared and outranked
