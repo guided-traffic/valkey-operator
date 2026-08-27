@@ -950,7 +950,24 @@ const (
 	boundManualFailover    = "manual-failover"
 	boundSentinelAwareness = "sentinel-awareness"
 	boundSyncWait          = "sync-wait"
+	boundRecreationWait    = "recreation-wait"
 )
+
+// annotationRecreationWaitStarted is the persisted half of the recreation-wait
+// bound: when the rolling update first found the pod it is waiting for absent.
+// Cleared the moment the pod exists again, so every wait episode gets its own
+// budget -- a single roll waits for several pods in sequence, and a timestamp
+// that survived the first episode would spend the budget of all later ones.
+const annotationRecreationWaitStarted = "vko.gtrfc.com/recreation-wait-started"
+
+// podRecreationOverrun is how long a deleted pod may stay absent before the
+// wait for it stops ending the pass. The StatefulSet controller recreates a
+// deleted pod within seconds; a pod that has been missing for minutes means
+// that controller is not creating it at all -- measured with T10, where an
+// immutable-field sync error wedged it on the lowest ordinal. Same value and
+// same shape as podTerminationOverrun (ADR 0026 D5): the wait is unchanged,
+// only the observation of it is bounded.
+const podRecreationOverrun = 2 * time.Minute
 
 // waitBoundKey builds the tracker key of one wait bound of one CR.
 //
@@ -1041,6 +1058,7 @@ func (r *ValkeyReconciler) forgetWaitBounds(namespace, name string) {
 	for _, bound := range []string{
 		boundTopologyRestore, boundFinalization, boundManualFailover,
 		boundSentinelAwareness, boundSyncWait, boundMultipleMasters,
+		boundRecreationWait,
 	} {
 		r.nudges.forget(waitBoundKey(namespace, name, bound))
 	}
@@ -1873,6 +1891,88 @@ func (r *ValkeyReconciler) holdDeleteWhileTerminating(ctx context.Context, v *vk
 		"Waiting for a pod to finish terminating before deleting the next one")
 }
 
+// recreationWait is the wait a deleted pod that has not been recreated earns,
+// and it is the ADR 0026 D5 shape applied to the absent pod instead of the
+// terminating one (T10):
+//
+//   - within podRecreationOverrun: the plain requeue these sites always
+//     returned. The StatefulSet controller recreates a deleted pod within
+//     seconds, so the ordinary path never sees more than a pass or two of it.
+//   - past it: DeferredRequeueAfter plus the PodRecreationStalled condition.
+//     The wait is unchanged -- the operator cannot create the pod, only the
+//     StatefulSet controller can -- but ending the pass on it froze the whole
+//     status surface and suspended the steady-state split-brain check for as
+//     long as the wedge lasted, and a T10 wedge lasts until a human clears it.
+//
+// The bound has no pod object to read a timestamp from, so it rides the
+// ensureWaitBound infrastructure (annotation plus in-memory tracker, ADR 0010
+// D7/D8) and is cleared per episode by clearRecreationWait: one roll waits for
+// several pods in sequence, and each wait owns its own budget.
+//
+// No Event on any of it (ADR 0025 D7): the condition is the report, and the
+// message says whose controller is being waited for.
+func (r *ValkeyReconciler) recreationWait(ctx context.Context, v *vkov1.Valkey,
+	podName string) *RollingUpdateResult {
+	logger := log.FromContext(ctx)
+
+	r.ensureWaitBound(ctx, v, annotationRecreationWaitStarted, boundRecreationWait)
+	if !r.waitBoundExceeded(v, annotationRecreationWaitStarted, boundRecreationWait, podRecreationOverrun) {
+		logger.Info("Waiting for pod to be recreated", "pod", podName)
+		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+	}
+
+	message := fmt.Sprintf(
+		"data pod %s was deleted over %v ago and the StatefulSet controller has not recreated it; "+
+			"the rolling update is holding. Check the StatefulSet events for "+
+			"FailedCreate/FailedUpdate -- an immutable-field sync error wedges pod creation on "+
+			"the lowest mismatching ordinal",
+		podName, podRecreationOverrun)
+	logger.Info("Pod not recreated; holding the rolling update and resuming the rest of the pass",
+		"pod", podName)
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypePodRecreationStalled,
+		metav1.ConditionTrue,
+		vkov1.ReasonPodNotRecreated,
+		message)
+	return &RollingUpdateResult{DeferredRequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// clearRecreationWait ends one recreation-wait episode: the pod the roll was
+// waiting for exists again. It runs on the exists path of every site that can
+// enter the wait, so a resolved episode is noticed by the next pass, and it
+// resets both halves of the bound -- the in-memory deadline and the annotation
+// -- because a timestamp that survived one episode would pre-expire the next.
+func (r *ValkeyReconciler) clearRecreationWait(ctx context.Context, v *vkov1.Valkey) {
+	r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundRecreationWait))
+	r.clearPodRecreationStalled(ctx, v)
+
+	if v.Annotations == nil {
+		return
+	}
+	if _, ok := v.Annotations[annotationRecreationWaitStarted]; !ok {
+		return
+	}
+	delete(v.Annotations, annotationRecreationWaitStarted)
+	if err := r.Update(ctx, v); err != nil {
+		// The in-memory half is already reset; a surviving annotation would make
+		// the next episode start expired, so this is worth a loud line.
+		log.FromContext(ctx).Error(err, "Failed to clear the recreation wait bound annotation")
+	}
+}
+
+// clearPodRecreationStalled retracts the stall report once the pod exists again.
+// Presence-guarded: a cluster that never stalled never gains the condition.
+func (r *ValkeyReconciler) clearPodRecreationStalled(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypePodRecreationStalled) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypePodRecreationStalled,
+		metav1.ConditionFalse,
+		vkov1.ReasonPodRecreated,
+		"The awaited pod exists again")
+}
+
 // waitForUnavailablePod is the wait a pod that is not available earns, and it
 // splits by the reason it is not: a booting pod gets the plain requeue it always
 // got, a terminating one gets the bounded observation above.
@@ -1956,9 +2056,9 @@ func (r *ValkeyReconciler) replaceNextReplica(ctx context.Context, v *vkov1.Valk
 	ps := candidates[0]
 
 	if !ps.exists {
-		logger.Info("Waiting for pod to be recreated", "pod", ps.name)
-		return &RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+		return r.recreationWait(ctx, v, ps.name)
 	}
+	r.clearRecreationWait(ctx, v)
 
 	if !ps.available() {
 		return r.waitForUnavailablePod(ctx, v, ps,
@@ -2476,9 +2576,9 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 		}
 
 		if !ps.exists {
-			logger.Info("Waiting for pod to be recreated", "pod", ps.name)
-			return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+			return *r.recreationWait(ctx, v, ps.name)
 		}
+		r.clearRecreationWait(ctx, v)
 
 		if !ps.available() {
 			return *r.waitForUnavailablePod(ctx, v, ps,
@@ -2893,6 +2993,9 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5). One map lookup on
 	// a CR that never carried the condition.
 	r.clearPodTerminationStalled(ctx, v)
+	// And for the recreation wait (T10), whose last episode can end the same way:
+	// the pod returns as the final replacement and no wait site runs again.
+	r.clearPodRecreationStalled(ctx, v)
 
 	if v.Annotations == nil {
 		return nil
@@ -2906,8 +3009,9 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasSyncWait := v.Annotations[annotationSyncWaitStarted]
 	_, hasTopologyRestore := v.Annotations[annotationTopologyRestoreStarted]
 	_, hasManualFailover := v.Annotations[annotationManualFailoverStarted]
+	_, hasRecreationWait := v.Annotations[annotationRecreationWaitStarted]
 	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness &&
-		!hasPromoted && !hasSyncWait && !hasTopologyRestore && !hasManualFailover {
+		!hasPromoted && !hasSyncWait && !hasTopologyRestore && !hasManualFailover && !hasRecreationWait {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
@@ -2917,6 +3021,7 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	delete(v.Annotations, annotationSentinelAwarenessStarted)
 	delete(v.Annotations, annotationPromotedPod)
 	delete(v.Annotations, annotationSyncWaitStarted)
+	delete(v.Annotations, annotationRecreationWaitStarted)
 	delete(v.Annotations, annotationTopologyRestoreStarted)
 	delete(v.Annotations, annotationManualFailoverStarted)
 	if err := r.Update(ctx, v); err != nil {
@@ -3200,15 +3305,15 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// Pod doesn't exist yet, wait for it.
-				logger.Info("Waiting for pod to be recreated", "pod", podName)
-				return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+				// Pod doesn't exist yet, wait for it -- bounded observation (T10).
+				return *r.recreationWait(ctx, v, podName)
 			}
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
 		if !podIsOurs(pod, currentSts) {
 			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
 		}
+		r.clearRecreationWait(ctx, v)
 
 		if podNeedsUpdate(pod, desiredImage, sidecarImg, configHashFromSts(currentSts),
 			podSpecHashFromSts(currentSts), tlsMaterialHashFromSts(currentSts),
@@ -4165,6 +4270,13 @@ func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.
 		if clearErr := r.clearRollingUpdateState(ctx, v); clearErr != nil {
 			return RollingUpdateResult{Error: clearErr}
 		}
+		// The completion marker is emitted on every completion exit, not only the
+		// clean one -- anything sequencing on RollingUpdateComplete would otherwise
+		// miss exactly the completions that deserve a second look (T17). The
+		// message says what was actually reached; the Warning above carries the
+		// why.
+		r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
+			"Multi-replica rolling update completed; the final topology was not verified")
 		return RollingUpdateResult{Completed: true}
 	}
 
@@ -4207,13 +4319,31 @@ func (r *ValkeyReconciler) verifyTopologyRestored(ctx context.Context, v *vkov1.
 			"timeout", finalizationStallTimeout)
 	}
 
+	// The message states the end state that was actually reached, not the one the
+	// happy path hoped for (T17). Three completions leave through here: the
+	// canonical restore, the stalled rogue-master case just above, and the
+	// abandoned restoration -- whose verdict Phase 1 recorded moments ago as
+	// TopologyRestored=False, and where the promoted replica staying master is a
+	// supported end state (ADR 0002 D11), so the Event names it instead of
+	// claiming the opposite of the condition. Read before the state clear, which
+	// refreshes v from the API server and would discard an unpersisted verdict.
+	completion := "Multi-replica rolling update completed, topology restored"
+	switch {
+	case rogueCount > 0:
+		completion = fmt.Sprintf(
+			"Multi-replica rolling update completed with %d rogue master(s) still present after %v",
+			rogueCount, finalizationStallTimeout)
+	case meta.IsStatusConditionFalse(v.Status.Conditions, vkov1.ConditionTypeTopologyRestored):
+		completion = "Multi-replica rolling update completed; the promoted replica stays master " +
+			"(pod-0 restoration was abandoned, a supported end state)"
+	}
+
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
 	}
 
-	logger.Info("Multi-replica rolling update completed, topology restored")
-	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
-		"Multi-replica rolling update completed, topology restored")
+	logger.Info(completion)
+	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete", "%s", completion)
 	return RollingUpdateResult{Completed: true}
 }
 

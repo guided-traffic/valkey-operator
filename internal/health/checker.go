@@ -372,10 +372,15 @@ func (h *Checker) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretNam
 		return nil, fmt.Errorf("failed to parse CA certificate from secret %s", secretName)
 	}
 
-	return &tls.Config{
+	cfg := &tls.Config{
 		RootCAs:    certPool,
 		MinVersion: tls.VersionTLS12,
-	}, nil
+	}
+	// Report-only: compares what each pod serves against the Secret it mounts,
+	// the one observation of the running process rather than a proxy for it
+	// (T28). Never fails a handshake.
+	observeServedCertificate(log.FromContext(ctx), cfg, secret)
+	return cfg, nil
 }
 
 // newValkeyClient creates a valkeyclient.Client with the given TLS and auth settings.

@@ -2122,6 +2122,10 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 	// Capture previous status to detect changes.
 	prevStatus := v.Status.DeepCopy()
 
+	// After the capture, so the verdict is detected as a change and rides the
+	// status write below (T7).
+	r.reportRWServiceEndpoints(ctx, v, readyReplicas)
+
 	switch {
 	case readyReplicas == v.Spec.Replicas:
 		// Verify actual connectivity to Valkey instances before reporting OK.
@@ -2339,6 +2343,10 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 
 	// Capture previous status to detect changes.
 	prevStatus := v.Status.DeepCopy()
+
+	// After the capture, so the verdict is detected as a change and rides the
+	// status write below (T7).
+	r.reportRWServiceEndpoints(ctx, v, readyReplicas)
 
 	switch {
 	case allValkeyReady && allSentinelReady:

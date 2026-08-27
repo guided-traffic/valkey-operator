@@ -4,6 +4,11 @@
 
 Accepted. Date: 2026-08-21.
 
+Amended 2026-08-27: **D12 is new — the operator reports an empty `-rw` selection instead of
+repairing it.** The sidecar stays the only writer of `instanceRole`; what changed is that
+its collective failure is no longer invisible on the CR (T7): a settled cluster with no
+master-labeled pod now carries the `RWServiceEmpty` condition.
+
 The stamp and the `findSyncedReplica` fix are implemented on branch `feat/support-pdb` —
 both in commit `cc7e034` — and covered by
 [`internal/sidecar/drain_test.go`](../../internal/sidecar/drain_test.go). Revert-verified by
@@ -327,6 +332,20 @@ failing is indistinguishable from doing nothing
 
 This changes nothing about D2 or D3: the stamp, its ordering and its best-effort nature are
 untouched. What changes is whether the promotion the stamp records can happen at all.
+
+**D12 — The operator reports an empty `-rw` selection; it never writes the label.** Added
+2026-08-27 (T7). D1 keeps the operator out of `instanceRole` entirely, which means the
+sidecars failing *collectively* used to be invisible on the CR: measured on a live cluster,
+all three data pods labeled `replica` for weeks, the `-rw` Service without endpoints, and
+every other status surface reading healthy — the sidecars were dying once per second on
+expired TLS client material (T21). `reportRWServiceEndpoints` now records the
+`RWServiceEmpty` condition on a **settled** cluster (every pod ready, no rolling update in
+flight) with no master-labeled pod, riding the status write the pass performs anyway. It is
+a report about the sidecars, never a repair: writing the label from the controller would
+reintroduce the second writer D1 exists to prevent. A brief `True` during a Sentinel
+failover on a fully ready fleet is possible and accepted — the same shape as
+`MultipleMasters` during every controlled failover — and the clearing `False` is only
+written over an existing condition, so no fleet gains the row from an upgrade.
 
 ## Consequences
 

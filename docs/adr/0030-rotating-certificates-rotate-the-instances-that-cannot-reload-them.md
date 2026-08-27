@@ -191,6 +191,21 @@ unnecessary; treating it as "reloads" costs the failure this ADR exists for, sil
 asymmetry is not close. **Measuring it is a way to remove a roll, never a prerequisite for
 having one.**
 
+*The measuring instrument exists since 2026-08-27 (T28), and D6 stands until someone reads
+it.* The health pass dials every pod anyway, and `observeServedCertificate`
+([`internal/health/served_certificate.go`](../../internal/health/served_certificate.go))
+arms that dial's `tls.Config` with a report-only `VerifyConnection` hook comparing the leaf
+each pod serves against the `tls.crt` of the Secret it mounts — the one observation of the
+running process rather than a proxy for it. A mismatch logs at Info (during a rotation roll
+it is the expected shape and otherwise the sign of a roll not happening); a match logs at
+V(1), so the experiment that could relax D6 — a pod serving the *new* leaf without having
+been replaced — is run by raising the log level, not by fleet-wide noise. Strictly
+report-only twice over: the hook never fails a handshake (D4 — no new replacement mechanism,
+and an observation must not be able to become an outage), and it does not authenticate the
+mount (D11 — after a hostile Secret swap has propagated, served leaf and Secret agree
+again). One fleet-wide log capture across a rotation window is still owed before D6 may
+move, and a single Valkey line on a single issuer is not enough to move it.
+
 **D7 — The trigger is the rotation, not the expiry.** Nothing parses `notAfter`, and nothing
 needs to: the rotation is an event the operator already sees.
 

@@ -163,6 +163,17 @@ var conditionRegistry = []conditionOwnership{
 		presenceGuarded: true,
 	},
 	{
+		// The ADR 0026 D5 shape applied to the absent pod instead of the
+		// terminating one (T10): recreationWait records the stall, the exists
+		// path of every wait site clears it, and clearRollingUpdateState covers
+		// the last-episode case where no wait site runs again.
+		conditionType:   vkov1.ConditionTypePodRecreationStalled,
+		kind:            conditionEdge,
+		evaluators:      1,
+		clearSite:       "clearPodRecreationStalled, from the exists path of every recreation-wait site and from clearRollingUpdateState",
+		presenceGuarded: true,
+	},
+	{
 		conditionType: vkov1.ConditionTypeRollingUpdatePaused,
 		kind:          conditionEdge,
 		evaluators:    1,
@@ -189,6 +200,19 @@ var conditionRegistry = []conditionOwnership{
 		// True froze forever with the alert firing on it (T24(d)). The evaluator
 		// handles the disabled case itself, presence-guarded: only a standing True
 		// is retracted, a cluster that never carried the condition never gains one.
+		presenceGuarded: false,
+	},
+	{
+		conditionType: vkov1.ConditionTypeRWServiceEmpty,
+		kind:          conditionLevel,
+		// One evaluator, mutating v.Status.Conditions in place between the
+		// prevStatus capture and persistStatus of both status arms, so the verdict
+		// rides the status write the pass performs anyway. Judged only on a
+		// settled cluster (all pods ready, no rolling update in flight); the
+		// clearing False is written only over an existing condition, so the fleet
+		// never gains the row from an upgrade (T7, the T24(d) neutrality style).
+		evaluators:      1,
+		clearSite:       "reportRWServiceEndpoints, on every settled pass of both status arms",
 		presenceGuarded: false,
 	},
 	{

@@ -161,6 +161,17 @@ const (
 	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
 	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
 
+	// ConditionTypePodRecreationStalled reports that the rolling update deleted a
+	// pod and the StatefulSet controller has not recreated it for over the
+	// recreation overrun (2 minutes) -- which means that controller cannot create
+	// it at all: the measured cause is an immutable-field sync error wedging pod
+	// creation on the lowest mismatching ordinal (T10). The roll of that tier
+	// holds; the rest of the pass -- the status write, the steady-state
+	// split-brain check, the Sentinel roll -- keeps running, the ADR 0026 D5
+	// shape applied to the absent pod instead of the terminating one. Cleared
+	// the moment the pod exists again.
+	ConditionTypePodRecreationStalled ConditionType = "PodRecreationStalled"
+
 	// ConditionTypeTLSMaterialStale reports that at least one pod is still running
 	// with TLS material older than the one in the TLS Secret it mounts.
 	//
@@ -178,6 +189,27 @@ const (
 	// fingerprint annotation; a pod created before the operator wrote fingerprints
 	// is not stale, it is unmeasured.
 	ConditionTypeTLSMaterialStale ConditionType = "TLSMaterialStale"
+
+	// ConditionTypeRWServiceEmpty reports that no data pod carries the
+	// instanceRole=master label on a cluster whose pods are all ready and whose
+	// rolling update is not in flight -- which means the <name>-rw Service, whose
+	// selector is exactly that label, has no endpoints and writes cannot reach the
+	// cluster through it.
+	//
+	// The operator never writes the label itself; each pod's sidecar labeler does
+	// (ADR 0012). This condition is therefore a report about the sidecars, and the
+	// measured cause on a live fleet was sidecars unable to dial their local
+	// Valkey at all -- TLS client material pinned at process start and expired
+	// (T21) -- while every other signal on the CR read healthy. It is only judged
+	// on a settled cluster, because a failover or a roll has legitimate
+	// label-less windows of a few seconds; those windows can still surface as a
+	// brief True, the same way MultipleMasters is briefly True during every
+	// controlled failover.
+	//
+	// Upgrade-neutral in the T24(d) style: a cluster that never exhibits the
+	// state never gains the condition -- the False is only ever written over an
+	// existing condition, never stamped onto the fleet.
+	ConditionTypeRWServiceEmpty ConditionType = "RWServiceEmpty"
 )
 
 const (
@@ -300,6 +332,23 @@ const (
 	// ReasonTLSMaterialCurrent clears TLSMaterialStale once every measured pod
 	// carries the fingerprint of the Secret it mounts.
 	ReasonTLSMaterialCurrent = "TLSMaterialCurrent"
+
+	// ReasonPodNotRecreated is the PodRecreationStalled reason while a deleted pod
+	// stays absent past the recreation overrun.
+	ReasonPodNotRecreated = "PodNotRecreated"
+
+	// ReasonPodRecreated clears PodRecreationStalled once the awaited pod exists
+	// again. Only written over an existing condition.
+	ReasonPodRecreated = "PodRecreated"
+
+	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
+	// cluster has no data pod carrying the instanceRole=master label, so the -rw
+	// Service selects nothing.
+	ReasonNoPodLabeledMaster = "NoPodLabeledMaster"
+
+	// ReasonMasterLabeled clears RWServiceEmpty once a data pod carries the
+	// master label again. Only written over an existing condition.
+	ReasonMasterLabeled = "MasterLabeled"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.

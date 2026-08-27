@@ -9,6 +9,22 @@ Amended 2026-08-26: D15 gains a clarification — "one-shot verdict" means the c
 no code changed; the two consequences of the historical reading (the freeze on class exit,
 and what a clear would destroy) are recorded under D15 as accepted rather than fixed.
 
+Amended 2026-08-27: **D16 is new — the wait for a pod that was deleted and never recreated
+is a bounded observation.** The three recreation waits (`replaceNextReplica`,
+`replaceRemainingPods`, the standalone loop) were the last unbounded waits in the rolling
+update, found by the T10 wedge: an immutable-field sync error stops the StatefulSet
+controller from creating the pod, the pass ended on the wait forever, and with it the status
+write, the steady-state split-brain check and the Sentinel roll. `recreationWait` now rides
+the D7/D8 `ensureWaitBound` infrastructure (there is no pod object to read a timestamp
+from), and past `podRecreationOverrun` = 2 min the pass stops ending on the wait —
+`DeferredRequeueAfter` plus the `PodRecreationStalled` condition, the ADR 0026 D5 shape
+applied to the absent pod instead of the terminating one. The wait itself is unchanged (the
+operator cannot create the pod; only its controller can), the bound is cleared per episode
+on the exists path so one roll's sequential waits each own their budget, and no Event is
+emitted (ADR 0025 D7). Also 2026-08-27: the `RollingUpdateComplete` Event now states the end
+state each of the three completion exits actually reached, and the verify-incomplete exit
+emits the completion marker it used to omit — the message drift D3/D5 owned is fixed (T17).
+
 Implemented on branch `feat/support-pdb`, not yet released — no tag contains this
 branch's HEAD and none of the files named below exist on `origin/main`. Guarded by
 [`internal/controller/rolling_update_bounds_test.go`](../../internal/controller/rolling_update_bounds_test.go),
@@ -244,6 +260,25 @@ through the manager cache, so a writer that just updated the CR itself reads bac
 version from before its own write and is rejected with a 409 that has no competing writer
 behind it. That is the failure CI hit; putting the record before the state write removes
 the preceding update as well, so the retry is the second line of defence, not the first.
+
+**D16 — The wait for a deleted pod that is never recreated is a bounded observation.**
+Added 2026-08-27 (T10). The three sites that wait for the StatefulSet controller to recreate
+a pod the roll deleted — `replaceNextReplica`, `replaceRemainingPods` and the standalone
+loop — returned a bare requeue with no bound: a wedge that makes the pod uncreatable (the
+measured one is an immutable-field sync error on the lowest mismatching ordinal) ended the
+pass on the wait forever, freezing the status surface and suspending the steady-state
+split-brain check for as long as the wedge lasted. `recreationWait` bounds the observation,
+not the wait: within `podRecreationOverrun` = 2 min the plain requeue is unchanged; past it
+the pass returns `DeferredRequeueAfter` and reports `PodRecreationStalled` naming the pod
+and where to look (`FailedCreate`/`FailedUpdate` on the StatefulSet). There is no pod object
+to read a deadline from, so the bound rides the D7/D8 annotation-plus-tracker
+infrastructure and is cleared per episode on the exists path — a single roll waits for
+several pods in sequence, and a timestamp surviving the first episode would spend the
+budget of all later ones. The exit is deliberately not a state transition: the operator
+cannot create the pod, so there is no other bounded state to hand over to — the D1 rule is
+satisfied by the observation being bounded while the wait itself remains until the pod
+exists or a human clears the wedge. No Event (ADR 0025 D7); this is the ADR 0026 D5 shape
+applied to the absent pod instead of the terminating one.
 
 ## Consequences
 
