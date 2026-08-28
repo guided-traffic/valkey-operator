@@ -4,6 +4,21 @@
 
 Accepted. Date: 2026-08-21.
 
+Amended 2026-08-27: **D12 is new — the operator reports an empty `-rw` selection instead of
+repairing it.** The sidecar stays the only writer of `instanceRole`; what changed is that
+its collective failure is no longer invisible on the CR (T7): a settled cluster with no
+master-labeled pod now carries the `RWServiceEmpty` condition.
+
+Also amended 2026-08-27: **the sidecar Role gains `get`, and the drain skips terminating
+peers.** D8's narrowing direction stands — this is the one deliberate widening it has, added
+because CI measured the drain of a dying master promoting the peer the rolling update had
+deleted in the same second, which consolidated the fleet toward an empty reborn pod
+([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D5a). `IsTerminating` reads
+the candidate pod's `DeletionTimestamp` through the same named-pod grant the patches use;
+unknown reads as alive, so an API blip cannot fail a drain. The security cost is bounded and
+stated in `SECURITY_ARCHITECTURE.md` section 4.2: `get` on this cluster's own data pods,
+whose Secrets are mounted rather than inlined.
+
 The stamp and the `findSyncedReplica` fix are implemented on branch `feat/support-pdb` —
 both in commit `cc7e034` — and covered by
 [`internal/sidecar/drain_test.go`](../../internal/sidecar/drain_test.go). Revert-verified by
@@ -53,6 +68,27 @@ away. A preStop hook on the Valkey container now waits for the drain. Guarded by
 end-to-end proof that the drain promotes at all is
 `TestE2E_NoSentinel_MasterKill_NoSplitBrain`, which since the same date asserts the promotion
 directly instead of inferring it from the resulting topology.
+
+Amended 2026-08-26: **D11 is new, and it closes the second way D10's premise fails.** D10
+assumed the only reason the drain handler cannot talk to its local Valkey is that Valkey
+exited first. It can also be that the handler's own TLS material is stale: a `*tls.Config`
+parsed at process start keeps presenting a certificate that a cert-manager rotation has
+already superseded, and on a live fleet it did — the drain promotion died silently on every
+TLS cluster whose pods outlived a rotation. Same fail-open consequence, different mechanism.
+The client the drain uses now takes its config from
+[`internal/tlsmaterial`](../../internal/tlsmaterial/reloader.go) per dial
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)).
+
+Amended 2026-08-27: **D8 gains step 4, and it retracts this ADR's own last residual.**
+That residual read *"a token-projection split that Kubernetes does not offer per container
+-- it is a pod-level field. Accepted."* The first half is false. `automountServiceAccountToken`
+is indeed pod-level, but declaring a projected volume by hand and mounting it into one
+container is a supported pattern and has been GA since Kubernetes 1.20. The data pod now
+sets the flag to `false` and hands the token to the sidecar alone; the Sentinel pod sets it
+too and hands it to nobody. The superseded residual is marked in place below rather than
+deleted, because the claim travelled into
+[`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and a reader has to be able to
+find where it came from.
 
 ## Context
 
@@ -168,8 +204,58 @@ grep over both packages, not assumed. The order is:
    ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)); a name leaves the grant
    when its pod is gone, not when the spec stops asking for it.
 
+4. then take the token away from every container that is not the sidecar — **done
+   2026-08-27**. The data pod sets `automountServiceAccountToken: false` and declares the
+   projection by hand: a `projected` volume with a `serviceAccountToken` source and the
+   namespace `kube-root-ca.crt` ConfigMap, mounted at
+   `/var/run/secrets/kubernetes.io/serviceaccount` into the **sidecar container only**
+   (`sidecarTokenVolume`,
+   [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go)). The Sentinel
+   pod sets the same flag and declares no projection at all — it runs `valkey-sentinel` and
+   `valkey-cli`, never the Kubernetes API.
+
 Dropping `list` was a **hard precondition** for step 3: `resourceNames` is incompatible with
 `list` in Kubernetes RBAC.
+
+**Step 4 shrinks the trust set instead of hardening a field inside it.** The grant is the
+same; who holds it is not. Before, `valkey-server` — which terminates client traffic — both
+init containers and the third-party `redis_exporter` all carried a token good for
+`pods: patch` on `<cr>-0 … <cr>-N`, and that one verb reaches at least eight things a
+compromised container could rewrite: the `instanceRole` label the `-rw` Service selects on,
+the D6 drain stamp the operator consumes as promotion evidence, all three pod-template hashes
+(`config-hash`, `pod-spec-hash`, `tls-material-hash`), `metadata.ownerReferences`,
+`metadata.finalizers` and `spec.containers[*].image` — the last of which is one of the five
+entries in the API server's `updatablePodSpecFields`. None of the six are in apimachinery's
+immutable ObjectMeta set. Step 4 removes all of it from those containers in one move, which
+no per-field hardening can do.
+
+Four properties hold it together:
+
+* **Nothing but the sidecar needed the token.** `internal/sidecar` and `cmd/sidecar` make
+  exactly one API call (D8's opening paragraph, re-verified); both init containers shell out
+  to `valkey-cli` only and `RequiredImageTools` names no `kubectl`; the preStop drain hook is
+  a filesystem poll; the exporter speaks to Valkey.
+* **The mount path is not ours to choose.** `rest.InClusterConfig` reads `token` and `ca.crt`
+  under `/var/run/secrets/kubernetes.io/serviceaccount`, hard-coded. Getting it wrong is
+  loud, not silent: the client fails to build, `sidecar.Run` errors and the readiness probe
+  never passes.
+* **The volume name must not start with `kube-api-access-`.** The ServiceAccount admission
+  plugin *adopts* the first volume carrying that prefix as the pod's token volume and mounts
+  it into every container. The `false` flag already stops the plugin from running; the naming
+  rule is what keeps that flag being lost from silently reinstating the leak.
+* **The flag needs its own comparison.** The introduction converges because the volume list
+  grows, but flipping `automountServiceAccountToken` back to `true` on a live StatefulSet
+  changes no volume and no container. `podSpecChanged` compares it — the same hole
+  `ObserverDeploymentHasChanged` had to close for step 2.
+
+The cost is one data-tier roll on the operator upgrade, which
+[ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11 already declares the
+baseline, plus **one Sentinel-tier roll** — the pod class D11 records as the one a plain
+upgrade does not touch. That is a deliberate exception, taken once, for a token the tier
+never uses. Single-replica clusters do not get the change on that upgrade at all:
+`handleStandaloneRollingUpdate` defers when the only difference is the sidecar image
+(`isSidecarOnlyChange`), and the pod-spec change rides that same image bump. Their blast
+radius is one pod whose sidecar Role names only itself.
 
 Three properties of step 3 hold it together, each with its own guard:
 
@@ -234,6 +320,42 @@ pod has nothing to fail over to. Neither pays a preStop on every deletion.
 version of it. Init containers with `restartPolicy: Always` are terminated *after* the
 regular containers, so Valkey would be guaranteed to be gone before the drain starts. That
 converts the race into a certainty.
+
+**D11 — The drain client holds the TLS material source, not a parsed config.** Added
+2026-08-26. D10's premise — "the drain handler can talk to the local Valkey" — fails a second
+way, and this one is not a race: on a TLS cluster the handler's `*tls.Config` was built at
+process start, and a cert-manager rotation makes it stale weeks before anything notices. The
+pod that is draining is by definition one that has been running a while, so it is the pod most
+likely to hold superseded material. Measured on a live fleet: the promotion died on every TLS
+cluster whose pods outlived a rotation, with the same signature D10 describes — no promotion,
+no stamp, no Event.
+
+`realValkeyClientFactory` ([`internal/sidecar/drain.go`](../../internal/sidecar/drain.go))
+therefore stores a `*tlsmaterial.Reloader` and asks it for a config **per dial**, not a
+`*tls.Config`. The precondition this buys is precise and worth stating exactly: the material
+was usable **when the sidecar started** — a `Reloader` that cannot be constructed fails
+sidecar startup rather than the drain — and it is **re-read at drain time**. It is *not* "the
+material is provably current": `Config()` returns the last config that worked rather than an
+error, which is the right trade for a call that happens once, at the end of a pod's life, when
+failing is indistinguishable from doing nothing
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D2).
+
+This changes nothing about D2 or D3: the stamp, its ordering and its best-effort nature are
+untouched. What changes is whether the promotion the stamp records can happen at all.
+
+**D12 — The operator reports an empty `-rw` selection; it never writes the label.** Added
+2026-08-27 (T7). D1 keeps the operator out of `instanceRole` entirely, which means the
+sidecars failing *collectively* used to be invisible on the CR: measured on a live cluster,
+all three data pods labeled `replica` for weeks, the `-rw` Service without endpoints, and
+every other status surface reading healthy — the sidecars were dying once per second on
+expired TLS client material (T21). `reportRWServiceEndpoints` now records the
+`RWServiceEmpty` condition on a **settled** cluster (every pod ready, no rolling update in
+flight) with no master-labeled pod, riding the status write the pass performs anyway. It is
+a report about the sidecars, never a repair: writing the label from the controller would
+reintroduce the second writer D1 exists to prevent. A brief `True` during a Sentinel
+failover on a fully ready fleet is possible and accepted — the same shape as
+`MultipleMasters` during every controlled failover — and the clearing `False` is only
+written over an existing condition, so no fleet gains the row from an upgrade.
 
 ## Consequences
 
@@ -335,6 +457,12 @@ costs the injection seam the sidecar tests rely on.
   a dataset when it is wrong, and one that D10 makes unnecessary for the observed failure.
   What stays uncovered: a Valkey that dies *despite* the hook, for instance by crashing
   rather than by SIGTERM.
+* **(Closed 2026-08-26) Stale TLS material was a second uncovered case of the same shape.**
+  Until D11 the drain handler could reach a live Valkey and still fail to authenticate to it,
+  with the same fail-open outcome. It is now re-read per dial. What stays uncovered in that
+  direction: material that was never usable at all fails the sidecar at startup, so the pod
+  runs without a labeler and without a drain, and the operator sees a pod that is simply not
+  Ready.
 * **A pod whose sidecar cannot write the marker is slow to delete, fleet-wide (D10).** A
   broken sidecar image, a volume that failed to mount, a sidecar OOM-killed before SIGTERM:
   each costs 60 s per pod deletion, and nothing surfaces the cause on the CR. The kubelet
@@ -388,10 +516,23 @@ costs the injection seam the sidecar tests rely on.
   object holding it was granted `pods: patch` on this cluster's own pods — the label the
   `-rw` Service selects on and the drain stamp this ADR's D6 has the operator consume as
   evidence.
-* **The valkey and exporter containers still carry the sidecar token.** The grant is now
+* ~~**The valkey and exporter containers still carry the sidecar token.** The grant is now
   per-pod-name, but it is mounted into every container of the data pod, not only into the
   sidecar. Closing that means a second ServiceAccount and a token-projection split that
-  Kubernetes does not offer per container — it is a pod-level field. Accepted.
+  Kubernetes does not offer per container — it is a pod-level field. Accepted.~~
+
+  **(Closed 2026-08-27, and the reasoning above was wrong.)** Kubernetes offers exactly that
+  split: `automountServiceAccountToken: false` plus a hand-declared projected volume mounted
+  into one container, GA since 1.20. No second ServiceAccount is involved. D8 step 4 ships
+  it. The false half of the claim had also been copied into
+  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and is corrected there too.
+
+* **The sidecar container itself still holds the grant, and must.** Step 4 shrinks who
+  carries the token; it cannot shrink what the token permits, because `PatchLabel` and
+  `PatchAnnotation` are the writes the sidecar exists to make (D8). A compromised **sidecar**
+  binary can still forge `instanceRole`, the drain stamp and any pod metadata on its own
+  cluster's pods. What changed is that reaching it now requires compromising the operator
+  image rather than `valkey-server` or a third-party exporter.
 
 ## References
 
@@ -400,7 +541,12 @@ costs the injection seam the sidecar tests rely on.
 * [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `patchMetadata`, `PatchLabel`, `PatchAnnotation`
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarRole`, `BuildSidecarServiceAccount`, `SidecarRolePodNames` (D8 step 3)
 * [`internal/builder/observer.go`](../../internal/builder/observer.go) — `BuildObserverServiceAccount`, the observer pod identity (D8 step 2)
+* [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `sidecarTokenVolume`, `SidecarTokenVolumeName`, the `AutomountServiceAccountToken` flag and its comparison in `podSpecChanged` (D8 step 4)
+* [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — the Sentinel pod carries no token (D8 step 4)
+* [`internal/builder/token_projection_test.go`](../../internal/builder/token_projection_test.go) — the invariant: the token reaches the sidecar and nothing else, on every topology
 * [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — operator-side `promoteAndRedirect`, `waitForWriteSync` (D9)
 * [`internal/common/annotations.go`](../../internal/common/annotations.go) — `AnnotationDrainPromotedAt`
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — how the stamp is consumed, cleared and outranked
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the surrounding privilege model
+* [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) — D11, and why a process of ours re-reads its TLS material instead of being replaced
+* [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — the material source the drain client holds (D11)

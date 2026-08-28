@@ -570,6 +570,20 @@ func TestHACluster_ReplicaAnnounceIP_Integration(t *testing.T) {
 	})
 
 	t.Run("HA cluster TLS init container injects replica-announce-port 16379", func(t *testing.T) {
+		// The operator refuses to persist a TLS pod template whose material it
+		// cannot fingerprint (ADR 0030 D12), and envtest has no cert-manager to
+		// issue one -- so the Secrets both tiers mount exist before the CR does.
+		for _, name := range []string{"ha-announce-tls-test-tls", "ha-announce-tls-test-sentinel-tls"} {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Data: map[string][]byte{
+					"ca.crt": []byte("ca"), "tls.crt": []byte("cert"), "tls.key": []byte("key"),
+				},
+			}
+			require.NoError(t, k8sClient.Create(ctx, secret))
+			t.Cleanup(func() { _ = k8sClient.Delete(ctx, secret) })
+		}
+
 		vTLS := &vkov1.Valkey{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "ha-announce-tls-test",

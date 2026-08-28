@@ -39,6 +39,17 @@ type mockPodPatcher struct {
 	// onAnnotation runs inside PatchAnnotation, before it returns. Tests use it
 	// to observe what has and has not happened yet at stamping time.
 	onAnnotation func()
+	// terminating names the pods IsTerminating answers true for; terminatingErr
+	// makes every IsTerminating call fail instead.
+	terminating    map[string]bool
+	terminatingErr error
+}
+
+func (m *mockPodPatcher) IsTerminating(_ context.Context, _ string, name string) (bool, error) {
+	if m.terminatingErr != nil {
+		return false, m.terminatingErr
+	}
+	return m.terminating[name], nil
 }
 
 type patchRecord struct {
@@ -374,21 +385,29 @@ func TestLabeler_SentinelCrossCheck_NotConfigured(t *testing.T) {
 	assert.Equal(t, common.RoleMaster, patcher.patches[0].labelValue)
 }
 
-// --- buildSidecarTLSConfig ---
+// --- sidecarTLSReloader ---
 
-func TestBuildSidecarTLSConfig_NoMaterialStillPinsMinVersion(t *testing.T) {
-	cfg, err := buildSidecarTLSConfig(Config{TLSEnabled: true})
+func TestSidecarTLSReloader_DisabledTLSHasNoSource(t *testing.T) {
+	src, err := sidecarTLSReloader(Config{})
 
 	require.NoError(t, err)
+	assert.Nil(t, src, "a nil source is what every caller reads as plaintext")
+}
+
+func TestSidecarTLSReloader_NoMaterialStillPinsMinVersion(t *testing.T) {
+	src, err := sidecarTLSReloader(Config{TLSEnabled: true})
+
+	require.NoError(t, err)
+	cfg := src.Config()
 	assert.Equal(t, uint16(tls.VersionTLS12), cfg.MinVersion)
 	assert.Nil(t, cfg.RootCAs)
 	assert.Empty(t, cfg.Certificates)
 }
 
-func TestBuildSidecarTLSConfig_LoadsCAAndClientKeyPair(t *testing.T) {
+func TestSidecarTLSReloader_LoadsCAAndClientKeyPair(t *testing.T) {
 	certs := generateTestCerts(t)
 
-	cfg, err := buildSidecarTLSConfig(Config{
+	src, err := sidecarTLSReloader(Config{
 		TLSEnabled: true,
 		TLSCACert:  certs.caPath,
 		TLSCert:    certs.certPath,
@@ -396,33 +415,34 @@ func TestBuildSidecarTLSConfig_LoadsCAAndClientKeyPair(t *testing.T) {
 	})
 
 	require.NoError(t, err)
+	cfg := src.Config()
 	require.NotNil(t, cfg.RootCAs)
 	require.Len(t, cfg.Certificates, 1)
 }
 
-func TestBuildSidecarTLSConfig_MissingCAFile(t *testing.T) {
-	_, err := buildSidecarTLSConfig(Config{TLSEnabled: true, TLSCACert: filepath.Join(t.TempDir(), "absent.crt")})
+func TestSidecarTLSReloader_MissingCAFile(t *testing.T) {
+	_, err := sidecarTLSReloader(Config{TLSEnabled: true, TLSCACert: filepath.Join(t.TempDir(), "absent.crt")})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "reading CA cert")
+	assert.Contains(t, err.Error(), "reading TLS material")
 }
 
-func TestBuildSidecarTLSConfig_UnparseableCA(t *testing.T) {
+func TestSidecarTLSReloader_UnparseableCA(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ca.crt")
 	require.NoError(t, os.WriteFile(path, []byte("not a certificate"), 0o600))
 
-	_, err := buildSidecarTLSConfig(Config{TLSEnabled: true, TLSCACert: path})
+	_, err := sidecarTLSReloader(Config{TLSEnabled: true, TLSCACert: path})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to parse CA cert")
+	assert.Contains(t, err.Error(), "failed to parse CA certificate")
 }
 
-func TestBuildSidecarTLSConfig_BrokenClientKeyPair(t *testing.T) {
+func TestSidecarTLSReloader_BrokenClientKeyPair(t *testing.T) {
 	certs := generateTestCerts(t)
 	broken := filepath.Join(certs.dir, "broken.key")
 	require.NoError(t, os.WriteFile(broken, []byte("not a key"), 0o600))
 
-	_, err := buildSidecarTLSConfig(Config{TLSEnabled: true, TLSCert: certs.certPath, TLSKey: broken})
+	_, err := sidecarTLSReloader(Config{TLSEnabled: true, TLSCert: certs.certPath, TLSKey: broken})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "loading client certificate")
@@ -508,6 +528,38 @@ func TestValkeyRoleDetector_TLSVariantsReachTheServer(t *testing.T) {
 			assert.Equal(t, common.RoleReplica, role)
 		})
 	}
+}
+
+// The failure this whole mechanism exists for, reproduced in the unit tier: the
+// material in the mount is replaced while the process runs. A detector that
+// parsed its TLS config once at startup answers the same way forever; this one
+// re-reads per command, so the rotation is visible on the next poll.
+//
+// The direction is deliberately broken-then-repaired, which is the production
+// order: the sidecar was already failing when the fresh material arrived.
+func TestValkeyRoleDetector_RereadsTLSMaterialPerCall(t *testing.T) {
+	server := generateTestCerts(t)
+	mount := generateTestCerts(t)
+
+	addr := fakeValkeyServer(t, server.serverTLSConfig(t), func([]string) string {
+		return infoReplicationReply("master")
+	})
+
+	detector, err := newValkeyRoleDetector(Config{
+		ValkeyAddr: addr,
+		TLSEnabled: true,
+		TLSCACert:  mount.caPath,
+	})
+	require.NoError(t, err)
+
+	_, err = detector.DetectRole()
+	require.Error(t, err, "the mounted CA does not sign this server yet")
+
+	mount.replaceCAWith(t, server)
+
+	role, err := detector.DetectRole()
+	require.NoError(t, err, "the rotated CA must be picked up without a restart")
+	assert.Equal(t, common.RoleMaster, role)
 }
 
 func TestValkeyRoleDetector_TLSConfigError(t *testing.T) {
@@ -611,7 +663,7 @@ func TestNewSentinelMasterQuerier_CarriesPasswordUnlessAuthIsDisabled(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a:26379", "b:26379"}, q.addrs)
 	assert.Equal(t, "s3cret", q.password)
-	assert.Nil(t, q.tlsCfg)
+	assert.Nil(t, q.tlsSrc)
 
 	q, err = newSentinelMasterQuerier(Config{SentinelAddrs: "a:26379", Password: "s3cret", SentinelDisableAuth: true})
 	require.NoError(t, err)
@@ -679,6 +731,34 @@ func TestSentinelMasterQuerier_TLSVariants(t *testing.T) {
 			assert.Equal(t, "test-2.test-headless.default.svc.cluster.local", ip)
 		})
 	}
+}
+
+// The Sentinel cross-check is the second of the three collaborators that used to
+// pin its material; it holds the reloader independently, so it gets its own
+// proof that the config is taken per query.
+func TestSentinelMasterQuerier_RereadsTLSMaterialPerQuery(t *testing.T) {
+	server := generateTestCerts(t)
+	mount := generateTestCerts(t)
+
+	addr := fakeValkeyServer(t, server.serverTLSConfig(t), func([]string) string {
+		return sentinelMasterReply("test-1.test-headless.default.svc.cluster.local")
+	})
+
+	q, err := newSentinelMasterQuerier(Config{
+		SentinelAddrs: addr,
+		TLSEnabled:    true,
+		TLSCACert:     mount.caPath,
+	})
+	require.NoError(t, err)
+
+	_, err = q.GetMasterAddress("mymaster")
+	require.Error(t, err)
+
+	mount.replaceCAWith(t, server)
+
+	ip, err := q.GetMasterAddress("mymaster")
+	require.NoError(t, err)
+	assert.Equal(t, "test-1.test-headless.default.svc.cluster.local", ip)
 }
 
 func TestSentinelMasterQuerier_AllUnreachable(t *testing.T) {

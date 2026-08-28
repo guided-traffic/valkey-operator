@@ -432,6 +432,36 @@ func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason 
 	require.NoError(t, err, append([]interface{}{failureMsg}, msgArgs...)...)
 }
 
+// requireNoWarningEvents asserts the CR collected no Warning Event at all.
+//
+// It is the assertion whose absence let a Warning per controlled failover ship:
+// every clean rolling update, on both topologies, is meant to read RollingUpdate
+// xn, FailoverTriggered / ManualFailover, RollingUpdateComplete and
+// SentinelUpdateComplete -- all Normal
+// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D7). A Warning
+// here means either a genuinely degraded run or an alarm the operator raises on
+// its own designed behaviour, and both have to fail the test rather than be
+// filtered out.
+//
+// Events travel through events.k8s.io/v1, the same API waitForValkeyEvent polls.
+func (tc *testClients) requireNoWarningEvents(t *testing.T, namespace, name string) {
+	t.Helper()
+
+	events, err := tc.kube.EventsV1().Events(namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err, "listing Events for %s/%s", namespace, name)
+
+	for i := range events.Items {
+		ev := &events.Items[i]
+		if ev.Regarding.Kind != "Valkey" || ev.Regarding.Name != name {
+			continue
+		}
+		if ev.Type == corev1.EventTypeWarning {
+			t.Errorf("%s/%s raised a Warning during a clean rolling update: %s: %s",
+				namespace, name, ev.Reason, ev.Note)
+		}
+	}
+}
+
 // statusOf renders a PDB status for assertion messages, tolerating a nil PDB.
 func statusOf(pdb *policyv1.PodDisruptionBudget) policyv1.PodDisruptionBudgetStatus {
 	if pdb == nil {

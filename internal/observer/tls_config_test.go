@@ -9,23 +9,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBuildTLSConfig_CACertOnly(t *testing.T) {
+// mustConfig builds the reloader and returns the config it currently yields, so
+// the assertions below keep reading as statements about the TLS config.
+func mustConfig(t *testing.T, cfg Config, withClientCert bool) *tls.Config {
+	t.Helper()
+	src, err := newTLSReloader(cfg, withClientCert)
+	require.NoError(t, err)
+	return src.Config()
+}
+
+func TestNewTLSReloader_CACertOnly(t *testing.T) {
 	caPath, _, _ := writeTestCerts(t)
 
-	cfg, err := buildTLSConfig(Config{TLSCACert: caPath}, false)
+	cfg := mustConfig(t, Config{TLSCACert: caPath}, false)
 
-	require.NoError(t, err)
 	assert.Equal(t, uint16(tls.VersionTLS12), cfg.MinVersion)
 	assert.NotNil(t, cfg.RootCAs, "the CA bundle must be loaded for server verification")
 	assert.Empty(t, cfg.Certificates, "without mTLS no client certificate is presented")
 }
 
-func TestBuildTLSConfig_ClientCertificateIsLoadedForMTLS(t *testing.T) {
+func TestNewTLSReloader_ClientCertificateIsLoadedForMTLS(t *testing.T) {
 	caPath, certPath, keyPath := writeTestCerts(t)
 
-	cfg, err := buildTLSConfig(Config{TLSCACert: caPath, TLSCert: certPath, TLSKey: keyPath}, true)
+	cfg := mustConfig(t, Config{TLSCACert: caPath, TLSCert: certPath, TLSKey: keyPath}, true)
 
-	require.NoError(t, err)
 	assert.NotNil(t, cfg.RootCAs)
 	require.Len(t, cfg.Certificates, 1, "mTLS must present exactly one client certificate")
 	assert.NotNil(t, cfg.Certificates[0].PrivateKey)
@@ -33,38 +40,36 @@ func TestBuildTLSConfig_ClientCertificateIsLoadedForMTLS(t *testing.T) {
 
 // The client certificate is only loaded when both paths are configured; a
 // half-configured pair must not fail the observer at startup.
-func TestBuildTLSConfig_MTLSWithoutCertPathsIsNotAnError(t *testing.T) {
+func TestNewTLSReloader_MTLSWithoutCertPathsIsNotAnError(t *testing.T) {
 	caPath, _, keyPath := writeTestCerts(t)
 
-	cfg, err := buildTLSConfig(Config{TLSCACert: caPath, TLSKey: keyPath}, true)
+	cfg := mustConfig(t, Config{TLSCACert: caPath, TLSKey: keyPath}, true)
 
-	require.NoError(t, err)
 	assert.Empty(t, cfg.Certificates)
 }
 
-func TestBuildTLSConfig_NoCACertUsesSystemRoots(t *testing.T) {
-	cfg, err := buildTLSConfig(Config{}, false)
+func TestNewTLSReloader_NoCACertUsesSystemRoots(t *testing.T) {
+	cfg := mustConfig(t, Config{}, false)
 
-	require.NoError(t, err)
 	assert.Nil(t, cfg.RootCAs, "an empty CA path leaves verification to the system roots")
 	assert.Equal(t, uint16(tls.VersionTLS12), cfg.MinVersion)
 }
 
-func TestBuildTLSConfig_Errors(t *testing.T) {
+func TestNewTLSReloader_Errors(t *testing.T) {
 	caPath, certPath, keyPath := writeTestCerts(t)
 
 	t.Run("missing CA file", func(t *testing.T) {
-		_, err := buildTLSConfig(Config{TLSCACert: caPath + ".absent"}, false)
+		_, err := newTLSReloader(Config{TLSCACert: caPath + ".absent"}, false)
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "reading CA cert")
+		assert.Contains(t, err.Error(), "reading TLS material")
 	})
 
 	t.Run("CA file that is not a certificate", func(t *testing.T) {
 		broken := caPath + ".broken"
 		require.NoError(t, os.WriteFile(broken, []byte("not a PEM block"), 0o600))
 
-		_, err := buildTLSConfig(Config{TLSCACert: broken}, false)
+		_, err := newTLSReloader(Config{TLSCACert: broken}, false)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to parse CA certificate")
@@ -74,7 +79,7 @@ func TestBuildTLSConfig_Errors(t *testing.T) {
 		brokenKey := keyPath + ".broken"
 		require.NoError(t, os.WriteFile(brokenKey, []byte("not a PEM block"), 0o600))
 
-		_, err := buildTLSConfig(Config{TLSCACert: caPath, TLSCert: certPath, TLSKey: brokenKey}, true)
+		_, err := newTLSReloader(Config{TLSCACert: caPath, TLSCert: certPath, TLSKey: brokenKey}, true)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "loading client certificate")
@@ -99,11 +104,11 @@ func TestNew_SentinelTLSConfigOmitsTheClientCertificate(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	require.NotNil(t, obs.tlsConfig)
-	require.NotNil(t, obs.sentinelTLSConfig)
-	assert.Len(t, obs.tlsConfig.Certificates, 1, "Valkey connections use mTLS")
-	assert.Empty(t, obs.sentinelTLSConfig.Certificates, "Sentinel connections must not present a client certificate")
-	assert.NotNil(t, obs.sentinelTLSConfig.RootCAs, "the Sentinel server is still verified")
+	require.NotNil(t, obs.tlsSrc)
+	require.NotNil(t, obs.sentinelTLSSrc)
+	assert.Len(t, obs.tlsSrc.Config().Certificates, 1, "Valkey connections use mTLS")
+	assert.Empty(t, obs.sentinelTLSSrc.Config().Certificates, "Sentinel connections must not present a client certificate")
+	assert.NotNil(t, obs.sentinelTLSSrc.Config().RootCAs, "the Sentinel server is still verified")
 }
 
 func TestNew_SentinelMTLSLoadsItsOwnClientCertificate(t *testing.T) {
@@ -121,7 +126,7 @@ func TestNew_SentinelMTLSLoadsItsOwnClientCertificate(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.Len(t, obs.sentinelTLSConfig.Certificates, 1)
+	assert.Len(t, obs.sentinelTLSSrc.Config().Certificates, 1)
 }
 
 func TestNew_WithoutSentinelNoSentinelTLSConfigIsBuilt(t *testing.T) {
@@ -138,8 +143,8 @@ func TestNew_WithoutSentinelNoSentinelTLSConfigIsBuilt(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.NotNil(t, obs.tlsConfig)
-	assert.Nil(t, obs.sentinelTLSConfig)
+	assert.NotNil(t, obs.tlsSrc)
+	assert.Nil(t, obs.sentinelTLSSrc)
 }
 
 // A broken Sentinel client certificate must be reported as such rather than as a

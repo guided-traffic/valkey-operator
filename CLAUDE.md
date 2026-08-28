@@ -112,7 +112,10 @@ spec:
     enabled: true
     namePrefix: "my-prefix"
   persistence:
-    enabled: true
+    enabled: true    # volumeClaimTemplates are immutable: toggling this on an existing
+                     # cluster blocks reconciliation until the StatefulSet is recreated
+                     # by hand, which is a rebuild and does not preserve the dataset; a
+                     # changed size/storageClass is reported, never applied - ADR 0023
     mode: rdb        # rdb | aof | both
     storageClass: ""
     size: 1Gi
@@ -158,7 +161,16 @@ vko.gtrfc.com/instanceRole: <replica | master>
 
 The CRD status must be visible in Lens and show the current operator task per instance:
 - `OK` when the instance is healthy
-- A short description of the current task otherwise (e.g., `Rolling Update 2/3`, `Syncing`, `Failover in progress`)
+- A short description of the current task otherwise (e.g., `Rolling Update 2/3`,
+  `Sentinel Rolling Update 1/3`, `Syncing`, `Failover in progress`)
+
+**With one exception, and it is deliberate:** while a managed write is being refused, the
+phase reports `Error` even on a perfectly healthy cluster, because a spec the operator
+accepted and cannot apply has to be visible. `phase` therefore carries two meanings and the
+blocked pass wins the field; the **`Ready` condition** carries only the data-plane verdict
+and stays `True`. That pair is not a contradiction — it reads as "your cluster is serving,
+and the operator cannot write something".
+→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D3, D5, D5a, D12
 
 ## Testing
 
@@ -323,6 +335,101 @@ these waits is bounded by `spec.rollingUpdate.syncTimeout` and pauses the update
 promoting.
 → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D10
 
+**Completion is reported per tier.** `RollingUpdateComplete` means the data tier and fires
+before the first Sentinel pod is replaced; the Sentinel tier rolls afterwards, carries the
+`SentinelUpdatePending` condition while it does (phase `Sentinel Rolling Update i/n`), and
+emits `SentinelUpdateComplete` exactly when that condition flips back to False. Anything
+sequencing on "the update is finished" on a sentinel-enabled cluster waits for the Sentinel
+marker, not the data one.
+→ [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md)
+
+## A Warning named split-brain means one that did not resolve itself
+
+Two pods answering `master` is the **design** of every controlled failover — the promoted pod
+has taken `REPLICAOF NO ONE` and the outgoing one answers until it terminates. The level is a
+condition (`MultipleMasters`, True from the first pass, message naming the pods and the
+authority); the `SplitBrainDetected` **Warning** is the edge where that level outlived
+`splitBrainWarnAfter` = 90 s — above the 75 s `terminationGracePeriodSeconds` and the 60 s
+drain preStop hook, below `finalizationStallTimeout`. `SplitBrainResolved` is Normal: it
+reports a repair that succeeded.
+
+The deadline lives in the condition's `LastTransitionTime` and its *reason* remembers whether
+the Warning already fired — no annotation. **`detectAndResolveSplitBrain` reports nothing**;
+the reporting wrapper is `resolveSplitBrain`, and the condition is written at its call sites
+because `writeStatusCondition` re-`Get`s the CR. **An unreachable pod carrying a
+`DeletionTimestamp` is not a master**: nothing clears the `instanceRole` label at delete time,
+so the label used to resurrect the pod the operator had just demoted and deleted. A clean
+rolling update emits **zero** Warning Events on either topology, and an e2e subtest per
+topology says so.
+→ [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+
+## Every condition is a level, an edge or history
+
+Adding a status condition means adding a row to `conditionRegistry`
+([`internal/controller/condition_registry.go`](internal/controller/condition_registry.go)) —
+the unit tier goes red otherwise, because the guard parses every `ConditionType` out of
+`api/v1` and demands exactly one row each. The row declares which of three things the
+condition is, and that decides what it owes: a **level** is re-measured every pass and owes
+exactly one evaluator; an **edge** records something and owes a clear at a site that
+*proves* the precondition is gone, plus a presence guard; **history** is a verdict about a
+completed operation and must never gain a clear.
+
+A **level** may have more than one evaluator only with a declared `ownershipRule` naming
+which site decides — the loosening `StorageSpecNotApplied` earned when its two StatefulSet
+reconcilers stopped racing: either tier may report a claim conflict, only the data tier may
+clear one, and that holds only while the data step runs first
+([ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md) D4a).
+
+It is a test and not a convention because the convention was missed four times — the clear
+kept ending up behind the very code path whose absence caused the staleness — and writing
+the table down for the first time immediately found two more (`RollingUpdatePaused` on
+non-Sentinel topologies, `StorageSpecNotApplied` with two evaluators), both declared in the
+registry with their ticket reference rather than silently carried, and **both fixed on
+2026-08-26** — one by narrowing an evaluator, one by moving the clear up one frame to the
+two sites every dispatch target reaches and deleting the unguarded `False` write that had
+stamped the condition onto the whole Sentinel fleet
+([ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10b). The one gap left
+is `Ready`/T18, an open re-decision rather than a defect. **There is deliberately no
+central condition-GC pass**: the producer stays the one reporter, and a sweep would have to
+exclude `MultipleMasters` (a flip resets the `splitBrainWarnAfter` deadline) and
+`TopologyRestored` (history) on its first two rows. No condition is ever deleted, which is
+why the presence guard is the whole upgrade-neutrality story.
+→ [ADR 0027](docs/adr/0027-conditions-are-levels-edges-or-history.md)
+
+**`Ready` reports the data plane; `status.phase` also reports whether the operator can
+converge the spec.** On a blocked-but-healthy cluster the two disagree by design, and
+`Ready=True` next to `phase=Error` means "your cluster is serving, and the operator cannot
+write something" — read `status.message` and `ReconcileBlocked` for what. A status field that
+only *it* can change needs its assignment on the far side of the `prevStatus` capture, next
+to `OperatorVersion`: `observerReady` sat on the near side and was therefore compared against
+itself, frozen at whatever the last pass that changed something else had sampled.
+→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D5, D5a
+
+## A pod being deleted is not available
+
+kubelet keeps `PodReady=True` for the **whole termination** of a pod whose readiness probe
+still passes — measured on Kubernetes 1.36.1, no flip, right up to the moment the object is
+gone. `podState.ready` is therefore renamed `readyCondition` and read only through two
+accessors: **`available()` = Ready and not being deleted is the default**, and every site that
+*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it;
+`reachable()` = Ready alone is the carve-out for the four sites that only *talk* to a pod, of
+which `demoteRogueMaster` is the load-bearing one — refusing to demote a terminating master
+would leave it accepting writes for the rest of its termination. **The rule is the rename, not
+a list of sites**: it had been stated as a list three times and been incomplete every time.
+
+On top of it one invariant: **the operator never deletes a pod of a tier while any pod of that
+tier is terminating.** The gate sits immediately in front of each `deleteOwnedPod` and never at
+a function head; "the tier" is the ordinal range `[0, *sts.Spec.Replicas)`, never a
+label-selector List. The refusal is never resumed — the *observation* of it is bounded, by the
+pod's own `deletionTimestamp` (which the API server sets to `now + gracePeriodSeconds`, so
+`time.Since` of it is the overrun) rather than by `ensureWaitBound`. Past
+`podTerminationOverrun` = 2 min the pass stops ending on the wait and reports
+`PodTerminationStalled`, so the Sentinel roll, the no-master recovery, the steady-state
+split-brain check and the status write run again. **No Event on any of it** — ADR 0025 D7 still
+promises zero Warnings on a clean roll. `countUpdatedPods` deliberately still counts a
+terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel path only.
+→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md)
+
 ## Reconcile concurrency
 
 The operator reconciles **4 Valkey CRs at a time** (`--max-concurrent-reconciles`, chart value
@@ -335,10 +442,10 @@ standing constraint on new code**, not a one-time audit. The same ADR carries th
 depends on which pod replied first.
 → [ADR 0019](docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)
 
-## The non-Sentinel master authority, in five rules
+## The non-Sentinel master authority, in six rules
 
 Without Sentinel nothing external arbitrates who the master is, and every mistake in this area
-is a `REPLICAOF` that discards a dataset. Five ADRs carry the design; the load-bearing
+is a `REPLICAOF` that discards a dataset. Six ADRs carry the design; the load-bearing
 sentences are repeated here so nothing is changed without them.
 
 1. **`vko.gtrfc.com/known-master` is the operator's recorded master authority.** It feeds the
@@ -372,6 +479,18 @@ sentences are repeated here so nothing is changed without them.
    to `Handle` inherits that contract: every exit path releases the marker, or every pod
    deletion in the fleet pays the 60 s bound.
    → [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+6. **A demotion may not discard the only dataset.** The rolling-update resolver stopped
+   trusting the named authority unconditionally: an authority holding zero keys while the rogue
+   holds some ends that demotion, and an unreadable count is a refusal, not a demotion. Both
+   empty is not a refusal. **Inside a roll only two signals discriminate — the drain stamp and
+   the dataset** — because every structural or temporal signal is a state the operator itself
+   produces: the pod it just promoted is legitimately the younger object, and the replica it is
+   about to demote legitimately could not have self-elected. One stamped master is adopted and
+   recorded before anything is demoted; two are ambiguous and demote nobody. A refusal emits no
+   Event — `MultipleMasters` and the 90 s `SplitBrainDetected` already carry it — and it
+   deliberately re-enters the deadlock the resolver exists to break, which is safe only because
+   every state that names an authority is bounded.
+   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)
 
 ## Provenance before every write and every delete
 
@@ -392,6 +511,133 @@ into the sidecar Role — that grant follows the name of the *object*, so an unf
 this cluster's sidecar `patch` on a stranger's pod.
 → [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes, grants and pods),
 [ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
+
+## Sentinel identity is pinned to the pod
+
+Sentinel never forgets a peer it has seen, and a failover leader needs a majority of that
+whole table. Because the Sentinel config lives on an `emptyDir`, a replacement pod used to
+boot with a fresh `sentinel myid` and a new IP, so every survivor recorded it next to the
+dead one — measured: two live Sentinels with five known peers each never promoted a replica
+after the master was killed, where the same topology with clean tables promoted one in under
+ten seconds. The init container now derives `sentinel myid` from the pod hostname, so the
+ordinal *is* the identity and peers switch the address instead of adding a voter. **A missing
+`HOSTNAME` falls back to Sentinel's own random id on purpose** — one shared id across the
+tier is worse than the drift.
+
+**The operator never issues `SENTINEL RESET` itself.** A reset rebuilds that Sentinel's peer
+and replica tables through the master, which is harmless with a healthy master and
+unrecoverable without one. Drift is *reported* as the `SentinelPeersStale` condition, read
+from the `SENTINEL MASTER` reply the health pass already asks for, and cleared by an operator
+or by the next Sentinel roll.
+→ [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md)
+
+## Rotating certificates rotate the instances that cannot reload them
+
+A Secret volume is rewritten in place when cert-manager rotates the certificate it holds, and a
+process that parsed the old bytes at startup keeps presenting them until it exits. Measured on
+a live fleet: the sidecar labeler, the Sentinel cross-check and the **ADR 0012 drain promotion**
+died on every TLS cluster whose pods outlived a rotation - silently, with valid material sitting
+in the mount, `Ready` still True and `phase` still `OK`, because the reconciler and the health
+checker read the Secret per call and present no client certificate at all.
+
+Two halves, and the split is the rule: **a long-lived process this repo owns re-reads its
+material and earns an exemption; every other process rides a roll.**
+
+- The sidecar and the observer take their `*tls.Config` from
+  [`internal/tlsmaterial`](internal/tlsmaterial/reloader.go) per dial - CA **and** keypair,
+  compared on bytes, keeping the last config that worked so a half-swapped mount costs one
+  degraded call instead of an outage. **A new long-lived client of ours inherits that, not an
+  exemption**: `valkeyclient.Client` holds no connection, so building one per command is an
+  allocation and nothing else.
+- Everything else is replaced. The reconciler stamps `VKO_TLS_MATERIAL_HASH` - a
+  fingerprint of `ca.crt`/`tls.crt`/`tls.key`, Secret *content* the builders never see - onto
+  the carrier container of both StatefulSet pod templates, so a rotation rides the ordinary
+  failover-aware rolling update. `valkey-server` and `valkey-sentinel` are treated as pinning because nobody has
+  measured otherwise; the third-party exporter provably is, and the restart unit is the pod, so
+  one non-reloading container spends the whole pod's exemption. The observer Deployment carries
+  no fingerprint and is never restarted for a rotation.
+
+**The trigger is the rotation, not the expiry.** That buys the full 30-day cert-manager grace
+window, so the roll is never time-critical and needs neither scheduling nor stampede control -
+the ADR 0019 concurrency cap is the only pacing there is, and the shipped
+`ValkeyTLSMaterialStale` alert waits **72 h** rather than minutes. The one thing the window does
+not cover is a roll that never starts, and that is what the `TLSMaterialStale` level reports.
+Upgrade neutrality is the presence guard the other hashes already use: a pod without the
+record is never restarted for one.
+
+**The operator never persists a TLS pod template without a material record** (ADR 0030 D12,
+closing T27): the Secret fingerprint is stamped when readable, inherited from the persisted
+template when it is not — an unreadable Secret never erases a record — and a template with
+neither is refused without failing the pass; the Secret watch re-enters it. A fresh TLS
+cluster therefore gets its StatefulSet a few seconds after the CR, once cert-manager has
+issued, and every pod it ever boots is measurable from birth. The refusal is the fix for the
+pods that used to be built from a record-less template and were then exempt from every
+rotation forever. `TLSMaterialStale` writes its all-clear only over a complete two-tier
+measurement, retracts a standing True when TLS is turned off, and names the record-less
+legacy pods a rotation will never replace (`False`/`TLSMaterialUnmeasured` — status- and
+alert-neutral, the reason is the signal) instead of absorbing them into the all-clear (T24).
+
+**The ADR debt is paid** (deferred 2026-08-26 as `ADR spaeter, erst Code`, discharged the same
+day). One correction the debt note itself got wrong: ADR 0016's residual risk asked whether
+**`valkey-server`** reloads, and that is *still* unmeasured — what fired and was measured is the
+same shape on the **client** side, ours. ADR 0030 D6 treats an unmeasured process as pinning so
+that nobody has to find out, and D11 bounds the content-fingerprint exception to TLS material.
+**The security parameter there is the entropy of the input, not the width of the digest** - a
+published digest of a private key confirms nothing because nobody enumerates 2048-bit RSA keys,
+while a published digest of the auth password is a brute-forceable oracle **at any digest
+strength**, since the attacker guesses candidates and hashes them. So **the password rotation
+gap stays open and must not be closed by copying this mechanism, and reaching for SHA-256 does
+not change that** - five documents used to phrase the refusal as "a 32-bit digest of ...",
+corrected 2026-08-27.
+
+**The Secret writer is accepted, permanently.** Whoever can write the TLS Secret can hit the
+32-bit digest by search and swap the material silently. A wide cryptographic digest would close
+exactly that and was still not taken, because what is left afterwards is a substitution
+**indistinguishable from a legitimate rotation** - same roll, same condition transition, no
+observer for whom the two differ. Raising the ceiling needs a trust anchor outside the Secret,
+not a better hash over it. Two arguments against the strong digest are recorded in ADR 0030 D11
+as **not holding**, so they are not reused: writing the previous content back is a denial of
+rotation and not a forged fingerprint, and the migration cost is solvable by versioning the
+record the same way ADR 0031 D5 already widens the presence rule.
+
+## A record the operator trusts lives in pod spec, and a token goes to one container
+
+Both halves land on 2026-08-27, out of the adversarial review of ADR 0030, and the finding that
+reordered the whole option list is that **deleting a record beats forging one**. Every consumer
+of a pod-template hash carries a presence rule - a pod with no record is *unmeasured*, which is
+the only reason an operator upgrade rolls nothing - so one merge patch setting the key to `null`
+switches the roll off. No collision needed, and no digest strength touches it. That kills every
+scheme that keeps the carrier in pod `metadata`.
+
+- **The TLS fingerprint moved into the pod spec.** `VKO_TLS_MATERIAL_HASH` on the sidecar
+  container (data tier) and the sentinel container (Sentinel tier), stamped *after*
+  `BuildStatefulSet` so `ComputePodSpecHash` does not move with it - one rotation, one signal.
+  `env` is not in the API server's `updatablePodSpecFields`, so the record is refused to every
+  principal including the operator. The superseded `vko.gtrfc.com/tls-material-hash` annotation
+  is **read and never written**: the fallback is self-extinguishing and exists because Sentinel
+  pods never roll on a plain upgrade (ADR 0005 D11), so without it that tier would go silently
+  unmeasured. **`config-hash` and `pod-spec-hash` are still in metadata** - a filed follow-up,
+  not a decided non-goal.
+- **The data pod hands its ServiceAccount token to the sidecar container alone.**
+  `automountServiceAccountToken: false` plus a hand-declared projected volume at
+  `/var/run/secrets/kubernetes.io/serviceaccount`; the volume name must **not** start with
+  `kube-api-access-`, which is the prefix the ServiceAccount admission plugin adopts and mounts
+  everywhere. Sentinel pods set the flag and project nothing. The claim that Kubernetes does not
+  offer a per-container split - carried in three places in this repository - was **false**; the
+  pattern is GA since 1.20. A new container in a data pod inherits no token, and a new
+  `AutomountServiceAccountToken` needs its own line in `podSpecChanged`, because the volume list
+  carries the introduction but nothing carries a flip back.
+
+→ [ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md),
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4,
+amending [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
+D4, [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D10 and
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D2, which had never registered
+`tlsMaterialHashFromSts` among its inputs.
+→ [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md),
+amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
+residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+D11, and `SECURITY_ARCHITECTURE.md` sections 2, 6 and 9.
 
 ## Metrics / Exporter
 

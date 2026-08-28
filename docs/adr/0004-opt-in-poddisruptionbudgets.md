@@ -269,4 +269,5 @@ first replace that guard with a mechanism that does not depend on seeing foreign
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) — the defaults rule this follows
 * [ADR 0006](0006-delete-only-what-the-operator-owns.md) — the ownership and UID-precondition rules the cleanup obeys
 * [ADR 0007](0007-failover-aware-rolling-update.md) — why the operator's own pod replacement is not subject to a budget
+* [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — the Sentinel roll enforces the same quorum in code, and a Sentinel being deleted no longer counts toward it
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — why an Event-based signal needs its RBAC rule in the same change

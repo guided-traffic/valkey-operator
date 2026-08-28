@@ -63,7 +63,12 @@ spec:
               ReconcileBlocked has been True for 15 minutes with reason
               {{ "{{ $labels.reason }}" }}. WriteFailed and ForeignObject clear only when a
               human acts; AdmissionWebhookDenied usually clears on its own once the
-              admission gate reopens.
+              admission gate reopens. RecreateRequired also needs a human: the
+              StatefulSet's volumeClaimTemplates are immutable and no longer match
+              spec.persistence, so the operator writes nothing to it - replica, image and
+              label changes are held with it. Putting spec.persistence back clears it at
+              no cost; applying it needs the StatefulSet recreated by hand and does not
+              preserve the dataset (see the spec.persistence section of the README).
 
         - alert: ValkeyPhaseNotOK
           expr: |
@@ -115,6 +120,31 @@ spec:
               operator has not converged since it started. This fires even when the
               resource otherwise looks healthy - it is the only rule here that catches a
               resource the operator quietly stopped touching.
+
+        - alert: ValkeyTLSMaterialStale
+          expr: |
+            max by (namespace, name, reason) (
+              vko_valkey_status_condition{condition="TLSMaterialStale",status="True"}
+            ) == 1
+            and on () max(vko_valkey_collector_success) == 1
+          for: 72h
+          labels:
+            severity: warning
+          annotations:
+            summary: '{{ "{{ $labels.namespace }}/{{ $labels.name }}" }} has been running superseded TLS material for three days'
+            description: >-
+              At least one pod still holds the TLS material from before the last
+              certificate rotation. Long-lived processes inside those pods - valkey-server,
+              valkey-sentinel and the metrics exporter - parse their certificate once at
+              startup and cannot pick up a rotated one, so the operator replaces the pods
+              through the normal failover-aware rolling update. The threshold is three days
+              on purpose: cert-manager renews 30 days before expiry and the previous
+              certificate keeps working for those 30 days, so a roll that takes hours costs
+              nothing and a short threshold would page on every normal rotation. This firing
+              means the roll is not happening at all - check ReconcileBlocked, the phase, and
+              whether the StatefulSet pod template carries the current
+              VKO_TLS_MATERIAL_HASH on its carrier container. Left alone, the pods keep
+              the old certificate until it expires and their long-lived processes go silent.
 
         - alert: ValkeyMetricsCollectorFailing
           expr: max(vko_valkey_collector_success) == 0

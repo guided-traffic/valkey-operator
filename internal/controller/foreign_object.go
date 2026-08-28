@@ -220,7 +220,9 @@ func (r *ValkeyReconciler) deleteIfOwned(ctx context.Context, v *vkov1.Valkey, o
 // controller reference on them, so a pod built to carry this cluster's label set and
 // left without a controller becomes genuinely ours by upstream rules. What this
 // closes is a collision and a stray, not a deliberate mimic. That adoption behaviour
-// is read from the API contract and is not reproduced anywhere in this repo.
+// was read from the API contract; a Kind run on 2026-08-23 (ADR 0023) reproduced it —
+// pods orphaned by --cascade=orphan were adopted by the recreated StatefulSet under
+// its new UID.
 func podIsOurs(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return pod != nil && sts != nil && metav1.IsControlledBy(pod, sts)
 }

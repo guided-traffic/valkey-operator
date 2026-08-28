@@ -235,3 +235,31 @@ func TestResourceReconcileSteps_RBACBeforeStatefulSet(t *testing.T) {
 	assert.Less(t, rbac, sts,
 		"the sidecar Role has to name a scale-up pod before the StatefulSet creates it")
 }
+
+// StorageSpecNotApplied has two evaluators and one clear authority: either
+// StatefulSet reconciler may report a claim conflict, only the data one may clear
+// (ADR 0023 D4a). That rule is expressed as a mayClear argument at the two call
+// sites, and it is correct only while the data step runs first — otherwise the
+// Sentinel tier's report would be erased by the data tier's clear in the same pass,
+// which is the same defect mirrored. Nothing else pins this order, and swapping the
+// two steps leaves every other test in the package green.
+func TestResourceReconcileSteps_StatefulSetBeforeSentinelResources(t *testing.T) {
+	v := newTestValkey("test", "default", haCluster)
+	r, _ := newTestReconciler(v)
+
+	indexOf := func(name string) int {
+		for i, step := range r.resourceReconcileSteps() {
+			if step.name == name {
+				return i
+			}
+		}
+		return -1
+	}
+
+	data, sentinel := indexOf("StatefulSet"), indexOf("Sentinel resources")
+	require.NotEqual(t, -1, data, "the data StatefulSet step must exist")
+	require.NotEqual(t, -1, sentinel, "the Sentinel resources step must exist")
+	assert.Less(t, data, sentinel,
+		"the clear authority for StorageSpecNotApplied is the data tier, which only holds "+
+			"while it runs first")
+}

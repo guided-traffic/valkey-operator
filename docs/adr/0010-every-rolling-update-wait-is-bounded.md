@@ -4,6 +4,27 @@
 
 Accepted. Date: 2026-08-21.
 
+Amended 2026-08-26: D15 gains a clarification — "one-shot verdict" means the condition is
+**history**, and the type comment that claimed liveness was corrected. No rule changed and
+no code changed; the two consequences of the historical reading (the freeze on class exit,
+and what a clear would destroy) are recorded under D15 as accepted rather than fixed.
+
+Amended 2026-08-27: **D16 is new — the wait for a pod that was deleted and never recreated
+is a bounded observation.** The three recreation waits (`replaceNextReplica`,
+`replaceRemainingPods`, the standalone loop) were the last unbounded waits in the rolling
+update, found by the T10 wedge: an immutable-field sync error stops the StatefulSet
+controller from creating the pod, the pass ended on the wait forever, and with it the status
+write, the steady-state split-brain check and the Sentinel roll. `recreationWait` now rides
+the D7/D8 `ensureWaitBound` infrastructure (there is no pod object to read a timestamp
+from), and past `podRecreationOverrun` = 2 min the pass stops ending on the wait —
+`DeferredRequeueAfter` plus the `PodRecreationStalled` condition, the ADR 0026 D5 shape
+applied to the absent pod instead of the terminating one. The wait itself is unchanged (the
+operator cannot create the pod; only its controller can), the bound is cleared per episode
+on the exists path so one roll's sequential waits each own their budget, and no Event is
+emitted (ADR 0025 D7). Also 2026-08-27: the `RollingUpdateComplete` Event now states the end
+state each of the three completion exits actually reached, and the verify-incomplete exit
+emits the completion marker it used to omit — the message drift D3/D5 owned is fixed (T17).
+
 Implemented on branch `feat/support-pdb`, not yet released — no tag contains this
 branch's HEAD and none of the files named below exist on `origin/main`. Guarded by
 [`internal/controller/rolling_update_bounds_test.go`](../../internal/controller/rolling_update_bounds_test.go),
@@ -198,6 +219,37 @@ it is, the CR is still stalled, and the next pass writes the verdict. This is
 [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) applied to the abandon: an
 abandon the operator could not record is not a completed abandon.
 
+Clarified 2026-08-26: **"one-shot verdict" means the condition is history, and its own type
+comment used to say otherwise.** The rule below is unchanged; what was missing is the
+consequence for a *reader*. Because nothing outside a rolling update writes
+`TopologyRestored`, a steady-state adoption ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md))
+or a no-master recovery moves the master and leaves the condition where it stood — so a
+`True` reading "pod-0 was promoted back to master" can sit next to a non-pod-0 master
+indefinitely. Measured read-only on a live fleet (2026-08-25): a chaos pod-kill promoted
+pod-1 two minutes after a roll ended, and three days later the CR still carried
+`TopologyRestored=True` naming pod-0, with `status.masterPod`, the `known-master` annotation
+and the labels all correctly on pod-1.
+
+That is this rule working, not a defect — ADR 0011's Context already books it as an accepted
+trace-gap, and README's condition table already said "the **last** rolling update". The
+defect was that
+[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) claimed the condition was "the only
+durable record that the topology differs from the canonical one", a *live* claim no writer
+supports, and that the `currentMasterPod` doc comment read the same way. Both now state the
+direction explicitly: **`status.masterPod` is the live answer ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)
+D11); this condition answers what the last update did.** A fleet audit read the two together
+and filed the pair as a bug, which is what a documentation defect in this area costs.
+
+Two consequences of the historical reading are recorded rather than fixed. A CR that leaves
+the multi-replica-non-Sentinel class — `spec.sentinel.enabled: true`, or a scale to one
+replica — reaches no writer again, so the verdict freezes for the life of the cluster with
+no path back; under the historical reading that is correct, and the presence-guarded
+class-exit clear that `SentinelUpdatePending` gets is deliberately **not** applied here,
+because ADR 0002 D10 is scoped to deferred *work* and extending it to a completed *verdict*
+is a different decision. And any clear that were added would have to carry the prior verdict
+forward: overwriting a standing `False`/`RestoreTimeout` discards the only durable record of
+an abandon, which is exactly what this rule exists to protect.
+
 Two limits are part of the rule. **Only a conflict is handed back.** Anything that repeats
 identically on every pass — a withdrawn RBAC on the `valkeys/status` subresource is the
 realistic one — is logged and the state machine advances without the record, because
@@ -208,6 +260,25 @@ through the manager cache, so a writer that just updated the CR itself reads bac
 version from before its own write and is rejected with a 409 that has no competing writer
 behind it. That is the failure CI hit; putting the record before the state write removes
 the preceding update as well, so the retry is the second line of defence, not the first.
+
+**D16 — The wait for a deleted pod that is never recreated is a bounded observation.**
+Added 2026-08-27 (T10). The three sites that wait for the StatefulSet controller to recreate
+a pod the roll deleted — `replaceNextReplica`, `replaceRemainingPods` and the standalone
+loop — returned a bare requeue with no bound: a wedge that makes the pod uncreatable (the
+measured one is an immutable-field sync error on the lowest mismatching ordinal) ended the
+pass on the wait forever, freezing the status surface and suspending the steady-state
+split-brain check for as long as the wedge lasted. `recreationWait` bounds the observation,
+not the wait: within `podRecreationOverrun` = 2 min the plain requeue is unchanged; past it
+the pass returns `DeferredRequeueAfter` and reports `PodRecreationStalled` naming the pod
+and where to look (`FailedCreate`/`FailedUpdate` on the StatefulSet). There is no pod object
+to read a deadline from, so the bound rides the D7/D8 annotation-plus-tracker
+infrastructure and is cleared per episode on the exists path — a single roll waits for
+several pods in sequence, and a timestamp surviving the first episode would spend the
+budget of all later ones. The exit is deliberately not a state transition: the operator
+cannot create the pod, so there is no other bounded state to hand over to — the D1 rule is
+satisfied by the observation being bounded while the wait itself remains until the pod
+exists or a human clears the wedge. No Event (ADR 0025 D7); this is the ADR 0026 D5 shape
+applied to the absent pod instead of the terminating one.
 
 ## Consequences
 
@@ -350,7 +421,18 @@ Rejected once the discarded error in two of the five was noticed — see D14.
   and completes, the state clears; a pod-0 that then *exists* but does not match the live
   template — stuck `Terminating`, or otherwise not replaced — keeps `needsRollingUpdate` true,
   so the next pass re-enters at `replaceNextReplica` and requeues with no bound, and the "tail
-  of the pass is skipped" consequence returns for that case. A pod-0 that was never created is
+  of the pass is skipped" consequence returns for that case.
+  *(Narrowed 2026-08-25.* The stuck-`Terminating` half of this item is now covered:
+  [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5 routes every wait on a
+  terminating pod — the delete gate and the `!available()` waits alike — through
+  `terminationWait`, which after `podTerminationOverrun` = 2 min stops setting `NeedsRequeue`
+  and reports `PodTerminationStalled` instead, so the tail of the pass runs again. The
+  *refusal* is still not resumed, deliberately. What remains open here is a pod-0 that does not
+  match the template for any **other** reason, which still requeues unbounded.
+  ADR 0026 D5 is also the one bounded rolling-update wait that does **not** go through
+  `ensureWaitBound`: it measures the pod's own `metadata.deletionTimestamp`, a timestamp the
+  API server writes, so the D7/D8 failure this ADR is about — an arming write that fails
+  silently — cannot occur there. The reasoning is recorded in that ADR rather than here.) A pod-0 that was never created is
   **not** that case: `checkAndHandleRollingUpdate` skips absent pods when deciding whether an
   update is needed, so with the state already cleared it returns before any dispatch, the pass
   runs on through `handlePostRollingUpdateChecks` and `updateStatus`, and the short-StatefulSet

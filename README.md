@@ -814,6 +814,97 @@ Spreading across availability zones instead of nodes is a `topologyKey` change:
 | `storageClass` | `string` | `""` | StorageClass name (empty = default) |
 | `size` | `Quantity` | `1Gi` | Requested storage size |
 
+`mode` is a config-file setting and propagates like any other one — it changes the
+config hash and rides the failover-aware rolling update. **`enabled`,
+`storageClass` and `size` are read when the StatefulSet is created and never
+again.** A StatefulSet's `volumeClaimTemplates` are immutable, the API server
+rejects every update that touches them, and the operator never writes them — so
+changing storage on an existing cluster is not drift that a later pass converges
+([ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md)).
+
+The operator reports the difference instead of submitting a write that cannot fix
+it — enabling persistence on an existing StatefulSet is rejected by the API server,
+and disabling it is *accepted*, which is worse: the pod template gains an
+`emptyDir` while the live claims stay on the object.
+
+| Change on an existing cluster | What the operator does |
+|---|---|
+| `enabled` toggled in either direction | Writes **nothing** to that StatefulSet — replica, image and label changes are held together with the storage change. `StorageSpecNotApplied=True` with reason `RecreateRequired`, `ReconcileBlocked=True` with the same reason, and a `StatefulSetRecreateRequired` Warning Event on every pass. |
+| `size` or `storageClass` changed while `enabled: true` | Applies every other change normally; only the storage stays as it is. `StorageSpecNotApplied=True` with reason `VolumeClaimTemplatesImmutable` and a `StatefulSetRecreateRequired` Warning Event naming the difference. The reconcile is **not** blocked. |
+
+Both shapes use the same Event reason — `StatefulSetRecreateRequired` for the data
+StatefulSet, `SentinelStatefulSetRecreateRequired` for the Sentinel one, which
+carries no `volumeClaimTemplates` today and therefore never conflicts — and the
+message says which shape it is. Because the Sentinel tier never conflicts, it is
+also never allowed to *resolve* `StorageSpecNotApplied`: either tier may report a
+conflict, only the data tier may clear one. A tier that compares empty against
+empty has proven nothing about the tier that holds the claims. While a `RecreateRequired` conflict stands the
+**ConfigMap keeps converging** — the `save`/`appendonly` directives follow the spec
+even though the volumes do not, so a pod that restarts for any other reason boots
+the new persistence config against the old volume layout. That costs consistency
+between the dump settings and the volume, never the dataset: the pod rejoins as a
+replica and resyncs from the master.
+
+**The migration works in one direction and not the other.** Both were walked on a
+running three-replica cluster (2026-08-23, Kind, Kubernetes 1.36); the results are
+not symmetric and the difference decides whether you can do this at all.
+
+Either way the first step is the same, and `--cascade=orphan` is not optional:
+
+```bash
+kubectl delete statefulset <name> -n <namespace> --cascade=orphan
+```
+
+> **Never omit `--cascade=orphan`.** Without it the delete takes every pod at once,
+> and a cluster whose data is only in memory loses it on the spot.
+
+**Turning persistence off: verified, lossless.** The pods survive the delete, the
+operator recreates the StatefulSet without claim templates, the
+statefulset-controller re-adopts the pods, and the failover-aware rolling update
+replaces them one by one with `emptyDir`-backed ones. Measured end state: three new
+pods, `phase: OK`, and the dataset intact on all three. The old
+PersistentVolumeClaims stay behind, still bound (see below).
+
+**Turning persistence on: do not do this on a cluster whose data matters.** The
+same first step wedges. Re-adoption itself works, but the statefulset-controller
+then tries to attach the new claim to each adopted pod, which pod immutability
+forbids — `Pod "<name>-0" is invalid: spec: Forbidden: pod updates may not change
+fields other than ...`. The sync fails on the lowest such ordinal and returns, so no
+missing pod is created either: a cluster the operator had already started rolling
+stays short of pods indefinitely. Deleting the adopted pods by hand, lowest ordinal
+first, does clear the wedge — and in the measured run the dataset did **not**
+survive that step: the empty replacement of ordinal 0 is still the recorded master,
+and the split-brain resolver demoted the drain-promoted pod that held the data. **That
+second half is fixed** since [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md):
+the operator no longer demotes a master holding keys toward a recorded one holding
+none, so the split brain stays visible instead of costing the dataset. The wedge
+itself is not fixed. Treat enabling persistence on an existing cluster
+as "stand up a new cluster and restore into it", and back up first
+(`valkey-cli --rdb`, or `BGSAVE` plus a copy out of the pod). Both findings, with
+their reproductions, are in
+[ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md).
+
+Reverting `spec.persistence` to what the StatefulSet was created with clears the
+block at once — the right move whenever the change was not deliberate. It touches
+no pod only when the operator's rendering of the pod template matches what the
+StatefulSet already carries; on a cluster whose StatefulSet predates the running
+operator version that is usually not the case, and the revert then rides an
+ordinary failover-aware rolling update (measured 2026-08-26: reverting
+persistence on a live cluster replaced all three data pods, losslessly).
+
+**Recreating does not resize or reclass the volumes that already exist.** The
+claims are named `data-<name>-<ordinal>` and are reused by name, so a recreated
+StatefulSet binds the same PersistentVolumeClaims it had before — only claims
+created *later*, when a scale-out adds a new ordinal, follow the new `size` or
+`storageClass`. Growing a volume is an edit on each PersistentVolumeClaim and needs
+a StorageClass with `allowVolumeExpansion: true`; changing the class means moving
+the data.
+
+**Turning persistence off leaves the data on disk.** The operator never deletes a
+PersistentVolumeClaim and sets no `persistentVolumeClaimRetentionPolicy`, so the
+old claims and their RDB/AOF files outlive the migration. They are reattached if a
+persistent cluster of the same name is created again, and removed only by hand.
+
 ### `spec.rollingUpdate`
 
 | Field | Type | Default | Description |
@@ -825,7 +916,7 @@ for a full dataset transfer, and it does something different at each:
 
 | Wait | On timeout |
 |------|------------|
-| A replaced replica syncing from the master, before the next pod is replaced | The rolling update is **paused** (`RollingUpdatePaused` condition, phase `Error`). It resumes on the next spec change. |
+| A replaced replica syncing from the master, before the next pod is replaced | The wait ends and is **reported** (`RollingUpdatePaused` condition, phase `Error` for that pass). It is a report, not a halt: the pass clears the rolling-update state, so a later pass that still finds outdated pods starts the state machine again on a fresh `syncTimeout` budget, and the phase returns to `OK` as soon as the cluster is Ready. A spec change restarts the roll from the beginning. |
 | The former master (pod-0) syncing back after the failover, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
 
 The second case never force-promotes pod-0. An unsynced pod-0 would come up as an
@@ -848,7 +939,7 @@ does not fit in five minutes.
 |-------|------|-------------|
 | `readyReplicas` | `int32` | Number of ready Valkey instances |
 | `masterPod` | `string` | Name of the current master pod |
-| `observerReady` | `bool` | Whether the observer deployment is ready (only set when `observer.enabled: true`) |
+| `observerReady` | `bool` | Whether the observer Deployment has a ready replica (only set when `observer.enabled: true`). The observer's readiness is its own last cluster health verdict, so this is a health signal, not a rollout signal. A Deployment holding the generated name that this `Valkey` does not control reads as **not** ready. |
 | `phase` | `string` | Current lifecycle phase |
 | `message` | `string` | Human-readable status description |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions |
@@ -857,10 +948,19 @@ does not fit in five minutes.
 
 | Type | Meaning when `True` |
 |------|---------------------|
-| `RollingUpdatePaused` | A rolling update stopped because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. It resumes on the next spec change. |
-| `TopologyRestored` | The last multi-replica rolling update handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. |
-| `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. A clearing branch exists but is not reached when the drift resolves (a pass with nothing to update returns before dispatching), so a `True` can outlive it — confirm the running image rather than this field. |
-| `ReconcileBlocked` | A managed resource could not be written. The reason distinguishes an admission-webhook rejection from any other write failure. |
+| `Ready` | The data plane is serving: the instances the spec asks for are running, reachable and, on a multi-replica cluster, replicating. Every `Valkey` carries it. **It answers a different question than `status.phase`, and on a blocked cluster the two disagree by design.** `phase` carries both the data-plane verdict *and* whether the operator can converge the spec, and while a managed write is being refused the second meaning wins the field and reports `Error` — a spec the operator cannot apply has to be visible. `Ready` carries only the first and keeps reporting the truth about the running cluster, because a rejected write says nothing about it. So `Ready=True` next to `phase=Error` means: your cluster is serving, and the operator cannot write something — read `status.message` and `ReconcileBlocked` to find out what. During a rolling update the condition keeps its pre-roll value, because a pass with a roll in flight writes its own phase and returns before the status computation ([ADR 0001](docs/adr/0001-continue-reconciling-past-a-rejected-write.md) D4). |
+| `RollingUpdatePaused` | A rolling update stopped waiting because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. **It reports an expired wait, not a halted operator:** the pause clears the rolling-update state, so a later pass that still finds outdated pods dispatches again on a fresh budget and sets the condition again; a spec change restarts the roll from the beginning rather than resuming it. It goes `False` with reason `Completed` when a roll finishes and with reason `Converged` when there is no roll left to run — the usual cause being a spec put back to what the pods already run. Both clears sit in `checkAndHandleRollingUpdate`, so every topology reaches them; before that the only clear was on the Sentinel path. Written only on a cluster that paused — clusters that never did carry no such condition. See [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10. |
+| `TopologyRestored` | The last data-tier rolling update of a multi-replica non-Sentinel cluster handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. **This is a verdict about that update, not a live statement about the topology now.** Nothing outside a rolling update writes it, so a later steady-state adoption (a drain that promoted another pod, for instance) moves the master without touching the condition, and a `True` can sit next to a non-pod-0 master indefinitely. **Read `status.masterPod` for the master; read this for what the last update did.** It is never written on a Sentinel-enabled or single-replica cluster, and never cleared when a cluster becomes one. See [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D15. |
+| `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. The message names the pod and the `spec.replicas` the deferral was decided on. It clears itself at either of the two sites that prove every pod matches the live StatefulSet template: the pass that finds nothing to update, and the pass that completes a rolling update. A cluster whose `spec.replicas` is above 1 never gains it — the sidecar image is part of the pod-spec hash, so a sidecar change rides the ordinary rolling update. Note the condition follows `spec.replicas`, not the number of running pods: those two can differ while a StatefulSet write is being refused (see [`spec.persistence`](#specpersistence)), which is why the message states the replica count it decided on. See [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10 and D10a. |
+| `ReconcileBlocked` | A managed resource could not be written, or the operator refused to write it. The reason says which, because they end differently: `AdmissionWebhookDenied` (a cluster-side admission gate rejected the write, or a fail-closed webhook could not be called — clears itself once the gate reopens), `ForeignObject` (one of the generated names is held by an object this `Valkey` does not control — clears when someone deletes or renames it), `RecreateRequired` (a StatefulSet whose immutable `volumeClaimTemplates` no longer match `spec.persistence` — clears when the StatefulSet is recreated or the spec is put back, see [`spec.persistence`](#specpersistence)), `WriteFailed` (any other write failure: RBAC, quota, conflict, API server unreachable). When one pass produces several, the reason reported is the one that needs a human: `ForeignObject` before `RecreateRequired` before `AdmissionWebhookDenied`. |
+| `StorageSpecNotApplied` | The storage `spec.persistence` asks for is not the storage the cluster runs on, because a StatefulSet's `volumeClaimTemplates` are immutable. Reason `RecreateRequired` means the operator writes nothing to that StatefulSet at all until it is recreated (`ReconcileBlocked` carries the same reason); reason `VolumeClaimTemplatesImmutable` means only `size`/`storageClass`/access modes are stuck while every other change still applies. The message names the difference. It goes `False` with reason `StorageSpecApplied` once the live claims match again, and is written only on a cluster that had a conflict — clusters that never had one carry no such condition. **On a Sentinel-enabled cluster both StatefulSet reconcilers evaluate it, and only the data one may resolve it:** a tier whose `volumeClaimTemplates` are empty by construction can never prove that the storage the spec asks for is the storage that runs. See [`spec.persistence`](#specpersistence) and [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md) D4a. |
+| `SentinelPeersStale` | At least one Sentinel knows more other Sentinels than the cluster has. Sentinel never forgets a peer it has seen, and the majority a failover leader needs is computed over that whole table — so the surplus is failover capacity that is already gone, not a display issue. The message names each pod and its count. Clear it with `SENTINEL RESET <cluster-name>` on one Sentinel at a time **while the master is healthy** (a reset with the master unreachable leaves that Sentinel knowing nothing and unable to rediscover), or leave it to the next Sentinel roll. Only written while all Valkey and Sentinel pods are Ready; a pass where no Sentinel answers leaves the previous value. A cluster reporting `True` is re-checked every 5 minutes, so a reset shows up as a cleared condition within the maintenance window rather than at the next cache resync. See [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md). |
+| `SentinelUpdatePending` | The Sentinel tier is being rolled: at least one Sentinel pod runs an outdated spec, or a replacement pod is not Ready yet. The `RollingUpdateComplete` event covers the **data tier only** and fires before the first Sentinel pod is replaced — the update as a whole is finished when this condition goes `False` with reason `Completed`, which is also the moment the `SentinelUpdateComplete` event is emitted. Reason `SentinelDisabled` means Sentinel was disabled while the condition stood (no completion event in that case). Written only on a cluster whose Sentinel tier actually rolled; clusters that never rolled carry no such condition. See [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md). |
+| `PodTerminationStalled` | A pod of the tier being rolled has been `Terminating` for more than two minutes past its own graceful deletion deadline, and the rolling update of that tier is holding: the operator never deletes a pod of a tier while another pod of that tier is on its way out. **The condition does not lift the hold and nothing resumes it** — deleting a second pod because the first is wedged is what the hold prevents. What it marks is that the operator stopped ending the reconcile pass on the wait, so the Sentinel roll, the no-master recovery, the steady-state split-brain check and the status write run again while the stall lasts. The message names the pod and how far past its deadline it is. Look at that pod: a `NodeNotReady` node, a stuck finalizer and a container ignoring SIGTERM are the usual causes. It clears itself with reason `PodTerminationCleared` once the pod is gone, and the roll continues on its own. No Event accompanies it. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md). |
+| `TLSMaterialStale` | At least one pod is still running the TLS material from before the last certificate rotation. **This is True for the length of every ordinary rotation roll and is not urgent**: cert-manager renews 30 days before expiry and the previous certificate keeps working for those 30 days, so the pods have a month of slack and the shipped alert waits three days before firing. The message names the pods and their tier. It clears itself with reason `TLSMaterialCurrent` once every measured pod carries the current fingerprint. What it exists to catch is the roll that **never starts** — the operator missed the Secret event, cannot write the StatefulSet, or is blocked for an unrelated reason — because no other signal fires in that case and the pods then keep the old certificate until it expires. Only written on TLS clusters (a cluster that turns TLS off has a standing `True` retracted once, with reason `TLSMaterialNotApplicable`), and only measured for pods that already carry the fingerprint (`VKO_TLS_MATERIAL_HASH` on the sidecar container, or the superseded `vko.gtrfc.com/tls-material-hash` annotation on pods from before 2026-08-27); pods created by an older operator are unmeasured, not stale — when such pods exist and nothing is stale, the condition stays `False` with reason `TLSMaterialUnmeasured` and names them: a rotation will not replace those pods until something else does. The all-clear (`TLSMaterialCurrent`) is only written when **both** tiers could be measured; stale pods are reported even while the other tier cannot be. See [Certificate rotation](#certificate-rotation). |
+| `MultipleMasters` | More than one data pod answered that it is the master while a rolling update was in flight. This is **not by itself a fault**: every controlled failover has a window in which the promoted pod and the outgoing one both answer master, and the operator closes it on the same pass. The reason tells the two apart — `MultipleMastersTransitional` is inside the 90 s bound and carries no Event, `MultipleMastersPersisted` is past it and is the moment the `SplitBrainDetected` **Warning** event fires. The message names the pods and the authority. It goes `False` with reason `SingleMaster` on the first pass that sees at most one master; a rolling update abandoned with rogue masters still present leaves it `True` until the next one, and so does a resolution the operator **refused** because demoting would have discarded the only dataset ([ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)) — a refusal carries no Event of its own, so a `MultipleMasters` that outlives the 90 s bound is how it surfaces. Written only during a rolling update — clusters that never saw two masters carry no such condition. See [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md). |
+| `PodRecreationStalled` | The rolling update deleted a pod and the StatefulSet controller has not recreated it for over two minutes — which means that controller cannot create it at all; the measured cause is an immutable-field sync error wedging pod creation on the lowest mismatching ordinal (see [`spec.persistence`](#specpersistence)). The roll holds; like `PodTerminationStalled`, the condition marks that the operator stopped ending the reconcile pass on the wait, so the status write and the steady-state checks keep running while the wedge lasts. The message names the pod and points at the StatefulSet events (`FailedCreate`/`FailedUpdate`). It clears itself with reason `PodRecreated` once the pod exists again. Written only on a cluster that stalled; no Event accompanies it. See [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D16. |
+| `RWServiceEmpty` | No data pod carries the `instanceRole=master` label on a settled cluster (every pod ready, no rolling update in flight) — so the `<name>-rw` Service, whose selector is exactly that label, has no endpoints and serves no writes. The operator never writes that label; each pod's sidecar does, so this is a report about the sidecars: check their container logs on the data pods (the measured cause was sidecars dying once per second on expired TLS client material, invisible on every other status surface). A brief `True` during a Sentinel failover is possible and harmless — the label follows the promotion within seconds. It clears itself with reason `MasterLabeled`; written only on a cluster that exhibited the state. See [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D12. |
 
 #### Phase Values
 
@@ -869,9 +969,10 @@ does not fit in five minutes.
 | `OK` | Cluster is healthy |
 | `Provisioning` | Initial setup in progress |
 | `Syncing` | Replication sync in progress |
-| `Rolling Update X/Y` | Rolling update progress |
+| `Rolling Update X/Y` | Data-tier rolling update progress |
+| `Sentinel Rolling Update X/Y` | Sentinel-tier rolling update progress (runs after the data tier, or alone on Sentinel-only spec changes) |
 | `Failover in progress` | Sentinel-triggered leader switch |
-| `Error` | Error state (see `message` for details) |
+| `Error` | Error state (see `message` for details). **Covers two different things:** a data plane the operator cannot verify (an unreachable instance, a failed cluster health check, a paused roll), and a healthy cluster whose spec the operator cannot converge because a managed write is being refused. Read `message` and the `ReconcileBlocked` condition to tell them apart — and read the `Ready` condition for the data plane, which stays `True` in the second case on purpose. |
 
 ---
 
@@ -906,6 +1007,70 @@ When TLS is enabled (`spec.tls.enabled: true`):
 - Sentinel listens on TLS port `36379` (= 26379 + 10000, following Valkey's `+10000` convention)
 - All replication traffic is encrypted (`tls-replication yes`) regardless of `allowUnencrypted`
 - Probes use `valkey-cli --tls` with the mounted certificates
+
+### Certificate rotation
+
+**The operator replaces the pods whose TLS material they cannot reload, and only those.**
+
+A Kubernetes Secret volume is rewritten in place when cert-manager rotates the certificate
+it holds. A process that parsed the old bytes at startup keeps using them until it exits —
+so on a cluster whose pods outlive a rotation, those processes eventually present an expired
+certificate and are rejected, silently, with valid material sitting in the mount.
+
+Which processes can pick up new material on their own:
+
+| Process | Reloads? | Why |
+|---|---|---|
+| init containers | yes | they shell out to `valkey-cli` per invocation and read the files fresh |
+| the operator sidecar | yes | re-reads its material per command |
+| the cluster observer | yes | same, and it runs alone in its Deployment |
+| `valkey-server` | not verified | treated as pinning |
+| `valkey-sentinel` | not verified | treated as pinning |
+| `oliver006/redis_exporter` | no | third-party, long-lived, not the operator's to change |
+
+The two "not verified" rows have a measuring instrument: on every health pass the operator
+compares the certificate each pod actually serves against the `tls.crt` in its Secret, and
+logs a mismatch (`pod serves a TLS certificate that differs from the one in its Secret`).
+During a rotation roll that line is expected; outside one it means a roll is not happening.
+The matching case logs at verbosity 1, so whether `valkey-server` reloads on its own can be
+measured by raising the operator log level across a rotation window. Report-only — it never
+fails a handshake and never triggers a roll.
+
+The restart unit is the pod, not the container, so one non-reloading process spends the
+whole pod's exemption. Both StatefulSets therefore carry a fingerprint of their TLS Secret
+in the pod template — the `VKO_TLS_MATERIAL_HASH` environment variable of the `sidecar`
+container on the data tier and of the `sentinel` container on the Sentinel tier — and a
+rotation changes it, which the
+**normal failover-aware rolling update** then acts on — the same controlled, one-pod-at-a-time
+replacement any other spec change gets. **The observer Deployment carries no fingerprint and is
+never restarted for a rotation.**
+
+The trigger is the rotation, not the expiry. cert-manager renews 30 days before expiry and
+the previous certificate stays valid for those 30 days, so the roll has a month of slack and
+nothing is time-critical; several clusters rotating in the same window simply queue behind
+`--max-concurrent-reconciles`. The `TLSMaterialStale` condition and the `ValkeyTLSMaterialStale`
+alert cover the one case the slack does not: a roll that never starts.
+
+**A fresh TLS cluster is covered from birth.** The operator refuses to create a StatefulSet
+whose TLS material it cannot fingerprint yet, so the StatefulSet appears a few seconds after
+the CR — once cert-manager has issued — and every pod carries the fingerprint from its first
+start. (Before 2026-08-27 the StatefulSet was created alongside the `Certificate`, its first
+pods carried no fingerprint, and a rotation never rolled a cluster that had not been changed
+since creation.) The one operational consequence: with a user-provided `spec.tls.secretName`,
+the Secret has to exist — until it does, no data plane is provisioned and the CR stays in
+`Provisioning` with "Waiting for StatefulSet creation".
+
+**Upgrading to an operator version that has this mechanism rolls nothing.** A pod that does not
+carry the fingerprint is never restarted for it, so existing pods adopt the
+fingerprint the next time they are replaced for another reason, and only rotations after that
+roll them.
+
+**On a single-replica cluster the roll is a restart of the only pod**, exactly like any other
+change to the pod spec or the generated config — brief downtime, and **data loss if
+`spec.persistence` is off**. That is unchanged from how this operator has always treated a
+standalone instance; it is called out here because a certificate rotation is the first thing
+that triggers it without anyone editing the CR. Turn on `spec.persistence` for standalone
+instances whose dataset matters.
 
 ### Port Summary
 
@@ -1141,12 +1306,17 @@ server and never converged — for example a field that is immutable on an alrea
 object. That is the shape of failure that can sit unnoticed for months, because the pods stay
 up and only the spec change is stuck.
 
-`prometheusRule.enabled: true` ships seven alerts over these series — `ValkeySpecNotObserved`,
+`prometheusRule.enabled: true` ships eight alerts over these series — `ValkeySpecNotObserved`,
 `ValkeyReconcileBlocked`, `ValkeyPhaseNotOK`, `ValkeyReplicasMissing`,
-`ValkeyOperatorVersionStale`, `ValkeyMetricsCollectorFailing` and `ValkeyMetricsAbsent`. Every
-rule is guarded on `vko_valkey_collector_success`, so a collector that cannot read reports
-"unknown" instead of "healthy". Thresholds are not exposed as values; replace the rule if they
-do not fit.
+`ValkeyOperatorVersionStale`, `ValkeyTLSMaterialStale`, `ValkeyMetricsCollectorFailing` and
+`ValkeyMetricsAbsent`. Every rule is guarded on `vko_valkey_collector_success`, so a collector
+that cannot read reports "unknown" instead of "healthy". Thresholds are not exposed as values;
+replace the rule if they do not fit.
+
+`ValkeyTLSMaterialStale` is the odd one out on timing: its `for:` is **72 hours**, not minutes,
+because the roll it watches is deliberately not time-critical (see
+[Certificate rotation](#certificate-rotation)). A short threshold would page on every normal
+rotation.
 
 Turning `serviceMonitor.enabled` on renders the Service as well — a ServiceMonitor selects
 Services, and one without the other scrapes nothing.

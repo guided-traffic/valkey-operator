@@ -4,6 +4,20 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended 2026-08-26:** the D8/NA62 read-path sweep is corrected in place — it omitted
+Deployments, and `isObserverDeploymentReady` was the unguarded consumer, which inverted the
+`status.observerReady` signal this ADR's own observer refusal direction rests on. The reader
+now treats a foreign Deployment as absent. Verified in this repository: `make test-unit`,
+`make lint` and `make cyclo` are green; no e2e or integration suite was run.
+
+**Amended 2026-08-23 (ADR 0023):** the pod re-adoption this ADR twice called "asserted from
+the API contract, reproduced nowhere in this repo" has been run and holds — both statements
+are corrected in place. The same run found the limit of the orphan-delete recovery D1 names:
+it is downtime-free only when the recreated StatefulSet keeps the `volumeClaimTemplates` the
+old one had. Adding a claim wedges the statefulset-controller on the adopted pods
+([ADR 0023](0023-volume-claim-templates-are-immutable.md) D6), so nothing recommends that
+procedure for that case any more.
+
 **Amended 2026-08-22 (NA61):** the guard also binds `reconcileStatefulSet`,
 `reconcileSentinelStatefulSet` and `reconcileObserverDeployment`, `cleanupObserverDeployment`
 gained the ADR 0006 delete guard, and D8 makes every other StatefulSet consumer treat a
@@ -130,8 +144,9 @@ branch; none is a report of an object observed being damaged on a cluster.
 * **(2026-08-22, NA63) Pods were reachable through three separate doors, and the one that
   was filed is the most expensive to use.** The filing named the network commands —
   `checkAndRecoverNoMaster` probing `<cr>-0..N-1` and `checkSteadyStateSplitBrain` demoting
-  label-selected pods with `REPLICAOF`. Those go through `podAddress`
-  ([`internal/health/checker.go`](../../internal/health/checker.go)), so reaching a foreign
+  label-selected pods with `REPLICAOF`. Those go through `valkeyPodAddress`
+  ([`internal/health/checker.go`](../../internal/health/checker.go); it was `podAddress` until
+  [ADR 0029](0029-a-name-is-not-a-component.md) replaced it), so reaching a foreign
   pod needs this cluster's label set, a per-pod record under the headless Service **and** the
   CR's password. The two doors nobody had filed need only the label set:
 
@@ -177,10 +192,22 @@ channel.
 
 An object that *lost* its controller reference — a CR deleted with
 `--cascade=orphan` and recreated, a backup restore that changed the CR UID, a hand edit —
-is refused like any other foreign object, visibly, with a downtime-free recovery
-(`kubectl delete sts <name> --cascade=orphan` keeps the pods; the operator recreates the
-StatefulSet and the statefulset-controller re-adopts the label-matching orphans — upstream
-behaviour, asserted from the API contract). An operator *upgrade* is not such a loss: the
+is refused like any other foreign object, visibly, with a recovery that keeps the pods
+running (`kubectl delete sts <name> --cascade=orphan` keeps the pods; the operator
+recreates the StatefulSet and the statefulset-controller re-adopts the label-matching
+orphans).
+
+**Amended 2026-08-23.** The adoption half of that sentence said "upstream behaviour,
+asserted from the API contract" and has now been run: pods orphaned by
+`--cascade=orphan` *are* adopted by the recreated StatefulSet, keyed on its new UID. The
+hedge can go. What replaced it is a narrower limitation the run also found: the recovery
+is downtime-free only when the recreated StatefulSet's `volumeClaimTemplates` are the
+ones the old object had. When the recreate *adds* a claim, the controller adopts the pods
+and then wedges trying to attach it to them, because a pod spec is immutable — and no
+missing pod is created either. That case, and why nothing recommends this procedure for
+it any more, is [ADR 0023](0023-volume-claim-templates-are-immutable.md) D6.
+
+An operator *upgrade* is not such a loss: the
 CR object and its UID survive the upgrade untouched, and every release ever built stamped
 the reference on create — `reconcileStatefulSet` and `reconcileConfigMap` since `b0081d9`,
 the Sentinel StatefulSet and `reconcileReplicaConfigMap` since `88b721b`, the observer
@@ -377,6 +404,35 @@ A sweep of the remaining kinds found no third consumer: nothing reads back a Ser
 NetworkPolicy, a ServiceMonitor or a Certificate to derive a decision from it. The one
 Certificate reader, `deleteLegacySentinelCertificate`, was already ownership-checked.
 
+Corrected 2026-08-26: **that sweep missed Deployments, and the consumer it missed is the one
+this ADR's own observer decision rests on.** `isObserverDeploymentReady` read the Deployment
+under `<cr>-observer` and returned `Status.ReadyReplicas > 0` with no `IsControlledBy` check,
+while both sibling readers in the same function — the data StatefulSet in `updateStatus` and
+the Sentinel StatefulSet in `updateHAStatus` — had one. So a stranger holding the generated
+name had its ready replica reported as *our* observer's readiness, at the same time as
+`reconcileObserverDeployment` was refusing to write and emitting an Event saying "the
+observer is not deployed and `status.observerReady` stays false". The unguarded read
+inverted precisely the signal the refusal direction was chosen for (see Consequences: "the
+observer is diagnostic, the CR does its job without it, and `status.observerReady` records
+the degradation"), and the rejected alternative below leans on the same field.
+
+The reader now treats a foreign Deployment as absent and returns `false`. Fail direction
+toward `false` is the honest answer and the one D2 prescribes for a diagnostic component,
+and no Event is added — `reconcileObserverDeployment` stays the one reporter. Guarded by the
+`a foreign deployment is not ready` subtest of `TestIsObserverDeploymentReady`
+([`internal/controller/resource_reconcile_test.go`](../../internal/controller/resource_reconcile_test.go)).
+Note what the fix cost outside the reader: the two positive subtests were passing against
+Deployments with **no** ownerReference at all, because `builder.BuildObserverDeployment`
+does not stamp one — `reconcileObserverDeployment` does — so the fixtures had to start
+declaring the ownership they were implicitly assuming. A fixture that cannot tell owned from
+foreign is how a read-path gap survives a test suite.
+
+The corrected sweep, verified by grep over every non-test caller: **Deployment** has one
+reader (`isObserverDeploymentReady`, now guarded); Service, NetworkPolicy, ServiceMonitor
+and Certificate still have none beyond the ownership-checked one named above. Every managed
+kind's read path is now either guarded or provably absent, which is the claim the original
+sweep intended to make.
+
 **D9 — A pod is proven two-hop, and the proof is the StatefulSet.** *(2026-08-22, NA63.)* A
 pod is the only managed object whose controller is not the CR: the statefulset-controller
 creates it and stamps itself. So the chain is `pod -> StatefulSet -> CR`, `podIsOurs(pod, sts)`
@@ -405,6 +461,25 @@ no extra read; every filtering path stays quiet. The rolling update emits no Eve
 its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
 message — so a collision produces one Event series per pass, the same rule D8 sets.
 
+**D10 — A value the operator writes onto a pod and later trusts is not protected by D9.**
+*(2026-08-27.)* D9 answers "is this pod ours". It does not answer "did we write what this pod
+says", and until 2026-08-27 those were being conflated: a pod provably ours could be carrying
+a fingerprint its own containers had patched, because pod metadata is writable by anything
+holding the sidecar token and every container held that token. Two changes close it, and the
+rule they leave behind belongs to this family:
+
+**Provenance of an object is not provenance of a field.** Where the operator writes a record
+onto a pod and reads it back as an input, the record goes into pod `spec` — which the API
+server refuses to change after creation — and not into pod `metadata`
+([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)). Where a container never
+needed the token that makes such a patch possible, it does not get one
+([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4).
+
+Not everything the operator reads off a pod is such a record. The `instanceRole` label and the
+drain stamp are *written by the sidecar on purpose* and read as evidence; they cannot move,
+and ADR 0011 and ADR 0028 are the design that reasons from evidence rather than trusting them.
+The distinction is who the writer is meant to be.
+
 **Two things D9 deliberately does not do.** The `resourceNames` of the sidecar Role keep the
 *desired* half, `<cr>-0..N-1` derived from `spec.replicas` before those pods exist; that half
 is load-bearing for scale-up (D3, and the comment on `SidecarRolePodNames`), and a name under
@@ -412,8 +487,10 @@ which no pod of ours can ever exist is a name our own StatefulSet is blocked on 
 the guard does not survive upstream adoption: the statefulset-controller adopts orphan pods
 matching its selector and stamps its own controller reference, so a pod built to carry this
 cluster's label set and left without a controller becomes genuinely ours by Kubernetes' own
-rules. D9 closes collisions and strays, not a deliberate mimic. That adoption behaviour is
-read from the API contract and reproduced nowhere in this repo.
+rules. D9 closes collisions and strays, not a deliberate mimic. That adoption behaviour was
+read from the API contract and, since 2026-08-23, is reproduced: a Kind run for
+[ADR 0023](0023-volume-claim-templates-are-immutable.md) orphan-deleted a StatefulSet and
+watched the recreated one adopt the surviving pods under its new UID.
 
 ## Consequences
 
@@ -716,8 +793,9 @@ that alters nothing a user asked for.
   [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go).
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `SidecarRolePodNames`, whose
   live half D9 filters and whose desired half it deliberately leaves alone.
-* [`internal/health/checker.go`](../../internal/health/checker.go) — `podAddress`, which is
-  why the network door needs a per-pod DNS record on top of the labels.
+* [`internal/health/checker.go`](../../internal/health/checker.go) — `valkeyPodAddress` and
+  `PodAddressForComponent`, which are why the network door needs a per-pod DNS record on top
+  of the labels.
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) —
   `reconcileBlockedReason` and its precedence.
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — the name-based subject and

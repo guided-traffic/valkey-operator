@@ -5,6 +5,9 @@
 Accepted. Date: 2026-08-21. Applies to the **non-Sentinel** path; the Sentinel path
 maintains the same annotation but takes its live truth from Sentinel.
 
+Amended 2026-08-26: D10 is no longer unconditional, see
+[ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D9.
+
 Implemented on branch `feat/support-pdb`; the self-claim and the steady-state check
 landed together in `2357946`, which no release tag contains — verified by reading this
 repository. Init-script behaviour is verified by executing the generated script, not by
@@ -122,6 +125,15 @@ self-claim.
 
 **D10 — During the failover states the resolver is fed a named authority; the heuristic
 is a fallback that must never decide while an authority exists.**
+
+*Amended 2026-08-26 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D9).*
+~~A named authority that answers `role:master` decides unconditionally.~~ It decides
+**unless** the demotion it implies would discard the only dataset (ADR 0028 D1), or a drain
+stamp on another reported master outranks it (ADR 0028 D2). The reason is this ADR's own
+mechanism read one step further: the record is what points the replica ConfigMap, so a
+recorded master that returns on a volume without the dataset takes the D8/D9 self-claim and
+comes back as an **empty** master — and the rule above then named it and demoted the pod
+that held the data. The rest of D10 stands unchanged.
 `handleMultiReplicaRollingUpdate` passes `vko.gtrfc.com/promoted-pod` for
 `stateManualFailover` and `stateReplacingMaster`, and the **known-master** annotation for
 `stateRestoringTopology` and `stateVerifyingTopology`. Those four are exactly the states

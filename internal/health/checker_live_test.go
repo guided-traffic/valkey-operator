@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -187,8 +188,15 @@ func replicaInfo() string {
 // sentinelMasterReply is the SENTINEL MASTER response of a Sentinel that agrees
 // on the master.
 func sentinelMasterReply(flags string) string {
+	return sentinelMasterReplyWithPeers(flags, 2)
+}
+
+// sentinelMasterReplyWithPeers is the same reply with num-other-sentinels set,
+// which is what peer-table drift looks like on the wire.
+func sentinelMasterReplyWithPeers(flags string, otherSentinels int) string {
 	return respArray("name", "mymaster", "ip", "10.0.0.1", "port", "6379",
-		"flags", flags, "num-slaves", "2", "quorum", "2")
+		"flags", flags, "num-slaves", "2", "quorum", "2",
+		"num-other-sentinels", strconv.Itoa(otherSentinels))
 }
 
 // answers replies to AUTH with +OK and to every other command with reply.
@@ -483,6 +491,70 @@ func TestFindMaster_SplitBrainPrefersTheMasterWithMostReplicas(t *testing.T) {
 	assert.Contains(t, logged, "test-2")
 }
 
+// --- sentinel peer tables ---
+
+// The peer count rides along on the reply the quorum check already asked for.
+// Collecting it must not cost a second connection per sentinel per pass.
+func TestObserveSentinels_CollectsPeerCountsWithoutExtraDials(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+
+	router := newProbeRouter()
+	router.serve(t, "test-sentinel-0", answers(sentinelMasterReplyWithPeers("master", 4)))
+	router.serve(t, "test-sentinel-1", answers(sentinelMasterReplyWithPeers("master", 3)))
+	router.serve(t, "test-sentinel-2", answers(sentinelMasterReplyWithPeers("master", 2)))
+
+	observed := router.install(newFakeChecker()).observeSentinels(ctx, v)
+
+	assert.Equal(t, map[string]int{
+		"test-sentinel-0": 4,
+		"test-sentinel-1": 3,
+		"test-sentinel-2": 2,
+	}, observed.peers)
+	assert.Equal(t, 2, observed.expectedPeers, "three sentinels means two others each")
+	assert.True(t, observed.monitoring())
+	assert.Len(t, router.dialedAddrs(), 3, "one dial per sentinel, peer counts included")
+}
+
+// A sentinel that does not answer is absent from the map rather than recorded as
+// knowing nobody: zero would read as the cleanest table in the cluster and hide
+// the drift on the ones that did answer.
+func TestObserveSentinels_SilentSentinelIsAbsentNotZero(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+
+	router := newProbeRouter()
+	router.serve(t, "test-sentinel-0", answers(sentinelMasterReplyWithPeers("master", 4)))
+
+	observed := router.install(newFakeChecker()).observeSentinels(ctx, v)
+
+	assert.Equal(t, map[string]int{"test-sentinel-0": 4}, observed.peers)
+}
+
+// CheckCluster is the only caller in production, so the counts have to survive
+// the trip into ClusterState -- the condition is written from there, not from the
+// observation.
+func TestCheckCluster_CarriesSentinelPeerCounts(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+
+	router := newProbeRouter()
+	router.serve(t, "test-0", answers(masterInfo(2)))
+	router.serve(t, "test-1", answers(replicaInfo()))
+	router.serve(t, "test-2", answers(replicaInfo()))
+	for i, peers := range []int{4, 3, 2} {
+		router.serve(t, fmt.Sprintf("test-sentinel-%d", i),
+			answers(sentinelMasterReplyWithPeers("master", peers)))
+	}
+
+	state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
+	require.NoError(t, state.Error)
+
+	assert.Equal(t, 2, state.SentinelPeersExpected)
+	assert.Equal(t, 4, state.SentinelPeers["test-sentinel-0"])
+	assert.Equal(t, 2, state.SentinelPeers["test-sentinel-2"])
+}
+
 // --- checkSentinel quorum ---
 
 func TestCheckSentinel_AgreementIsAMajority(t *testing.T) {
@@ -541,7 +613,7 @@ func TestCheckSentinel_AgreementIsAMajority(t *testing.T) {
 				router.serve(t, pod, answers(reply))
 			}
 
-			agreed := router.install(newFakeChecker()).checkSentinel(ctx, v)
+			agreed := router.install(newFakeChecker()).observeSentinels(ctx, v).monitoring()
 
 			assert.Equal(t, tc.want, agreed)
 			assert.Equal(t, []string{

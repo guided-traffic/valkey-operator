@@ -255,20 +255,22 @@ func TestVerifyTopologyRestored_PrefersKnownMasterOverLowestOrdinal(t *testing.T
 		},
 	}
 
-	addr := fakeValkeyServer(t)
-	var demoted []string
-	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
-		demoted = append(demoted, target)
-		return valkeyclient.New(addr)
-	}
+	// Both masters hold keys, so the dataset veto (ADR 0028 D1) stays inert and the
+	// subject of the test remains the authority. The assertion is on the command each
+	// pod received rather than on which pod was contacted: the resolver now reads a key
+	// count from the master it is protecting.
+	fleet := newValkeyFleet(t, r, map[string]int{
+		name + "-0": 4711, name + "-1": 4711, name + "-2": 4711,
+	})
 
 	result := r.verifyTopologyRestored(context.Background(), v, sts)
 
 	require.Nil(t, result.Error)
 	assert.True(t, result.NeedsRequeue)
-	require.Len(t, demoted, 1, "exactly one of the two masters may be demoted")
-	assert.Contains(t, demoted[0], name+"-0.",
+	assert.True(t, fleet.sawReplicaOf(name+"-0"),
 		"the known master holds the data; pod-0 is the rogue one")
+	assert.False(t, fleet.sawReplicaOf(name+"-1"),
+		"the pod the known-master annotation names must not be demoted")
 }
 
 // TestVerifyTopologyRestored_CompletesWhenPodLookupKeepsFailing bounds the one
@@ -297,6 +299,8 @@ func TestVerifyTopologyRestored_CompletesWhenPodLookupKeepsFailing(t *testing.T)
 		},
 	}
 	r, c := newInterceptedReconciler(failPodGets, v, sts)
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
 
 	// First pass: the wait is legitimate and only gets timestamped.
 	result := r.verifyTopologyRestored(context.Background(), v, sts)
@@ -321,6 +325,89 @@ func TestVerifyTopologyRestored_CompletesWhenPodLookupKeepsFailing(t *testing.T)
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, final))
 	assert.Empty(t, final.Annotations[annotationRollingUpdateState], "all rolling update state must be cleared")
 	assert.Empty(t, final.Annotations[annotationTopologyRestoreStarted])
+
+	// T17: the completion marker is present on this exit too, and its message
+	// says what was reached instead of claiming a verification that never ran.
+	complete := rec.withReason("RollingUpdateComplete")
+	require.Len(t, complete, 1, "every completion exit emits the completion marker")
+	assert.Contains(t, complete[0].note, "not verified")
+	assert.NotContains(t, complete[0].note, "topology restored")
+}
+
+// T17: the abandoned restoration is a supported end state (ADR 0002 D11), and the
+// completion Event names it instead of stating the opposite of the
+// TopologyRestored=False verdict Phase 1 recorded moments earlier.
+func TestVerifyTopologyRestored_AbandonedRestorationNamesTheRealEndState(t *testing.T) {
+	const name = "topo-abandoned"
+	promotedHost := fmt.Sprintf("%s-1.%s-headless.default.svc.cluster.local", name, name)
+
+	r, _, v, sts := topologyRestoreFixture(t, name, map[string]string{
+		annotationRollingUpdateState:  stateVerifyingTopology,
+		annotationPromotedPod:         name + "-1",
+		builder.AnnotationKnownMaster: promotedHost,
+	})
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			if podName == name+"-1" {
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 2}, nil
+			}
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+		},
+	}
+	// The verdict abandonTopologyRestoration wrote before entering Phase 2.
+	apimeta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:   vkov1.ConditionTypeTopologyRestored,
+		Status: metav1.ConditionFalse,
+		Reason: "RestoreTimeout",
+	})
+
+	result := r.verifyTopologyRestored(context.Background(), v, sts)
+	require.Nil(t, result.Error)
+	require.True(t, result.Completed)
+
+	complete := rec.withReason("RollingUpdateComplete")
+	require.Len(t, complete, 1)
+	assert.Contains(t, complete[0].note, "stays master")
+	assert.NotContains(t, complete[0].note, "topology restored",
+		"the Event must not claim the opposite of the recorded verdict")
+}
+
+// T17: completing past the stall with rogue masters still present says so.
+func TestVerifyTopologyRestored_StalledRogueMastersAreNamedInTheCompletion(t *testing.T) {
+	const name = "topo-rogue-done"
+	promotedHost := fmt.Sprintf("%s-1.%s-headless.default.svc.cluster.local", name, name)
+
+	r, _, v, sts := topologyRestoreFixture(t, name, map[string]string{
+		annotationRollingUpdateState:  stateVerifyingTopology,
+		annotationPromotedPod:         name + "-1",
+		builder.AnnotationKnownMaster: promotedHost,
+		annotationFinalizationTimestamp: time.Now().
+			Add(-(finalizationStallTimeout + time.Minute)).UTC().Format(time.RFC3339),
+	})
+	rec := &fakeEventRecorder{}
+	r.Recorder = rec
+	r.InstanceChecker = &mockInstanceChecker{
+		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
+			switch podName {
+			case name + "-0", name + "-1":
+				return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
+			default:
+				return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
+			}
+		},
+	}
+	newValkeyFleet(t, r, map[string]int{name + "-0": 4711, name + "-1": 4711, name + "-2": 4711})
+
+	result := r.verifyTopologyRestored(context.Background(), v, sts)
+	require.Nil(t, result.Error)
+	require.True(t, result.Completed, "the stall bound completes the update despite the rogue master")
+
+	complete := rec.withReason("RollingUpdateComplete")
+	require.Len(t, complete, 1)
+	assert.Contains(t, complete[0].note, "rogue master")
+	assert.NotContains(t, complete[0].note, "topology restored")
 }
 
 func TestKnownMasterPodName(t *testing.T) {

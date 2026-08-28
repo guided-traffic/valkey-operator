@@ -41,6 +41,14 @@ type ClusterState struct {
 	// SentinelMonitoring is true when sentinel instances agree on the master.
 	SentinelMonitoring bool
 
+	// SentinelPeers maps each sentinel pod that answered to the number of other
+	// Sentinels it knows. Empty when Sentinel is disabled or no sentinel answered.
+	SentinelPeers map[string]int
+
+	// SentinelPeersExpected is how many other Sentinels each of them should know:
+	// one less than the configured replica count.
+	SentinelPeersExpected int
+
 	// Error holds any error encountered during health check.
 	Error error
 }
@@ -123,7 +131,10 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 
 	// Check sentinel view if sentinel is enabled.
 	if v.IsSentinelEnabled() {
-		state.SentinelMonitoring = h.checkSentinel(ctx, v)
+		observed := h.observeSentinels(ctx, v)
+		state.SentinelMonitoring = observed.monitoring()
+		state.SentinelPeers = observed.peers
+		state.SentinelPeersExpected = observed.expectedPeers
 	}
 
 	return state
@@ -132,8 +143,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 // PingPod sends a PING to a specific Valkey pod.
 func (h *Checker) PingPod(ctx context.Context, v *vkov1.Valkey, podName string) error {
 	password := h.readAuthPassword(ctx, v)
-	port := int(builder.ServicePort(v))
-	addr := podAddress(v, podName, port)
+	addr := valkeyPodAddress(v, podName)
 
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if err != nil {
@@ -147,8 +157,7 @@ func (h *Checker) PingPod(ctx context.Context, v *vkov1.Valkey, podName string) 
 // GetReplicationInfo returns the replication info for a specific Valkey pod.
 func (h *Checker) GetReplicationInfo(ctx context.Context, v *vkov1.Valkey, podName string) (*valkeyclient.ReplicationInfo, error) {
 	password := h.readAuthPassword(ctx, v)
-	port := int(builder.ServicePort(v))
-	addr := podAddress(v, podName, port)
+	addr := valkeyPodAddress(v, podName)
 
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if err != nil {
@@ -209,7 +218,6 @@ func (h *Checker) probeMasterRole(
 func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string, tlsConfig *tls.Config) (string, string, error) {
 	logger := log.FromContext(ctx)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
-	port := int(builder.ServicePort(v))
 
 	found := make([]*masterCandidate, v.Spec.Replicas)
 	var wg sync.WaitGroup
@@ -219,7 +227,7 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		go func(idx int32) {
 			defer wg.Done()
 			podName := fmt.Sprintf("%s-%d", stsName, idx)
-			found[idx] = h.probeMasterRole(ctx, v, podName, podAddress(v, podName, port), password, tlsConfig)
+			found[idx] = h.probeMasterRole(ctx, v, podName, valkeyPodAddress(v, podName), password, tlsConfig)
 		}(i)
 	}
 	wg.Wait()
@@ -258,8 +266,33 @@ func masterCandidateNames(candidates []masterCandidate) []string {
 	return names
 }
 
-// checkSentinel checks if sentinel instances are monitoring the cluster correctly.
-func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
+// sentinelObservation is what one pass of SENTINEL MASTER over every sentinel pod
+// saw: how many of them report a healthy master, and how many other Sentinels each
+// of them knows.
+//
+// Both answers come from the same reply. Peer drift would otherwise cost a second
+// connection per sentinel per reconcile pass for a field that is already on the
+// wire.
+type sentinelObservation struct {
+	// agreeing is the number of sentinels reporting the master with no error flags.
+	agreeing int
+	// replicas is the configured sentinel replica count.
+	replicas int32
+	// expectedPeers is how many other Sentinels each of them should know.
+	expectedPeers int
+	// peers maps a sentinel pod name to its num-other-sentinels. A sentinel that
+	// did not answer is absent rather than zero.
+	peers map[string]int
+}
+
+// monitoring reports whether a majority of the configured sentinels sees a healthy
+// master.
+func (o sentinelObservation) monitoring() bool {
+	return o.agreeing > int(o.replicas/2)
+}
+
+// observeSentinels queries every sentinel pod once and reports what it saw.
+func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentinelObservation {
 	logger := log.FromContext(ctx)
 	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
 	monitorName := builder.SentinelMonitorName(v)
@@ -277,23 +310,21 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 	}
 
 	// Build TLS config for sentinel connections (uses sentinel TLS secret).
+	observation := sentinelObservation{
+		replicas:      sentinelReplicas,
+		expectedPeers: int(sentinelReplicas) - 1,
+		peers:         map[string]int{},
+	}
+
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
 	if err != nil {
 		logger.Info("Could not build TLS config for sentinel health check", "error", err)
-		return false
+		return observation
 	}
 
-	// Sentinel port: use TLS port (36379) when TLS is enabled, plaintext (26379) otherwise.
-	// With TLS enabled, Sentinel listens on SentinelTLSPort (tls-port directive).
-	port := builder.SentinelPort
-	if v.IsTLSEnabled() {
-		port = builder.SentinelTLSPort
-	}
-
-	agreeing := 0
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
-		addr := podAddress(v, podName, port)
+		addr := sentinelPodAddress(v, podName)
 
 		c := h.newValkeyClient(addr, sentinelPassword, tlsConfig)
 		masterInfo, err := c.SentinelMaster(monitorName)
@@ -302,13 +333,15 @@ func (h *Checker) checkSentinel(ctx context.Context, v *vkov1.Valkey) bool {
 			continue
 		}
 
+		observation.peers[podName] = masterInfo.NumOtherSentinels
+
 		// Sentinel should report the master with "master" flag and no error flags.
 		if masterInfo.Flags == "master" {
-			agreeing++
+			observation.agreeing++
 		}
 	}
 
-	return agreeing > int(sentinelReplicas/2)
+	return observation
 }
 
 // buildTLSConfig constructs a tls.Config for connecting to TLS-enabled Valkey/Sentinel pods.
@@ -339,10 +372,15 @@ func (h *Checker) buildTLSConfig(ctx context.Context, v *vkov1.Valkey, secretNam
 		return nil, fmt.Errorf("failed to parse CA certificate from secret %s", secretName)
 	}
 
-	return &tls.Config{
+	cfg := &tls.Config{
 		RootCAs:    certPool,
 		MinVersion: tls.VersionTLS12,
-	}, nil
+	}
+	// Report-only: compares what each pod serves against the Secret it mounts,
+	// the one observation of the running process rather than a proxy for it
+	// (T28). Never fails a handshake.
+	observeServedCertificate(log.FromContext(ctx), cfg, secret)
+	return cfg, nil
 }
 
 // newValkeyClient creates a valkeyclient.Client with the given TLS and auth settings.
@@ -362,20 +400,49 @@ func (h *Checker) newValkeyClient(addr, password string, tlsConfig *tls.Config) 
 	return valkeyclient.New(addr)
 }
 
-// podAddress returns the FQDN address for a pod using the headless service.
-func podAddress(v *vkov1.Valkey, podName string, port int) string {
-	component := common.ComponentValkey
-	// Detect sentinel pods by name suffix.
-	if len(podName) > 9 && podName[len(podName)-10:len(podName)-2] == "sentinel" {
-		component = common.ComponentSentinel
-	}
+// valkeyPodAddress returns the address of a data-tier pod: the Valkey headless
+// Service and the Valkey client port, chosen in one place so they cannot
+// disagree.
+//
+// The component is never derived from the pod name. It used to be, by testing a
+// fixed-offset window of the name against "sentinel", and that guess was wrong in
+// two directions at once: a data pod of a CR whose own name ends in "sentinel"
+// (`term-no-sentinel-0`) was dialled through the Sentinel headless Service, and a
+// Sentinel pod from ordinal 10 upward was dialled through the data one. Both
+// resolve to nothing, so the operator went blind to its own pods -- loudly for
+// PingPod (phase Error), silently for GetReplicationInfo and findMaster, which
+// read an unreachable pod as "not the master".
+//
+// Every caller of these helpers already knows which tier it is addressing, and
+// already picks the matching port. Pairing the two removes the only place that
+// had to guess (docs/adr/0029-a-name-is-not-a-component.md, D1, D2).
+func valkeyPodAddress(v *vkov1.Valkey, podName string) string {
+	return PodAddressForComponent(v, podName, common.ComponentValkey, int(builder.ServicePort(v)))
+}
 
-	headlessSvc := common.HeadlessServiceName(v, component)
-	return fmt.Sprintf("%s.%s.%s.svc.cluster.local:%d",
-		podName, headlessSvc, v.Namespace, port)
+// sentinelPodAddress returns the address of a Sentinel-tier pod: the Sentinel
+// headless Service and the Sentinel port, chosen together for the reason
+// valkeyPodAddress states.
+func sentinelPodAddress(v *vkov1.Valkey, podName string) string {
+	return PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort(v))
+}
+
+// sentinelPort is the port Sentinel listens on: the TLS port when TLS is enabled
+// (Sentinel is configured with the tls-port directive), the plaintext port
+// otherwise.
+func sentinelPort(v *vkov1.Valkey) int {
+	if v.IsTLSEnabled() {
+		return builder.SentinelTLSPort
+	}
+	return builder.SentinelPort
 }
 
 // PodAddressForComponent returns the FQDN for a pod given an explicit component.
+//
+// The component and the port belong together -- a Sentinel Service with a Valkey
+// port resolves to nothing, and so does the converse. Callers inside this package
+// use valkeyPodAddress or sentinelPodAddress, which pair them; a caller that uses
+// this function directly owns that pairing itself.
 func PodAddressForComponent(v *vkov1.Valkey, podName, component string, port int) string {
 	headlessSvc := common.HeadlessServiceName(v, component)
 	return fmt.Sprintf("%s.%s.%s.svc.cluster.local:%d",

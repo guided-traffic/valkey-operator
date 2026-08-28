@@ -52,8 +52,8 @@ func gateCluster(t *testing.T, name string, annotations map[string]string) (
 	r, c := newTestReconciler(v)
 
 	pods := []podState{
-		{name: name + "-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: name + "-1", exists: true, ready: true, needsUpdate: false},
+		{name: name + "-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: name + "-1", exists: true, readyCondition: true, needsUpdate: false},
 	}
 	return r, c, v, pods
 }

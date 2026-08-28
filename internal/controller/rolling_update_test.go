@@ -12,9 +12,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8sevents "k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -76,7 +78,7 @@ func TestPodNeedsUpdate_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
@@ -87,12 +89,12 @@ func TestPodNeedsUpdate_NeedsUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyContainers(t *testing.T) {
 	pod := &corev1.Pod{}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
@@ -106,7 +108,7 @@ func TestPodNeedsUpdate_SidecarNeedsUpdate(t *testing.T) {
 		},
 	}
 	// Valkey image matches, but sidecar image changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", newSidecar, "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
@@ -119,7 +121,7 @@ func TestPodNeedsUpdate_SidecarUpToDate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", sidecar, "", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
@@ -132,7 +134,7 @@ func TestPodNeedsUpdate_EmptySidecarImage_SkipsSidecarCheck(t *testing.T) {
 		},
 	}
 	// Empty desiredSidecarImage → sidecar check skipped.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: config hash checks ---
@@ -151,7 +153,7 @@ func TestPodNeedsUpdate_ConfigHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different hash → allowUnencrypted was toggled → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
@@ -167,7 +169,7 @@ func TestPodNeedsUpdate_ConfigHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
@@ -180,7 +182,7 @@ func TestPodNeedsUpdate_NoConfigHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "cafebabe", "", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
@@ -197,7 +199,7 @@ func TestPodNeedsUpdate_EmptyDesiredConfigHash_SkipsCheck(t *testing.T) {
 		},
 	}
 	// Empty desired hash → skip config hash check entirely.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: pod spec hash checks ---
@@ -216,7 +218,7 @@ func TestPodNeedsUpdate_PodSpecHashMismatch_TriggersUpdate(t *testing.T) {
 		},
 	}
 	// Pod has a different pod spec hash → resources changed → needs update.
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344", nil))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "11223344", "", nil))
 }
 
 func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
@@ -232,7 +234,7 @@ func TestPodNeedsUpdate_PodSpecHashMatch_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", "", nil))
 }
 
 func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
@@ -244,7 +246,7 @@ func TestPodNeedsUpdate_NoPodSpecHashAnnotation_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "aabbccdd", "", nil))
 }
 
 func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
@@ -260,7 +262,7 @@ func TestPodNeedsUpdate_EmptyDesiredPodSpecHash_SkipsCheck(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "", "", nil))
 }
 
 // --- podNeedsUpdate: resource fallback for pods without hash annotation ---
@@ -294,7 +296,7 @@ func TestPodNeedsUpdate_NoAnnotation_ResourceChanged_TriggersUpdate(t *testing.T
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_ResourceUnchanged_NoUpdate(t *testing.T) {
@@ -326,7 +328,7 @@ func TestPodNeedsUpdate_NoAnnotation_ResourceUnchanged_NoUpdate(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_LimitsChanged_TriggersUpdate(t *testing.T) {
@@ -356,7 +358,7 @@ func TestPodNeedsUpdate_NoAnnotation_LimitsChanged_TriggersUpdate(t *testing.T) 
 			},
 		},
 	}
-	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", desiredContainers))
+	assert.True(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_WithAnnotation_IgnoresContainersFallback(t *testing.T) {
@@ -394,7 +396,7 @@ func TestPodNeedsUpdate_WithAnnotation_IgnoresContainersFallback(t *testing.T) {
 		},
 	}
 	// Hash matches → no update, even though resources differ.
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "samehash", desiredContainers))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "samehash", "", desiredContainers))
 }
 
 func TestPodNeedsUpdate_NoAnnotation_NilDesiredContainers_SkipsFallback(t *testing.T) {
@@ -414,7 +416,7 @@ func TestPodNeedsUpdate_NoAnnotation_NilDesiredContainers_SkipsFallback(t *testi
 			},
 		},
 	}
-	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", nil))
+	assert.False(t, podNeedsUpdate(pod, "valkey/valkey:9.0", "", "", "newhash", "", nil))
 }
 
 // --- containersResourceChanged ---
@@ -507,9 +509,9 @@ func TestContainersResourceChanged_RequestsAddedInDesired(t *testing.T) {
 
 func TestCountReplacedPods(t *testing.T) {
 	pods := []podState{
-		{name: "p-0", needsUpdate: true, ready: true},
-		{name: "p-1", needsUpdate: false, ready: true},
-		{name: "p-2", needsUpdate: false, ready: false}, // replaced but not ready
+		{name: "p-0", needsUpdate: true, readyCondition: true},
+		{name: "p-1", needsUpdate: false, readyCondition: true},
+		{name: "p-2", needsUpdate: false, readyCondition: false}, // replaced but not ready
 	}
 	// countUpdatedPods only counts ready + !needsUpdate → 1
 	assert.Equal(t, 1, countUpdatedPods(pods))
@@ -723,10 +725,11 @@ func createPodForSts(v *vkov1.Valkey, ordinal int, image string, ready bool) *co
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: v.Namespace,
-			Labels: map[string]string{
-				common.LabelInstance:  v.Name,
-				common.LabelComponent: common.ComponentValkey,
-			},
+			// The full selector set, as the StatefulSet stamps it. LabelManagedBy was
+			// missing here, so every List(MatchingLabels(SelectorLabels)) -- the drain
+			// stamp clear among them -- matched nothing in a unit test and silently
+			// looked like a no-op that succeeded.
+			Labels: common.SelectorLabels(v, common.ComponentValkey),
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -1206,9 +1209,9 @@ func TestWaitForWriteSync_NoReplicas_ReturnsNil(t *testing.T) {
 
 	// Master is pod 2, replicas are not ready or still need update → numReplicas == 0.
 	pods := []podState{
-		{name: "ha-0", needsUpdate: true, ready: false},
-		{name: "ha-1", needsUpdate: true, ready: false},
-		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+		{name: "ha-0", needsUpdate: true, readyCondition: false},
+		{name: "ha-1", needsUpdate: true, readyCondition: false},
+		{name: "ha-2", needsUpdate: true, readyCondition: true, isMaster: true},
 	}
 	masterIdx := 2
 
@@ -1227,9 +1230,9 @@ func TestWaitForWriteSync_ConnectionFails_Requeues(t *testing.T) {
 
 	// Two replicas are ready and updated, master is pod 2.
 	pods := []podState{
-		{name: "ha-0", needsUpdate: false, ready: true},
-		{name: "ha-1", needsUpdate: false, ready: true},
-		{name: "ha-2", needsUpdate: true, ready: true, isMaster: true},
+		{name: "ha-0", needsUpdate: false, readyCondition: true},
+		{name: "ha-1", needsUpdate: false, readyCondition: true},
+		{name: "ha-2", needsUpdate: true, readyCondition: true, isMaster: true},
 	}
 	masterIdx := 2
 
@@ -2401,6 +2404,217 @@ func TestCheckAndHandleSentinelRollingUpdate_PartialUpdate_DeletesNextPod(t *tes
 	}, pod2))
 }
 
+// --- ADR 0024: the Sentinel tier reports its own completion ---
+
+// sentinelUpdatePendingTrue seeds the CR with SentinelUpdatePending=True, the
+// memory that a Sentinel roll is in flight.
+func sentinelUpdatePendingTrue(v *vkov1.Valkey) {
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:    vkov1.ConditionTypeSentinelUpdatePending,
+		Status:  metav1.ConditionTrue,
+		Reason:  vkov1.ReasonSentinelPodsOutdated,
+		Message: "Sentinel rolling update in progress: 2/3 pods updated and ready",
+	})
+}
+
+func getSentinelUpdatePending(t *testing.T, c client.Client, v *vkov1.Valkey) *metav1.Condition {
+	t.Helper()
+	fresh := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, fresh))
+	return meta.FindStatusCondition(fresh.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_RecordsPendingConditionAndPhase(t *testing.T) {
+	// All 3 sentinel pods outdated and ready → the pass deletes one, and before
+	// acting it must record the roll: condition True with the progress count, and
+	// the phase naming the current task (the data tier's completion event has
+	// already fired at this point).
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, true)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	require.True(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond, "SentinelUpdatePending must be recorded while the roll is in flight")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelPodsOutdated, cond.Reason)
+	assert.Contains(t, cond.Message, "0/3")
+
+	fresh := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, fresh))
+	assert.Equal(t, vkov1.ValkeyPhase("Sentinel Rolling Update 0/3"), fresh.Status.Phase)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_NoCompletionWhileReplacementBoots(t *testing.T) {
+	// The last outdated pod was deleted (p2 absent), p0/p1 are current and ready,
+	// and the roll is recorded in flight. No pod needs an update any more, but
+	// completion must not fire while the replacement is still booting — that is
+	// exactly the too-early edge the marker exists to remove.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		sentinelUpdatePendingTrue(v)
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	// p2 intentionally absent: deleted last pass, replacement not created yet.
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.True(t, result.NeedsRequeue, "Completion detection must keep driving itself while a replacement boots")
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status, "Condition must stay True until every pod is current and Ready")
+	assert.Empty(t, rec.Events, "No completion event while a replacement pod is still booting")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_EmitsCompletionEventExactlyOnce(t *testing.T) {
+	// Roll recorded in flight, every pod current and ready → the condition flips
+	// to False and SentinelUpdateComplete is emitted. A second pass over the same
+	// state must stay silent: the event is gated on the flip actually landing.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		sentinelUpdatePendingTrue(v)
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, true)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelUpdateComplete, cond.Reason)
+
+	require.Len(t, rec.Events, 1, "Exactly one completion event on the flip")
+	event := <-rec.Events
+	assert.Contains(t, event, "SentinelUpdateComplete")
+
+	// Second pass over the converged state: no new event, no condition change.
+	result = r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+	assert.Empty(t, rec.Events, "A repeated pass over the converged state must not re-emit the event")
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_SteadyStateWritesNothing(t *testing.T) {
+	// A healthy pass with no roll in flight must stay exactly as silent as before
+	// the condition existed: no condition written onto the CR, no event. This is
+	// what keeps the upgrade from stamping SentinelUpdatePending=False onto every
+	// sentinel-enabled cluster in the fleet.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, sentinelTestNewImage, true)
+	p1 := createSentinelPod(v, 1, sentinelTestNewImage, true)
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, true)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+	r.Recorder = rec
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	assert.False(t, result.NeedsRequeue)
+
+	assert.Nil(t, getSentinelUpdatePending(t, c, v), "Steady state must not create the condition")
+	assert.Empty(t, rec.Events)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_QuorumWaitKeepsConditionTrue(t *testing.T) {
+	// quorum=2, readyCount=2 → the delete is deferred, but the roll is still in
+	// flight and must be recorded as such.
+	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 3
+		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	})
+	const oldImg = "valkey/valkey:8.0"
+	sts := buildTestSentinelSts(v)
+	p0 := createSentinelPod(v, 0, oldImg, true)
+	p1 := createSentinelPod(v, 1, oldImg, true)
+	p2 := createSentinelPod(v, 2, oldImg, false)
+
+	r, c := newTestReconciler(v, sts, p0, p1, p2)
+
+	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+	require.Nil(t, result.Error)
+	require.True(t, result.NeedsRequeue)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond, "The quorum wait is part of the roll and must be recorded")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+}
+
+func TestClearSentinelUpdatePending_OnlyWhenPresent(t *testing.T) {
+	// A CR without the condition must not gain one (fleet-neutral upgrade); a CR
+	// carrying True gets it flipped to False with the disabled reason and no
+	// completion event — disabling is not completing.
+	bare := newTestValkey("bare", "default")
+	carrying := newTestValkey("carrying", "default", sentinelUpdatePendingTrue)
+
+	rec := k8sevents.NewFakeRecorder(10)
+	r, c := newTestReconciler(bare, carrying)
+	r.Recorder = rec
+
+	r.clearSentinelUpdatePending(context.Background(), bare)
+	assert.Nil(t, getSentinelUpdatePending(t, c, bare), "No condition may be created on a CR that never carried one")
+
+	r.clearSentinelUpdatePending(context.Background(), carrying)
+	cond := getSentinelUpdatePending(t, c, carrying)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelDisabled, cond.Reason)
+	assert.Empty(t, rec.Events, "Disabling Sentinel must not emit a completion event")
+}
+
+func TestHandlePostRollingUpdateChecks_SentinelDisabledClearsCondition(t *testing.T) {
+	// Sentinel was disabled while the condition stood. The sentinel branch is
+	// skipped forever on such a CR, so the clear must happen on the non-sentinel
+	// path — otherwise the condition is permanent drift (the T6 class).
+	v := newTestValkey("standalone", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		sentinelUpdatePendingTrue(v)
+	})
+	r, c := newTestReconciler(v)
+
+	_, done, err := r.handlePostRollingUpdateChecks(context.Background(), v)
+	require.NoError(t, err)
+	assert.False(t, done)
+
+	cond := getSentinelUpdatePending(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, vkov1.ReasonSentinelDisabled, cond.Reason)
+}
+
 // --- ADR 0001 D7: a Sentinel rolling-update error must lead to a retry ---
 
 // TestReconcileWorkload_RetriesAfterSentinelRollingUpdateError pins the ADR 0001 D7 fix.
@@ -2637,9 +2851,9 @@ func TestCheckFinalizationTopology_StalledCascadedReplication_Proceeds(t *testin
 	reconcileOnce(t, r, "ha-cascaded", "default")
 
 	pods := []podState{
-		{name: "ha-cascaded-0", pod: pod0, exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "ha-cascaded-1", pod: pod1, exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "ha-cascaded-2", pod: pod2, exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "ha-cascaded-0", pod: pod0, exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "ha-cascaded-1", pod: pod1, exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "ha-cascaded-2", pod: pod2, exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 
 	// checkFinalizationTopology must return nil (proceed with partial sync) even
@@ -2668,10 +2882,10 @@ func TestSyncSentinelWithMaster_StalledGetReplicationInfoFails_ProceedsWithMaste
 
 	// Pod-2 is master (not pod-0 — verifies the fix avoids the pod-0 fallback).
 	masterPS := podState{
-		name:     "ha-errstall-2",
-		isMaster: true,
-		exists:   true,
-		ready:    true,
+		name:           "ha-errstall-2",
+		isMaster:       true,
+		exists:         true,
+		readyCondition: true,
 	}
 
 	// Default mockInstanceChecker returns an error for GetReplicationInfo,
@@ -3222,25 +3436,25 @@ func TestSentinelPodNeedsUpdate_ConfigHashMatch(t *testing.T) {
 
 func TestCountUpdatedPods_AllUpdatedAndReady(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: true},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: true},
 	}
 	assert.Equal(t, 3, countUpdatedPods(pods))
 }
 
 func TestCountUpdatedPods_NoneUpdated(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: true, ready: true},
-		{needsUpdate: true, ready: true},
+		{needsUpdate: true, readyCondition: true},
+		{needsUpdate: true, readyCondition: true},
 	}
 	assert.Equal(t, 0, countUpdatedPods(pods))
 }
 
 func TestCountUpdatedPods_UpdatedButNotReady(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: false},
-		{needsUpdate: false, ready: false},
+		{needsUpdate: false, readyCondition: false},
+		{needsUpdate: false, readyCondition: false},
 	}
 	assert.Equal(t, 0, countUpdatedPods(pods))
 }
@@ -3252,16 +3466,16 @@ func TestCountUpdatedPods_EmptySlice(t *testing.T) {
 
 func TestCountReplacedPods_AllReplaced(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: false, ready: true},
-		{needsUpdate: false, ready: false},
+		{needsUpdate: false, readyCondition: true},
+		{needsUpdate: false, readyCondition: false},
 	}
 	assert.Equal(t, 2, countReplacedPods(pods))
 }
 
 func TestCountReplacedPods_NoneReplaced(t *testing.T) {
 	pods := []podState{
-		{needsUpdate: true, ready: true},
-		{needsUpdate: true, ready: false},
+		{needsUpdate: true, readyCondition: true},
+		{needsUpdate: true, readyCondition: false},
 	}
 	assert.Equal(t, 0, countReplacedPods(pods))
 }
@@ -3303,9 +3517,9 @@ func TestPodSpecHashFromSts_EmptyAnnotations(t *testing.T) {
 
 func TestFindPromotionCandidate_FindsReadyUpdatedReplica(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 1, idx)
@@ -3313,9 +3527,9 @@ func TestFindPromotionCandidate_FindsReadyUpdatedReplica(t *testing.T) {
 
 func TestFindPromotionCandidate_SkipsMaster(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 2, idx)
@@ -3323,9 +3537,9 @@ func TestFindPromotionCandidate_SkipsMaster(t *testing.T) {
 
 func TestFindPromotionCandidate_NoCandidates(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: true, isMaster: false},
-		{name: "pod-2", exists: true, ready: false, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: false, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, -1, idx)
@@ -3333,9 +3547,9 @@ func TestFindPromotionCandidate_NoCandidates(t *testing.T) {
 
 func TestFindPromotionCandidate_SkipsNotExisting(t *testing.T) {
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: true, isMaster: true},
-		{name: "pod-1", exists: false, ready: false, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: true, isMaster: true},
+		{name: "pod-1", exists: false, readyCondition: false, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 	idx := findPromotionCandidate(pods, 0)
 	assert.Equal(t, 2, idx)
@@ -3426,9 +3640,9 @@ func TestFinalizeMultiReplicaRollingUpdate_ClearsState(t *testing.T) {
 	r, _ := newTestReconciler(v)
 
 	pods := []podState{
-		{name: "pod-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "pod-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "pod-2", exists: true, ready: true, needsUpdate: false, isMaster: false},
+		{name: "pod-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "pod-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "pod-2", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
 	}
 
 	result := r.finalizeMultiReplicaRollingUpdate(context.Background(), v, pods)
@@ -3538,9 +3752,9 @@ func TestVerifyReplacedReplicasSynced_AllSynced(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3563,9 +3777,9 @@ func TestVerifyReplacedReplicasSynced_SyncInProgress(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-test-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-test-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3582,9 +3796,9 @@ func TestVerifyReplacedReplicasSynced_SkipsMasterAndPendingPods(t *testing.T) {
 	// Default mock returns error — should not matter because all pods are skipped.
 
 	pods := []podState{
-		{name: "sync-test-0", exists: true, ready: true, needsUpdate: false, isMaster: true},    // master: skip
-		{name: "sync-test-1", exists: true, ready: true, needsUpdate: true, isMaster: false},    // needs update: skip
-		{name: "sync-test-2", exists: false, ready: false, needsUpdate: false, isMaster: false}, // not exists: skip
+		{name: "sync-test-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},    // master: skip
+		{name: "sync-test-1", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},    // needs update: skip
+		{name: "sync-test-2", exists: false, readyCondition: false, needsUpdate: false, isMaster: false}, // not exists: skip
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3598,10 +3812,10 @@ func TestVerifyReplacedReplicasSynced_NotReadyBlocksNextDeletion(t *testing.T) {
 	r, _ := newTestReconciler(v)
 
 	pods := []podState{
-		{name: "sync-notready-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
+		{name: "sync-notready-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
 		// Pod-1 was replaced (needsUpdate=false) but is not yet ready — must block.
-		{name: "sync-notready-1", exists: true, ready: false, needsUpdate: false, isMaster: false},
-		{name: "sync-notready-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-notready-1", exists: true, readyCondition: false, needsUpdate: false, isMaster: false},
+		{name: "sync-notready-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3622,9 +3836,9 @@ func TestVerifyReplacedReplicasSynced_ErrorRequeues(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-err-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-err-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-err-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-err-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-err-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-err-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3651,9 +3865,9 @@ func TestVerifyReplacedReplicasSynced_TimeoutPausesUpdate(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "sync-timeout-0", exists: true, ready: true, needsUpdate: false, isMaster: true},
-		{name: "sync-timeout-1", exists: true, ready: true, needsUpdate: false, isMaster: false},
-		{name: "sync-timeout-2", exists: true, ready: true, needsUpdate: true, isMaster: false},
+		{name: "sync-timeout-0", exists: true, readyCondition: true, needsUpdate: false, isMaster: true},
+		{name: "sync-timeout-1", exists: true, readyCondition: true, needsUpdate: false, isMaster: false},
+		{name: "sync-timeout-2", exists: true, readyCondition: true, needsUpdate: true, isMaster: false},
 	}
 
 	result := r.verifyReplacedReplicasSynced(context.Background(), v, pods)
@@ -3812,9 +4026,9 @@ func TestDetectAndResolveSplitBrain_NoSplitBrain_SingleMaster(t *testing.T) {
 
 	r, _ := newTestReconciler(v)
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -3834,9 +4048,9 @@ func TestDetectAndResolveSplitBrain_NoSplitBrain_NoMaster(t *testing.T) {
 
 	r, _ := newTestReconciler(v)
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-1", isMaster: false, needsUpdate: true, exists: true, ready: true},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-0", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-1", isMaster: false, needsUpdate: true, exists: true, readyCondition: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, -1, "")
@@ -3856,6 +4070,10 @@ func TestDetectAndResolveSplitBrain_TwoMasters_FallbackToConnectedSlaves(t *test
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	// Mock: pod-0 reports master with 0 slaves, pod-1 reports master with 1 slave.
 	// Sentinel is unreachable (unit test, no real sentinel), so fallback to slave count.
 	r.InstanceChecker = &mockInstanceChecker{
@@ -3881,11 +4099,11 @@ func TestDetectAndResolveSplitBrain_TwoMasters_FallbackToConnectedSlaves(t *test
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true,
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
 	}
 
@@ -3905,6 +4123,10 @@ func TestDetectAndResolveSplitBrain_SentinelBasedResolution(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			return &valkeyclient.ReplicationInfo{Role: "master", ConnectedSlaves: 0}, nil
@@ -3912,11 +4134,11 @@ func TestDetectAndResolveSplitBrain_SentinelBasedResolution(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	// Sentinel says test-0 is the real master — should override connected slaves fallback.
@@ -3936,6 +4158,10 @@ func TestDetectAndResolveSplitBrain_ThreeMasters(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -3952,11 +4178,11 @@ func TestDetectAndResolveSplitBrain_ThreeMasters(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: true, needsUpdate: false, exists: true, ready: true,
+		{name: "test-2", isMaster: true, needsUpdate: false, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 2, "valkey/valkey:9.0", true)},
 	}
 
@@ -3982,6 +4208,10 @@ func TestDetectAndResolveSplitBrain_ReplicationInfoUnavailable(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	// All replication info calls fail — fallback picks the first master index.
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
@@ -3990,11 +4220,11 @@ func TestDetectAndResolveSplitBrain_ReplicationInfoUnavailable(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", true)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -4020,6 +4250,10 @@ func TestDetectAndResolveSplitBrain_RoguePodNotReady(t *testing.T) {
 	})
 
 	r, _ := newTestReconciler(v)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the resolution
+	// itself rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			if podName == "test-1" {
@@ -4030,11 +4264,11 @@ func TestDetectAndResolveSplitBrain_RoguePodNotReady(t *testing.T) {
 	}
 
 	pods := []podState{
-		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, ready: false,
+		{name: "test-0", isMaster: true, needsUpdate: true, exists: true, readyCondition: false,
 			pod: createPodForSts(v, 0, "valkey/valkey:8.0", false)},
-		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, ready: true,
+		{name: "test-1", isMaster: true, needsUpdate: true, exists: true, readyCondition: true,
 			pod: createPodForSts(v, 1, "valkey/valkey:8.0", true)},
-		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, ready: true},
+		{name: "test-2", isMaster: false, needsUpdate: false, exists: true, readyCondition: true},
 	}
 
 	resultPods, masterIdx := r.detectAndResolveSplitBrain(context.Background(), v, pods, 1, "")
@@ -4093,6 +4327,10 @@ func TestHandleRollingUpdate_HA_SplitBrain_BreaksDeadlock(t *testing.T) {
 	pod2 := createPodForSts(v, 2, "valkey/valkey:9.0", true)
 
 	r, c := newTestReconciler(v, pod0, pod1, pod2)
+	// A reachable, non-empty Valkey: the dataset veto (ADR 0028 D1) only fires on an
+	// authority that holds no keys, so this keeps the subject of the test the deadlock
+	// rather than the veto.
+	withReachableValkey(t, r)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4195,14 +4433,14 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 
 	r, _ := newTestReconciler(v, sts, pod0, pod1, pod2)
 
-	// A server that answers REPLICAOF, so the demotion is exercised for real instead
-	// of dying on a refused connection.
-	addr := fakeValkeyServer(t)
-	var demoted []string
-	r.NewValkeyClientFn = func(target, _ string, _ *tls.Config) *valkeyclient.Client {
-		demoted = append(demoted, target)
-		return valkeyclient.New(addr)
-	}
+	// One server per pod, each answering REPLICAOF and a non-empty DBSIZE, so the
+	// demotion is exercised for real and the dataset veto (ADR 0028 D1) stays inert.
+	// The assertion is on the command each pod received, not on which pod was
+	// contacted: the resolver reads a key count from the master it is protecting, so
+	// being contacted no longer means being demoted.
+	fleet := newValkeyFleet(t, r, map[string]int{
+		"mr-split-0": 4711, "mr-split-1": 4711, "mr-split-2": 4711,
+	})
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(podName string) (*valkeyclient.ReplicationInfo, error) {
 			switch podName {
@@ -4225,8 +4463,8 @@ func TestHandleMultiReplicaRollingUpdate_SplitBrainDemotedBeforeUpdate(t *testin
 
 	// The master without connected slaves is the rogue one and the only pod that may
 	// be demoted — demoting pod-1 would point the data it serves at an empty master.
-	require.Len(t, demoted, 1, "exactly one pod must be demoted")
-	assert.Contains(t, demoted[0], "mr-split-0.", "the rogue master must be the demoted pod")
+	assert.True(t, fleet.sawReplicaOf("mr-split-0"), "the rogue master must be the demoted pod")
+	assert.False(t, fleet.sawReplicaOf("mr-split-1"), "the master serving replicas must not be demoted")
 }
 
 // --- Two-phase handleTopologyRestoration ---
@@ -4479,9 +4717,9 @@ func TestIsFinalizationStalled_UsedForTopologyVerification(t *testing.T) {
 func TestFindPromotionCandidate_SkipsPod0(t *testing.T) {
 	// masterIdx=2 (pod-2 is master); pod-0 and pod-1 are updated replicas.
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-1", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-2", isMaster: true, needsUpdate: true, ready: true, exists: true},
+		{name: "test-0", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-1", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-2", isMaster: true, needsUpdate: true, readyCondition: true, exists: true},
 	}
 	candidate := findPromotionCandidate(pods, 2)
 	assert.Equal(t, 1, candidate, "Should pick pod-1, never pod-0")
@@ -4490,8 +4728,8 @@ func TestFindPromotionCandidate_SkipsPod0(t *testing.T) {
 func TestFindPromotionCandidate_Pod0IsOnlyCandidate_ReturnsNegative(t *testing.T) {
 	// Only pod-0 is available as a non-master updated replica → no valid candidate.
 	pods := []podState{
-		{name: "test-0", isMaster: false, needsUpdate: false, ready: true, exists: true},
-		{name: "test-1", isMaster: true, needsUpdate: true, ready: true, exists: true},
+		{name: "test-0", isMaster: false, needsUpdate: false, readyCondition: true, exists: true},
+		{name: "test-1", isMaster: true, needsUpdate: true, readyCondition: true, exists: true},
 	}
 	candidate := findPromotionCandidate(pods, 1)
 	assert.Equal(t, -1, candidate, "Should return -1 when only pod-0 is available")

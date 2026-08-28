@@ -25,32 +25,191 @@ const (
 type ConditionType = string
 
 const (
+	// ConditionTypeReady is the data-plane verdict: the instances the CR asks for are
+	// running, reachable and, on a multi-replica cluster, replicating. Every Valkey CR
+	// carries it, and it is recomputed on every pass that reaches updateStatus.
+	//
+	// It answers a different question than status.phase, and on a blocked cluster the two
+	// disagree BY DESIGN. phase carries two meanings -- the data-plane verdict AND whether
+	// the operator can converge the spec -- and while a managed write is being refused the
+	// second one wins the field and reports Error, because a spec the operator cannot apply
+	// has to be visible (ADR 0002 D3). Ready carries only the first, and keeps reporting
+	// the truth about the running cluster, because a rejected write says nothing about it
+	// (ADR 0002 D5). So `Ready=True` next to `phase=Error` means: your cluster is serving,
+	// and the operator cannot write something. Read status.message and ReconcileBlocked to
+	// find out what.
+	//
+	// It is a level, not an edge, with one carve-out: a pass with a rolling update in
+	// flight returns before updateStatus and writes its own phase, so during a roll Ready
+	// keeps its pre-roll value (ADR 0001 D4).
+	ConditionTypeReady ConditionType = "Ready"
+
 	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
 	// the sidecar container image has drifted from the desired version.
 	// Standalone pods are not automatically restarted for sidecar-only changes;
 	// the update will occur on the next pod restart (manual delete or image change).
 	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
 
-	// ConditionTypeRollingUpdatePaused is set when a rolling update is paused
-	// because a replaced pod failed to sync within the configured timeout.
-	// The operator will not resume until the user applies a new spec change.
+	// ConditionTypeRollingUpdatePaused is set when a rolling update stopped waiting
+	// because a replaced pod failed to sync within spec.rollingUpdate.syncTimeout.
+	//
+	// It reports that the wait expired, not that the operator stopped: the pause
+	// clears the rolling-update state, so a later pass that still finds outdated
+	// pods dispatches again on a fresh syncTimeout budget and sets this condition
+	// again. A spec change restarts the roll from the beginning rather than
+	// resuming it.
+	//
+	// It goes False with reason Completed once a roll finishes, and with reason
+	// Converged when there is no roll left to run — the usual cause being a spec
+	// put back to what the pods already run. It is written only on a cluster that
+	// paused; clusters that never did carry no such condition.
 	ConditionTypeRollingUpdatePaused ConditionType = "RollingUpdatePaused"
 
-	// ConditionTypeTopologyRestored reports whether the multi-replica rolling
-	// update managed to hand the master role back to pod-0. It is set to True
-	// once pod-0 has been promoted again, and to False when the operator gave up
-	// waiting for pod-0 to sync and left the promoted replica as master. The
-	// cluster is healthy in both cases -- the Services select the master by label,
-	// not by ordinal -- so the condition is the only durable record that the
-	// topology differs from the canonical one.
+	// ConditionTypeTopologyRestored reports whether the LAST data-tier rolling update of
+	// a multi-replica non-Sentinel cluster managed to hand the master role back to pod-0.
+	// It is set to True once pod-0 has been promoted again, and to False when the operator
+	// gave up waiting for pod-0 to sync and left the promoted replica as master. The
+	// cluster is healthy in both cases -- the Services select the master by label, not by
+	// ordinal.
+	//
+	// It is a one-shot verdict about that update, not a live statement about the topology
+	// now (ADR 0010 D15). Nothing outside a rolling update writes it, so a later
+	// steady-state adoption (ADR 0011) or no-master recovery moves the master without
+	// touching it, and a True can sit next to a non-pod-0 master indefinitely -- measured
+	// on a fleet, and the reason this sentence exists. **status.masterPod is the live
+	// answer** (ADR 0002 D11); this condition answers what the last update did.
+	//
+	// It is also never written on a Sentinel-enabled or single-replica cluster, and never
+	// cleared when a CR leaves that class.
 	ConditionTypeTopologyRestored ConditionType = "TopologyRestored"
 
-	// ConditionTypeReconcileBlocked is set when the operator could not write one
-	// of the managed resources. Its reason distinguishes an admission-webhook
-	// rejection (a cluster-side gate, e.g. a fail-closed policy webhook whose
-	// backend is down) from any other write failure, so users do not have to read
-	// operator logs to tell the two apart.
+	// ConditionTypeReconcileBlocked is set when the operator could not write one of
+	// the managed resources, or refused to. Its reason names which of the four
+	// causes it was -- an admission-webhook rejection (a cluster-side gate, e.g. a
+	// fail-closed policy webhook whose backend is down), a generated name held by a
+	// foreign object, a StatefulSet whose immutable fields no longer match the spec,
+	// or any other write failure -- so users do not have to read operator logs to
+	// tell them apart. They end differently: the first clears itself, the other
+	// three clear only when someone acts.
 	ConditionTypeReconcileBlocked ConditionType = "ReconcileBlocked"
+
+	// ConditionTypeStorageSpecNotApplied reports that the storage spec.persistence
+	// asks for is not the storage the cluster runs on. A StatefulSet's
+	// volumeClaimTemplates are immutable, so neither toggling persistence nor
+	// changing the size or storage class of an existing cluster is something a
+	// reconcile can converge; the condition is the durable record of that, since
+	// the Events naming it expire.
+	//
+	// True with reason RecreateRequired means the operator also refuses to write the
+	// StatefulSet at all (ReconcileBlocked carries the same reason). True with
+	// reason VolumeClaimTemplatesImmutable means only the storage parameters are
+	// stuck and every other change is still applied.
+	// See docs/adr/0023-volume-claim-templates-are-immutable.md.
+	ConditionTypeStorageSpecNotApplied ConditionType = "StorageSpecNotApplied"
+
+	// ConditionTypeSentinelPeersStale reports that at least one Sentinel knows more
+	// other Sentinels than the cluster has. Sentinel never forgets a peer it has
+	// seen, so a replacement pod that announced a new identity is recorded next to
+	// the dead one, and the majority a failover leader needs is computed over the
+	// whole table. The condition is therefore failover capacity that is already
+	// gone, not a cosmetic discrepancy. It clears itself once the tables agree with
+	// the replica count -- either through a one-time SENTINEL RESET or at the next
+	// Sentinel roll.
+	// See docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md.
+	ConditionTypeSentinelPeersStale ConditionType = "SentinelPeersStale"
+
+	// ConditionTypeSentinelUpdatePending reports that the Sentinel tier is being
+	// rolled: at least one Sentinel pod runs a spec older than the Sentinel
+	// StatefulSet template, or a replacement pod is not Ready yet. The data tier
+	// always finishes first — its RollingUpdateComplete event fires before the
+	// first Sentinel pod is touched — so this condition, and the
+	// SentinelUpdateComplete event emitted exactly when it flips back to False,
+	// are the signal that the update as a whole is finished. The condition's own
+	// previous value is the memory that a roll was in flight; there is no
+	// annotation behind it.
+	// See docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md.
+	ConditionTypeSentinelUpdatePending ConditionType = "SentinelUpdatePending"
+
+	// ConditionTypeMultipleMasters reports that more than one data pod answered
+	// that it is the master while a rolling update was in flight. Two masters are
+	// not by themselves a fault: every controlled failover has a window in which
+	// the promoted pod and the outgoing one both answer master, and the operator
+	// closes it on the same pass. The condition is therefore the level -- True for
+	// as long as the window is open -- while the SplitBrainDetected Warning Event
+	// is the edge that the window outlived splitBrainWarnAfter.
+	//
+	// The reason tells the two apart: MultipleMastersTransitional is inside the
+	// bound, MultipleMastersPersisted is past it and is the one moment the Warning
+	// is emitted. It is written by the rolling-update resolver only; outside a
+	// rolling update nothing measures it.
+	// See docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md.
+	ConditionTypeMultipleMasters ConditionType = "MultipleMasters"
+
+	// ConditionTypePodTerminationStalled reports that the rolling update is
+	// refusing to delete the next pod because another pod of the same tier has
+	// been Terminating for longer than the operator considers legitimate.
+	//
+	// The refusal itself is never lifted -- deleting a second pod while the first
+	// is wedged is the failure the refusal exists to prevent. What the condition
+	// marks is the moment the operator stops ending the reconcile pass on the
+	// wait, so the rest of the pass (the Sentinel roll, no-master recovery, the
+	// steady-state split-brain check and the status write) runs again while the
+	// stall lasts. It clears by itself once the pod is gone.
+	//
+	// There is no Event: a clean rolling update must emit zero Warnings
+	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md).
+	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
+	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
+
+	// ConditionTypePodRecreationStalled reports that the rolling update deleted a
+	// pod and the StatefulSet controller has not recreated it for over the
+	// recreation overrun (2 minutes) -- which means that controller cannot create
+	// it at all: the measured cause is an immutable-field sync error wedging pod
+	// creation on the lowest mismatching ordinal (T10). The roll of that tier
+	// holds; the rest of the pass -- the status write, the steady-state
+	// split-brain check, the Sentinel roll -- keeps running, the ADR 0026 D5
+	// shape applied to the absent pod instead of the terminating one. Cleared
+	// the moment the pod exists again.
+	ConditionTypePodRecreationStalled ConditionType = "PodRecreationStalled"
+
+	// ConditionTypeTLSMaterialStale reports that at least one pod is still running
+	// with TLS material older than the one in the TLS Secret it mounts.
+	//
+	// It is True for the length of every ordinary certificate roll, which is why
+	// the alert over it is measured in days rather than minutes: cert-manager
+	// renews 30 days before expiry and the previously issued certificate keeps
+	// working for those 30 days, so nothing about this is urgent -- a roll that
+	// takes hours costs nothing. What the condition exists to catch is the roll
+	// that never starts, where no other signal fires at all: the operator missed
+	// the Secret event, could not write the StatefulSet, or is blocked for an
+	// unrelated reason, and the pods then keep the material they pinned at start
+	// until it expires and their long-lived processes go silent.
+	//
+	// It is written only on TLS clusters, and only for pods that already carry the
+	// fingerprint annotation; a pod created before the operator wrote fingerprints
+	// is not stale, it is unmeasured.
+	ConditionTypeTLSMaterialStale ConditionType = "TLSMaterialStale"
+
+	// ConditionTypeRWServiceEmpty reports that no data pod carries the
+	// instanceRole=master label on a cluster whose pods are all ready and whose
+	// rolling update is not in flight -- which means the <name>-rw Service, whose
+	// selector is exactly that label, has no endpoints and writes cannot reach the
+	// cluster through it.
+	//
+	// The operator never writes the label itself; each pod's sidecar labeler does
+	// (ADR 0012). This condition is therefore a report about the sidecars, and the
+	// measured cause on a live fleet was sidecars unable to dial their local
+	// Valkey at all -- TLS client material pinned at process start and expired
+	// (T21) -- while every other signal on the CR read healthy. It is only judged
+	// on a settled cluster, because a failover or a roll has legitimate
+	// label-less windows of a few seconds; those windows can still surface as a
+	// brief True, the same way MultipleMasters is briefly True during every
+	// controlled failover.
+	//
+	// Upgrade-neutral in the T24(d) style: a cluster that never exhibits the
+	// state never gains the condition -- the False is only ever written over an
+	// existing condition, never stamped onto the fleet.
+	ConditionTypeRWServiceEmpty ConditionType = "RWServiceEmpty"
 )
 
 const (
@@ -72,9 +231,124 @@ const (
 	// (docs/adr/0020-write-only-what-the-operator-owns.md).
 	ReasonForeignObject = "ForeignObject"
 
+	// ReasonRecreateRequired is the ReconcileBlocked reason for a StatefulSet the
+	// operator refused to update because its volumeClaimTemplates are immutable and
+	// no longer match spec.persistence. Like ReasonForeignObject nothing failed --
+	// the operator could have submitted the write and chose not to, because the API
+	// server rejects it when persistence was enabled and, worse, accepts it when
+	// persistence was disabled, leaving the pod template and the live claims
+	// disagreeing. It clears only when the StatefulSet is recreated or the spec is
+	// put back (docs/adr/0023-volume-claim-templates-are-immutable.md).
+	ReasonRecreateRequired = "RecreateRequired"
+
+	// ReasonVolumeClaimTemplatesImmutable is the StorageSpecNotApplied reason for a
+	// size, storage class or access mode that differs from the live claims while the
+	// claims themselves are the ones the spec asks for. It never blocks a reconcile:
+	// the pod template write is unrelated and still happens.
+	ReasonVolumeClaimTemplatesImmutable = "VolumeClaimTemplatesImmutable"
+
+	// ReasonStorageSpecApplied clears StorageSpecNotApplied once the live
+	// volumeClaimTemplates match spec.persistence again.
+	ReasonStorageSpecApplied = "StorageSpecApplied"
+
 	// ReasonReconcileSucceeded clears ReconcileBlocked after a fully successful
 	// reconcile pass over all managed resources.
 	ReasonReconcileSucceeded = "ReconcileSucceeded"
+
+	// ReasonSentinelPodsOutdated is the SentinelUpdatePending reason while the
+	// Sentinel tier rolls: at least one Sentinel pod is on an outdated spec or a
+	// replacement pod is not Ready yet. The message carries the progress count.
+	ReasonSentinelPodsOutdated = "SentinelPodsOutdated"
+
+	// ReasonSentinelUpdateComplete clears SentinelUpdatePending once every
+	// Sentinel pod runs the desired spec and is Ready. The transition to this
+	// reason is the one moment the SentinelUpdateComplete event is emitted.
+	ReasonSentinelUpdateComplete = "Completed"
+
+	// ReasonSentinelDisabled clears SentinelUpdatePending on a CR whose Sentinel
+	// was disabled while the condition stood — disabling is not completing, so no
+	// SentinelUpdateComplete event accompanies it.
+	ReasonSentinelDisabled = "SentinelDisabled"
+
+	// ReasonRollingUpdateCompleted clears RollingUpdatePaused from the completion
+	// branch of checkAndHandleRollingUpdate: every pod of the data tier matches the
+	// live StatefulSet template and the dispatch target reported the roll finished.
+	// The value is unchanged from the write this clear replaced, so a CR already
+	// carrying it does not see a spurious transition.
+	ReasonRollingUpdateCompleted = "Completed"
+
+	// ReasonRollingUpdateConverged clears RollingUpdatePaused from the converged
+	// early return, where there is no roll left to run at all — the usual cause
+	// being a spec put back to what the pods already run. Distinct from
+	// ReasonRollingUpdateCompleted on purpose: nothing completed here, and a CR
+	// that says otherwise is making a claim the operator cannot support.
+	ReasonRollingUpdateConverged = "Converged"
+
+	// ReasonMultipleMastersTransitional is the MultipleMasters reason while the
+	// double-master window is younger than splitBrainWarnAfter. Every controlled
+	// failover passes through it, so it carries no Warning Event.
+	ReasonMultipleMastersTransitional = "MultipleMastersTransitional"
+
+	// ReasonMultipleMastersPersisted is the MultipleMasters reason once the window
+	// outlived splitBrainWarnAfter. The transition into this reason is the one
+	// moment the SplitBrainDetected Warning Event is emitted, which is why the
+	// reason -- not an annotation and not process memory -- is what remembers that
+	// the Warning already fired.
+	ReasonMultipleMastersPersisted = "MultipleMastersPersisted"
+
+	// ReasonSingleMaster clears MultipleMasters once at most one pod answers that
+	// it is the master.
+	ReasonSingleMaster = "SingleMaster"
+
+	// ReasonPodStuckTerminating is the PodTerminationStalled reason while a pod of
+	// the tier being rolled has outlived podTerminationStallTimeout in Terminating.
+	// The message names the pod.
+	ReasonPodStuckTerminating = "PodStuckTerminating"
+
+	// ReasonPodTerminationCleared clears PodTerminationStalled once no pod of the
+	// tier carries a DeletionTimestamp any more.
+	ReasonPodTerminationCleared = "PodTerminationCleared"
+
+	// ReasonTLSMaterialRollPending is the TLSMaterialStale reason while pods still
+	// hold a superseded fingerprint. The message names them and their tier.
+	ReasonTLSMaterialRollPending = "TLSMaterialRollPending"
+
+	// ReasonTLSMaterialUnmeasured is the TLSMaterialStale reason when no measured
+	// pod is stale but some pods record no fingerprint at all -- the legacy
+	// population from before the mechanism, which a certificate rotation will
+	// never replace. Status stays False (unmeasured is not stale, and the shipped
+	// alert matches True only); the reason and the message stop the CR claiming a
+	// coverage it does not have. The pods leave the list the next time anything
+	// replaces them.
+	ReasonTLSMaterialUnmeasured = "TLSMaterialUnmeasured"
+
+	// ReasonTLSMaterialNotApplicable clears a standing TLSMaterialStale=True on a
+	// cluster that has turned TLS off: there is no material left to be stale, and
+	// without the retraction the shipped alert would fire on the frozen True for
+	// the life of the CR. Written only over an existing True, never onto a
+	// cluster that does not carry the condition.
+	ReasonTLSMaterialNotApplicable = "TLSMaterialNotApplicable"
+
+	// ReasonTLSMaterialCurrent clears TLSMaterialStale once every measured pod
+	// carries the fingerprint of the Secret it mounts.
+	ReasonTLSMaterialCurrent = "TLSMaterialCurrent"
+
+	// ReasonPodNotRecreated is the PodRecreationStalled reason while a deleted pod
+	// stays absent past the recreation overrun.
+	ReasonPodNotRecreated = "PodNotRecreated"
+
+	// ReasonPodRecreated clears PodRecreationStalled once the awaited pod exists
+	// again. Only written over an existing condition.
+	ReasonPodRecreated = "PodRecreated"
+
+	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
+	// cluster has no data pod carrying the instanceRole=master label, so the -rw
+	// Service selects nothing.
+	ReasonNoPodLabeledMaster = "NoPodLabeledMaster"
+
+	// ReasonMasterLabeled clears RWServiceEmpty once a data pod carries the
+	// master label again. Only written over an existing condition.
+	ReasonMasterLabeled = "MasterLabeled"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -89,6 +363,10 @@ const (
 	ValkeyphaseSyncing ValkeyPhase = "Syncing"
 	// ValkeyPhaseRollingUpdate indicates a rolling update is in progress.
 	ValkeyPhaseRollingUpdate ValkeyPhase = "Rolling Update"
+	// ValkeyPhaseSentinelRollingUpdate indicates the Sentinel tier is being
+	// rolled. It follows the data tier's "Rolling Update" phase (the data tier
+	// always converges first) and appears alone on Sentinel-only spec changes.
+	ValkeyPhaseSentinelRollingUpdate ValkeyPhase = "Sentinel Rolling Update"
 	// ValkeyPhaseFailover indicates a failover is in progress.
 	ValkeyPhaseFailover ValkeyPhase = "Failover in progress"
 	// ValkeyPhaseError indicates an error state.

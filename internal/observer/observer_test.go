@@ -25,7 +25,7 @@ func TestNew_WithoutTLS(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.NotNil(t, obs)
-	assert.Nil(t, obs.tlsConfig)
+	assert.Nil(t, obs.tlsSrc)
 	assert.False(t, obs.result.Ready)
 	assert.NotNil(t, obs.result.Checks)
 	assert.NotNil(t, obs.metrics)
@@ -162,8 +162,8 @@ func TestNew_WithSentinel_BuildsSeparateTLSConfigs(t *testing.T) {
 
 	obs, err := New(cfg)
 	require.NoError(t, err)
-	assert.Nil(t, obs.tlsConfig)
-	assert.Nil(t, obs.sentinelTLSConfig)
+	assert.Nil(t, obs.tlsSrc)
+	assert.Nil(t, obs.sentinelTLSSrc)
 }
 
 func TestRunSentinelChecks_IncludesHostnameChecks(t *testing.T) {
@@ -246,5 +246,5 @@ func TestNew_TLS_SentinelMTLSFlags(t *testing.T) {
 
 	obs, err := New(cfg)
 	require.NoError(t, err)
-	assert.Nil(t, obs.sentinelTLSConfig)
+	assert.Nil(t, obs.sentinelTLSSrc)
 }

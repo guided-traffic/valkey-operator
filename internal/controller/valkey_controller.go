@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -47,8 +49,6 @@ const (
 	certManagerGroup = "cert-manager.io"
 	// certManagerKindCertificate is the Kind of cert-manager Certificate resources.
 	certManagerKindCertificate = "Certificate"
-	// conditionTypeReady is the standard "Ready" condition type.
-	conditionTypeReady = "Ready"
 	// certManagerCertificateNameAnnotation is the annotation cert-manager stamps
 	// on every Secret it issues, naming the Certificate that produced it. Verified
 	// against cert-manager v1.21.1: present on all 119 issued Secrets of the
@@ -80,6 +80,16 @@ type ValkeyReconciler struct {
 	OperatorImage     string
 	OperatorNamespace string
 	OperatorVersion   string
+
+	// APIReader reads straight from the API server, bypassing the manager cache.
+	// It exists for exactly one class of read: the delete gate's last look at the
+	// tier immediately before a pod delete (ADR 0026 D5). The cache is allowed to
+	// be a few hundred milliseconds behind, and that lag was measured turning
+	// into a double termination: a chaos delete landed after the pass collected
+	// its pod states, the gate saw a quiet tier, and the roll deleted its next
+	// candidate on top of the terminating one. Every other read stays on the
+	// cache. Nil in tests that do not wire it; the gate then skips the live look.
+	APIReader client.Reader
 	// NewValkeyClientFn overrides the default Valkey client factory.
 	// Used in unit tests to avoid real TCP connections.
 	NewValkeyClientFn func(addr, password string, tlsConfig *tls.Config) *valkeyclient.Client
@@ -324,6 +334,15 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	if rollingResult.NeedsRequeue {
 		return ctrl.Result{RequeueAfter: rollingResult.RequeueAfter}, nil
 	}
+	// A rolling-update wait that has outlived its bound without being resumed. The
+	// wait continues — nothing was deleted and nothing is retried early — but the
+	// pass must not end on it, or everything below stays suspended for as long as
+	// the stall lasts: the Sentinel roll, the no-master recovery, the steady-state
+	// split-brain check and the status write
+	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5). The cadence is
+	// applied at the end of the pass, exactly like the one a post-update check asks
+	// for without taking it.
+	deferredRequeue := ctrl.Result{RequeueAfter: rollingResult.DeferredRequeueAfter}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
 	//
@@ -361,7 +380,10 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 
 	// The recheck a post-update check asked for without ending the pass. Zero
 	// unless one of them set it, so the healthy path still returns no requeue.
-	return pending, nil
+	if pending.RequeueAfter > 0 {
+		return pending, nil
+	}
+	return deferredRequeue, nil
 }
 
 // handlePostRollingUpdateChecks runs Sentinel rolling updates and no-master recovery
@@ -386,6 +408,12 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 		if sentinelResult.NeedsRequeue {
 			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
 		}
+	} else {
+		// Disabling Sentinel mid-roll skips the check above forever, which would
+		// leave a standing SentinelUpdatePending=True as permanent drift (the T6
+		// class). Clearing it here is one map lookup on every non-Sentinel pass
+		// and a single write on the transition.
+		r.clearSentinelUpdatePending(ctx, v)
 	}
 
 	// For multi-replica non-Sentinel clusters, detect a no-master state and recover
@@ -479,6 +507,16 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
 		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
 		{name: "monitoring", run: r.reconcileMonitoringResources},
+		// Last, and a report rather than a write: it measures the pods against the
+		// fingerprints the two StatefulSet steps above have just stamped. It lives
+		// among the resource steps and not in the workload pass because every one
+		// of those returns early while a rolling update is in flight, and a level
+		// condition that is not re-measured every pass is the staleness this repo
+		// has now fixed four times (ADR 0027). Deliberately no when: IsTLSEnabled
+		// gate -- the evaluator itself handles the disabled case, because a gate
+		// here silences the condition's only writer the moment TLS is turned off
+		// and freezes a True forever (T24(d), the T15 shape again).
+		{name: "TLS material", run: r.reportTLSMaterialStale},
 	}
 }
 
@@ -1194,6 +1232,14 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 	current := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// The fingerprint is Secret content and the builder never sees it, so it
+		// is stamped here rather than folded into the pod-spec hash. The sidecar
+		// container carries it: the one container of the data pod that is ours.
+		// A template it cannot arm is not created -- ADR 0030 D12.
+		if !r.ensureTLSMaterialRecord(ctx, v, desired, nil,
+			builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
+			return nil
+		}
 		logger.Info("Creating StatefulSet", "name", desired.Name)
 		return r.Create(ctx, desired)
 	}
@@ -1214,6 +1260,29 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 			"the data plane is not provisioned: the operator will not write the object, nudge it, "+
 				"run rolling updates against it, or count its pods in status")
 		return foreignObjectError("StatefulSet", desired.Name)
+	}
+
+	// volumeClaimTemplates are immutable and this function never writes them, so a
+	// difference between spec.persistence and the live claims is not drift the next
+	// pass converges. Checked before the drift detection, because the update the
+	// drift would trigger is the doomed one (ADR 0023).
+	//
+	// mayClear: this is the tier whose builder writes the claims, so it is the only
+	// one that can prove the storage the spec asks for is the storage that runs, and
+	// therefore the only one allowed to retract StorageSpecNotApplied (ADR 0023 D4a).
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
+		reasonStatefulSetRecreateRequired, true); err != nil {
+		return err
+	}
+
+	// After the ownership proof, because case 2 reads the record off current
+	// (ADR 0020 D10), and before the drift detection, which compares the stamped
+	// template. A refusal leaves the live template untouched: the window where
+	// this tier has neither a readable Secret nor a recorded fingerprint is the
+	// window in which every created pod would be permanently unmeasurable.
+	if !r.ensureTLSMaterialRecord(ctx, v, desired, current,
+		builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
+		return nil
 	}
 
 	// Detect drift and update.
@@ -1310,6 +1379,15 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 	current := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// The Sentinel tier has no sidecar of ours at all -- its probes shell out
+		// to valkey-cli per exec -- so whether it can skip the roll is decided
+		// entirely by valkey-sentinel, which has never been measured. It carries
+		// the fingerprint, and a template it cannot arm is not created (ADR 0030
+		// D12).
+		if !r.ensureTLSMaterialRecord(ctx, v, desired, nil,
+			builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
+			return nil
+		}
 		logger.Info("Creating Sentinel StatefulSet", "name", desired.Name)
 		return r.Create(ctx, desired)
 	}
@@ -1326,6 +1404,29 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 			"Sentinel is not provisioned: the operator will not write the object, nudge it, "+
 				"run rolling updates against it, or count its pods in status")
 		return foreignObjectError("StatefulSet", desired.Name)
+	}
+
+	// Sentinel keeps its state on an emptyDir and the builder writes no
+	// volumeClaimTemplates at all, so this compares empty against empty. It is here
+	// so that a future Sentinel storage feature cannot reintroduce the trap in a
+	// reconciler that shares no code with the data one (ADR 0023 D4).
+	//
+	// mayClear=false, and the call does NOT cost nothing — that was the claim ADR
+	// 0023 D4 made and D4a withdraws. This step runs after the data one, so an
+	// unconditional clear here erased whatever the data tier had just reported, on
+	// every pass of every Sentinel cluster with a claim conflict. This tier may
+	// report; it may never retract.
+	if err := r.guardVolumeClaimTemplates(ctx, v, desired, current,
+		reasonSentinelStatefulSetRecreateRequired, false); err != nil {
+		return err
+	}
+
+	// Same placement and same rule as the data tier: after the ownership proof
+	// (ADR 0020 D10), before the drift detection, and a refusal leaves the live
+	// template untouched (ADR 0030 D12).
+	if !r.ensureTLSMaterialRecord(ctx, v, desired, current,
+		builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
+		return nil
 	}
 
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
@@ -1959,13 +2060,23 @@ func (r *ValkeyReconciler) cleanupObserverServiceAccount(ctx context.Context, v 
 }
 
 // isObserverDeploymentReady returns true if the observer Deployment has at least one ready replica.
+//
+// A foreign Deployment holding the generated name is treated as absent, like the data
+// StatefulSet in updateStatus and the Sentinel StatefulSet in updateHAStatus: without
+// the guard this reported a stranger's ready replica as our observer's readiness, while
+// reconcileObserverDeployment was refusing to write and saying "the observer is not
+// deployed and status.observerReady stays false". The refusal returns nil precisely
+// because this field is meant to record the degradation, so reading the collision as
+// health inverted the one signal that decision rests on
+// (docs/adr/0020-write-only-what-the-operator-owns.md). No Event here — the reconciler
+// is the one reporter.
 func (r *ValkeyReconciler) isObserverDeploymentReady(ctx context.Context, v *vkov1.Valkey) bool {
 	deploy := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      builder.ObserverDeploymentName(v),
 		Namespace: v.Namespace,
 	}, deploy)
-	if err != nil {
+	if err != nil || !metav1.IsControlledBy(deploy, v) {
 		return false
 	}
 	return deploy.Status.ReadyReplicas > 0
@@ -2000,19 +2111,12 @@ func (r *ValkeyReconciler) updateStatus(ctx context.Context, v *vkov1.Valkey) er
 	}
 
 	// Always record which operator version last reconciled this resource.
-	// NOTE: v.Status.OperatorVersion is set inside the sub-functions (after prevStatus capture)
-	// so that a version change is detected by statusUnchanged.
+	// NOTE: v.Status.OperatorVersion is set inside persistStatus (after prevStatus
+	// capture) so that a version change is detected by statusUnchanged. status.observerReady
+	// is set there for the same reason and had to be moved for it (ADR 0002 D5).
 
 	readyReplicas := sts.Status.ReadyReplicas
 	v.Status.ReadyReplicas = readyReplicas
-
-	// Update observer status.
-	if v.IsObserverEnabled() {
-		observerReady := r.isObserverDeploymentReady(ctx, v)
-		v.Status.ObserverReady = &observerReady
-	} else {
-		v.Status.ObserverReady = nil
-	}
 
 	// In HA mode, also check Sentinel readiness.
 	if v.IsSentinelEnabled() {
@@ -2028,6 +2132,10 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 	// Capture previous status to detect changes.
 	prevStatus := v.Status.DeepCopy()
 
+	// After the capture, so the verdict is detected as a change and rides the
+	// status write below (T7).
+	r.reportRWServiceEndpoints(ctx, v, readyReplicas)
+
 	switch {
 	case readyReplicas == v.Spec.Replicas:
 		// Verify actual connectivity to Valkey instances before reporting OK.
@@ -2036,7 +2144,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.Message = fmt.Sprintf("Instance unreachable: %v", err)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ConnectivityCheckFailed",
@@ -2049,7 +2157,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 			v.Status.MasterPod = r.currentMasterPod(ctx, v)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "AllReplicasReady",
@@ -2061,7 +2169,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = fmt.Sprintf("Waiting for replicas: %d/%d ready", readyReplicas, v.Spec.Replicas)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "ReplicasNotReady",
@@ -2072,7 +2180,7 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 		v.Status.Message = "Waiting for replicas to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "NoReplicasReady",
@@ -2094,6 +2202,12 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 // not on the ordinal -- so the status field was lying exactly where the condition
 // next to it was trying to tell the truth (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md,
 // D11).
+//
+// "The condition next to it" is not a live one, and the direction of the reading matters:
+// TopologyRestored is the verdict of the last data-tier roll, so this field is the live
+// answer and the condition is not. A drain adoption after that roll moves the master here
+// and leaves the condition where it stood
+// (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D15).
 //
 // The order of the three answers is the order of their authority:
 //
@@ -2131,6 +2245,88 @@ func (r *ValkeyReconciler) currentMasterPod(ctx context.Context, v *vkov1.Valkey
 	return pod0
 }
 
+// sentinelPeerDriftRecheckInterval is how soon a cluster carrying stale Sentinel
+// peer entries is looked at again.
+//
+// Deliberately slow. The drift itself changes only when a Sentinel pod is replaced
+// or an administrator resets a table, so this is not a signal that needs following
+// closely -- it is the clock that lets a SENTINEL RESET show up as a cleared
+// condition within a maintenance window instead of at the next cache resync. Only
+// clusters that already report drift pay it.
+const sentinelPeerDriftRecheckInterval = 5 * time.Minute
+
+// recordSentinelPeerDrift turns the peer counts the health pass already collected
+// into the SentinelPeersStale condition.
+//
+// It is a report, not a repair. Removing a stale entry means SENTINEL RESET, which
+// wipes that Sentinel's replica and peer tables and rebuilds them through the
+// master -- harmless with a healthy master, unrecoverable without one, since
+// discovery has no other channel. The operator does not take that decision on its
+// own; ADR 0022 keeps the identity stable so the drift stops accruing, and this
+// says which clusters still carry the entries that predate it.
+//
+// Nothing is written when no sentinel answered: an empty map is "not measured",
+// and overwriting a True condition with False on the strength of three failed
+// connections would clear exactly the signal the operator is meant to act on.
+func (r *ValkeyReconciler) recordSentinelPeerDrift(ctx context.Context, v *vkov1.Valkey, state *health.ClusterState) {
+	if len(state.SentinelPeers) == 0 {
+		return
+	}
+
+	stale := staleSentinelPods(state)
+	if len(stale) == 0 {
+		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+			Type:               vkov1.ConditionTypeSentinelPeersStale,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: v.Generation,
+			Reason:             "SentinelPeersConsistent",
+			Message: fmt.Sprintf("Every Sentinel knows %d other Sentinels, as expected",
+				state.SentinelPeersExpected),
+		})
+		return
+	}
+
+	details := make([]string, 0, len(stale))
+	for _, pod := range stale {
+		details = append(details, fmt.Sprintf("%s knows %d", pod, state.SentinelPeers[pod]))
+	}
+
+	// Clearing the entries is a manual SENTINEL RESET (ADR 0022 D6), and that
+	// produces no Kubernetes event at all: no pod restarts, no owned object
+	// changes, and the CR watch is generation-gated. Without this recheck the
+	// condition would keep saying True until the 10 h cache resync, which is
+	// exactly the window an operator wants to verify the reset in. Only a cluster
+	// that is actually carrying drift polls, and it stops on the pass that finds
+	// the tables agreeing again.
+	requestRecheck(ctx, sentinelPeerDriftRecheckInterval)
+
+	meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
+		Type:               vkov1.ConditionTypeSentinelPeersStale,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: v.Generation,
+		Reason:             "StaleSentinelEntries",
+		Message: fmt.Sprintf(
+			"Expected %d other Sentinels, but %s. Dead entries still count towards the "+
+				"majority a failover leader needs; clear them with SENTINEL RESET while the "+
+				"master is healthy, or leave them to the next Sentinel roll",
+			state.SentinelPeersExpected, strings.Join(details, ", ")),
+	})
+}
+
+// staleSentinelPods returns the sentinel pods whose peer table is larger than the
+// cluster, sorted by pod name so the condition message is stable across passes --
+// a message that reorders itself would rewrite the status on every reconcile.
+func staleSentinelPods(state *health.ClusterState) []string {
+	var stale []string
+	for pod, known := range state.SentinelPeers {
+		if known > state.SentinelPeersExpected {
+			stale = append(stale, pod)
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
 // updateHAStatus updates the status for HA (Sentinel) mode.
 func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, readyReplicas int32) error {
 	sentinelReady := int32(0)
@@ -2158,18 +2354,23 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 	// Capture previous status to detect changes.
 	prevStatus := v.Status.DeepCopy()
 
+	// After the capture, so the verdict is detected as a change and rides the
+	// status write below (T7).
+	r.reportRWServiceEndpoints(ctx, v, readyReplicas)
+
 	switch {
 	case allValkeyReady && allSentinelReady:
 		// Verify actual cluster health before reporting OK.
 		checker := r.getInstanceChecker()
 		clusterState := checker.CheckCluster(ctx, v)
+		r.recordSentinelPeerDrift(ctx, v, clusterState)
 
 		if clusterState.Error != nil {
 			v.Status.Phase = vkov1.ValkeyPhaseError
 			v.Status.Message = fmt.Sprintf("Cluster health check failed: %v", clusterState.Error)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ClusterHealthCheckFailed",
@@ -2182,7 +2383,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				clusterState.ReadyReplicas, clusterState.TotalReplicas)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: v.Generation,
 				Reason:             "ReplicationSyncing",
@@ -2195,7 +2396,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 				readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 			meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-				Type:               conditionTypeReady,
+				Type:               vkov1.ConditionTypeReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: v.Generation,
 				Reason:             "HAClusterReady",
@@ -2208,7 +2409,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 			readyReplicas, v.Spec.Replicas, sentinelReady, expectedSentinels)
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterProvisioning",
@@ -2220,7 +2421,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		v.Status.Message = "Waiting for HA cluster pods to become ready"
 
 		meta.SetStatusCondition(&v.Status.Conditions, metav1.Condition{
-			Type:               conditionTypeReady,
+			Type:               vkov1.ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: v.Generation,
 			Reason:             "HAClusterNotReady",
@@ -2238,6 +2439,16 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 // previous ones kept, so the pass keeps its single Error phase write. Everything
 // else — readyReplicas, masterPod, observerReady, conditions — keeps updating:
 // a rejected managed write says nothing about the running data plane.
+//
+// observerReady is computed HERE and not in updateStatus, for the same reason
+// OperatorVersion is: statusUnchanged compares it, so a value assigned before the
+// caller captured prevStatus is compared against itself and can never be the reason a
+// write happens. It was assigned in updateStatus's prologue until 2026-08-26 and was
+// therefore frozen at whatever the last pass that changed some *other* status field had
+// sampled — measured on wds18 as three seconds of real observer downtime persisting for
+// hours, in both directions (ADR 0002 D5). Every path that reached the old assignment
+// reaches this one: updateStatus's two early returns are in front of both, and
+// persistStatus is the sole return of updateStandaloneStatus and of updateHAStatus.
 func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, prevStatus *vkov1.ValkeyStatus) error {
 	if passIsBlocked(ctx) {
 		v.Status.Phase = prevStatus.Phase
@@ -2246,6 +2457,16 @@ func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, p
 
 	// Set OperatorVersion after prevStatus is captured so a version upgrade triggers an update.
 	v.Status.OperatorVersion = r.OperatorVersion
+
+	// Same reason, see the doc comment: a change in observer readiness alone has to be
+	// able to trigger the write.
+	if v.IsObserverEnabled() {
+		observerReady := r.isObserverDeploymentReady(ctx, v)
+		v.Status.ObserverReady = &observerReady
+	} else {
+		v.Status.ObserverReady = nil
+	}
+
 	if statusUnchanged(prevStatus, &v.Status) {
 		return nil
 	}
@@ -2347,14 +2568,17 @@ func (r *ValkeyReconciler) writePhase(ctx context.Context, v *vkov1.Valkey, phas
 // and decides for itself what a failed write means
 // (docs/adr/0010-every-rolling-update-wait-is-bounded.md, D3).
 func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) {
-	if err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
+	if _, err := r.writeStatusCondition(ctx, v, condType, status, reason, message); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to write status condition; it will be recomputed on the next reconcile",
 			"condition", condType, "reason", reason)
 	}
 }
 
 // writeStatusCondition is the write setStatusCondition documents, reporting
-// whether it landed.
+// whether it landed and whether it changed anything. The changed verdict is what
+// lets a caller emit a transition edge (an Event) exactly once: a write that
+// found the stored condition already matching reports false, so a repeated pass
+// over the same state stays silent.
 //
 // Every attempt reads the CR again, because the read goes through the manager
 // cache and a caller that updated the CR itself moments earlier reads back the
@@ -2366,8 +2590,10 @@ func (r *ValkeyReconciler) setStatusCondition(ctx context.Context, v *vkov1.Valk
 //
 // A CR that disappeared under the pass is not a failure: there is nothing left to
 // record on, and every caller would swallow the NotFound anyway.
-func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Valkey, condType string, status metav1.ConditionStatus, reason, message string) (bool, error) {
+	changed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		changed = false
 		if err := r.Get(ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -2384,20 +2610,37 @@ func (r *ValkeyReconciler) writeStatusCondition(ctx context.Context, v *vkov1.Va
 		}) {
 			return nil
 		}
-		return r.Status().Update(ctx, v)
+		if err := r.Status().Update(ctx, v); err != nil {
+			return err
+		}
+		changed = true
+		return nil
 	})
+	return changed, err
 }
 
 // setSidecarUpdatePendingCondition sets or clears the SidecarUpdatePending condition.
-// When pending is true the condition is set to True, indicating that a standalone pod
-// has an outdated sidecar image that will be updated on the next natural pod restart.
-func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pending bool) {
-	if pending {
+// A non-empty pod name sets it to True and names that pod as the one whose sidecar image
+// is outdated and will be updated on its next natural restart; the empty string clears it.
+//
+// The pod name is a parameter rather than an implied "the standalone pod" because the
+// message used to say exactly that and was read on a three-replica cluster, where it
+// looked like a contradiction rather than what it was. That mismatch is still reachable:
+// the deferral guard reads spec.Replicas <= 1 while the loop walks the live
+// StatefulSet's replica count, and a refused StatefulSet write (an immutable
+// volumeClaimTemplates conflict, ADR 0023) holds the two apart — so a cluster scaled
+// down to one replica in that state can carry three running pods. The message therefore
+// reports spec.replicas as the number the decision was actually made on, not a claim
+// about how many pods exist.
+func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context, v *vkov1.Valkey, pod string) {
+	if pod != "" {
 		r.setStatusCondition(ctx, v,
 			vkov1.ConditionTypeSidecarUpdatePending,
 			metav1.ConditionTrue,
 			"SidecarImageDrift",
-			"Standalone pod has an outdated sidecar image; update will occur on the next pod restart")
+			fmt.Sprintf("Pod %s has an outdated sidecar image. spec.replicas is %d, so the operator does "+
+				"not restart the pod for a sidecar-only change; the update applies on its next restart.",
+				pod, v.Spec.Replicas))
 		return
 	}
 	r.setStatusCondition(ctx, v,
@@ -2419,6 +2662,12 @@ func (r *ValkeyReconciler) setSidecarUpdatePendingCondition(ctx context.Context,
 // True with reason SidecarImageDrift for the rest of the cluster's life. Indistinguishable from a
 // cluster that never applied it, and permanent drift for anything keyed on the condition.
 //
+// It has two callers since 2026-08-26, both in checkAndHandleRollingUpdate and both proving
+// convergence: the converged-steady-state early return, and the completion branch. Neither
+// subsumes the other -- the completing pass got past the early return by definition, and a
+// leftover from a roll that finished long ago is only ever reached by the early return
+// (ADR 0002 D10, amended).
+//
 // The presence check is what keeps this from being a new condition on every CR in the
 // fleet: meta.SetStatusCondition adds an absent condition and reports a change, so
 // calling it unconditionally would write SidecarUpdatePending=False onto clusters that
@@ -2429,7 +2678,71 @@ func (r *ValkeyReconciler) clearSidecarUpdatePending(ctx context.Context, v *vko
 	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSidecarUpdatePending) == nil {
 		return
 	}
-	r.setSidecarUpdatePendingCondition(ctx, v, false)
+	r.setSidecarUpdatePendingCondition(ctx, v, "")
+}
+
+// clearRollingUpdatePaused resolves the paused report on a CR that carries one.
+//
+// It is the third instance of the ADR 0002 D10 shape and the one that took longest
+// to find, because the clear existed: it sat inside finalizeRollingUpdate, which
+// only the Sentinel dispatch arm calls. A multi-replica cluster without Sentinel
+// could reach pauseRollingUpdate through three chains and had no code path that
+// ever cleared, so the condition stood for the life of the cluster — and the
+// collector exports it, so a stale True is a permanently firing series rather than
+// a stale row in kubectl.
+//
+// Presence-guarded, like every other clear here: meta.SetStatusCondition ADDS an
+// absent condition and reports a change, so the unguarded write this replaces had
+// already stamped RollingUpdatePaused=False onto every Sentinel CR that ever
+// completed a roll.
+//
+// The reason is a parameter because the two call sites prove different things. See
+// ReasonRollingUpdateCompleted and ReasonRollingUpdateConverged.
+func (r *ValkeyReconciler) clearRollingUpdatePaused(ctx context.Context, v *vkov1.Valkey,
+	reason, message string) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeRollingUpdatePaused) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v, vkov1.ConditionTypeRollingUpdatePaused,
+		metav1.ConditionFalse, reason, message)
+}
+
+// clearRollingUpdatePausedIfConverged is the guarded half, called from the
+// converged early return of checkAndHandleRollingUpdate.
+//
+// "No pod needs updating" is not the same statement as "the tier converged". The
+// ordinal loop skips a pod that does not exist, and a pod recreated on the current
+// template is up to date the moment it appears — both of which happen in the middle
+// of a replacement the operator is still waiting on. Clearing there would turn a
+// permanently stale True into a permanently wrong False, which is the worse of the
+// two failures: it says a stuck roll is fine.
+//
+// The count is the branch, so the caller stays a plain statement — the loop it sits
+// in is at the cyclomatic limit the repo enforces.
+func (r *ValkeyReconciler) clearRollingUpdatePausedIfConverged(ctx context.Context, v *vkov1.Valkey,
+	readyPods, tierSize int) {
+	if readyPods != tierSize {
+		return
+	}
+	r.clearRollingUpdatePaused(ctx, v, vkov1.ReasonRollingUpdateConverged,
+		"Every pod of the data tier matches the live StatefulSet template and is Ready")
+}
+
+// clearSentinelUpdatePending flips SentinelUpdatePending to False on a CR whose
+// Sentinel is disabled, but only for a CR that actually carries the condition —
+// the same presence guard as clearSidecarUpdatePending, and for the same reason:
+// an unconditional call would write the condition onto every non-Sentinel CR in
+// the fleet. Disabling is not completing, so no SentinelUpdateComplete event
+// accompanies the flip (docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
+func (r *ValkeyReconciler) clearSentinelUpdatePending(ctx context.Context, v *vkov1.Valkey) {
+	if meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending) == nil {
+		return
+	}
+	r.setStatusCondition(ctx, v,
+		vkov1.ConditionTypeSentinelUpdatePending,
+		metav1.ConditionFalse,
+		vkov1.ReasonSentinelDisabled,
+		"Sentinel is disabled; no sentinel pods to update")
 }
 
 // checkAndRecoverNoMaster detects a no-master state in multi-replica non-Sentinel
@@ -2612,7 +2925,7 @@ func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.O
 	var requests []reconcile.Request
 	for i := range valkeyList.Items {
 		v := &valkeyList.Items[i]
-		if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secret.Name {
+		if secretConcernsValkey(v, secret.Name) {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      v.Name,
@@ -2628,4 +2941,23 @@ func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.O
 	}
 
 	return requests
+}
+
+// secretConcernsValkey reports whether a Secret change is one this Valkey has to
+// react to: the auth Secret it reads its password from, or either of the TLS
+// Secrets its pods mount.
+//
+// The TLS half was missing, and its absence is half of why a certificate
+// rotation was invisible to the operator: cert-manager rewrote the Secret, no CR
+// matched, nothing was enqueued, and the pods kept the material they had parsed
+// at startup. Matching the TLS names is what turns a rotation into a reconcile;
+// the fingerprint annotation is what turns that reconcile into a roll.
+func secretConcernsValkey(v *vkov1.Valkey, secretName string) bool {
+	if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secretName {
+		return true
+	}
+	if !v.IsTLSEnabled() {
+		return false
+	}
+	return secretName == builder.ValkeyTLSSecretName(v) || secretName == builder.SentinelTLSSecretName(v)
 }

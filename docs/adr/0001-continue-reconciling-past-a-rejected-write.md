@@ -4,6 +4,10 @@
 
 Accepted. Date: 2026-08-21.
 
+Clarified 2026-08-26: D4 gains an explicit statement of what its second half costs — the
+rolling-update exits skip `updateStatus`, so `Ready` and three status fields keep their
+pre-roll values for the whole roll. No rule changed and no code changed.
+
 Implemented on branch `feat/support-pdb` (51 commits ahead of `main` at the time
 of writing; not yet released). Verified by
 [`internal/controller/reconcile_steps_test.go`](../../internal/controller/reconcile_steps_test.go)
@@ -89,6 +93,17 @@ objects; only the phase is overridden afterwards (see
 of `reconcileWorkload` still own their own returns: a pass with a rolling update in
 flight — blocked or not — returns before `updateStatus` and writes its phase
 itself.
+
+Clarified 2026-08-26: the rule is unchanged, and the price of its second half is now named
+rather than implied. Because those exits skip `updateStatus` entirely, `readyReplicas`,
+`masterPod`, `observerReady` **and the `Ready` condition** all keep their pre-roll values
+for the whole duration of a roll — so a cluster reports `Ready=True` while its pods are
+being replaced one by one, with the phase reporting `Rolling Update i/n` beside it. The
+`Ready` contract states this ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)
+D5a). Whether that is the intended reading of the condition — "the last steady state was
+healthy" rather than "the cluster is serving now" — is deliberately left open here: it is a
+re-decision of this rule, not a gap in it, and changing it means reaching `persistStatus` on
+every exit rather than adding one write site.
 
 **D5 — A failing pass returns its error, never a hand-picked `RequeueAfter`.**
 Shaping retry cadence is the rate limiter's job. Swallowing the error would give a

@@ -42,6 +42,7 @@ A reader must never find the old rule stated as current.
 | [0002](0002-surface-a-blocked-reconcile-on-the-cr.md) | Surface a blocked reconcile on the CR |
 | [0003](0003-nudge-a-short-of-pods-statefulset.md) | Nudge a short-of-pods StatefulSet |
 | [0019](0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md) | Reconcile concurrency, and the cost of a stuck pass |
+| [0027](0027-conditions-are-levels-edges-or-history.md) | Every condition is a level, an edge or history, and a test says which |
 
 ### Workload guarantees
 
@@ -50,6 +51,7 @@ A reader must never find the old rule stated as current.
 | [0004](0004-opt-in-poddisruptionbudgets.md) | Opt-in PodDisruptionBudgets with a quorum-derived Sentinel budget |
 | [0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) | Upgrade-neutral defaults, and pod anti-affinity off by default |
 | [0006](0006-delete-only-what-the-operator-owns.md) | Delete only what the operator can prove it owns |
+| [0023](0023-volume-claim-templates-are-immutable.md) | A StatefulSet whose volumeClaimTemplates no longer match the spec is refused, not rewritten |
 
 ### Data plane and master authority
 
@@ -61,6 +63,12 @@ A reader must never find the old rule stated as current.
 | [0010](0010-every-rolling-update-wait-is-bounded.md) | Every rolling-update wait is bounded and has a named exit |
 | [0011](0011-evidence-based-steady-state-split-brain-resolution.md) | Evidence-based steady-state split-brain resolution |
 | [0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) | The sidecar records its drain promotion on the pod, not on the CR |
+| [0022](0022-sentinel-identity-is-pinned-to-the-pod.md) | A Sentinel's identity is pinned to its pod, and peer drift is reported rather than reset |
+| [0024](0024-the-sentinel-tier-reports-its-own-completion.md) | The Sentinel tier reports its own completion — RollingUpdateComplete means the data tier |
+| [0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) | A Warning named split-brain means one that did not resolve itself |
+| [0026](0026-a-pod-being-deleted-is-not-available.md) | A pod being deleted is not available — readiness answers reachability, never spendability |
+| [0028](0028-a-demotion-may-not-discard-the-only-dataset.md) | A demotion may not discard the only dataset — the roll resolver gets the drain stamp and a key-count veto |
+| [0029](0029-a-name-is-not-a-component.md) | A name is not a component — the tier is passed, never parsed |
 
 ### Security and API surface
 
@@ -71,6 +79,8 @@ A reader must never find the old rule stated as current.
 | [0015](0015-one-crd-validated-by-schema-only.md) | One CRD, validated by schema only — no admission webhook |
 | [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture |
 | [0020](0020-write-only-what-the-operator-owns.md) | Write only what the operator can prove it owns, and grant only to a subject it owns |
+| [0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) | Rotating certificates rotate the instances that cannot reload them — ours re-read their material, everything else rides a roll |
+| [0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) | A per-pod record the operator trusts lives in pod spec, not pod metadata — a pod can patch its own metadata |
 
 ### Process
 
@@ -83,5 +93,5 @@ A reader must never find the old rule stated as current.
 ## Related documents
 
 * [README.md](../../README.md) — user-facing reference
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the privilege footprint and hardening checklist ([ADR 0013](0013-operator-is-cluster-wide-privileged.md), [ADR 0014](0014-rbac-lives-in-three-places.md), [ADR 0016](0016-authentication-and-tls-posture.md))
+* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the privilege footprint and hardening checklist ([ADR 0013](0013-operator-is-cluster-wide-privileged.md), [ADR 0014](0014-rbac-lives-in-three-places.md), [ADR 0016](0016-authentication-and-tls-posture.md), [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md))
 * [CLAUDE.md](../../CLAUDE.md) — project conventions and the ADR obligation

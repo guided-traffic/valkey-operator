@@ -15,6 +15,22 @@ and the e2e `TestE2E_AdmissionRejection_ReconcileBlockedCondition`
 ([`test/e2e/admission_recovery_test.go`](../../test/e2e/admission_recovery_test.go)). Those
 files were read and their assertions match the rules below; no suite was run for this ADR.
 
+Amended 2026-08-26: D5 gains an implementation correction and D5a; D10 gains an amendment
+and D10a. `observerReady` never satisfied D5 and was moved into `persistStatus`; the
+`SidecarUpdatePending` clear gained a second site at the completion branch; the `Ready`
+contract is now declared on `vkov1.ConditionTypeReady` in `api/v1`. Implemented and verified
+in this repository: `make test-unit`, `make lint` and `make cyclo` are green, and each new
+regression test was confirmed to fail against the pre-fix code. No e2e or integration suite
+was run for this amendment.
+
+Amended again 2026-08-26: **D10b**, the third instance of the D10 shape, closes the
+`RollingUpdatePaused` clear gap D10 named as a separate open item — and D10's own
+convergence proof is marked **corrected in place**, because the claim that both
+`verifyTopologyRestored` completion sites are entered through `updatedCount == totalPods`
+is false. Implemented and verified in this repository: `make test-unit`, `make lint` and
+`make cyclo` green, three of the six new probes confirmed to fail against the pre-fix code.
+No e2e or integration suite was run.
+
 Amended 2026-08-22: D7 keeps its rule for the conditions this ADR is about, and gains an
 exception. `setStatusCondition` is now a logging wrapper around `writeStatusCondition`,
 which returns the error and retries a conflict against a freshly read CR; a caller whose
@@ -86,6 +102,51 @@ and the `Ready` condition keep updating. A rejected managed write says nothing a
 the running data plane; freezing the whole status would hide real cluster state
 behind an unrelated admission failure.
 
+Amended 2026-08-26: **the rule is unchanged and was not implemented for two of the four
+fields.** `statusUnchanged` compares `readyReplicas` and `observerReady` correctly, but
+`updateStatus` assigned both in its prologue — *before* `updateStandaloneStatus` and
+`updateHAStatus` captured the `prevStatus` those comparisons run against. Each field was
+therefore compared against itself, and `persistStatus` skipped the write. `masterPod`,
+`OperatorVersion` and the conditions were unaffected because they are set after the
+capture; the NOTE in `updateStatus` documented that exact hazard for `OperatorVersion` and
+nobody applied it to its two neighbours.
+
+Consequence, measured read-only on a live fleet (2026-08-25, 12 CRs): `observerReady` was
+wrong on **six of the eight** observer-enabled clusters, in both directions. On one CR the
+sequence is exact — a status write at `07:05:07Z` sampled the observer three seconds before
+it became `Available` at `07:05:10Z`, and the field still read `false` fourteen minutes
+later. Three seconds of real lag became a permanently wrong value, because a field with no
+proxy in phase, message or conditions has no passenger seat: nothing else changes when only
+it changes. `readyReplicas` carries the identical defect and is masked rather than fixed —
+every branch's phase message is a function of the ready count, so it always rides along.
+That masking is a property of the current message strings, not an invariant.
+
+The fix keeps D5's wording and moves the assignment: `observerReady` is now computed in
+`persistStatus`, next to `v.Status.OperatorVersion`, which is the side of the capture this
+ADR always meant. Guarded by
+`TestUpdateStatus_ObserverReadyTransitionIsPersistedOnItsOwn` and
+`TestUpdateStatus_DisablingTheObserverClearsAStoredVerdict`
+([`internal/controller/valkey_controller_test.go`](../../internal/controller/valkey_controller_test.go));
+both were confirmed to fail against the pre-fix assignment order before being kept.
+`readyReplicas` is deliberately left where it is — see Residual risks.
+
+**D5a — `Ready` is the data-plane verdict, and its disagreement with the phase is the
+design.** Added 2026-08-26. D5 kept the condition updating without ever saying what it
+means, and the pair `Ready=True` beside `phase=Error` was then filed as a contradiction off
+a live cluster. It is not: `status.phase` carries two meanings — the data-plane verdict and
+whether the operator can converge the spec — and D3 hands the field to the second one while
+blocked. `Ready` carries only the first. The contract now lives on
+`vkov1.ConditionTypeReady`, which moved out of `internal/controller` (where it was an
+unexported string constant, and therefore the one condition every CR carries with no
+declared type and no entry in any table built from `api/v1`) into
+[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go). It is stated in the README
+condition table and pinned by `TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked` and
+`TestUpdateHAStatus_KeepsReadyTrueWhileBlocked` — the second because no test at any tier
+reached the `HAClusterReady` shape the finding was actually reported on.
+
+The alternative of reconciling the two surfaces rather than documenting them was weighed
+and refused; see Alternatives.
+
 **D6 — A blocked pass writes its phase even when the workload half also failed.**
 `Reconcile` keeps the workload result instead of returning on it, writes the Error
 phase, and then returns `errors.Join(resourceErr, workloadErr)`. An early
@@ -144,6 +205,102 @@ only caller sat at the end of `handleStandaloneRollingUpdate` (`744b589^`, verif
 reading), unreachable once the deferred update actually applied, so
 `SidecarUpdatePending=True` stayed set forever and a converged cluster was
 indistinguishable from one that never applied the update.
+
+Amended 2026-08-26: **there are two such sites, and neither subsumes the other.** "The only
+site" above is superseded: it was wrong about the pass that *completes* a roll. That pass got
+past the early return by definition — a pod needed updating, or state was recorded — so it
+never reached the clear, and the completion branch cleared only the rolling-update state
+annotation. The completing pass schedules no follow-up either: the healthy path returns a
+zero requeue, the CR watch is `GenerationChangedPredicate`-gated, there is no Pod watch and
+no `SyncPeriod` override, so the next *guaranteed* pass is the controller-runtime cache
+resync of an owned object.
+
+Measured read-only on a live fleet (2026-08-25): four non-Sentinel clusters completed their
+data roll within four seconds of each other on 2026-08-22, and the clear landed 1 s, 3 s,
+6 min 9 s and **41 min 9 s** later — each time only because an unrelated pod-kill happened
+to enqueue a pass. A fleet audit read the CRs inside that window and filed the 41-minute
+lag as a permanent stall, which it was not; on a cluster nothing disturbs, the resync is
+the real bound.
+
+The clear is therefore also called from the `result.Completed` branch of
+`checkAndHandleRollingUpdate`, **before** `clearRollingUpdateState` so a failing annotation
+write cannot skip it. The convergence proof there is `updatedCount == totalPods`, which
+`countUpdatedPods` evaluates as `!needsUpdate && reachable()` over the whole tier — not the
+`Completed` flag itself, because two of the completion sites inside
+`verifyTopologyRestored` are stalled completions that could not re-read the pods; ~~both are
+entered only through that same count, so the proof holds for them too~~. Guarded by
+`TestCheckAndHandleRollingUpdate_CompletionClearsSidecarUpdatePending`
+([`internal/controller/sidecar_pending_condition_test.go`](../../internal/controller/sidecar_pending_condition_test.go)),
+confirmed to fail without the call.
+
+> **Corrected 2026-08-26.** The struck sentence is false and was false when it was written.
+> `verifyTopologyRestored` has two callers: one inside the `updatedCount == totalPods`
+> branch of `handleMultiReplicaRollingUpdate`, and one in `dispatchMultiReplicaState`,
+> whose only caller sits **after** that branch closes — so `Completed: true` is reachable
+> with `updatedCount != totalPods`. The site is kept: the dispatch target declaring the
+> roll finished is the strongest statement available, and every clear here is
+> presence-guarded, so the cost of the weaker proof is a report retracted one pass early
+> rather than a condition invented. The same correction is made in the code comment at
+> that site.
+
+Clearing from inside `clearRollingUpdateState` instead — one site covering all eight of its
+callers — was considered and **rejected**: two of those callers clear state *mid-roll*
+without proving convergence, so it would erase a `True` that is still accurate. The same
+trap makes it the wrong site for `RollingUpdatePaused`, ~~whose own clear gap is a separate
+open item~~ — closed 2026-08-26 by D10b.
+
+**D10b — `RollingUpdatePaused` is cleared from the same two sites, and the converged one
+is gated.** Added 2026-08-26, the third instance of this shape.
+
+The condition had exactly one clear, inside `finalizeRollingUpdate`, which only the Sentinel
+dispatch arm calls. `pauseRollingUpdate` is reachable on two of the three topologies — the
+`default:` arm (`replicas <= 1` without Sentinel) has no pause site in its call graph — so a
+**multi-replica cluster without Sentinel** could set the condition and had no code path that
+ever cleared it. The collector exports every condition as `vko_valkey_status_condition`
+([ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) D1), so that is a
+permanently firing series rather than a stale row.
+
+The second half ran the other way and was already on the fleet rather than waiting to
+happen: that `False` write was **not** presence-guarded, and `meta.SetStatusCondition` adds
+an absent condition, so every Sentinel CR that ever completed a roll *gained* a condition it
+never had. The write is deleted, not moved.
+
+Both clears now sit in `checkAndHandleRollingUpdate`, presence-guarded, next to the
+`SidecarUpdatePending` ones — but the converged early return is **gated on tier
+convergence**, and that asymmetry is the decision. "No pod needs updating" is not "the tier
+converged": the ordinal loop skips a pod that does not exist, and a pod recreated on the
+current template is up to date the instant it appears — both of which happen in the middle
+of a replacement the operator is still waiting on. A deferred sidecar update is answered by
+the templates matching; a pause is not. Clearing ungated there was measured to write `False`
+onto a stuck roll, which turns a permanently stale `True` into a permanently wrong `False` —
+the worse failure, because it says a stuck roll is fine.
+
+The two sites carry different reasons on purpose: `Completed` where a dispatch target
+reported the roll finished, `Converged` where there was no roll left to run at all. Saying
+"completed" on a spec that was simply put back would be a claim the operator cannot support.
+
+Guarded by six probes in
+[`internal/controller/rolling_update_paused_condition_test.go`](../../internal/controller/rolling_update_paused_condition_test.go),
+three of which fail without the change; the gate is what the two "a pod is missing" and "a
+pod is not Ready" probes exist for. **Not verified:** whether the shape those two describe
+occurs on a real cluster — it was produced in a fixture. The gate is taken anyway because it
+costs two lines.
+
+`pauseRollingUpdate` still halts nothing, and the four places that said it did are corrected
+in the same change. That is a separate item (T23), not part of D10b.
+
+**D10a — The condition names the pod and the number the decision was made on.** Added
+2026-08-26. The message was the fixed string "Standalone pod has an outdated sidecar image",
+and a fleet audit read it on a three-replica cluster, where it looked like a contradiction
+rather than the pre-v1.5.1 legacy value it was (before `3f0a1fe` the dispatch had no
+topology guard, so every non-Sentinel cluster went through the standalone handler). The
+mismatch is still reachable and is therefore not only a wording fix: the deferral guard
+reads `v.Spec.Replicas <= 1` while the loop walks `*currentSts.Spec.Replicas`, and a refused
+StatefulSet write ([ADR 0023](0023-volume-claim-templates-are-immutable.md)) holds the two
+apart — so a cluster scaled down to one replica in that state can carry three running pods.
+The message reports `spec.replicas` as the number the decision was made on, never as a
+claim about how many pods exist, and `setSidecarUpdatePendingCondition` takes the pod name
+as a parameter so a pending state without a named pod is unrepresentable.
 
 **D11 — On the non-Sentinel path `status.masterPod` derives from the `-rw` Service
 selector, never from the ordinal.** `currentMasterPod` answers in authority order: the
@@ -248,8 +405,42 @@ Rejected as inert on the path that matters most; see D9.
 ### Clear `SidecarUpdatePending` from `handlePostRollingUpdateChecks` or `updateStatus`
 
 A workable alternative (b in the original analysis) that costs a per-pass condition
-evaluation on the healthy path. D10's site was preferred because it is the one place
-that already proves convergence.
+evaluation on the healthy path. D10's site was preferred because it is one of only two
+places that already prove convergence; the completion branch is the other, and it was added
+in 2026-08-26 rather than moving the evaluation onto the status path.
+
+### Clear `SidecarUpdatePending` from inside `clearRollingUpdateState`
+
+Considered in 2026-08-26 as the single site covering all eight callers, and rejected: two of
+those callers (`clearStaleRollingUpdateState` and `pauseRollingUpdate`) clear state
+*mid-roll*, where nothing proves convergence, so the clear would erase a `True` that is
+still accurate. It is named here because it is the fix the next reader will propose, and
+because it is also the trap that makes it the wrong site for `RollingUpdatePaused`.
+
+### Make `Ready` follow the phase — `False`/`ReconcileBlocked` while blocked
+
+Refused 2026-08-26, and it is a direct reversal of D5. It presents one verdict at the cost
+of deleting the only field that tells an operator "your three-node HA cluster is serving"
+during a block — the exact live case that raised the question, where the data plane was
+verified healthy and the block was a StatefulSet the operator refused to touch. It would
+also move `vko_valkey_status_observed_generation`, which is the maximum `observedGeneration`
+across conditions, and therefore the `ValkeySpecNotObserved` alert
+([ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) D2) — a second
+consumer, not only a status field.
+
+### Add a distinct phase value `Blocked` so `Error` means only a broken data plane
+
+Weighed 2026-08-26 and **not taken now**, on cost rather than on principle. It is cheap:
+`Status.Phase` carries no `+kubebuilder:validation:Enum` and already holds composed values
+like `Rolling Update 2/3`, so a new value needs no CRD change, and `ValkeyPhaseNotOK` stays
+armed because it matches `phase != "OK"`. What it costs is a one-time label transition on
+`vko_valkey_status_phase`, which resets the `for: 30m` accumulation of an already-firing
+alert and silently stops matching any user silence pinned to `phase="Error"` — the same
+series-identity argument ADR 0021 uses against a different design. It also does not fix the
+identical ambiguity on the four non-blocked `Error` phases. D5a documents the split instead;
+if the surface is misread a third time, this is the option to revisit, and the structural
+answer (splitting the two meanings into two fields with its own printer column) is the one
+after that.
 
 ## Residual risks
 
@@ -267,11 +458,36 @@ that already proves convergence.
   so no guard would change the outcome.
 * A user reading only `ReconcileBlocked` cannot see a blocked **pod** creation (D13);
   that path is visible as a short-of-pods StatefulSet plus the nudge.
+* **`readyReplicas` still cannot trigger a status write on its own** (D5, amended).
+  Deliberately not fixed with `observerReady`: the field is masked by the fact that every
+  branch's phase message is a function of the ready count, so it rides along on every pass
+  that changes it, and no case could be constructed by reading in which it goes stale. The
+  accepted cost is that the masking is a property of the message strings — anyone who makes
+  a phase message stop naming the count reopens the defect, and nothing tests for that.
+  Moving the assignment next to `observerReady` closes it and is a two-line change if the
+  coupling is ever judged too fragile to keep.
+* **The `Ready` contract is documented, not enforced** (D5a). Nothing prevents a future
+  writer from setting `Ready` off something that is not the data plane, and nothing prevents
+  a consumer from reading it as "the operator is healthy". The condition registry
+  ([ADR 0027](0027-conditions-are-levels-edges-or-history.md)) records that `Ready` is a
+  level with one evaluator, which catches a second evaluator appearing but not a wrong one.
+* **`Ready` keeps its pre-roll value for the whole rolling update**, because a pass with a
+  roll in flight returns before `updateStatus`
+  ([ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) D4). That is decided
+  behaviour, and D5a states it, but it means "Ready" and "serving right now" come apart for
+  the duration of a roll — as do `masterPod`, `readyReplicas` and `observerReady`. Whether
+  that is the intended reading of the condition is an open question, not a settled one.
+* **Not verified for the 2026-08-26 amendments:** no e2e or integration suite was run. The
+  unit tier, `make lint` and `make cyclo` were run and are green, and each new regression
+  test was confirmed to fail against the pre-fix code. Every claim about live fleet state is
+  a read-only `kubectl get` observation from 2026-08-25, not a controlled experiment.
 
 ## References
 
 * [`internal/controller/reconcile_blocked.go`](../../internal/controller/reconcile_blocked.go) — `setReconcileBlockedCondition`, `isAdmissionRejection`, `withBlockedPass`, `passIsBlocked`, `compactErrorMessage`, `truncateConditionMessage`
-* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `setStatusCondition`, `persistStatus`, `writePhase`, `currentMasterPod`, `clearSidecarUpdatePending`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `setStatusCondition`, `persistStatus`, `writePhase`, `currentMasterPod`, `clearSidecarUpdatePending`, `clearRollingUpdatePaused`, `clearRollingUpdatePausedIfConverged`
+* [`internal/controller/rolling_update_paused_condition_test.go`](../../internal/controller/rolling_update_paused_condition_test.go) — the six D10b probes, including the two the convergence gate exists for
+* [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — the registry that declared this gap and the row D10b closes
 * [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) — why the pass reaches the status write at all
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the failure mode this condition deliberately does not cover
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — why split-brain paths requeue instead of ending the pass

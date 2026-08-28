@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/common"
@@ -93,6 +94,37 @@ const (
 	// DefaultServiceAccountName is the Kubernetes "default" service account name.
 	DefaultServiceAccountName = "default"
 
+	// SidecarTokenVolumeName is the projected volume that carries the sidecar's
+	// ServiceAccount token, mounted into the sidecar container and nowhere else
+	// (ADR 0012 D8 step 4).
+	//
+	// The name deliberately does not start with "kube-api-access-". The
+	// ServiceAccount admission plugin *adopts* the first volume carrying that
+	// prefix as the pod's token volume and mounts it into every container
+	// (mountServiceAccountToken, admission.go:423 in k8s.io/kubernetes@v1.36.4).
+	// The AutomountServiceAccountToken=false below already stops the plugin from
+	// running at all -- this is what keeps the mistake from being silent if that
+	// flag is ever lost.
+	SidecarTokenVolumeName = "sidecar-api-access" // #nosec G101 -- a volume name, not a credential
+
+	// ServiceAccountTokenMountPath is where client-go's rest.InClusterConfig looks
+	// for "token" and "ca.crt" (hard-coded at rest/config.go:545-546 in
+	// client-go@v0.36.4, and the same string as the admission plugin's
+	// DefaultAPITokenMountPath). It is not configurable, so a hand-declared
+	// projection has to reproduce it exactly -- getting it wrong is loud, not
+	// silent: the sidecar fails to build a client and never becomes ready.
+	ServiceAccountTokenMountPath = "/var/run/secrets/kubernetes.io/serviceaccount" // #nosec G101 -- path, not a credential
+
+	// serviceAccountTokenExpirationSeconds matches the projection the ServiceAccount
+	// admission plugin injects by default. kubelet refreshes the file at 80% of the
+	// lifetime and client-go re-reads BearerTokenFile every 60s, so nothing here
+	// outlives its token.
+	serviceAccountTokenExpirationSeconds = 3607
+
+	// rootCAConfigMapName is the ConfigMap kube-controller-manager publishes into
+	// every namespace; it holds the API server CA bundle under "ca.crt".
+	rootCAConfigMapName = "kube-root-ca.crt"
+
 	// IssuerRefNameKey is the unstructured map key for an issuer reference name.
 	IssuerRefNameKey = "name"
 
@@ -172,6 +204,12 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 	}
 
 	volumes = append(volumes, drainSignalVolumes(v)...)
+
+	// The token the sidecar needs, delivered as a volume rather than by the
+	// ServiceAccount admission plugin, so that AutomountServiceAccountToken below
+	// can take it away from every other container. Appended unconditionally: the
+	// sidecar always runs, and buildPodSpec sits at the gocyclo ceiling.
+	volumes = append(volumes, sidecarTokenVolume())
 
 	var initContainers []corev1.Container
 
@@ -560,9 +598,17 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 
 	spec := corev1.PodSpec{
 		ServiceAccountName: SidecarServiceAccountName(v),
-		Containers:         buildPodContainers(v, operatorImage),
-		Volumes:            volumes,
-		Affinity:           BuildPodAntiAffinity(v, common.ComponentValkey),
+		// The token is projected into the sidecar container by hand
+		// (sidecarTokenVolume) instead of being mounted into all of them. It takes
+		// the sidecar ServiceAccount away from valkey-server, from both init
+		// containers and from the third-party exporter, and with it the whole
+		// "pods: patch on this cluster's data pods" grant -- the instanceRole label,
+		// the drain stamp, every pod-template hash, ownerReferences, finalizers and
+		// the container image field, in one move (ADR 0012 D8 step 4).
+		AutomountServiceAccountToken: ptr.To(false),
+		Containers:                   buildPodContainers(v, operatorImage),
+		Volumes:                      volumes,
+		Affinity:                     BuildPodAntiAffinity(v, common.ComponentValkey),
 	}
 
 	// Set terminationGracePeriodSeconds to allow time for graceful failover.
@@ -633,6 +679,46 @@ func drainSignalVolumes(v *vkov1.Valkey) []corev1.Volume {
 			EmptyDir: &corev1.EmptyDirVolumeSource{},
 		},
 	}}
+}
+
+// sidecarTokenVolume returns the projected volume that reproduces what the
+// ServiceAccount admission plugin would have mounted into every container, so that
+// exactly one container gets it.
+//
+// The two sources are the two files rest.InClusterConfig reads. There is
+// deliberately no downwardAPI "namespace" projection: client-go never reads that
+// file, and the sidecar takes its namespace from the POD_NAMESPACE downward-API
+// env var instead.
+func sidecarTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: SidecarTokenVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				// 0644, the mode the API server defaults a projected volume to and the
+				// mode the admission plugin's own token projection ends up with. Written
+				// in octal on purpose: manifests spell this "420", which is the *decimal*
+				// form of 0644 -- and 0o420 is r---w----, which the sidecar cannot read.
+				// Measured: the pod starts and CrashLoopBackOffs with
+				// "open /var/run/secrets/kubernetes.io/serviceaccount/token: permission
+				// denied", green unit tests and all.
+				DefaultMode: ptr.To(int32(0o644)),
+				Sources: []corev1.VolumeProjection{
+					{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Path:              "token",
+							ExpirationSeconds: ptr.To(int64(serviceAccountTokenExpirationSeconds)),
+						},
+					},
+					{
+						ConfigMap: &corev1.ConfigMapProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: rootCAConfigMapName},
+							Items:                []corev1.KeyToPath{{Key: TLSCACertKey, Path: TLSCACertKey}},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 // drainPreStop holds the Valkey process open until the sidecar drain handler has
@@ -861,7 +947,15 @@ func buildSidecarContainer(v *vkov1.Valkey, operatorImage string) corev1.Contain
 		})
 	}
 
-	var volumeMounts []corev1.VolumeMount
+	// The sidecar is the only container in the pod that reaches the Kubernetes API,
+	// and after ADR 0012 D8 step 4 it is the only one that can: the pod spec sets
+	// AutomountServiceAccountToken=false and this mount is what hands the token
+	// back to exactly this container.
+	volumeMounts := []corev1.VolumeMount{{
+		Name:      SidecarTokenVolumeName,
+		MountPath: ServiceAccountTokenMountPath,
+		ReadOnly:  true,
+	}}
 
 	// Mount TLS certificates if TLS is enabled.
 	if v.IsTLSEnabled() {
@@ -1154,9 +1248,17 @@ func podTemplateChanged(desired, current corev1.PodTemplateSpec) bool {
 
 // podSpecChanged returns true if two PodSpecs differ in rolling-update-relevant ways.
 // It covers all containers (including sidecar), init containers, volumes,
-// ServiceAccountName, and TerminationGracePeriodSeconds.
+// ServiceAccountName, AutomountServiceAccountToken, and TerminationGracePeriodSeconds.
 func podSpecChanged(desired, current corev1.PodSpec) bool {
 	if desired.ServiceAccountName != current.ServiceAccountName {
+		return true
+	}
+	// The automount flag is its own comparison for the same reason
+	// ObserverDeploymentHasChanged compares it: the volume list carries the token
+	// projection, so the introduction of ADR 0012 D8 step 4 converges either way --
+	// but flipping the flag back to true on a live StatefulSet changes no volume and
+	// no container, and without this line the operator would never converge it back.
+	if automountsToken(&desired) != automountsToken(&current) {
 		return true
 	}
 	if !terminationGracePeriodEqual(desired.TerminationGracePeriodSeconds, current.TerminationGracePeriodSeconds) {

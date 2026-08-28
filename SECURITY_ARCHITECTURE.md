@@ -31,8 +31,8 @@ A `DEVELOPER.md` does not exist yet.
 | **Pre-upgrade hook** | ServiceAccount `<release>-upgrade`, cluster-wide, created and deleted per `helm upgrade` ([`pre-upgrade-rbac.yaml`](deploy/helm/valkey-operator/templates/pre-upgrade-rbac.yaml)) | Cluster-wide, lifetime of the hook Job | `valkeys` get/list/patch/update and `customresourcedefinitions` get/list/patch/update |
 | **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **This cluster's own data pods**, by name: `pods` patch with `resourceNames` (section 4.2) | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
 | **Observer** | Its **own** ServiceAccount `<cr-name>-observer`, bound to no Role, with `automountServiceAccountToken: false` ([`BuildObserverServiceAccount`](internal/builder/observer.go)) | None — no Role, and no token mounted | Nothing — it makes no Kubernetes API call at all (verified: no `client-go` import in `internal/observer` or `cmd/observer`) |
-| **Valkey pods** | Same `<cr-name>-sidecar` ServiceAccount — the whole pod, so the `valkey`, `sidecar` and `exporter` containers all carry the token ([`statefulset.go:547`](internal/builder/statefulset.go)) | Same | The `valkey` process itself needs no API access; only the sidecar container uses the token |
-| **Sentinel pods** | The namespace `default` ServiceAccount ([`sentinel.go:368`](internal/builder/sentinel.go)) | Whatever `default` is bound to (nothing, in a stock cluster) | Nothing — Sentinel pods carry no labeler sidecar |
+| **Valkey pods** | The pod runs as `<cr-name>-sidecar`, but the token reaches the **`sidecar` container only**: `automountServiceAccountToken: false` plus a projected volume mounted into that one container ([`sidecarTokenVolume`](internal/builder/statefulset.go)) | Same as the sidecar row, for that container | `valkey`, `exporter` and both init containers hold no credential at all |
+| **Sentinel pods** | The namespace `default` ServiceAccount, with `automountServiceAccountToken: false` ([`sentinel.go`](internal/builder/sentinel.go)) | None — no token mounted | Nothing — Sentinel pods carry no labeler sidecar and never call the Kubernetes API |
 | **CR author** | Any principal with `create valkeys` in a namespace | That namespace | Chooses images, the auth Secret name, the TLS mode — see section 3 for what that buys them |
 
 ```
@@ -122,8 +122,85 @@ Two mutually exclusive sources ([`TLSSpec`](api/v1/valkey_types.go)):
 - `spec.tls.secretName` — a Secret the user provides (`tls.crt`, `tls.key`, `ca.crt`).
 - `spec.tls.certManager` — the operator creates a **cert-manager `Certificate`**
   (`unstructured`, no typed dependency) and cert-manager issues the Secret. The
-  operator never holds a private key; it mounts the Secret into the pods and reads
-  it to build its own client TLS config.
+  operator never writes a private key and never persists one of its own. It does **hold**
+  them: the manager cache backs an unfiltered Secret informer, so every watched Secret —
+  `tls.key` and every cluster password included — is resident in operator memory for the
+  process lifetime. That is not new with the fingerprint, and it is what the `secrets` scope
+  item on the hardening checklist is about.
+
+**Two different consumers read that Secret, and they read different parts of it.**
+
+| Consumer | Reads | Why |
+|---|---|---|
+| the reconciler's and the health checker's own client config | `ca.crt` only | they verify the server and present **no client certificate**, so a rotation never breaks them |
+| the material fingerprint (`ComputeTLSMaterialHash`) | `ca.crt`, `tls.crt`, `tls.key` | it has to notice that the *content* changed, which is what triggers the roll |
+
+The fingerprint is a 32-bit FNV-1a digest, carried as the `VKO_TLS_MATERIAL_HASH`
+environment variable of the sidecar container on the data tier and the sentinel
+container on the Sentinel tier, on both StatefulSet pod templates, and therefore
+**readable by anyone with `get pods` or `get statefulsets`**. It is derived from a
+private key, which is high-entropy and not guessable, so the digest confirms nothing
+an attacker does not already hold.
+
+It sits in the pod **spec** rather than in pod metadata since 2026-08-27, because
+metadata is patchable by anything holding the sidecar token and spec is not — and the
+cheap attack was never forging the value but *deleting* it: both consumers skip a pod
+that carries no record, so one merge patch setting the key to `null` switched the roll
+off. The superseded `vko.gtrfc.com/tls-material-hash` annotation is still read for pods
+written before that date and is never written again
+([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)).
+
+The same construction over the **password** would be a brute-forceable oracle, and
+[ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
+D11 refuses it there — **at any digest strength**, because what makes the TLS case safe is that
+nobody enumerates 2048-bit RSA keys, not that FNV-1a is narrow. A wider hash of a password is a
+marginally slower oracle, not a safe one.
+
+**It is a change detector, not an integrity control, and must not be read as one.**
+FNV-1a is non-cryptographic and 32 bits wide, and `tls.key` is hashed last, so trailing
+bytes appended after the PEM block — which every PEM parser ignores — let a chosen digest
+be hit by search. Anyone who can **write** the TLS Secret can therefore replace the
+material while keeping the fingerprint identical, and neither the rolling update nor
+`TLSMaterialStale` would notice. That principal can already replace the cluster's TLS
+identity outright, so this buys evasion of the report rather than new access — but the
+report must not be presented as evidence that the material is unchanged.
+
+**Decided 2026-08-27: this stays.** A wide cryptographic digest would remove the collision and
+therefore the silence, and it was still not taken, because of what remains afterwards: the
+attacker loses the silent swap and gains one **indistinguishable from a legitimate rotation** —
+same fleet roll, same condition transition, no observer for whom the two differ. What would
+raise the ceiling is a trust anchor outside the Secret, not a better hash over it, and nothing
+here has one. ADR 0030 D11 carries the reasoning and the two counter-arguments that do not
+hold.
+
+**The record used to be writable from inside a data pod, and is not any more.** The sidecar
+Role grants `pods: patch` on this cluster's data pods. Until 2026-08-27 the fingerprint was a
+pod annotation and every container of the data pod mounted the token, so `valkey-server` and
+the third-party exporter could delete or overwrite it and suppress both the roll and the
+staleness report. Two changes closed it, and either alone would have left a hole:
+
+- **The token reaches one container.** `automountServiceAccountToken: false` on the data pod
+  plus a projected volume mounted into the `sidecar` container
+  ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4).
+  `valkey-server`, both init containers and the exporter now hold no credential — but the
+  sidecar must keep the grant, so this does not close the record.
+- **The record left pod metadata.** It is an env var of that container's spec, and env is not
+  one of the fields the API server lets a pod update change, so the patch is refused for every
+  principal — the compromised sidecar included, and the operator too
+  ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)).
+
+Two corrections to what this section used to say. It called the annotation the *third*
+forgeable field of that grant. Section 3 now enumerates them instead of counting: nine rows,
+eight of them still live. And it treated forgery as the attack: **deletion was cheaper**, and
+no digest strength would have touched it.
+
+**Who reloads and who is replaced.** A process that parsed a certificate at startup
+keeps presenting it until it exits — measured on a live fleet, it killed the sidecar
+labeler, the Sentinel cross-check and the drain promotion of
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) on
+every TLS cluster whose pods outlived a rotation, silently. The rule that follows is
+in section 6 and in ADR 0030: **a long-lived process this repository owns re-reads its
+material; every other process is replaced by a rolling update the rotation triggers.**
 
 Server-side settings the operator renders
 ([`configmap.go:80-93`](internal/builder/configmap.go)):
@@ -169,7 +246,11 @@ password.
 
 - Every generated object carries an ownerReference to its CR, so deleting the CR
   removes the whole cluster and nothing survives except user-owned Secrets and
-  PVCs.
+  PVCs. Turning `spec.persistence.enabled` off leaves them behind too: it needs
+  the manual StatefulSet migration in
+  [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md), and the
+  operator never deletes a PVC — so the RDB/AOF data of a cluster that is no
+  longer persistent stays on disk until someone removes the claims by hand.
 - Each Valkey CR gets **its own** ServiceAccount, Role and RoleBinding
   (`<cr-name>-sidecar`), and the Role names the pods it may patch, so the blast
   radius of a stolen sidecar token is **one cluster** — not the namespace, and not
@@ -204,13 +285,37 @@ password.
 - **The NetworkPolicies are ingress-only.** No egress rule is written, so a
   compromised Valkey pod may open connections anywhere, including to the API
   server.
-- **The sidecar can patch any metadata on its own cluster's pods.** The grant is
-  no longer namespace-wide — `resourceNames` limits it to `<cr-name>-0 …
-  <cr-name>-N` (section 4.2) — but within that list it is unrestricted: a
-  compromised sidecar can set `instanceRole=master` on any pod of *its* cluster
-  and can forge the drain stamp the operator consumes as promotion evidence.
-  Nothing narrower is expressible: those are the writes the sidecar exists to
-  make ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).
+- **The sidecar can patch any metadata on its own cluster's pods, and `pods: patch`
+  is wider than metadata.** The grant is no longer namespace-wide —
+  `resourceNames` limits it to `<cr-name>-0 … <cr-name>-N` (section 4.2) — and
+  since 2026-08-27 only the **sidecar container** holds the token that carries it
+  ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
+  step 4). Within that list it is still unrestricted. What a compromised sidecar can
+  rewrite, enumerated rather than sampled — this list used to say "the third field"
+  and stop at two:
+
+  | Field | What it buys |
+  |---|---|
+  | `instanceRole` label | the `-rw` and `-r` Services select on it; setting `master` diverts client writes |
+  | `vko.gtrfc.com/drain-promoted-at` | the operator consumes it as promotion evidence ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D6, [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)) |
+  | `vko.gtrfc.com/config-hash` | suppresses the rolling update for a config change |
+  | `vko.gtrfc.com/pod-spec-hash` | suppresses the rolling update for a pod-spec change |
+  | ~~`vko.gtrfc.com/tls-material-hash`~~ | it did suppress the certificate-rotation roll **and** the `TLSMaterialStale` report; the record moved into pod spec on 2026-08-27 and the annotation is now inert ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) |
+  | any selector label | deleting one detaches the pod from its StatefulSet controllerRef; `podIsOurs` then reads false |
+  | `metadata.ownerReferences` | not in apimachinery's immutable ObjectMeta set — that set is exactly `name`, `namespace`, `uid`, `creationTimestamp`, `deletionTimestamp`, `deletionGracePeriodSeconds` |
+  | `metadata.finalizers` | same; a foreign finalizer keeps the pod from ever being deleted |
+  | `spec.containers[*].image` | one of the five entries the API server allows a pod update to change |
+
+  Nine rows, of which the struck-through one is no longer reachable: eight are live.
+  For every hash still in that table the **deletion** is cheaper than the forgery,
+  because both consumers carry a presence guard (`recorded != "" && recorded !=
+  desired`), so setting the key to `null` makes the pod unmeasured rather than
+  mismatched. That is why the TLS fingerprint's answer was to leave pod metadata and
+  not to get a stronger digest, and it is the argument for moving `config-hash` and
+  `pod-spec-hash` next ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)
+  D6). Nothing narrower is expressible for the label and the drain stamp: those
+  are the writes the sidecar exists to make
+  ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).
 - **The workload pods have no securityContext at all.** No `runAsNonRoot`, no
   `readOnlyRootFilesystem`, no `capabilities: drop [ALL]`, no
   `seccompProfile` — verified by the absence of any `SecurityContext` in
@@ -218,11 +323,19 @@ password.
   ([`deployment.yaml`](deploy/helm/valkey-operator/templates/deployment.yaml)); the
   clusters it creates inherit whatever the namespace's Pod Security admission
   level allows. A restricted-PSA namespace will reject these pods outright.
-- **The data pod mounts the sidecar token into every container.**
+- ~~**The data pod mounts the sidecar token into every container.**
   `automountServiceAccountToken` is disabled on the observer pod and nowhere else,
   so the `valkey` and `exporter` containers carry the sidecar token too. It is a
   pod-level field, so splitting it per container is not expressible in Kubernetes;
-  a separate ServiceAccount per container would need a separate pod.
+  a separate ServiceAccount per container would need a separate pod.~~
+  **No longer true, and the last sentence never was.** Since 2026-08-27 the data pod
+  sets `automountServiceAccountToken: false` and projects the token into the
+  `sidecar` container alone; the Sentinel pod sets the flag and projects nothing.
+  The split needs no second ServiceAccount and no second pod — a hand-declared
+  `projected` volume with a `serviceAccountToken` source, mounted into one
+  container, has been GA since Kubernetes 1.20
+  ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
+  step 4).
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
   arbitrary strings with no registry allowlist, and the pods run with the
   namespace's default security posture.
@@ -306,15 +419,20 @@ pods), so the narrower alternative (dropping `escalate`) is worth testing.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["patch"]
+    verbs: ["get", "patch"]
     resourceNames: ["<cr-name>-0", "<cr-name>-1", "<cr-name>-2"]   # example: replicas 3
 ```
 
-What the sidecar actually calls: **`Pods(ns).Patch` and nothing else.** Verified
-by grep over `internal/sidecar` and `cmd/sidecar` — the only clientset call site is
-`patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
+What the sidecar actually calls: **`Pods(ns).Patch` and `Pods(ns).Get`, nothing
+else.** Verified by grep over `internal/sidecar` and `cmd/sidecar` — the clientset
+call sites are `patchMetadata` ([`internal/sidecar/labeler.go`](internal/sidecar/labeler.go)),
 used by `PatchLabel` (own pod, `instanceRole`) and `PatchAnnotation` (the peer pod
-the drain handler promoted). The grant matches that exactly: one verb, and only the
+the drain handler promoted), and `IsTerminating` (same file), the drain handler
+reading whether a promotion candidate carries a `DeletionTimestamp` before it
+forwards the drain window to it (added 2026-08-27, ADR 0028 D5a — promoting a
+terminating peer was measured wiping the fleet). `get` on the same named pods
+reveals pod specs of this cluster only; the Secrets those pods use are mounted,
+never inlined, so the read exposes no credential material. The grant matches that exactly: one verb, and only the
 pods of this cluster. `TestBuildSidecarRole` pins verb set and name list together,
 and the operator rewrites the Role on every reconcile, so existing clusters narrow
 on their next pass with no migration step.
@@ -349,6 +467,15 @@ Residual risks).
 The observer no longer shares this ServiceAccount: it runs under `<cr-name>-observer`,
 which is bound to no Role, and its pod sets `automountServiceAccountToken: false`, so
 it mounts no token to steal.
+
+**Since 2026-08-27 the grant reaches one container, not the whole data pod.** The pod
+still runs as `<cr-name>-sidecar` — a pod has one identity — but it sets
+`automountServiceAccountToken: false` and hands the token to the `sidecar` container
+through a projected volume it declares itself. `valkey-server`, both init containers
+and the third-party `redis_exporter` now hold no credential. Sentinel pods, which
+never call the API, set the same flag and declare no projection. This is D8 step 4 of
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md);
+section 3 lists what the grant still permits the sidecar itself.
 
 ### 4.3 The pre-upgrade hook
 
@@ -414,13 +541,16 @@ What that means in practice:
 | Change | Propagates? | Mechanism |
 |---|---|---|
 | `spec.image`, resources, probes, config | Yes | Pod-spec hash / config hash on the pod template, failover-aware rolling update ([`ComputePodSpecHash`](internal/builder/statefulset.go), `ComputeConfigHash`) |
-| cert-manager certificate renewal | Partially | The Secret content changes and the mount follows it; **whether the running `valkey-server` reloads the new material is not verified in this repo** |
+| cert-manager certificate renewal | **Yes**, since 2026-08-26 | The Secret content changes, the mount follows it, and a fingerprint of that content (`VKO_TLS_MATERIAL_HASH` in the carrier container of both StatefulSet pod templates) makes the rotation ride the failover-aware rolling update. Processes this repo owns re-read their material instead and are exempt. **Whether `valkey-server` itself reloads is still not verified** — it is treated as pinning so that nobody has to find out ([ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)) |
 | `spec.tls.secretName` (different Secret) | Yes | The name is part of the pod spec, so the hash changes and the pods roll |
 | **Password change inside the auth Secret** | **No** | See below |
 | `spec.auth.secretName` (different Secret) | Yes | Same reason as the TLS Secret name |
 
 **The password rotation gap, stated precisely.** The Secret is watched
-([`findValkeyForSecret`, `valkey_controller.go:1919`](internal/controller/valkey_controller.go))
+([`findValkeyForSecret`, `valkey_controller.go:2861`](internal/controller/valkey_controller.go),
+whose predicate `secretConcernsValkey` matches the auth Secret **and** the TLS Secrets of
+both tiers, unified and user-provided — until 2026-08-26 it matched auth Secrets only, so a
+certificate rotation enqueued nothing at all)
 and a change does enqueue a reconcile — but the password reaches the pods as an
 `env.valueFrom.secretKeyRef`, which Kubernetes resolves **once, at pod start**, and
 the pod-spec hash covers the *reference*, not the value. So after `kubectl edit
@@ -545,7 +675,9 @@ analysis.
 
 - [ ] **Scope the operator away from `secrets: get,list` on everything.** It needs
       the auth Secret and the TLS Secret of the namespaces it serves, not the
-      cluster's Secrets. Options: a namespaced Role per watched namespace, or a
+      cluster's Secrets. Since 2026-08-26 the TLS Secret is read on **every pass** of
+      every TLS cluster, for the material fingerprint, so a filtered cache has one
+      more consumer to satisfy. Options: a namespaced Role per watched namespace, or a
       cache filtered by label with the ClusterRole narrowed to match. Cost: the
       operator stops being install-and-forget for new namespaces.
 - [ ] **Re-examine `roles: escalate` + `rolebindings` + `serviceaccounts: create`.**
@@ -635,12 +767,46 @@ analysis.
       ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 2,
       done 2026-08-21). `<cr-name>-observer` is bound to no Role and the pod sets
       `automountServiceAccountToken: false`.
-- [ ] **Stop mounting the sidecar token into the `valkey` and `exporter`
-      containers.** `automountServiceAccountToken` is a pod-level field, so the
-      only way to give the sidecar a token the other containers do not have is to
-      move it out of the pod — a design change, not a flag.
+- [x] **Stop mounting the sidecar token into the `valkey` and `exporter`
+      containers** ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+      D8 step 4, done 2026-08-27). The row used to say this needed moving the token
+      out of the pod. It did not: `automountServiceAccountToken: false` plus a
+      hand-declared `projected` volume mounted into the `sidecar` container is the
+      supported pattern, GA since Kubernetes 1.20. `valkey`, `exporter` and both init
+      containers now carry no token; the Sentinel pod carries none at all. The sidecar
+      container still holds the grant and must.
 - [ ] **Add egress NetworkPolicies.** Today's policies are ingress-only, so a
       compromised data pod can talk to anything, the API server included.
+- [ ] **Watch for a certificate roll that never starts.** A rotation is propagated by
+      replacing the pods that cannot reload their material, and the previous
+      certificate stays valid for the cert-manager overlap — 30 days at defaults — so
+      the roll is never urgent. What that window does not cover is a roll that does not
+      happen at all. The `TLSMaterialStale` condition reports it per cluster and the
+      shipped `ValkeyTLSMaterialStale` alert fires after **72 h**; the chart's
+      `PrometheusRule` is **default off**, so this entry stays unchecked until it is
+      enabled. Read it as a liveness check on the roll, **not** as an integrity check on
+      the material: the fingerprint it compares is forgeable by whoever can write
+      the Secret, by collision against a 32-bit digest (see section 2). That is
+      **accepted permanently** as of 2026-08-27 — a wide digest would remove the
+      collision and leave a substitution indistinguishable from a legitimate
+      rotation, which no observer can act on. See
+      [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D11.
+
+- [ ] **Do not extend the TLS material fingerprint to low-entropy secrets — at any
+      digest strength.** The `VKO_TLS_MATERIAL_HASH` record is a digest of Secret
+      content, published on the pod template and readable with `get pods`. Over a
+      private key that is harmless, because nobody can enumerate 2048-bit RSA keys;
+      over the cluster password it would be a brute-forceable oracle, because an
+      attacker holding the digest guesses candidates and hashes them. **The security
+      parameter is the entropy of the input, not the width of the digest** — this row
+      used to say "32-bit", which read as though SHA-256 would make the password case
+      safe. It would not; it would only make the guessing marginally slower. Moving
+      the carrier into the pod spec
+      ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md))
+      changed who can *write* it and nothing about who can read it. ADR 0030 D11
+      bounds the exception to TLS material, and the password rotation gap in
+      section 6 must not be closed by copying it.
+
 - [ ] **Require client certificates where the deployment can.**
       `tls-auth-clients optional` means TLS authenticates the server only.
 - [ ] **Do not leave `spec.sentinel.disableAuth` or either `allowUnencrypted` on

@@ -91,3 +91,18 @@ func NudgePatch(now time.Time) []byte {
 	return []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`,
 		AnnotationNudge, now.UTC().Format(time.RFC3339)))
 }
+
+// AnnotationTLSMaterialHash is the **superseded** carrier of the TLS material
+// fingerprint, kept because pods created before 2026-08-27 still hold it.
+//
+// The operator no longer writes it. It carried a value the operator then trusted,
+// and pod metadata is patchable by anything holding the sidecar token, so a
+// single merge patch setting the key to null made the pod unmeasured -- no
+// collision needed, and no digest strength would have helped. The fingerprint
+// moved into the pod spec, which the API server refuses to change after creation
+// (TLSMaterialHashEnvName, ADR 0031).
+//
+// RecordedTLSMaterialHash is the only reader left, and it consults this key only
+// for a pod that carries no env. That fallback is self-extinguishing: a pod it
+// fires on is a pod the roll then replaces with one that carries the env.
+const AnnotationTLSMaterialHash = "vko.gtrfc.com/tls-material-hash"

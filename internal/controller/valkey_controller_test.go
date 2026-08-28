@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -94,9 +95,17 @@ func newTestReconcilerWithInterceptor(funcs interceptor.Funcs, objs ...client.Ob
 
 	return &ValkeyReconciler{
 		Client:          fakeClient,
+		APIReader:       fakeClient,
 		Scheme:          s,
 		InstanceChecker: &mockInstanceChecker{},
 		OperatorImage:   "ghcr.io/guided-traffic/valkey-operator:test",
+		// Every test reconciler records Events, whether or not the test looks at
+		// them. recordEvent returns early on a nil recorder, so the previous default
+		// meant a test could neither observe a new Event nor fail on one -- which is
+		// how a Warning per controlled failover shipped with zero assertions against
+		// it (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D8).
+		// A test that wants to read them replaces this with its own recorder.
+		Recorder: &fakeEventRecorder{},
 		// Redirect all Valkey client connections to localhost so unit tests
 		// get instant "connection refused" instead of DNS/TCP timeouts.
 		// The original port is preserved so tests that verify port selection
@@ -873,6 +882,34 @@ func TestStatusUnchanged_DetectsChanges(t *testing.T) {
 	diffMaster := base.DeepCopy()
 	diffMaster.MasterPod = "test-1"
 	assert.False(t, statusUnchanged(base, diffMaster), "different masterPod should be detected")
+
+	// The three fields this test used to omit. observerReady is the one that mattered: the
+	// comparison was correct all along and was dead code, because updateStatus assigned
+	// the field before the caller captured the baseline it is compared against. A
+	// field-by-field test cannot see that, which is why the transition itself is pinned in
+	// TestUpdateStatus_ObserverReadyTransitionIsPersistedOnItsOwn — but a comparison this
+	// helper does not make is worth failing on here.
+	diffObserver := base.DeepCopy()
+	diffObserver.ObserverReady = ptr.To(true)
+	assert.False(t, statusUnchanged(base, diffObserver),
+		"observerReady appearing must be detected")
+
+	observerFlipped := diffObserver.DeepCopy()
+	observerFlipped.ObserverReady = ptr.To(false)
+	assert.False(t, statusUnchanged(diffObserver, observerFlipped),
+		"observerReady flipping must be detected; this is the field that froze on a live fleet")
+
+	diffVersion := base.DeepCopy()
+	diffVersion.OperatorVersion = "1.12.0"
+	assert.False(t, statusUnchanged(base, diffVersion), "different operatorVersion should be detected")
+
+	diffConditions := base.DeepCopy()
+	diffConditions.Conditions = []metav1.Condition{{
+		Type:   vkov1.ConditionTypeReady,
+		Status: metav1.ConditionTrue,
+		Reason: "AllReplicasReady",
+	}}
+	assert.False(t, statusUnchanged(base, diffConditions), "a new condition should be detected")
 }
 
 // --- Unified Certificate migration ---
@@ -1282,14 +1319,25 @@ func TestCleanseCertificateSpec_RemovesPrivateKey(t *testing.T) {
 
 // --- ConfigMap Update ---
 
+// TestReconcile_UpdatesConfigMapOnSpecChange keeps its original subject — the
+// ConfigMap converges on a spec change — and now asserts the second half with it.
+//
+// Toggling spec.persistence on a running cluster is the one change the StatefulSet
+// cannot take: its volumeClaimTemplates are immutable, so the pass refuses the
+// write and reports it. The inversion from "the pass succeeds" to "the pass reports
+// a conflict" is deliberate and is the documented consequence of ADR 0023 A2(i) —
+// the ConfigMap keeps converging while the StatefulSet is held. Both halves are
+// asserted, because a pass that stopped writing the ConfigMap and a pass that wrote
+// the StatefulSet anyway would each be a regression.
 func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	v := newTestValkey("test", "default")
 	r, c := newTestReconciler(v)
+	key := types.NamespacedName{Name: "test", Namespace: "default"}
 
 	reconcileOnce(t, r, "test", "default")
 
 	// Enable persistence.
-	err := c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, v)
+	err := c.Get(context.Background(), key, v)
 	require.NoError(t, err)
 
 	v.Spec.Persistence = &vkov1.PersistenceSpec{
@@ -1300,7 +1348,9 @@ func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	err = c.Update(context.Background(), v)
 	require.NoError(t, err)
 
-	reconcileOnce(t, r, "test", "default")
+	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	require.Error(t, err, "the live StatefulSet has no claims and cannot gain one")
+	assert.ErrorIs(t, err, errRecreateRequired)
 
 	cm := &corev1.ConfigMap{}
 	err = c.Get(context.Background(), types.NamespacedName{
@@ -1309,7 +1359,15 @@ func TestReconcile_UpdatesConfigMapOnSpecChange(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should now contain RDB save directives.
-	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "save 900 1")
+	assert.Contains(t, cm.Data[builder.ValkeyConfigKey], "save 900 1",
+		"a held StatefulSet must not stop the rest of the pass from converging (ADR 0001 D1)")
+
+	stored := &vkov1.Valkey{}
+	require.NoError(t, c.Get(context.Background(), key, stored))
+	blocked := findCondition(stored, vkov1.ConditionTypeReconcileBlocked)
+	require.NotNil(t, blocked, "the conflict has to be visible on the CR, not only in the returned error")
+	assert.Equal(t, metav1.ConditionTrue, blocked.Status)
+	assert.Equal(t, vkov1.ReasonRecreateRequired, blocked.Reason)
 }
 
 // --- StatefulSet Update ---
@@ -2747,9 +2805,12 @@ func TestReconcile_ObserverStatus_FalseWhenNoReadyReplicas(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
 
 	// Observer deployment was just created, no ready replicas yet.
-	if updated.Status.ObserverReady != nil {
-		assert.False(t, *updated.Status.ObserverReady, "observer should not be ready when deployment has no ready replicas")
-	}
+	//
+	// Asserted unconditionally. This used to sit behind `if updated.Status.ObserverReady
+	// != nil`, and that hedge is why the defect below shipped: the field could be nil on
+	// a pass that should have set it and the test still passed.
+	require.NotNil(t, updated.Status.ObserverReady, "an observer-enabled CR must report a verdict")
+	assert.False(t, *updated.Status.ObserverReady, "observer should not be ready when deployment has no ready replicas")
 }
 
 func TestReconcile_ObserverStatus_NilWhenDisabled(t *testing.T) {
@@ -2762,6 +2823,87 @@ func TestReconcile_ObserverStatus_NilWhenDisabled(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, updated))
 
 	assert.Nil(t, updated.Status.ObserverReady, "observer status should be nil when observer is disabled")
+}
+
+// markObserverDeploymentReady drives the observer Deployment to one ready replica, which
+// is what isObserverDeploymentReady measures.
+func markObserverDeploymentReady(t *testing.T, c client.Client, v *vkov1.Valkey) {
+	t.Helper()
+	deploy := &appsv1.Deployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
+		Name: builder.ObserverDeploymentName(v), Namespace: v.Namespace}, deploy))
+	deploy.Status.Replicas = 1
+	deploy.Status.ReadyReplicas = 1
+	deploy.Status.AvailableReplicas = 1
+	require.NoError(t, c.Status().Update(context.Background(), deploy))
+}
+
+// [REGRESSION] status.observerReady must be able to move on its own.
+//
+// It could not, from the day it was added until 2026-08-26: updateStatus assigned it in
+// its prologue, BEFORE updateStandaloneStatus/updateHAStatus captured the prevStatus that
+// statusUnchanged compares against - so the comparison at statusUnchanged's ObserverReady
+// branch ran the freshly computed value against itself and could never report a change. On
+// a cluster where nothing else about the status moved, an observer that came up was never
+// persisted.
+//
+// Measured on a live fleet before the fix: a status write at 07:05:07Z sampled the
+// observer three seconds before it became Available at 07:05:10Z, and the CR still read
+// false at 07:19Z. Six of eight observer-enabled clusters carried a wrong value, in both
+// directions. The fix is that the assignment moved next to OperatorVersion in
+// persistStatus, which is the side of the capture the NOTE in updateStatus already
+// documented for exactly this hazard (ADR 0002 D5).
+func TestUpdateStatus_ObserverReadyTransitionIsPersistedOnItsOwn(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+	ctx := context.Background()
+
+	reconcileOnce(t, r, "test", "default")
+	markStatefulSetReady(t, c, v)
+	stored := crGet(t, c, v.Name)
+	require.NoError(t, r.updateStatus(ctx, stored))
+	stored = crGet(t, c, v.Name)
+	require.NotNil(t, stored.Status.ObserverReady)
+	require.False(t, *stored.Status.ObserverReady, "the observer Deployment has no ready replica yet")
+
+	// The observer comes up, and NOTHING else about the status changes: same phase, same
+	// message, same conditions, same replica counts, same operator version. Before the fix
+	// this pass wrote nothing at all.
+	markObserverDeploymentReady(t, c, v)
+	require.NoError(t, r.updateStatus(ctx, stored))
+
+	after := crGet(t, c, v.Name)
+	require.NotNil(t, after.Status.ObserverReady)
+	assert.True(t, *after.Status.ObserverReady,
+		"an observer that became ready must reach the CR even when it is the only thing that changed")
+}
+
+// The same defect in the other direction: disabling the observer sets the field to nil,
+// and that assignment sat before the same capture, so a stored true was never cleared.
+func TestUpdateStatus_DisablingTheObserverClearsAStoredVerdict(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
+		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+	})
+	r, c := newTestReconciler(v)
+	ctx := context.Background()
+
+	reconcileOnce(t, r, "test", "default")
+	markStatefulSetReady(t, c, v)
+	markObserverDeploymentReady(t, c, v)
+	stored := crGet(t, c, v.Name)
+	require.NoError(t, r.updateStatus(ctx, stored))
+	require.NotNil(t, crGet(t, c, v.Name).Status.ObserverReady, "precondition: a verdict is stored")
+
+	// Disable it, changing nothing else about the observable status.
+	stored = crGet(t, c, v.Name)
+	stored.Spec.Observer = nil
+	require.NoError(t, c.Update(ctx, stored))
+	require.NoError(t, r.updateStatus(ctx, stored))
+
+	assert.Nil(t, crGet(t, c, v.Name).Status.ObserverReady,
+		"a disabled observer must not leave its last verdict standing on the CR")
 }
 
 // --- No-Master Recovery ---

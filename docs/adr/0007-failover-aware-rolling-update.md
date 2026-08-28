@@ -5,7 +5,16 @@
 Accepted. Date: 2026-08-21.
 
 The strategy itself predates this ADR set; the template-source and freshness-guard
-decisions below landed on branch `feat/support-pdb`. Guards, per decision:
+decisions below landed on branch `feat/support-pdb`.
+
+Amended 2026-08-27: **D2 undercounted its own inputs.** It named four sts-derived values and
+the persisted container list; `tlsMaterialHashFromSts`, added by
+[ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D4, was
+never registered here. The count is corrected in place and the rule it states is unchanged —
+that input always did come from the persisted template, which is why a blocked StatefulSet
+write cannot turn a certificate rotation into a pod-delete loop.
+
+Guards, per decision:
 
 * D2, D3 — the five tests of
   [`internal/controller/rolling_update_blocked_write_test.go`](../../internal/controller/rolling_update_blocked_write_test.go)
@@ -96,14 +105,19 @@ a pod that would then have to full-resync. Replacing the master last means the p
 holding the authoritative dataset is disturbed exactly once, at the end, when a synced
 successor already exists.
 
-**D2 — Every "desired" input comes from the live StatefulSet, never from the CR.** Four
+**D2 — Every "desired" input comes from the live StatefulSet, never from the CR.** Five
 are named values: `valkeyImageFromSts(sts)`, `sidecarImageFromSts(sts)`,
 `configHashFromSts(sts)` (the `vko.gtrfc.com/config-hash` annotation on the persisted pod
-template) and `podSpecHashFromSts(sts)`. The fifth is the persisted template's own
-container list, `currentSts.Spec.Template.Spec.Containers`, which every `podNeedsUpdate`
-call site passes through to `podSpecHashChanged` as the fallback for a pod carrying no
-`vko.gtrfc.com/pod-spec-hash` annotation — same source, and precisely the input the first
-residual risk below leans on. `v.Spec.Image` and `builder.ComputeConfigHash(v)` are read
+template), `podSpecHashFromSts(sts)` and `tlsMaterialHashFromSts(sts)` — the last added by
+[ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) D4
+and, until 2026-08-27, never registered here; it reads the `VKO_TLS_MATERIAL_HASH` env of
+the persisted template's carrier container, with the superseded
+`vko.gtrfc.com/tls-material-hash` annotation as a fallback
+([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)). The sixth is the
+persisted template's own container list, `currentSts.Spec.Template.Spec.Containers`, which
+every `podNeedsUpdate` call site passes through to `podSpecHashChanged` as the fallback for
+a pod carrying no `vko.gtrfc.com/pod-spec-hash` annotation — same source, and precisely the
+input the first residual risk below leans on. `v.Spec.Image` and `builder.ComputeConfigHash(v)` are read
 at no rolling-update decision site — not in `checkAndHandleRollingUpdate`,
 `collectPodStates`, `handleStandaloneRollingUpdate` or `handlePostManualFailover`. In one
 line:
@@ -122,7 +136,7 @@ and a malformed or partially-written template must never be able to trigger a de
 
 **D4 — The pre-`REPLICAOF` freshness guard compares the full pod template.** The new-pod
 guard in `handlePostManualFailover` calls `podNeedsUpdate` against the live StatefulSet
-with the same five sts-derived inputs used by `checkAndHandleRollingUpdate` and
+with the same sts-derived inputs used by `checkAndHandleRollingUpdate` and
 `collectPodStates`, rather than comparing the Valkey image alone. The old image-only
 guard was skipped entirely when the image was empty, so a config-hash-only rolling
 update passed it trivially and `REPLICAOF` was sent to the old, about-to-die master —
@@ -180,6 +194,14 @@ replication link stays Ready: the readiness probe is a plain PING against a conf
 observed. Consequence to hold on to: **readiness can never be used as a proxy for
 replication health anywhere in the operator** — the rolling update waits on sync state,
 not on readiness.
+
+*Second half, added 2026-08-25:* readiness is not a proxy for **being spendable** either.
+kubelet keeps `PodReady=True` for the whole termination of a pod whose probe still passes,
+so a pod the operator itself has just deleted answers Ready until it is gone. Every site
+that deletes, promotes or counts a pod therefore asks `podState.available()` rather than
+the Ready condition, and the four sites that only need to talk to a pod ask `reachable()`.
+The full rule, the carve-out and the delete gate:
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md).
 
 **D10 — Before a promotion, "synced" is the full replication answer, and the wait for it
 is bounded.** `waitForReplicasReady` and `verifyReplacedReplicasSynced` ask

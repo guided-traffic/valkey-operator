@@ -4,6 +4,24 @@
 
 Accepted. Date: 2026-08-21. Applies to **non-Sentinel** multi-replica clusters.
 
+Amended 2026-08-24 by [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md):
+the shared `demoteRogueMaster` helper (D20) emits `SplitBrainResolved` as a **Normal** Event,
+and the Consequence about status invisibility is narrowed to this check. Both are marked in
+place below.
+
+Amended 2026-08-27 by [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D5a
+and the [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) amendment of the same day:
+**a terminating pod is never the adopted or confirmed authority**, whatever evidence it
+carries — its dataset dies with it, measured in CI as a full-fleet `dbsize=0`. The guard
+binds every adoption and confirmation door of this check (`stampedMasters`,
+`confirmedMasterAuthority`, `adoptUnrecordedPromotion`) and refuses only on positive
+evidence: an unreadable Pod object refuses nothing, the same one-sided reading the
+creation-order rule already has. Demoting a terminating rogue stays allowed (D20 carve-out).
+
+Amended 2026-08-26 by [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md): D3's
+premise about what the operator knows inside a rolling update, and D16's list of stamp-clearing
+sites. Both are marked in place below.
+
 Supersedes two earlier shapes of the same check, both written and discarded during
 development on this branch. **Neither shipped, and neither is reproducible from git:**
 `internal/controller/steady_state_master.go` has exactly one commit in the whole history
@@ -66,10 +84,18 @@ state annotation is set. The healthy case costs no connection at all.
 
 **D3 — It never tie-breaks.** `detectAndResolveSplitBrain` is deliberately **not** reused,
 so the "most connected slaves" fallback stays unreachable from outside a rolling update.
-Inside an update the operator knows which pod it promoted; in steady state it does not,
+~~Inside an update the operator knows which pod it promoted; in steady state it does not,~~
 and that fallback ties at zero in a shrunken cluster and picks the lowest ordinal — the
 exact mechanism that destroyed a promoted pod's data (the loss was observed on a cluster;
 what is checkable in this repository is the tie-at-zero fallback itself).
+
+*Amended 2026-08-26 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D9).*
+The struck premise holds for the operator's **own** promotions and not for a sidecar drain
+that lands mid-roll: that promotion is recorded on the pod, not on the CR, so inside an
+update the operator knows which pod *it* promoted and nothing more. ADR 0028 closes the gap
+at the other site rather than here — the non-reuse itself stands, and its argument is now
+stronger: both branches of `refuseDemotion` fire on states a rolling update produces on
+purpose, so porting them would refuse every normal failover and every topology restoration.
 
 **D4 — The contract on the annotation, sharpened rather than widened:**
 
@@ -220,7 +246,14 @@ blocked the managed-resource writes can also reject those two; that failure is l
 next pass retries, and `persistKnownMaster` restores the in-memory value it could not write,
 leaving nothing half-applied.
 
-**D16 — The stamp has a lifecycle, and clearing it is correctness, not hygiene.** A stamp
+**D16 — The stamp has a lifecycle, and clearing it is correctness, not hygiene.**
+
+*Amended 2026-08-26 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D7).*
+~~The two clearing sites are `recordPromotedMaster` and `clearRollingUpdateState`.~~ There
+are three: `persistManualFailoverState` clears them too. It writes the known master
+directly, and covering it only at `clearRollingUpdateState` left a stale stamp in place for
+the whole roll — harmless while the roll resolver ignored stamps, and a wrong demotion once
+it reads them. A stamp
 means "a promotion nobody recorded", so once the operator records one the stamp is **spent
 evidence** — and evidence beats the annotation on the next pass (rule 1 is evidence-first),
 so a leftover stamp would have the operator adopt the stale pod and `REPLICAOF` the master
@@ -261,6 +294,15 @@ disagree with the one that actually routes writes, so the operator would consoli
 different set of masters than clients reach; a second demote path would duplicate the most
 destructive operation in the codebase.
 
+*Amended 2026-08-24 ([ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D7).*
+Sharing `demoteRogueMaster` means sharing its Event: it emits `SplitBrainResolved` as
+**Normal**, not Warning, in both regimes. ~~The helper emitted `SplitBrainResolved` as a
+Warning.~~ It reports a repair that succeeded, and the monitoring contract below names
+`SplitBrainUnresolved`, `SplitBrainDemotionRefused` and `MasterAdoptionRefused` — never this
+reason — so nothing documented here depended on the type. Reporting a completed repair as an
+alarm is what made the Warning channel unreadable during a rolling update; a Warning named
+split-brain now means one that nobody resolved.
+
 **D21 — No Pod watch.** The operator watches its owned objects and Secrets only. Evidence
 must therefore be durable enough to be read by a pass that arrives **late**, not only by one
 that observes a transient window — which is exactly what the drain stamp provides, at no new
@@ -290,6 +332,12 @@ at random.
   and the recorded pod as `status.masterPod` (`currentMasterPod` deliberately declines to
   pick a winner between two labeled masters). **Monitoring must key on all three Events**;
   the CR status will not show the split brain.
+  *Amended 2026-08-24:* still true for **this** check. The rolling-update regime does set a
+  condition since [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+  — `MultipleMasters`, written by `resolveSplitBrain` — but that condition is written only
+  while a rolling update is in flight, and D1 above is exactly the statement that this check
+  is the one that runs outside one. A steady-state split brain the operator could not resolve
+  is therefore still invisible in the CR status.
 * An unadopted, unrecorded promotion persists until the next natural reconcile. Accepted:
   it is not a data-plane emergency.
 * A split brain that appears while a rolling-update state annotation is *stuck* is not

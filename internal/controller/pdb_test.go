@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -230,12 +231,25 @@ type recordedEvent struct {
 
 // fakeEventRecorder collects Events instead of sending them to the API server.
 // It implements k8s.io/client-go/tools/events.EventRecorder.
+//
+// Every reconciler built by newTestReconciler carries one, so a test that never
+// mentions Events still observes them -- and a newly added Event can fail an
+// assertion instead of being dropped on a nil recorder, which is how a
+// per-failover Warning storm reached production unnoticed
+// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md, D8).
+//
+// The mutex is not decoration: findMaster probes pods concurrently
+// (docs/adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md), so a default recorder is
+// reachable from more than one goroutine of the same pass.
 type fakeEventRecorder struct {
+	mu     sync.Mutex
 	events []recordedEvent
 }
 
 func (f *fakeEventRecorder) Eventf(_ runtime.Object, _ runtime.Object,
 	eventType, reason, _, note string, args ...interface{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.events = append(f.events, recordedEvent{
 		eventType: eventType,
 		reason:    reason,
@@ -243,10 +257,17 @@ func (f *fakeEventRecorder) Eventf(_ runtime.Object, _ runtime.Object,
 	})
 }
 
+// all returns a copy of every collected Event.
+func (f *fakeEventRecorder) all() []recordedEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedEvent(nil), f.events...)
+}
+
 // withReason returns the collected Events carrying the given reason.
 func (f *fakeEventRecorder) withReason(reason string) []recordedEvent {
 	var matching []recordedEvent
-	for _, e := range f.events {
+	for _, e := range f.all() {
 		if e.reason == reason {
 			matching = append(matching, e)
 		}
@@ -254,7 +275,22 @@ func (f *fakeEventRecorder) withReason(reason string) []recordedEvent {
 	return matching
 }
 
-func (f *fakeEventRecorder) reset() { f.events = nil }
+// withType returns the collected Events of the given type (Normal / Warning).
+func (f *fakeEventRecorder) withType(eventType string) []recordedEvent {
+	var matching []recordedEvent
+	for _, e := range f.all() {
+		if e.eventType == eventType {
+			matching = append(matching, e)
+		}
+	}
+	return matching
+}
+
+func (f *fakeEventRecorder) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = nil
+}
 
 // pdbWriteCounter counts the create and update calls a pass issues against
 // PodDisruptionBudgets, so a warning can be asserted to be independent of them.

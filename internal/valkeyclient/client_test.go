@@ -129,6 +129,21 @@ quorum
 	assert.Equal(t, 2, info.Quorum)
 }
 
+// num-other-sentinels is the denominator of the majority a failover leader needs,
+// so it has to survive parsing even though nothing else in the reply moves with it.
+func TestParseSentinelMasterInfo_NumOtherSentinels(t *testing.T) {
+	raw := "name\ntest\nflags\nmaster\nnum-slaves\n2\nnum-other-sentinels\n4\nquorum\n2\n"
+	info := parseSentinelMasterInfo(raw)
+	assert.Equal(t, 4, info.NumOtherSentinels)
+}
+
+// A Sentinel that has seen nobody yet reports 0, and a reply that omits the field
+// must read the same way rather than as garbage.
+func TestParseSentinelMasterInfo_NumOtherSentinelsAbsent(t *testing.T) {
+	info := parseSentinelMasterInfo("name\ntest\nflags\nmaster\n")
+	assert.Equal(t, 0, info.NumOtherSentinels)
+}
+
 func TestParseSentinelMasterInfo_EmptyInput(t *testing.T) {
 	info := parseSentinelMasterInfo("")
 	assert.Equal(t, "", info.Name)

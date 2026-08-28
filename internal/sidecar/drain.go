@@ -2,8 +2,8 @@ package sidecar
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/guided-traffic/valkey-operator/internal/common"
+	"github.com/guided-traffic/valkey-operator/internal/tlsmaterial"
 	"github.com/guided-traffic/valkey-operator/internal/valkeyclient"
 )
 
@@ -154,7 +155,7 @@ func (d *DrainHandler) sentinelFailover(ctx context.Context, log drainLog) error
 // the topology has a master, so this drain has nothing to promote and nothing to
 // stamp. See findSyncedReplica for why that case is not hypothetical.
 func (d *DrainHandler) manualFailover(ctx context.Context, log drainLog) error {
-	replicaAddr, masterPresent, err := d.findSyncedReplica(log)
+	replicaAddr, masterPresent, err := d.findSyncedReplica(ctx, log)
 	if err != nil {
 		return fmt.Errorf("finding synced replica: %w", err)
 	}
@@ -257,10 +258,22 @@ func (d *DrainHandler) podNameFromHost(host string) (string, bool) {
 // Every reachable peer is therefore queried before "no master" may be concluded:
 // returning at the first synced replica could hand back a promotion target while
 // a master sits further down the list.
-func (d *DrainHandler) findSyncedReplica(log drainLog) (string, bool, error) {
+func (d *DrainHandler) findSyncedReplica(ctx context.Context, log drainLog) (string, bool, error) {
 	addrs := d.buildReplicaAddrs()
 	synced := ""
 	for _, addr := range addrs {
+		// A terminating peer is out of the running entirely -- as a promotion
+		// candidate and as a "master already present" answer. It keeps answering
+		// role queries for the whole of its termination and then returns on an
+		// empty volume, so promoting it (or deferring to it) forwards the drain
+		// window's writes into nothing. Measured in CI (2026-08-27): the drain of
+		// a chaos-killed master promoted the peer the rolling update had deleted
+		// in the same second, and the fleet consolidated toward the empty pod it
+		// came back as (ADR 0028 D5a). Unknown reads as alive -- an API blip must
+		// not fail a drain that has one bounded chance to run.
+		if d.peerIsTerminating(ctx, log, addr) {
+			continue
+		}
 		client := d.clientFactory.NewClient(addr)
 		info, err := client.InfoReplication()
 		if err != nil {
@@ -279,6 +292,29 @@ func (d *DrainHandler) findSyncedReplica(log drainLog) (string, bool, error) {
 		return "", false, fmt.Errorf("no synced replica found among %d candidates", len(addrs))
 	}
 	return synced, false, nil
+}
+
+// peerIsTerminating reports whether the peer behind addr provably carries a
+// DeletionTimestamp. Everything short of that proof -- an address that does not
+// parse, a name outside this StatefulSet, an API error -- reads as alive.
+func (d *DrainHandler) peerIsTerminating(ctx context.Context, log drainLog, addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	name, ok := d.podNameFromHost(host)
+	if !ok {
+		return false
+	}
+	terminating, err := d.patcher.IsTerminating(ctx, d.podNamespace, name)
+	if err != nil {
+		log.Info("cannot read a promotion candidate; treating it as alive", "pod", name, "error", err.Error())
+		return false
+	}
+	if terminating {
+		log.Info("peer is terminating; skipping it as a promotion candidate", "pod", name)
+	}
+	return terminating
 }
 
 // signalDrainComplete tells the Valkey container that it may exit
@@ -412,38 +448,31 @@ func splitHostPort(addr string) (string, string) {
 // --- Production ValkeyClientFactory ---
 
 // realValkeyClientFactory creates real Valkey clients with optional TLS and auth.
+//
+// It holds the TLS material source, not a parsed config: the drain promotion of
+// ADR 0012 is the one call this factory exists for, it happens once at the very
+// end of a pod's life, and a config parsed at process start is exactly the thing
+// that is stale by then on a cluster whose certificate rotated.
 type realValkeyClientFactory struct {
-	password  string
-	tlsConfig *tls.Config
+	password string
+	tlsSrc   *tlsmaterial.Reloader
 }
 
 // newRealValkeyClientFactory creates a factory from the sidecar config.
 func newRealValkeyClientFactory(cfg Config) (*realValkeyClientFactory, error) {
-	factory := &realValkeyClientFactory{
+	tlsSrc, err := sidecarTLSReloader(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building TLS config for drain handler: %w", err)
+	}
+	return &realValkeyClientFactory{
 		password: cfg.Password,
-	}
-	if cfg.TLSEnabled {
-		tlsCfg, err := buildSidecarTLSConfig(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("building TLS config for drain handler: %w", err)
-		}
-		factory.tlsConfig = tlsCfg
-	}
-	return factory, nil
+		tlsSrc:   tlsSrc,
+	}, nil
 }
 
 // NewClient creates a Valkey client for the given address, applying TLS and/or auth as configured.
 func (f *realValkeyClientFactory) NewClient(addr string) ValkeyCommander {
-	if f.tlsConfig != nil && f.password != "" {
-		return valkeyclient.NewTLSWithPassword(addr, f.tlsConfig, f.password)
-	}
-	if f.tlsConfig != nil {
-		return valkeyclient.NewTLS(addr, f.tlsConfig)
-	}
-	if f.password != "" {
-		return valkeyclient.NewWithPassword(addr, f.password)
-	}
-	return valkeyclient.New(addr)
+	return newValkeyClient(addr, f.tlsSrc, f.password)
 }
 
 // buildDrainHandler creates a DrainHandler from the sidecar Config with shared dependencies.

@@ -47,6 +47,14 @@ func RequiredImageTools() []string {
 		"echo",    // the init containers report their decision on stdout
 		"seq",     // enumerates the peer ordinals the discovery loop walks
 
+		// Sentinel init container: deriving the pinned Sentinel identity.
+		//
+		// Without sha1sum the init container leaves "sentinel myid" to Sentinel,
+		// which regenerates it on every pod replacement -- the peer-table drift
+		// ADR 0022 exists to prevent. The fallback is silent by design (a wrong id
+		// is worse than none), so the image check is the only thing that notices.
+		"sha1sum",
+
 		// Sentinel init container: rewriting the mounted config in place.
 		//
 		// sed is the one whose absence is silent rather than loud. It substitutes the
