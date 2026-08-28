@@ -28,7 +28,14 @@ through an uncached `APIReader` immediately before permitting a delete (a handfu
 per pod replacement, not per pass). A live look that cannot be performed changes nothing:
 the cached answer was already "quiet", and a gate must not manufacture a hold out of
 ignorance. The window is narrowed to the single read-to-delete gap, not closed — nothing
-short of an API-server-side transaction could close it.
+short of an API-server-side transaction could close it. The residue fired on the very next
+run: both writers deleted in the same second, each after a read that truthfully showed a
+quiet tier. That is the accepted physics of two uncoordinated writers, and the e2e sampler's
+attribution now carries it — an overlap containing the test's own victim whose other pod
+began terminating within `simultaneousDeleteWindow` (3 s) of the injection is the test's,
+while a delete past that window is a genuine violation, because the operator's live
+pre-delete read had the injected termination in front of it and a next-pass delete is at
+least a requeue interval away.
 
 Implemented: the `available()` / `reachable()` split on `podState` with the per-site answers of
 D1–D4, the delete gate of D5, the tier definition of D7, the bounded stall observation and the
