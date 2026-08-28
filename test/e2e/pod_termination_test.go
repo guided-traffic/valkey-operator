@@ -124,7 +124,7 @@ func runNoSecondDeleteScenario(t *testing.T, suffix string, sentinel bool) {
 		t.Logf("Deleting the already-replaced pod %s mid-roll (already terminating: %v)", victim, already)
 		// Armed before the delete, not after: the sampler ticks every 250 ms and must
 		// not classify the very first sample of our own deletion as the operator's.
-		sampler.attributeTo(victim, already)
+		sampler.attributeTo(victim, already, time.Now())
 		err := tc.kube.CoreV1().Pods(ns).Delete(context.Background(), victim, metav1.DeleteOptions{})
 		require.NoError(t, err, "deleting %s", victim)
 	} else {
@@ -283,6 +283,17 @@ func isPodReadyForTest(pod *corev1.Pod) bool {
 // roll take its next candidate, and it is also what makes a victim available here.
 // Waiting for a quiet tier instead would mean waiting for a window the operator
 // closes within the same second, and the injection would mostly not happen at all.
+//
+// Attribution has a time dimension, and it is the second CI-measured shape: the
+// operator verifies the tier with an uncached read immediately before every
+// delete (ADR 0026), so a delete of its own that lands within instants of the
+// injection was decided while the tier was still quiet -- two writers acting on
+// consistent reads, which no check-then-act on either side can prevent. One such
+// pod, first seen terminating within simultaneousDeleteWindow of the injection,
+// is therefore the tests overlap, not the operators. A pod that starts
+// terminating after the window is a genuine violation: the operators live read
+// had the injected termination in front of it by then, and a next-pass delete is
+// at least a requeue interval away.
 type terminationSampler struct {
 	t         *testing.T
 	tc        *testClients
@@ -301,10 +312,22 @@ type terminationSampler struct {
 
 	// victim is the pod this test deleted, empty until it did.
 	victim string
+	// injectedAt is when the test issued that delete.
+	injectedAt time.Time
 	// deletedBeforeVictim are the pods the operator had already put on their way
 	// out at that moment.
 	deletedBeforeVictim map[string]struct{}
+	// firstSeen records when each pod was first observed terminating, at the
+	// samplers 250 ms resolution -- the clock the window attribution runs on.
+	firstSeen map[string]time.Time
 }
+
+// simultaneousDeleteWindow is how close to the injection an operator delete may
+// begin and still be blind to it: the operators uncached tier read and its
+// delete are instants apart (measured in CI: same second), while a delete that
+// could actually have seen the injection is at least a requeue interval (10 s)
+// later. Three seconds separates the two regimes with margin on both sides.
+const simultaneousDeleteWindow = 3 * time.Second
 
 func newTerminationSampler(t *testing.T, tc *testClients, namespace, name string, replicas int) *terminationSampler {
 	return &terminationSampler{
@@ -313,25 +336,30 @@ func newTerminationSampler(t *testing.T, tc *testClients, namespace, name string
 		done:                make(chan struct{}),
 		seen:                map[string]struct{}{},
 		deletedBeforeVictim: map[string]struct{}{},
+		firstSeen:           map[string]time.Time{},
 	}
 }
 
 // attributeTo records the delete this test issued and what was already terminating
 // when it issued it, so overlaps the test caused can be told from the ones the
 // operator caused.
-func (s *terminationSampler) attributeTo(victim string, alreadyTerminating []string) {
+func (s *terminationSampler) attributeTo(victim string, alreadyTerminating []string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.victim = victim
+	s.injectedAt = at
 	for _, p := range alreadyTerminating {
 		s.deletedBeforeVictim[p] = struct{}{}
 	}
 }
 
-// causedByThisTest reports whether an observed overlap is one the test made. It is
-// true only when the test's own victim is in it and every other pod was already
-// terminating before the test deleted -- i.e. the operator issued its delete
-// first, into a quiet tier, and this test then deleted on top of it.
+// causedByThisTest reports whether an observed overlap is one the test made: the
+// tests own victim is in it, and every other pod either was already terminating
+// when the test deleted (the operator went first, into a quiet tier), or -- for
+// at most ONE pod -- began terminating within simultaneousDeleteWindow of the
+// injection, where the operators pre-delete live read could not have seen the
+// injection yet. Two simultaneous non-victim terminations are never excused:
+// at most one of them can be the blind counterpart of our own delete.
 //
 // The caller holds s.mu.
 func (s *terminationSampler) causedByThisTest(terminating []string) bool {
@@ -339,14 +367,21 @@ func (s *terminationSampler) causedByThisTest(terminating []string) bool {
 		return false
 	}
 	sawVictim := false
+	windowExcuses := 0
 	for _, p := range terminating {
 		if p == s.victim {
 			sawVictim = true
 			continue
 		}
-		if _, before := s.deletedBeforeVictim[p]; !before {
-			return false
+		if _, before := s.deletedBeforeVictim[p]; before {
+			continue
 		}
+		if windowExcuses == 0 && !s.injectedAt.IsZero() &&
+			s.firstSeen[p].Before(s.injectedAt.Add(simultaneousDeleteWindow)) {
+			windowExcuses++
+			continue
+		}
+		return false
 	}
 	return sawVictim
 }
@@ -379,19 +414,22 @@ func (s *terminationSampler) sample() {
 		terminating = append(terminating, podName)
 	}
 
-	s.record(terminating)
+	s.record(time.Now(), terminating)
 }
 
 // record classifies one observation. Split from sample so the classification can
 // be driven directly by TestTerminationSampler_AttributesOverlapsToWhoCausedThem:
 // the case that matters is the one a cluster run reaches only by chance, and a
 // path that only runs when a race happens to fire is a path nobody has tested.
-func (s *terminationSampler) record(terminating []string) {
+func (s *terminationSampler) record(at time.Time, terminating []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sampleCount++
 	for _, p := range terminating {
 		s.seen[p] = struct{}{}
+		if _, ok := s.firstSeen[p]; !ok {
+			s.firstSeen[p] = at
+		}
 	}
 	if len(terminating) > 1 {
 		if s.causedByThisTest(terminating) {
@@ -443,30 +481,49 @@ func (s *terminationSampler) excusedSamples() int {
 func TestTerminationSampler_AttributesOverlapsToWhoCausedThem(t *testing.T) {
 	t.Parallel()
 
+	t0 := time.Now()
+	afterWindow := t0.Add(simultaneousDeleteWindow + 7*time.Second)
+	withinWindow := t0.Add(time.Second)
+
 	tests := []struct {
 		name        string
 		victim      string
 		already     []string
+		observedAt  time.Time
 		observed    []string
 		wantOverlap bool
 	}{
 		{
-			// The measured CI failure: the operator deleted term-*-2 into a quiet
-			// tier, logged that it was now waiting, and the test deleted term-*-1
-			// 0.6 s later. The operator held; the test piled on.
+			// The first measured CI failure: the operator deleted term-*-2 into a
+			// quiet tier, logged that it was now waiting, and the test deleted
+			// term-*-1 0.6 s later. The operator held; the test piled on.
 			name:        "the operator deleted first and the test piled on",
 			victim:      "term-1",
 			already:     []string{"term-2"},
+			observedAt:  afterWindow,
 			observed:    []string{"term-1", "term-2"},
 			wantOverlap: false,
 		},
 		{
-			// The violation this test exists to catch: the tier was quiet when the
-			// test deleted, and the operator then deleted its next candidate on top
-			// of a pod that was already on its way out.
+			// The second measured CI failure: both writers deleted in the same
+			// second, each after a read that showed a quiet tier. The operators
+			// uncached pre-delete look could not have seen the injection, so the
+			// overlap is the tests.
+			name:        "a blind simultaneous delete within the window",
+			victim:      "term-1",
+			already:     nil,
+			observedAt:  withinWindow,
+			observed:    []string{"term-1", "term-2"},
+			wantOverlap: false,
+		},
+		{
+			// The violation this test exists to catch: the operator deleted its next
+			// candidate long after the injected termination was in front of every
+			// read it makes -- a next-pass delete is at least a requeue interval away.
 			name:        "the operator deleted on top of the injected delete",
 			victim:      "term-1",
 			already:     nil,
+			observedAt:  afterWindow,
 			observed:    []string{"term-1", "term-2"},
 			wantOverlap: true,
 		},
@@ -474,28 +531,33 @@ func TestTerminationSampler_AttributesOverlapsToWhoCausedThem(t *testing.T) {
 			name:        "an overlap the test had no part in",
 			victim:      "term-1",
 			already:     []string{"term-2"},
+			observedAt:  afterWindow,
 			observed:    []string{"term-0", "term-2"},
 			wantOverlap: true,
 		},
 		{
-			// Three at once is never excusable: at most one of them is ours.
+			// Three at once is never excusable: at most one of them can be the
+			// blind counterpart of our own delete, even inside the window.
 			name:        "a third pod joins an excusable pair",
 			victim:      "term-1",
-			already:     []string{"term-2"},
+			already:     nil,
+			observedAt:  withinWindow,
 			observed:    []string{"term-0", "term-1", "term-2"},
 			wantOverlap: true,
 		},
 		{
 			// Before the injection there is nothing to attribute, so every overlap
-			// is the operator's.
+			// is the operators.
 			name:        "an overlap before the injection",
 			victim:      "",
+			observedAt:  withinWindow,
 			observed:    []string{"term-1", "term-2"},
 			wantOverlap: true,
 		},
 		{
 			name:        "a single terminating pod is not an overlap",
 			victim:      "term-1",
+			observedAt:  withinWindow,
 			observed:    []string{"term-1"},
 			wantOverlap: false,
 		},
@@ -505,13 +567,13 @@ func TestTerminationSampler_AttributesOverlapsToWhoCausedThem(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTerminationSampler(t, nil, "ns", "term", 3)
 			if tt.victim != "" {
-				s.attributeTo(tt.victim, tt.already)
+				s.attributeTo(tt.victim, tt.already, t0)
 			}
 
-			s.record(tt.observed)
+			s.record(tt.observedAt, tt.observed)
 
 			if tt.wantOverlap {
-				assert.Len(t, s.overlaps(), 1, "this overlap is the operator's and must be reported")
+				assert.Len(t, s.overlaps(), 1, "this overlap is the operators and must be reported")
 				assert.Zero(t, s.excusedSamples())
 				return
 			}
@@ -525,11 +587,13 @@ func TestTerminationSampler_AttributesOverlapsToWhoCausedThem(t *testing.T) {
 func TestTerminationSampler_KeepsReportingAfterAnExcusedOverlap(t *testing.T) {
 	t.Parallel()
 
+	t0 := time.Now()
 	s := newTerminationSampler(t, nil, "ns", "term", 3)
-	s.attributeTo("term-1", []string{"term-2"})
+	s.attributeTo("term-1", []string{"term-2"}, t0)
 
-	s.record([]string{"term-1", "term-2"}) // ours
-	s.record([]string{"term-1", "term-0"}) // the operator deleting on top of ours
+	s.record(t0.Add(time.Second), []string{"term-1", "term-2"}) // ours
+	s.record(t0.Add(simultaneousDeleteWindow+10*time.Second),
+		[]string{"term-1", "term-0"}) // the operator deleting on top of ours
 
 	assert.Equal(t, 1, s.excusedSamples())
 	assert.Len(t, s.overlaps(), 1)
