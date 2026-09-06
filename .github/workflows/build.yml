@@ -170,9 +170,11 @@ jobs:
           fi
 
       - name: Update Chart Version
+        id: version
         run: |
           # Extrahiere Version aus dem Release-Tag (ohne 'v' Prefix)
           VERSION=${GITHUB_REF_NAME#v}
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           # Aktualisiere Chart und App Version
           sed -i "s/^version:.*$/version: ${VERSION}/" deploy/helm/valkey-operator/Chart.yaml
           sed -i "s/^appVersion:.*$/appVersion: \"${VERSION}\"/" deploy/helm/valkey-operator/Chart.yaml
@@ -229,11 +231,16 @@ jobs:
           git commit -m "Release Helm chart for $GITHUB_REF_NAME"
           git push --force origin gh-pages
 
+      # The working directory is the gh-pages checkout, which holds every chart ever
+      # published: a `*.tgz` glob here attached the whole chart history to each release
+      # (89 assets on v1.12.3). Only this release's own package belongs on it.
+      # index.yaml is the full repo index and stays as a restorable snapshot of gh-pages.
       - name: Update Release Assets
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            *.tgz
+            valkey-operator-${{ steps.version.outputs.version }}.tgz
             index.yaml
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
