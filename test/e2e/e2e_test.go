@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -416,27 +418,49 @@ func buildValkeyObject(name, namespace string, spec map[string]interface{}) *uns
 	}
 }
 
-// waitForServiceEndpoints waits until a Service has at least one endpoint with the expected port.
-func (tc *testClients) waitForServiceEndpoints(t *testing.T, namespace, name string) {
-	t.Helper()
-	ctx := context.Background()
-
-	err := wait.PollUntilContextTimeout(ctx, pollInterval, testTimeout, true, func(ctx context.Context) (bool, error) {
-		ep, err := tc.kube.CoreV1().Endpoints(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		for _, subset := range ep.Subsets {
-			if len(subset.Addresses) > 0 {
-				return true, nil
-			}
-		}
-		return false, nil
+// readyEndpointPodNames returns the sorted, de-duplicated names of the pods that
+// currently back a Service with a ready address. It is the only endpoint reader in
+// the suite; the three callers differ only in how they wait on it.
+//
+// It reads discovery.k8s.io/v1 EndpointSlices and not v1 Endpoints, which is
+// deprecated since Kubernetes 1.33 and made every run log "v1 Endpoints is
+// deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice" once per client.
+//
+// A Service owns one slice per address type, and more once it outgrows the
+// per-slice limit, so the names are collected across all of them and de-duplicated:
+// a dual-stack Service lists the same pod in its IPv4 and its IPv6 slice, where the
+// per-address count this replaces would have counted it twice.
+//
+// A nil Conditions.Ready means ready -- the field is optional and its absence is
+// defined as ready -- which is what makes this the equivalent of the ready-only
+// Subsets[].Addresses it replaces, as opposed to NotReadyAddresses.
+func (tc *testClients) readyEndpointPodNames(ctx context.Context, namespace, serviceName string) ([]string, error) {
+	slices, err := tc.kube.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: discoveryv1.LabelServiceName + "=" + serviceName,
 	})
-	require.NoError(t, err, "Service %s/%s did not get endpoints", namespace, name)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	var names []string
+	for i := range slices.Items {
+		for _, ep := range slices.Items[i].Endpoints {
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			if ep.TargetRef == nil || ep.TargetRef.Kind != "Pod" {
+				continue
+			}
+			if _, dup := seen[ep.TargetRef.Name]; dup {
+				continue
+			}
+			seen[ep.TargetRef.Name] = struct{}{}
+			names = append(names, ep.TargetRef.Name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // replicationEstablished reports whether a master INFO replication output shows the
@@ -696,6 +720,16 @@ func (tc *testClients) valkeyPodForensics(t *testing.T, namespace, podName strin
 // valkeyContainerName is the name the builder gives the Valkey container
 // (internal/builder/statefulset.go, ValkeyContainerName).
 const valkeyContainerName = "valkey"
+
+// containerImage returns the image of the named container, or "" when absent.
+func containerImage(pod *corev1.Pod, container string) string {
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == container {
+			return pod.Spec.Containers[i].Image
+		}
+	}
+	return ""
+}
 
 // containerStateSummary renders a container state as one short field.
 func containerStateSummary(state corev1.ContainerState) string {

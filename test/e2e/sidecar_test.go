@@ -45,39 +45,22 @@ func (tc *testClients) waitForPodLabel(t *testing.T, namespace, podName, labelKe
 // getEndpointPodNames returns the names of pods backing a service's endpoints.
 func (tc *testClients) getEndpointPodNames(t *testing.T, namespace, serviceName string) []string {
 	t.Helper()
-	ep, err := tc.kube.CoreV1().Endpoints(namespace).Get(
-		context.Background(), serviceName, metav1.GetOptions{})
+	names, err := tc.readyEndpointPodNames(context.Background(), namespace, serviceName)
 	if err != nil {
-		t.Logf("Failed to get endpoints for %s: %v", serviceName, err)
+		t.Logf("Failed to list endpoint slices for %s: %v", serviceName, err)
 		return nil
 	}
-	var podNames []string
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			if addr.TargetRef != nil && addr.TargetRef.Kind == "Pod" {
-				podNames = append(podNames, addr.TargetRef.Name)
-			}
-		}
-	}
-	return podNames
+	return names
 }
 
 // waitForEndpointPodCount waits until a service has the expected number of ready
-// endpoint addresses.
+// endpoint pods.
 func (tc *testClients) waitForEndpointPodCount(t *testing.T, namespace, serviceName string, expected int) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		ep, err := tc.kube.CoreV1().Endpoints(namespace).Get(
-			context.Background(), serviceName, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-		count := 0
-		for _, subset := range ep.Subsets {
-			count += len(subset.Addresses)
-		}
-		t.Logf("Service %s endpoints: %d (want %d)", serviceName, count, expected)
-		return count == expected
+		names := tc.getEndpointPodNames(t, namespace, serviceName)
+		t.Logf("Service %s endpoints: %d (want %d)", serviceName, len(names), expected)
+		return len(names) == expected
 	}, testTimeout, pollInterval,
 		"Service %s/%s did not reach %d endpoints", namespace, serviceName, expected)
 }
