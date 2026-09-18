@@ -261,6 +261,17 @@
       ]
     },
     {
+      "description": "k8s.io/kube-openapi and sigs.k8s.io/structured-merge-diff are indirect deps whose compatible version is dictated by the k8s.io/apimachinery release branch, not by their own tip. Renovate's digest updates advanced kube-openapi past the commit where it switched to structured-merge-diff/v7, which apimachinery v0.37.0 cannot compile against - every job that loads packages died on 'cannot use typeSchema.Types ... v7 ... as ... v6'. Let MVS pick both from apimachinery; they still advance whenever the k8s.io/* group does.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "k8s.io/kube-openapi",
+        "/^sigs\\.k8s\\.io/structured-merge-diff//"
+      ],
+      "enabled": false
+    },
+    {
       "description": "Use 'fix' instead of 'chore' for dependency updates",
       "semanticCommitType": "fix",
       "matchUpdateTypes": [

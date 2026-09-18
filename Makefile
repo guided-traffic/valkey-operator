@@ -23,6 +23,32 @@ endif
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
+LOCALBIN ?= $(shell pwd)/bin
+## Tool Binaries
+KUSTOMIZE ?= $(LOCALBIN)/kustomize
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+GOCYCLO ?= $(LOCALBIN)/gocyclo
+GOSEC ?= $(LOCALBIN)/gosec
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
+
+## Tool Versions
+# renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
+KUSTOMIZE_VERSION ?= v5.8.1
+# renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
+CONTROLLER_GEN_VERSION ?= v0.22.0
+# renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
+ENVTEST_VERSION ?= release-0.19
+# renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+GOLANGCI_LINT_VERSION ?= v2.13.2
+# renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
+GOCYCLO_VERSION ?= v0.6.0
+# renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
+GOSEC_VERSION ?= v2.29.0
+# renovate: datasource=go depName=golang.org/x/vuln/cmd/govulncheck
+GOVULNCHECK_VERSION ?= v1.8.0
+
 .PHONY: all
 all: build
 
@@ -51,16 +77,14 @@ lint: golangci-lint ## Run linting.
 	$(GOLANGCI_LINT) run --timeout=5m
 
 .PHONY: cyclo
-cyclo: ## Run cyclomatic complexity analysis.
+cyclo: $(GOCYCLO) ## Run cyclomatic complexity analysis.
 	@echo "Running cyclomatic complexity analysis (threshold: $(CYCLO_THRESHOLD))..."
-	@which gocyclo > /dev/null || (echo "Installing gocyclo..." && go install github.com/fzipp/gocyclo/cmd/gocyclo@$(GOCYCLO_VERSION))
-	@gocyclo -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && gocyclo -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && exit 1)
+	@$(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && $(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && exit 1)
 
 .PHONY: cyclo-report
-cyclo-report: ## Show full cyclomatic complexity report (including tests).
+cyclo-report: $(GOCYCLO) ## Show full cyclomatic complexity report (including tests).
 	@echo "Cyclomatic complexity report (sorted by complexity):"
-	@which gocyclo > /dev/null || (echo "Installing gocyclo..." && go install github.com/fzipp/gocyclo/cmd/gocyclo@$(GOCYCLO_VERSION))
-	@gocyclo -top 20 .
+	@$(GOCYCLO) -top 20 .
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
@@ -259,16 +283,14 @@ coverage-json: ## Generate coverage badge JSON for shields.io.
 ##@ Security
 
 .PHONY: gosec
-gosec: ## Run gosec security scan.
+gosec: $(GOSEC) ## Run gosec security scan.
 	@echo "Running gosec security scan..."
-	@which gosec > /dev/null || (echo "Installing gosec..." && go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION))
-	GOFLAGS="-buildvcs=false -p=$(GOSEC_CONCURRENCY)" GOMEMLIMIT=$(GOSEC_MEMLIMIT) gosec -concurrency=$(GOSEC_CONCURRENCY) ./...
+	GOFLAGS="-buildvcs=false -p=$(GOSEC_CONCURRENCY)" GOMEMLIMIT=$(GOSEC_MEMLIMIT) $(GOSEC) -concurrency=$(GOSEC_CONCURRENCY) ./...
 
 .PHONY: vuln
-vuln: ## Check for vulnerabilities.
+vuln: $(GOVULNCHECK) ## Check for vulnerabilities.
 	@echo "Checking for vulnerabilities..."
-	@which govulncheck > /dev/null || (echo "Installing govulncheck..." && go install golang.org/x/vuln/cmd/govulncheck@latest)
-	GOFLAGS="-buildvcs=false" govulncheck ./...
+	GOFLAGS="-buildvcs=false" $(GOVULNCHECK) ./...
 
 ##@ Code Generation
 
@@ -341,29 +363,8 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 ##@ Dependencies
 
 ## Location to install dependencies to
-LOCALBIN ?= $(shell pwd)/bin
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
-
-## Tool Binaries
-KUSTOMIZE ?= $(LOCALBIN)/kustomize
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-ENVTEST ?= $(LOCALBIN)/setup-envtest
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
-
-## Tool Versions
-# renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
-KUSTOMIZE_VERSION ?= v5.8.1
-# renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
-CONTROLLER_GEN_VERSION ?= v0.22.0
-# renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
-ENVTEST_VERSION ?= release-0.19
-# renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.13.2
-# renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
-GOCYCLO_VERSION ?= v0.6.0
-# renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.29.0
 
 # gosec defaults its concurrency to the CPU count and lets the Go toolchain fan
 # out one compiler per core while loading the (large) k8s dependency graph. On
@@ -404,6 +405,20 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+# gocyclo, gosec and govulncheck install into $(LOCALBIN) like every other tool
+# rather than into GOBIN: the previous `which <tool> || go install` probed PATH
+# but installed into GOPATH/bin, so on any machine where that is not on PATH the
+# target reinstalled on every run and then failed with "command not found" -
+# and where it was on PATH, a stale binary shadowed the pinned version forever.
+$(GOCYCLO): $(LOCALBIN)
+	$(call go-install-tool,$(GOCYCLO),github.com/fzipp/gocyclo/cmd/gocyclo,$(GOCYCLO_VERSION))
+
+$(GOSEC): $(LOCALBIN)
+	$(call go-install-tool,$(GOSEC),github.com/securego/gosec/v2/cmd/gosec,$(GOSEC_VERSION))
+
+$(GOVULNCHECK): $(LOCALBIN)
+	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and target path
 define go-install-tool
