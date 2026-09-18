@@ -34,6 +34,15 @@ the promoted pod lost its process afterwards: the workflow collects pod logs aft
 has finished, and every test namespace deletes itself in a defer, so the collection step had
 printed an empty section for months.
 
+Amended 2026-09-18: **D50 and D51 are new.** `TestE2E_RollingUpdate_TopologyRestoreAbandoned`
+failed on four runs in ten days, each time on a different leg, which is the shape of a test
+whose setup races rather than of a regression. It forces the abandon path by jamming pod-0's
+replication, and it picked the pod to jam by rolling-update state plus `role:slave` -- a pair
+the *outgoing* master also satisfies for the one second between the operator logging "Demoted
+outgoing master to replica" and "Deleting old master pod after manual failover". D51 is
+unrelated and came out of the same logs: every suite run was printing a deprecation warning
+for an API the operator does not use at all.
+
 Amended 2026-09-18: **D49 is new.** Three of the Makefile's own quality targets could not
 run on a developer machine at all, which is how D1's "the Makefile is the only entry point"
 had been true of CI and false locally.
@@ -406,6 +415,35 @@ both still advance whenever the `k8s-go-modules` group does, which is the only v
 that was ever supported; what is given up is a fix landing in the days between a kube-openapi
 commit and the k8s patch release that adopts it.
 
+**D50 — An e2e that forces a transient state pins the object identity it acts on, never a
+state name.** A rolling-update state annotation names a *phase*, and a phase spans more than
+one generation of the pod it is about. `jamPod0Replication` therefore waits for the pod-0 that
+runs the **new** image and carries no `deletionTimestamp` -- the outgoing master still runs the
+old one -- and reads the poisoned `masterauth` back rather than trusting the two `OK`s, because
+a pod replaced between the two commands answers `OK` from the process that is going away.
+Runtime `CONFIG SET` does not survive a pod replacement, so a jam that lands one second early
+is silently discarded, Phase 1 then finds a healthy link on the replacement, and the test fails
+on `TopologyRestored=True`/`Restored` having never entered the path it exists to cover
+(measured on runs 35312304295, 35315129844 and 35317540380).
+
+**The general rule is the one the four failures teach:** where a fixture manipulates a pod the
+operator is concurrently replacing, "which pod" is part of the assertion and has to be
+expressed as identity -- image, UID or `deletionTimestamp` -- not inferred from a controller
+state that outlives the object.
+
+**D51 — Endpoint membership is read through `discovery.k8s.io/v1` EndpointSlice.** `v1 Endpoints`
+is deprecated since Kubernetes 1.33 and each client using it logs
+`Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice` once.
+The operator never used the API -- it holds no `endpoints` RBAC marker and makes no such call --
+so this was the e2e suite alone, in three helpers: two now read through one
+`readyEndpointPodNames`, the same way D25 and D26 folded the duplicated Event pollers, and
+`waitForServiceEndpoints` is deleted rather than migrated -- it had no callers, and a second
+endpoint reader that nothing exercises is exactly what this decision says not to keep. The
+reader collects across every slice of a Service and de-duplicates by pod: a Service owns one
+slice per address type and more once it outgrows the per-slice limit, so the per-address count
+it replaces would have counted a dual-stack pod twice. A nil `Conditions.Ready` counts as
+ready, which is what keeps it equivalent to the ready-only `Subsets[].Addresses` it replaces.
+
 ### Coverage, complexity and record-keeping
 
 **D34 — Coverage gaps are decisions, exhaustively listed and re-stated each pass.** The
@@ -601,6 +639,11 @@ committed lockfile.** Three rules:
   cannot regenerate for itself.
 * `k8s.io/kube-openapi` and `sigs.k8s.io/structured-merge-diff` no longer appear in any Renovate
   PR (D48), so their movement is invisible until the `k8s.io/*` group bumps.
+* **A flaky required check now blocks every merge (D47).** That is the cost the 2026-09-18
+  required-contexts change bought and it was not visible when the change was written: three
+  E2E legs run per push, and one intermittent failure in any of them stops the queue where
+  it used to be waved through. D50 removes the one known instance; the policy answer for the
+  next one is to fix or quarantine it, never to drop the context.
 * `bin/` now holds seven tools instead of four (D49); a stale one is deleted, not upgraded in
   place, because `go-install-tool` skips whenever the file exists. A version bump therefore
   needs `rm bin/<tool>` locally — CI starts from an empty `bin/` and never sees it.
@@ -772,6 +815,17 @@ that; only a kube-openapi digest from apimachinery's own compatibility window ca
   unreviewed automerge by `guided-traffic-bot`.
 * **The 15 days of red `main` were never noticed by a human.** D47 stops the next one at the
   merge; nothing alerts on a red default branch, and that was not addressed.
+* **D50 is verified by mechanism, not by repetition.** The operator log of two failing runs
+  shows the jam landing between the demote and the delete, and the new gate cannot match that
+  pod; what has *not* been done is running the test enough times to show the failure rate is
+  now zero. A test that failed intermittently needs a green streak, not one green run, and the
+  streak is what CI will or will not produce.
+* **D50 leaves the window itself intact.** The jam still has to land between pod-0 becoming
+  Ready and Phase 1 observing a healthy link -- roughly ten seconds in the runs measured. It is
+  now the *only* window rather than one of two, and the read-back makes a missed jam retry
+  instead of pass, but a sufficiently slow `kubectl exec` can still miss it and would then fail
+  on the `jamPollTimeout` with a message naming the image, not on a confusing `Restored`.
+
 * **D49's `govulncheck` pin freezes what CI scans with.** It ran `@latest` before, so the
   scanner now advances only when Renovate bumps `GOVULNCHECK_VERSION`. The vulnerability
   database is fetched from `vuln.go.dev` at run time and is unaffected; a missed *scanner*
@@ -792,6 +846,8 @@ that; only a kube-openapi digest from apimachinery's own compatibility window ca
 * [`test/integration/`](../../test/integration/) — envtest suites, including the UID delete-precondition test
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
 * `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
+* [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamPod0Replication` and the D50 identity gate
+* [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
 * [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
