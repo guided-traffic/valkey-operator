@@ -186,6 +186,17 @@ and the operator cannot write something".
 Tier responsibilities, the verification rules (mutation and revert checks, what may be an e2e
 and what may not) and the CI matrix: [ADR 0017](docs/adr/0017-test-and-ci-policy.md).
 
+**A fixture that manipulates a pod the operator is concurrently replacing names the pod by
+identity, never by controller state.** A rolling-update state annotation names a phase, and a
+phase outlives the pod it is about: the abandon e2e jammed pod-0 on "state is one of three
+values and pod-0 answers `role:slave`", which the *outgoing* master also satisfies for the one
+second between the demote and the delete — runtime `CONFIG SET` dies with that pod, and the
+test failed on four runs in ten days, each on a different leg. Use the image, the UID or
+`deletionTimestamp`, and read the effect back rather than trusting the write. Endpoint
+membership is read through `discovery.k8s.io/v1` EndpointSlice (`readyEndpointPodNames`); `v1
+Endpoints` is deprecated since 1.33 and the operator never used it.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D50, D51
+
 ### Makefile as Entry Point
 
 Always use Makefile targets to run tests, linting, and analysis. Never invoke Go test commands or tools directly. The CI pipeline relies on the same targets.

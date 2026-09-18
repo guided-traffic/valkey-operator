@@ -21,7 +21,18 @@ package e2e
 // What does reach the abandon path is a pod-0 that returns, becomes Ready, accepts
 // the operator's REPLICAOF and then never reports master_link_status:up. That is
 // what jamPod0Replication produces, in a form that survives the operator's own
-// REPLICAOF and therefore does not race the state transition.
+// REPLICAOF.
+//
+// It does not, however, survive pod-0 being replaced, and for its first life this
+// test read as if it did: the jam gate was "rolling-update state is one of three
+// values and pod-0 answers role:slave", which the *outgoing* master also satisfies
+// for the one second between "Demoted outgoing master to replica" and "Deleting old
+// master pod after manual failover". A jam that lands there is thrown away with the
+// pod, Phase 1 finds a healthy link on the replacement and promotes pod-0 back, and
+// the test fails on TopologyRestored=True/Restored having never reached the path it
+// exists to cover. jamPod0Replication therefore waits for the pod-0 that is running
+// the *new* image and carries no deletionTimestamp, and reads the poison back
+// instead of trusting the two OKs.
 //
 // One property of the scenario is worth knowing before reading a failure: from the
 // promotion until the jam is lifted, the promoted replica holds the only copy of the
@@ -147,7 +158,7 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	t.Log("Triggering the rolling update that ends in the manual failover")
 	tc.updateValkeyImage(t, ns, name, updatedImage)
 
-	tc.jamPod0Replication(t, ns, name)
+	tc.jamPod0Replication(t, ns, name, updatedImage)
 
 	t.Run("Phase 1 gives up and leaves the promoted replica as master", func(t *testing.T) {
 		cond := tc.waitForValkeyCondition(t, ns, name, "TopologyRestored", "False", abandonConditionTimeout)
@@ -272,17 +283,37 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 // re-pointed it, the masterauth half is not biting and the fallback is to re-issue
 // REPLICAOF <blackhole> on a short interval until the abandon fires -- correct, but
 // with a small window between the operator's REPLICAOF and the next re-jam.
-func (tc *testClients) jamPod0Replication(t *testing.T, namespace, name string) {
+func (tc *testClients) jamPod0Replication(t *testing.T, namespace, name, updatedImage string) {
 	t.Helper()
 
 	pod0 := fmt.Sprintf("%s-0", name)
 	err := wait.PollUntilContextTimeout(context.Background(), jamPollInterval, jamPollTimeout, true,
-		func(_ context.Context) (bool, error) {
+		func(ctx context.Context) (bool, error) {
 			state := tc.getValkeyAnnotations(t, namespace, name)[annotationRollingUpdateStateKey]
 			switch state {
 			case "manual-failover", "replacing-master", "restoring-topology":
 			default:
 				// pod-0 is still the master, or it was already promoted back.
+				return false, nil
+			}
+
+			// The jam has to land on the pod-0 that comes *back*, and "pod-0 is a
+			// replica" does not say that: the operator demotes the outgoing master
+			// one second before it deletes it ("Demoted outgoing master to replica"
+			// then "Deleting old master pod after manual failover"), so for that
+			// second the dying pod matches every gate above. CONFIG SET is runtime
+			// state, the replacement boots clean, Phase 1 then finds a healthy link
+			// and promotes pod-0 back -- the abandon path is never entered and the
+			// test fails on TopologyRestored=True/Restored. Measured on runs
+			// 35312304295, 35315129844 and 35317540380.
+			//
+			// The returned pod-0 is the one running the new image and not carrying a
+			// deletionTimestamp; the outgoing one still runs the old image.
+			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, pod0, metav1.GetOptions{})
+			if err != nil || pod.DeletionTimestamp != nil {
+				return false, nil
+			}
+			if containerImage(pod, valkeyContainerName) != updatedImage {
 				return false, nil
 			}
 
@@ -300,12 +331,21 @@ func (tc *testClients) jamPod0Replication(t *testing.T, namespace, name string) 
 				return false, nil
 			}
 
-			t.Logf("Jammed replication on %s while the rolling update was in state %q", pod0, state)
+			// Read the value back rather than trust the two OKs: a pod replaced
+			// between them answers OK from the old process and boots clean, which is
+			// the same silent miss in a narrower window.
+			if !strings.Contains(
+				tc.valkeyExecQuick(t, namespace, pod0, 6379, "CONFIG", "GET", "masterauth"), masterauthPoison) {
+				return false, nil
+			}
+
+			t.Logf("Jammed replication on %s (image %s) while the rolling update was in state %q",
+				pod0, updatedImage, state)
 			return true, nil
 		})
 	require.NoError(t, err,
-		"%s never came back as a replica while the manual failover was in flight; "+
-			"without the jam the test cannot reach the abandon path", pod0)
+		"%s never came back as a replica on %s while the manual failover was in flight; "+
+			"without the jam the test cannot reach the abandon path", pod0, updatedImage)
 }
 
 // valkeyStatusCondition returns one status condition of a Valkey CR by type, or nil

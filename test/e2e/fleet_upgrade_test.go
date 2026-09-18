@@ -540,16 +540,6 @@ func (tc *testClients) requireNoNotOwnedEvents(t *testing.T, namespace, name str
 
 // --- small utilities -----------------------------------------------------
 
-// containerImage returns the image of the named container, or "" when absent.
-func containerImage(pod *corev1.Pod, container string) string {
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == container {
-			return pod.Spec.Containers[i].Image
-		}
-	}
-	return ""
-}
-
 // podReady reports whether the pod carries a Ready condition in status True.
 func podReady(pod *corev1.Pod) bool {
 	for _, cond := range pod.Status.Conditions {
