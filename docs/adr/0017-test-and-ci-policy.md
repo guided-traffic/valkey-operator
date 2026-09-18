@@ -34,6 +34,22 @@ the promoted pod lost its process afterwards: the workflow collects pod logs aft
 has finished, and every test namespace deletes itself in a defer, so the collection step had
 printed an empty section for months.
 
+Amended 2026-09-18: **D49 is new.** Three of the Makefile's own quality targets could not
+run on a developer machine at all, which is how D1's "the Makefile is the only entry point"
+had been true of CI and false locally.
+
+Amended 2026-09-18: **D47 and D48 are new.** `main` had been red for 15 days and nobody was
+stopped: `Generated Manifests Up To Date` is a CI job, not a *required* status check, so
+Renovate's platform automerge merged PR #209 (controller-tools v0.21.0 -> v0.22.0, which
+stamps its own version into the CRD annotation and was never regenerated) and then #210, #212,
+#214, #215, #218 and #219 on top of it, each carrying the same red check. Four of the twelve
+gate jobs had never been required; `semantic-release` already `needs:` all of them, so the
+release correctly stopped while the merges did not. The second break arrived the same way from
+the other side: Renovate advanced `k8s.io/kube-openapi` — a pseudo-versioned indirect dep — past
+the commit that switched it to `structured-merge-diff/v7`, which `k8s.io/apimachinery` v0.37.0
+cannot compile against, and that one *was* caught by required checks and simply blocked the
+whole `k8s-go-modules` group forever instead.
+
 Amended 2026-08-22: **D46 is new.** The npm dependency set behind semantic-release was
 exercised in exactly one place: the release job, on pushes to main, after a Renovate bump had
 merged. Two failures rode that gap. `conventional-changelog-conventionalcommits` v10 ships its
@@ -78,6 +94,23 @@ All three are the same failure: **something that cannot fail was believed.**
 tools are never invoked directly, by humans or by agents. CI invokes the same targets, so a
 local run that bypasses the Makefile can pass with different flags than the pipeline uses.
 Centralising the flags is also what makes D3 enforceable in one place.
+
+**D49 — Every pinned tool installs into `$(LOCALBIN)` and is invoked by its path.** `gocyclo`,
+`gosec` and `govulncheck` used `which <tool> > /dev/null || go install …@$(VERSION)`, which
+probes `PATH` but installs into `GOBIN`/`GOPATH/bin`. On a machine where that directory is not
+on `PATH` — the default on macOS — `make cyclo`, `make gosec` and `make vuln` reinstalled on
+every run and then died with `command not found`; where it *was* on `PATH`, any binary another
+project had put there shadowed the pinned version silently and forever. All three now use the
+`go-install-tool` define and `$(LOCALBIN)` like `controller-gen`, `setup-envtest`, `kustomize`
+and `golangci-lint` already did, and `govulncheck` gains the renovate-managed pin it never had
+(it was installed `@latest`, so the three tools CI ran were not the three a developer ran).
+
+**Prerequisites are expanded when a rule is read, not when it runs**, so the tool-path and
+tool-version variables move above the first target that names one; only the `$(LOCALBIN)` mkdir
+rule stays where it was, because a rule placed above `all: build` becomes the default goal.
+Naming a tool in a target's prerequisites while its variable is still undefined expands to
+nothing and silently drops the dependency — which is how the first attempt at this decision
+failed.
 
 **D2 — Three tiers with fixed responsibilities.** Unit tests cover all reconciliation logic;
 integration tests (envtest) cover what only a real API server decides — CRD defaulting (D14),
@@ -346,6 +379,33 @@ import and the kube-proxy settings all loop over `kind get nodes`. The image imp
 specifically because the operator runs with `pullPolicy: Never`, so on a multi-node cluster its
 pod can land on any worker.
 
+**D47 — A CI job that can fail the build is a required status check, enumerated here.** The
+required contexts on `main` are exactly: `Code Linting`, `Cyclomatic Complexity`,
+`GoSec Security Scan`, `Unit Tests`, `Integration Tests (envtest)`, `E2E Tests`,
+`Vulnerability Check`, `Malware Scan (Source Code)`, `Container Malware Scan`,
+`Generated Manifests Up To Date`, `Valkey Image Tools`, `Release Tooling` — twelve, matching
+the twelve `needs:` of `semantic-release` minus `coverage-report`. **A new gate job is added to
+branch protection in the same change that adds the job**, and the matrix legs are never
+required by name; `e2e-gate` is the only E2E context (D31).
+
+Two jobs are deliberately **not** required, and each for its own reason. `Combined Coverage
+Report` is conditional (`if: always() && (unit || integration)`) and GitHub scores a skipped
+required check as passing, so requiring it would buy nothing while risking a PR that can never
+go green; it is a report, and the tiers it reports on are required already. `Semantic Release`
+runs only on `push` to `main`, so on a pull request it never reports at all.
+
+**D48 — A pseudo-versioned indirect dependency whose compatible version is dictated by a direct
+one is not Renovate's to bump.** `k8s.io/kube-openapi` and `sigs.k8s.io/structured-merge-diff`
+are disabled in [`renovate.json`](../../renovate.json) and left to MVS, which takes them from
+`k8s.io/apimachinery`. Their tip is not a version the repo may hold independently: kube-openapi
+has no release branches, the k8s release branch pins one digest per minor, and crossing the
+digest where it swapped `structured-merge-diff/v6` for `/v7` made every package-loading job die
+on `cannot use typeSchema.Types (… v7 …) as … v6 … in struct literal` — `go build`, `go vet`,
+`golangci-lint`, `govulncheck`, unit and integration alike. **This is not a security carve-out:**
+both still advance whenever the `k8s-go-modules` group does, which is the only version of them
+that was ever supported; what is given up is a fix landing in the days between a kube-openapi
+commit and the k8s patch release that adopts it.
+
 ### Coverage, complexity and record-keeping
 
 **D34 — Coverage gaps are decisions, exhaustively listed and re-stated each pass.** The
@@ -532,6 +592,18 @@ committed lockfile.** Three rules:
   closes. Accepted.
 * Documentation sections grow correction blocks rather than shrinking (D37); a reader must read
   a section to its end before quoting it.
+* **Branch protection is repository state, not a file in this repository** (D47). Nothing in a
+  PR proves the list is still complete; the enumeration above is the only record, and it goes
+  stale silently if a job is added without touching it.
+* A generator-tool bump (controller-tools, kustomize) now **blocks its own automerge** until a
+  human runs `make generate-all` and commits (D47). That red PR is the intended outcome, not a
+  regression — Renovate runs inside the action's container, which carries no Go toolchain, so it
+  cannot regenerate for itself.
+* `k8s.io/kube-openapi` and `sigs.k8s.io/structured-merge-diff` no longer appear in any Renovate
+  PR (D48), so their movement is invisible until the `k8s.io/*` group bumps.
+* `bin/` now holds seven tools instead of four (D49); a stale one is deleted, not upgraded in
+  place, because `go-install-tool` skips whenever the file exists. A version bump therefore
+  needs `rm bin/<tool>` locally — CI starts from an empty `bin/` and never sees it.
 
 ## Alternatives Considered
 
@@ -626,6 +698,30 @@ Rejected: the wrong statement keeps being read, and the analysis and the status 
 
 Rejected: it contaminates the pass's own verification.
 
+### Require branches to be up to date before merging (`strict: true`)
+
+Rejected for now. It would not have caught either break — both were red on the PR itself, not
+only after merging — and with `prConcurrentLimit: 0` every merge would invalidate every other
+open Renovate PR and re-run a three-leg E2E matrix on shared self-hosted runners. The cheap
+guarantee is D47; a merge queue is the version of this worth revisiting, not `strict`.
+
+### Teach Renovate to run `make generate-all` via `postUpgradeTasks`
+
+Rejected: `renovatebot/github-action` runs Renovate in its own container, which has no Go
+toolchain and no `controller-gen`, so the task would fail or silently no-op — and a
+regeneration that silently no-ops is exactly the failure D47 exists to stop.
+
+### Pin `k8s.io/kube-openapi` to a digest and let Renovate keep proposing bumps
+
+Rejected: that is the state that broke, one PR later. The pin is not the mechanism; MVS from
+`apimachinery` is (D48).
+
+### Fix the `v6`/`v7` split by adding a direct `require` on `structured-merge-diff/v7`
+
+Rejected: the conflict is inside `apimachinery`'s own source, which constructs a `v6` struct
+from what kube-openapi now returns as `v7`. No version selection in this module can reconcile
+that; only a kube-openapi digest from apimachinery's own compatibility window can.
+
 ## Residual risks
 
 * **The drift guard sees only a vocabulary (D42).** `shellCommandCatalog` covers the
@@ -666,6 +762,26 @@ Rejected: it contaminates the pass's own verification.
 * **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
   Nothing regenerates them; the commits they cover are in the git history and the compare
   links still work.
+* **Nothing enforces D47.** The twelve contexts were set through the GitHub API on 2026-09-18
+  and verified by reading the endpoint back; no test, job or file compares them against the
+  workflow's job names, so a thirteenth gate job added without a matching API call repeats the
+  exact failure this decision was written for. Making `semantic-release`'s `needs:` list the
+  single source and diffing it against branch protection was **not** done.
+* **`enforce_admins` is false and no review is required.** Not changed here, and not evaluated:
+  a repository admin can still merge past all twelve checks, and every merge to date was an
+  unreviewed automerge by `guided-traffic-bot`.
+* **The 15 days of red `main` were never noticed by a human.** D47 stops the next one at the
+  merge; nothing alerts on a red default branch, and that was not addressed.
+* **D49's `govulncheck` pin freezes what CI scans with.** It ran `@latest` before, so the
+  scanner now advances only when Renovate bumps `GOVULNCHECK_VERSION`. The vulnerability
+  database is fetched from `vuln.go.dev` at run time and is unaffected; a missed *scanner*
+  improvement is the accepted cost of the three tools being the same ones locally and in CI.
+
+* **D48 was verified by construction, not over time.** `go mod tidy` with kube-openapi pinned
+  back to `v0.0.0-20260821135717-be32def86098` (the digest `main` last built green with)
+  dropped `structured-merge-diff/v7` and the tree builds, vets, lints and passes unit,
+  integration, gosec and govulncheck locally. Whether the next `k8s.io/*` group bump carries a
+  kube-openapi digest that is itself consistent has not been and cannot be checked in advance.
 
 ## References
 
@@ -676,6 +792,7 @@ Rejected: it contaminates the pass's own verification.
 * [`test/integration/`](../../test/integration/) — envtest suites, including the UID delete-precondition test
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
 * `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
+* [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the decision table these tests are written against

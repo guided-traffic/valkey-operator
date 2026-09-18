@@ -213,6 +213,13 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Build Docker image            | `make docker-build`            |
 | Build & load into Kind        | `make kind-load`               |
 
+Every pinned tool installs into `bin/` and is invoked by its path, never by bare name — probing
+`PATH` while installing into `GOPATH/bin` made `make cyclo`, `make gosec` and `make vuln` fail
+with `command not found` on any machine without that directory on `PATH`. A tool path or
+version variable must stay **above** the first target naming it: prerequisites expand when the
+rule is read, so a late definition silently drops the dependency.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D49
+
 ### No `-short`, no `testing.Short()` gates
 
 The unit targets deliberately do **not** pass `-short`, and no test in this
@@ -262,6 +269,25 @@ stays on the 9.x line until `@semantic-release/release-notes-generator` ships
 conventional-changelog-writer@9 — a red Renovate PR for preset 10.x is the signal that
 upstream is still incompatible.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46
+
+### A gate job that is not required is not a gate
+
+`main` was red for 15 days and seven automerges rode over it, because
+`Generated Manifests Up To Date` was a CI job and not a *required status check*: a
+controller-tools bump stamped a new version into the CRD annotation, nothing regenerated, and
+Renovate merged that PR and every one after it. Four of the twelve gate jobs had never been
+required at all. **Adding a job that can fail the build means adding it to branch protection in
+the same change** — the twelve required contexts are enumerated in the ADR, and nothing in this
+repository checks that the list is still complete. The matrix legs are never required by name;
+`e2e-gate` ("E2E Tests") is the only E2E context.
+
+The same automerge path broke the build from the other side: `k8s.io/kube-openapi` is
+pseudo-versioned with no release branches, and advancing it past the commit where it swapped
+`structured-merge-diff/v6` for `/v7` made every package-loading job die inside
+`k8s.io/apimachinery`. **It and `sigs.k8s.io/structured-merge-diff` are disabled in
+`renovate.json` and taken from `apimachinery` by MVS** — they still move with the
+`k8s-go-modules` group, which is the only version of them that was ever supported.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D47, D48
 
 ### E2E cluster topology
 
