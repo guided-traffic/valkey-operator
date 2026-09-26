@@ -569,8 +569,9 @@ spec:
                       pods, 65532 on the observer) maps to an unprivileged uid on the node. It needs node support - Kubernetes 1.33 or later (1.30 with the
                       UserNamespacesSupport feature gate), a container runtime with user-namespace
                       support (containerd 2.0 or later, CRI-O 1.25 or later), and idmap-mount support
-                      in the kernel for tmpfs (Linux 6.3) and for the file system of every data
-                      volume, which NFS does not have. A pod on a node without it does not start.
+                      in the kernel for tmpfs (Linux 6.3), in the file system of every data volume
+                      (NFS has none) and in the runtime's snapshotter (overlayfs has it, containerd's
+                      native snapshotter does not). A pod on a node without it does not start.
                       Changing it rolls every data and Sentinel pod.
                     type: boolean
                 type: object

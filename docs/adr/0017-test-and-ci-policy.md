@@ -240,7 +240,7 @@ controller path touching Valkey must decide explicitly whether the command shoul
 (default) or succeed (`fakeValkeyServer`); there is no third option.
 
 **D5 — A skipped E2E never counts as coverage.** Three guards, and they do not cover the same
-tests. `E2E_REQUIRE_MULTI_NODE=true` turns the "fewer than 3 schedulable nodes" skip into
+tests. *(Amended 2026-09-26: a fourth, `E2E_REQUIRE_USER_NAMESPACES`, below.)* `E2E_REQUIRE_MULTI_NODE=true` turns the "fewer than 3 schedulable nodes" skip into
 `t.Fatalf` on the leg that exists to run it — but that skip lives in exactly one place,
 `requireThreeSchedulableNodes` (`test/e2e/affinity_test.go`), whose only caller is
 `TestE2E_AntiAffinity_HardSpreadsAcrossNodes`; `TestE2E_PodDisruptionBudget_SerializesEvictions`
@@ -249,6 +249,24 @@ has no node-count skip for the variable to convert. The workflow greps the outpu
 `Verify Kind cluster` step asserts the node count equals `workers + 1` before any test runs.
 **A skip is indistinguishable from a pass in a CI summary**, and renaming either grepped test
 must break the grep on purpose.
+
+*(Amended 2026-09-26.)* **`E2E_REQUIRE_USER_NAMESPACES=true`** is the fourth guard, and the first
+one no CI leg sets. `TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest` starts a
+restricted probe pod with `hostUsers: false` (`userNamespacesSupported`); when its container does
+not start, the test moves the cluster without the user namespace and skips only the
+user-namespace subtest, by name and with the runtime's message — the variable turns that into a
+failure. The first push of the test failed both single-node legs on `b13377e`: the legs run Kind
+inside Docker-in-Docker with containerd's `native` snapshotter, and there a pod with
+`hostUsers: false` never starts. **Measured** locally with the CI Kind config (`kindest/node`
+v1.33.4, containerd 2.1.3, `snapshotter = "native"`, single node): the init container failed with
+"mount callback failed … container ID 1109000192 cannot be mapped to a host ID", the observer's
+container with Kind's `createContainer` hook "permission denied", the roll held at its first
+replica, and the CR reported `PodAvailabilityStalled=True/ValkeyPodNotAvailable` — ADR 0026 D11
+doing its job. The CI log itself was not readable here (no API credentials); that the legs failed
+on this test is inferred from the reproduction and from the multi-node leg, which does not run the
+test, going green. With the probe the test passes on that config (user-namespace subtest skipped)
+and fails with the variable set; on a local Kind cluster with overlayfs it runs the whole test.
+So the user-namespace half is **verified locally only**, never in CI.
 
 **D6 — A pass's unit run must report zero SKIPs on the uncached run (`-count=1`)**, which is
 also repeated (`-count=2`) so no result comes from the cache. Zero SKIPs at `-count=1` is the

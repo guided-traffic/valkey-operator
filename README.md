@@ -1164,7 +1164,9 @@ the template without it again on every pass — on such a cluster, opt in.
 > **Security note — `userNamespaces`:** it needs support on every node a pod can land on:
 > Kubernetes 1.33 or later (1.30 with the `UserNamespacesSupport` feature gate),
 > containerd 2.0 or CRI-O 1.25 or later, Linux 6.3 or later (idmapped `tmpfs`), and idmap
-> support in the file system of every data volume — **NFS has none**. The securityContext
+> support in the file system of every data volume — **NFS has none** — and in the container
+> runtime's snapshotter: containerd's `native` snapshotter cannot map the ids (measured on a
+> Kind node: "container ID … cannot be mapped to a host ID"), overlayfs can. The securityContext
 > inside the namespace is unchanged (uid 999, 65532 in the observer; `drop: [ALL]`; no
 > privilege escalation). Two ways it fails, and how each shows:
 >

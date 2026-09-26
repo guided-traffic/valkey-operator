@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/utils/ptr"
 
 	"github.com/guided-traffic/valkey-operator/test/testimages"
 )
@@ -95,8 +97,83 @@ func requireUserNamespace(t *testing.T, namespace, pod, container string) {
 	require.NotEmpty(t, uidMap, "%s/%s", pod, container)
 	assert.NotEqual(t, "0 0 4294967295", uidMap, "%s/%s runs in the node's user namespace", pod, container)
 	assert.True(t, strings.HasPrefix(uidMap, "0 "), "%s/%s: uid 0 inside maps somewhere else: %q", pod, container, uidMap)
+}
+
+// requireSeccompFilter asserts PID 1 of the container runs under a seccomp filter.
+func requireSeccompFilter(t *testing.T, namespace, pod, container string) {
+	t.Helper()
 	status := execInContainer(t, namespace, pod, container, "cat", "/proc/1/status")
 	assert.Contains(t, status, "Seccomp:\t2", "%s/%s must run under a seccomp filter", pod, container)
+}
+
+// userNamespacesRequiredEnv turns "this node cannot run a user namespace" into a
+// failure. The CI legs run Kind inside Docker-in-Docker with containerd's native
+// snapshotter, where a pod with hostUsers: false does not start -- measured
+// 2026-09-26 with the CI Kind config (kindest/node v1.33.4, containerd 2.1.3):
+// "mount callback failed ... container ID 1109000192 cannot be mapped to a host
+// ID", and Kind's own createContainer hook failing with permission denied -- so CI
+// does not set it; a local Kind cluster on overlayfs runs the user-namespace half.
+const userNamespacesRequiredEnv = "E2E_REQUIRE_USER_NAMESPACES"
+
+// userNamespacesSupported starts a restricted probe pod with hostUsers: false and
+// reports whether its container starts, or the runtime's reason why not. A probe
+// rather than a node field: the kubelet and the runtime can both refuse, and only a
+// started container answers for both.
+func (tc *testClients) userNamespacesSupported(t *testing.T, namespace string) (bool, string) {
+	t.Helper()
+	ctx := context.Background()
+	probe := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "userns-probe", Namespace: namespace},
+		Spec: corev1.PodSpec{
+			HostUsers:     ptr.To(false),
+			RestartPolicy: corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:   ptr.To(true),
+				RunAsUser:      ptr.To(int64(999)),
+				RunAsGroup:     ptr.To(int64(999)),
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []corev1.Container{{
+				Name:    "probe",
+				Image:   testimages.Default(),
+				Command: []string{"sh", "-c", "cat /proc/self/uid_map"},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: ptr.To(false),
+					ReadOnlyRootFilesystem:   ptr.To(true),
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+			}},
+		},
+	}
+	_, err := tc.kube.CoreV1().Pods(namespace).Create(ctx, probe, metav1.CreateOptions{})
+	require.NoError(t, err, "creating the user-namespace probe")
+	defer func() {
+		_ = tc.kube.CoreV1().Pods(namespace).Delete(ctx, probe.Name, metav1.DeleteOptions{})
+	}()
+
+	supported, reason := false, ""
+	pollUntil(t, 2*time.Second, 2*time.Minute, func() (bool, string) {
+		pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, probe.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err.Error()
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodRunning {
+			supported = true
+			return true, string(pod.Status.Phase)
+		}
+		for _, st := range pod.Status.ContainerStatuses {
+			if w := st.State.Waiting; w != nil && w.Reason != "ContainerCreating" && w.Reason != "PodInitializing" {
+				reason = w.Reason + ": " + w.Message
+				return true, reason
+			}
+			if term := st.State.Terminated; term != nil && term.ExitCode != 0 {
+				reason = term.Reason + ": " + term.Message
+				return true, reason
+			}
+		}
+		return false, string(pod.Status.Phase)
+	}, "the user-namespace probe neither started nor reported why")
+	return supported, reason
 }
 
 func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) {
@@ -120,6 +197,22 @@ func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) 
 		"observer": map[string]interface{}{"enabled": true},
 	}))
 	defer tc.deleteValkey(t, ns, name)
+
+	// Whether this node can run a user namespace at all decides the one opt-in the
+	// move below can carry. Without support the move runs without it, and only the
+	// user-namespace assertions are skipped, by name and with the runtime's reason.
+	userns, why := tc.userNamespacesSupported(t, ns)
+	if !userns {
+		require.NotEqual(t, "true", os.Getenv(userNamespacesRequiredEnv),
+			"%s=true, but this node cannot start a pod with hostUsers: false: %s", userNamespacesRequiredEnv, why)
+		t.Logf("user namespaces unsupported on this node (%s): the move runs without them", why)
+	}
+	podSecurity := map[string]interface{}{
+		"seccompProfile": map[string]interface{}{"type": "Localhost", "localhostProfile": hardeningProfilePath},
+	}
+	if userns {
+		podSecurity["userNamespaces"] = true
+	}
 
 	data := map[string]string{"hard:a": "1", "hard:b": "2", "hard:c": "3"}
 	var digestImage string
@@ -155,11 +248,8 @@ func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) 
 
 	t.Run("one patch moves the cluster: user namespace, Localhost profile, digest, Sentinel resources", func(t *testing.T) {
 		tc.patchValkeySpec(t, ns, name, map[string]interface{}{
-			"image": digestImage,
-			"podSecurity": map[string]interface{}{
-				"userNamespaces": true,
-				"seccompProfile": map[string]interface{}{"type": "Localhost", "localhostProfile": hardeningProfilePath},
-			},
+			"image":       digestImage,
+			"podSecurity": podSecurity,
 			"sentinel.resources": map[string]interface{}{
 				"requests": map[string]interface{}{"cpu": "10m", "memory": "32Mi"},
 				"limits":   map[string]interface{}{"memory": "128Mi"},
@@ -187,7 +277,11 @@ func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) 
 				continue
 			}
 			kinds[p.Labels["app.kubernetes.io/component"]]++
-			assert.Equal(t, false, derefBool(p.Spec.HostUsers, true), "%s: hostUsers", p.Name)
+			if userns {
+				assert.Equal(t, false, derefBool(p.Spec.HostUsers, true), "%s: hostUsers", p.Name)
+			} else {
+				assert.Nil(t, p.Spec.HostUsers, "%s: hostUsers is set only when asked for", p.Name)
+			}
 			assert.Equal(t, false, derefBool(p.Spec.EnableServiceLinks, true), "%s: enableServiceLinks", p.Name)
 			require.NotNil(t, p.Spec.SecurityContext.SeccompProfile, p.Name)
 			assert.Equal(t, corev1.SeccompProfileTypeLocalhost, p.Spec.SecurityContext.SeccompProfile.Type, p.Name)
@@ -211,10 +305,10 @@ func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) 
 		}
 	})
 
-	t.Run("the processes run in a user namespace under the Localhost filter", func(t *testing.T) {
+	t.Run("the processes run under the Localhost filter", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
-			requireUserNamespace(t, ns, fmt.Sprintf("%s-%d", name, i), "valkey")
-			requireUserNamespace(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i), "sentinel")
+			requireSeccompFilter(t, ns, fmt.Sprintf("%s-%d", name, i), "valkey")
+			requireSeccompFilter(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i), "sentinel")
 		}
 		// Inside, the posture of ADR 0032 is unchanged: uid 999, nothing in the
 		// bounding set, no_new_privs -- the user namespace sits underneath it.
@@ -229,15 +323,25 @@ func TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest(t *testing.T) 
 		}
 	})
 
-	t.Run("the data written before the move is intact and keeps its owners through the idmapped mount", func(t *testing.T) {
+	t.Run("the processes run in a user namespace", func(t *testing.T) {
+		if !userns {
+			t.Skipf("user namespaces unsupported on this node (%s); set %s=true to fail instead", why, userNamespacesRequiredEnv)
+		}
+		for i := 0; i < 3; i++ {
+			requireUserNamespace(t, ns, fmt.Sprintf("%s-%d", name, i), "valkey")
+			requireUserNamespace(t, ns, fmt.Sprintf("%s-sentinel-%d", name, i), "sentinel")
+		}
+	})
+
+	t.Run("the data written before the move is intact and keeps its owners", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			pod := fmt.Sprintf("%s-%d", name, i)
 			tc.waitForReplicaSyncedOrMaster(t, ns, pod)
 			for k, want := range data {
 				assert.Equal(t, want, tc.valkeyExec(t, ns, pod, 6379, "GET", k), "%s: %s", pod, k)
 			}
-			// Through the idmapped mount every file keeps the owner the container saw
-			// before the move: what valkey-server wrote is 999, the volume root is
+			// Through the idmapped mount (when the move added a user namespace) every
+			// file keeps the owner the container saw before the move: what valkey-server wrote is 999, the volume root is
 			// what it was. Without the mapping they would read as the overflow uid
 			// 65534, and valkey-server could not write its AOF.
 			owners := execInContainer(t, ns, pod, "valkey", "sh", "-c",

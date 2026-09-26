@@ -220,7 +220,9 @@ securityContext is unchanged — uid 999, `drop: [ALL]`, no privilege escalation
 builder; that it still yields an empty bounding set and `no_new_privs` on a node is what the
 e2e checks, ~~not yet run~~ *(run 2026-09-26, see Residual risks: a user namespace on every
 data and Sentinel pod, `Uid 999`, `CapBnd 0`, `NoNewPrivs 1` on the `valkey` container of
-pod 0)*.
+pod 0)*. *(Added 2026-09-26, measured.)* The node requirements include the container runtime's
+snapshotter: containerd's `native` snapshotter cannot map the ids ("container ID … cannot be
+mapped to a host ID"), overlayfs can (Residual risks).
 
 **D3 — A user namespace the API server dropped blocks the pass.** Every create and update of the
 data StatefulSet, the Sentinel StatefulSet and the observer Deployment — every write that
@@ -497,6 +499,15 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
   cannot see the file it names (Residual risks).
 
 ## Residual risks
+
+- **User namespaces are verified locally only, never in CI** *(added 2026-09-26)*. The CI legs
+  run Kind in Docker-in-Docker with containerd's `native` snapshotter, where a pod with
+  `hostUsers: false` does not start ("container ID … cannot be mapped to a host ID"; measured with
+  the CI Kind config, [ADR 0017](0017-test-and-ci-policy.md) D5). The hardening e2e probes for
+  support and, without it, runs everything but the user-namespace subtest, which it skips by
+  name (`E2E_REQUIRE_USER_NAMESPACES=true` makes that a failure). The same measurement is a node
+  requirement D2 did not name: the runtime's snapshotter must support idmapped mounts —
+  overlayfs does, `native` does not.
 
 - **Verification** *(filled in with the runs of 2026-09-26)*:
   - unit: `TestPodHardening_DefaultsOnEveryTemplate` (`podSecurityMatrix`, the 72 clusters the
