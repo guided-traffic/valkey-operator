@@ -109,12 +109,15 @@ run since, locally on Kind and not in CI: see D55 and Residual risks, updated 20
 D55 run recorded below stays true for the code it ran against (Residual risks).
 
 Amended 2026-09-26, last on the day: **D50 gains a second instance.** The last full e2e run of
-the day went red once, on the single-node Valkey 9 leg, in `TestE2E_SidecarFailoverDrainMaster`.
+the day went red once, on the ~~single-node~~ Valkey 9 leg *(corrected 2026-09-26: that local
+run, like every local run of the day, ran on `make kind-create`'s control-plane + 3 workers; only
+the CI legs are single-node — T34)*, in `TestE2E_SidecarFailoverDrainMaster`.
 Every wait after its master delete was already met by the terminating old master, which kubelet
 keeps Ready ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)) *(the diagnosis, from the
 test code and its timing, not traced in the failed run — noted 2026-09-26)*; the test now waits
 for the replacement by UID. The diagnosis, the experiment behind it and the five sites of the
-same shape still unaudited (T34) are recorded at D50.
+same shape ~~still unaudited~~ *(audited 2026-09-26: two vacuous, three fine)* (T34) are recorded
+at D50.
 
 **What "the final image" means in this ADR** *(clarified 2026-09-26)*. Every site that says
 "the final image" or "the final code" means the last image at the time that site was written,
@@ -127,7 +130,10 @@ the D50 fix above, which changes test code only. Run on Kind (Kubernetes 1.36.1,
 2.3.1, runc 1.4.2, Linux 6.10), not in CI:
 `TestE2E_FleetUpgrade` from 1.12.8 green; the full suite 53/53 on Valkey 8 and 52/53 on Valkey 9,
 the one failure the D50 instance; two further Valkey 8 runs of D54's test and ADR 0033's hardening
-e2e green. No full suite has run on the D50 fix. The CI-parity gates — `make generate-all` (no diff
+e2e green. ~~No full suite has run on the D50 fix.~~ *(Corrected 2026-09-26: no local full
+suite has; CI ran the full suite on the fix — it landed in `b13377e` — on `b13377e`, `a04e2d0`
+and `e6a9d7c`, both single-node legs each, Kubernetes 1.33.4, and the D50 test passed in all six
+legs; T34.)* The CI-parity gates — `make generate-all` (no diff
 with a fresh controller-gen v0.22.0), `make lint` (golangci-lint v2.14.0, 0 issues), `make cyclo`,
 `make gosec` (v2.29.0, 0 issues), `make vuln` (no vulnerabilities), the unit and integration
 coverage targets, `make test-image-tools` and `make test-release-tooling` — are recorded green
@@ -573,8 +579,9 @@ deletes a pod itself just as much. `TestE2E_SidecarFailoverDrainMaster`
 cluster and then waited for the StatefulSet at 3/3, phase `OK`, every pod Ready and exactly one
 pod answering master. The **terminating** old master satisfies every one of those: kubelet keeps
 it Ready for its whole termination ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)),
-and it still answers master. On the single-node Valkey 9 leg of the last full e2e run of the day
-the delete subtest passed in 0.38 s. "Data survives failover" then picked the dying pod as the
+and it still answers master. On the ~~single-node~~ Valkey 9 leg of the last full e2e run of the
+day *(corrected 2026-09-26: a local run on Kind's control-plane + 3 workers, as its own log shows;
+T34)* the delete subtest passed in 0.38 s. "Data survives failover" then picked the dying pod as the
 master holding the keys, and its `DBSIZE`, sent by pod name, reached the empty replacement and
 read 0. The operator log of that cluster shows no operator action between its creation and its
 deletion. The pod logs were lost with the CR, so this diagnosis is read from the test code and
@@ -582,7 +589,8 @@ its timing, supported by the experiment below and not traced in the red run itse
 
 **Experiment, on Kind.** The unchanged test run alone went green 10 of 10, but 5 of the 10 took
 the vacuous path, with the delete subtest finishing in 0.28–0.30 s. A watcher recorded role and
-`DBSIZE` ~~of every pod~~ once a second *(corrected 2026-09-26: what is recorded is what it
+`DBSIZE` ~~of every pod~~ ~~once a second~~ about every 2 s per pod *(corrected 2026-09-26,
+T34: the watcher slept 1 s between rounds of nine `kubectl` calls)* *(corrected 2026-09-26: what is recorded is what it
 showed for the new master and the replacement; that it covered every pod is not)*. It showed the new master holding all 50 keys, and the
 replacement reading `dbsize=0` for several seconds while it resynchronised. So on the vacuous
 path the verdict is timing: the `DBSIZE` is green when it reaches the dying master or a
@@ -592,14 +600,21 @@ measured on one run).
 **The fix names the pod by identity.** The subtest records the deleted pod's UID and waits for a
 Ready pod of that name with a different UID (`waitForPodRecreated`) before any role or data
 check. The fixed test ran 8 of 8 green on Valkey 9, with the delete subtest taking 8.3–10.3 s.
-**Not verified:** no full suite has run on the fix, and 8 green runs on one host are a streak,
-not a failure rate (the same limit as D50 itself, Residual risks). ~~Five more e2e sites wait on
+**Not verified:** ~~no full suite has run on the fix, and~~ *(corrected 2026-09-26: CI ran the
+full suite on it in six single-node legs, on `b13377e`, `a04e2d0` and `e6a9d7c`, all green; T34)*
+8 green runs on one host, and six green CI legs, are a streak, not a failure rate (the same limit
+as D50 itself, Residual risks). ~~Five more e2e sites wait on
 controller state after deleting a pod~~ *(corrected 2026-09-26, read: five more e2e sites delete a
 pod and none of them then waits for the replacement by UID; whether their waits can be met by the
 terminating pod is what the audit has to establish)*, in `sidecar_test.go` (the replica drain),
 `admission_recovery_test.go`, `sentinel_stale_master_test.go`, `pod_termination_test.go` and
 `topology_abandon_test.go`. They are filed unaudited as T34 on
-[the ticket board](../tickets/local_BOARD.md).
+[the ticket board](../tickets/local_BOARD.md). *(Audited 2026-09-26, T34, read and from the run
+logs:)* two are vacuous — the replica drain in `sidecar_test.go` asserts "no failover" and "the
+recreated replica is labelled" before a replacement can exist, and `sentinel_stale_master_test.go`
+logs "all pods restarted and ready" on the old pods, its assertions protected only by how fast
+the old Sentinels stop answering — and three are fine by construction or by effect. The fixture
+fix is open.
 
 **D51 — Endpoint membership is read through `discovery.k8s.io/v1` EndpointSlice.** `v1 Endpoints`
 is deprecated since Kubernetes 1.33 and each client using it logs

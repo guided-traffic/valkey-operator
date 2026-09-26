@@ -1575,9 +1575,11 @@ analysis.
       pod logs were lost with the CR, and its operator log shows no operator action between the
       cluster's creation and its deletion. The test now waits for the replacement by UID
       ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D50) and was green 8 of 8 alone on
-      Valkey 9; five other sites of the same shape, not yet audited, are ticket T34.
+      Valkey 9, and in all six CI full-suite legs since; five other sites of the same shape
+      ~~, not yet audited,~~ are ticket T34 *(audited 2026-09-26: two vacuous, three fine)*.
       Trigger and demotion counts for the final run are not recorded here. Still locally, not in
-      CI. Not covered at all: CRI-O's smaller default capability set, and
+      CI *(precised 2026-09-26: the runs and counts of this item are local; CI on `e6a9d7c` ran
+      the hardening e2e green in both single-node legs, its user-namespace half skipped)*. Not covered at all: CRI-O's smaller default capability set, and
       OpenShift — **its `restricted-v2` SCC refuses a fixed `runAsUser: 999` outside the
       namespace's UID range**, so these pods are not admitted there; nothing in this
       repository targets OpenShift today.

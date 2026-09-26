@@ -219,8 +219,10 @@ test failed on four runs in ten days, each on a different leg. Again on 2026-09-
 conditions the terminating old master already met (kubelet keeps it Ready, ADR 0026) — vacuous
 in 5 of 10 green runs of it alone on Kind, red once in a Valkey 9 suite by reading `DBSIZE 0`
 from the empty replacement (inferred from the test code and timing; that run's pod logs were
-lost) — and now waits for the new UID (`waitForPodRecreated`, 8/8 green alone on Valkey 9); the
-sites of the same shape, not yet audited, are T34. Use the image, the UID or
+lost) — and now waits for the new UID (`waitForPodRecreated`, 8/8 green alone on Valkey 9, and
+green in all six CI full-suite legs since `b13377e`); of the five sites of the same shape ~~, not
+yet audited,~~ two are vacuous (the replica drain in `sidecar_test.go`, the restart in
+`sentinel_stale_master_test.go`) and three fine *(audited 2026-09-26)*, T34. Use the image, the UID or
 `deletionTimestamp`, and read the effect back rather than trusting the write. Endpoint
 membership is read through `discovery.k8s.io/v1` EndpointSlice (`readyEndpointPodNames`); `v1
 Endpoints` is deprecated since 1.33 and the operator never used it.
@@ -972,7 +974,9 @@ one-update arm, before the drain e2e fix:)* on the same Kind versions the fleet-
 1.12.8 green, the full suite 53/53 on Valkey 8 and 52/53 on Valkey 9 — the one failure
 `TestE2E_SidecarFailoverDrainMaster`, a fixture waiting on controller state (section Testing),
 fixed afterwards and 8/8 green alone on Valkey 9 — and two extra Valkey 8 runs of the hardening
-and restricted-namespace e2e green; no full suite has run on the drain fix.
+and restricted-namespace e2e green; ~~no full suite has run on the drain fix~~ no local full
+suite has run on the drain fix, CI ran it in six single-node legs, all green *(corrected
+2026-09-26, T34)*.
 ~~Of the CI-parity gates on the final code only `make generate-all` (a
 clean copy, empty `bin/`, fresh controller-gen v0.22.0: no diff) and `make test-release-tooling`
 are recorded green; `make test-unit`, lint, cyclo, gosec, vuln, the coverage targets and
