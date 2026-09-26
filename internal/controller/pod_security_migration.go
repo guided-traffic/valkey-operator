@@ -32,13 +32,22 @@ import (
 // immutable, so no label or annotation can forge the pod evidence, and both kinds
 // survive an operator restart.
 //
-// Once carried, it is kept until every ordinal of the tier holds a migrated pod:
-// proven ours, rootless, and past the repair -- its pre-flight exited 0, or it has
-// been Ready. A missing pod, or a rootless one that never got that far (an image it
-// cannot pull, a node it cannot schedule on), does not count. The asymmetry closes
-// two races the plain "any legacy pod exists" rule has on the last migration of a
-// tier: a pass between the last legacy pod disappearing and its recreation, and a
-// replacement that is rootless but has not run its repair yet.
+// Once carried, it is kept until every ordinal of the tier holds a migrated pod --
+// proven ours, rootless and Ready -- and no data-tier roll is recorded. A missing
+// pod, or a rootless one that never got that far (an image it cannot pull, a node
+// it cannot schedule on), does not count. The asymmetry closes two races the plain
+// "any legacy pod exists" rule has on the last migration of a tier: a pass between
+// the last legacy pod disappearing and its recreation, and a replacement that is
+// rootless but has not run its repair yet.
+//
+// The removal outdates every pod that carries the repair, so it is what starts the
+// second roll (ADR 0032 D2), and the two conditions order that roll behind the
+// first. reconcileStatefulSet runs before the rolling update in the same pass, so a
+// removal while the first roll is still recorded would outdate every pod under it:
+// clearStaleRollingUpdateState would discard its state as stale -- on the
+// non-Sentinel path in the middle of the topology restoration -- and its
+// finalization would never run. A single pod records no roll state; Ready is what
+// keeps its second restart behind the first having served.
 //
 // Persistence is read off the live StatefulSet, never off the CR: a persistence
 // toggle the operator refused to apply (ADR 0023) must not change what it does to
@@ -54,6 +63,9 @@ func (r *ValkeyReconciler) dataOwnershipRepairNeeded(ctx context.Context, v *vko
 		return true
 	}
 	carried := builder.HasDataOwnershipRepair(&current.Spec.Template.Spec)
+	if carried && r.getRollingUpdateState(v) != "" {
+		return true
+	}
 	allMigrated := true
 	for i := int32(0); i < *current.Spec.Replicas; i++ {
 		pod := &corev1.Pod{}
@@ -65,7 +77,7 @@ func (r *ValkeyReconciler) dataOwnershipRepairNeeded(ctx context.Context, v *vko
 		if !builder.PodRunsRootless(pod) {
 			return true
 		}
-		if !podPassedPreflight(pod) {
+		if !isPodReady(pod) {
 			allMigrated = false
 		}
 	}
@@ -83,26 +95,6 @@ func stsIsPersistent(sts *appsv1.StatefulSet) bool {
 func templateRunsRootless(spec *corev1.PodSpec) bool {
 	sc := spec.SecurityContext
 	return sc != nil && sc.RunAsNonRoot != nil && *sc.RunAsNonRoot
-}
-
-// podPassedPreflight reports whether a pod got past the ownership repair: its
-// check-data-writable init container exited 0, or the pod has been Ready (which it
-// cannot be without that). Either proves its volume is writable by uid 999.
-func podPassedPreflight(pod *corev1.Pod) bool {
-	if isPodReady(pod) {
-		return true
-	}
-	for _, st := range pod.Status.InitContainerStatuses {
-		if st.Name == builder.DataWritableCheckContainerName && st.State.Terminated != nil &&
-			st.State.Terminated.ExitCode == 0 {
-			return true
-		}
-		if st.Name == builder.DataWritableCheckContainerName && st.LastTerminationState.Terminated != nil &&
-			st.LastTerminationState.Terminated.ExitCode == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // singlePodDeferral decides whether the only data pod of a spec.replicas: 1

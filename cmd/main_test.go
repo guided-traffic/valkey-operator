@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"io"
+	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -205,6 +206,7 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 		"--leader-elect",
 		"--operator-image=repo/img:tag",
 		"--max-concurrent-reconciles=9",
+		"--allowed-seccomp-localhost-profiles=profiles/a.json, profiles/b.json,",
 	}
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse: %v", err)
@@ -224,6 +226,20 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 	}
 	if f.maxConcurrentReconciles != 9 {
 		t.Errorf("maxConcurrentReconciles = %d, want 9", f.maxConcurrentReconciles)
+	}
+	if got := profileList(f.allowedSeccompLocalhostProfiles); !reflect.DeepEqual(got, []string{"profiles/a.json", "profiles/b.json"}) {
+		t.Errorf("allowed seccomp profiles = %q, want the two listed, trimmed, without the empty tail", got)
+	}
+}
+
+// TestProfileList: an unset flag is an empty allow-list, which refuses every
+// Localhost profile (ADR 0033 D9) -- never a list holding one empty entry.
+func TestProfileList(t *testing.T) {
+	if got := profileList(""); got != nil {
+		t.Errorf("profileList(\"\") = %q, want nil", got)
+	}
+	if got := profileList(" , ,"); got != nil {
+		t.Errorf("profileList of blanks = %q, want nil", got)
 	}
 }
 
@@ -300,7 +316,8 @@ func TestNewReconciler(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	f := &operatorFlags{operatorImage: "guidedtraffic/valkey-operator:v9", maxConcurrentReconciles: 6}
+	f := &operatorFlags{operatorImage: "guidedtraffic/valkey-operator:v9", maxConcurrentReconciles: 6,
+		allowedSeccompLocalhostProfiles: "profiles/valkey.json"}
 	r := newReconciler(mgr, f, "valkey-system")
 
 	if r.Client == nil {
@@ -319,6 +336,10 @@ func TestNewReconciler(t *testing.T) {
 	}
 	if r.OperatorNamespace != "valkey-system" {
 		t.Errorf("OperatorNamespace = %q, want valkey-system", r.OperatorNamespace)
+	}
+	if !reflect.DeepEqual(r.AllowedSeccompLocalhostProfiles, []string{"profiles/valkey.json"}) {
+		t.Errorf("AllowedSeccompLocalhostProfiles = %q, want the --allowed-seccomp-localhost-profiles value",
+			r.AllowedSeccompLocalhostProfiles)
 	}
 	if r.OperatorVersion != version {
 		t.Errorf("OperatorVersion = %q, want the ldflags build version %q", r.OperatorVersion, version)

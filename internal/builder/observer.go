@@ -125,7 +125,7 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 		Containers:                   containers,
 		Volumes:                      buildObserverVolumes(v),
 	}
-	applyObserverPodSecurity(&podSpec)
+	applyObserverPodSecurity(&podSpec, v)
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -347,7 +347,8 @@ func ObserverDeploymentHasChanged(desired, current *appsv1.Deployment) bool {
 	// The posture has to be its own line for the same reason: the observer carries
 	// no pod-spec hash, so without it an existing observer Deployment would never
 	// receive a securityContext at all (ADR 0032 D1).
-	if podSecurityContextChanged(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) {
+	if podSecurityContextChanged(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) ||
+		podHardeningChanged(&desired.Spec.Template.Spec, &current.Spec.Template.Spec) {
 		return true
 	}
 

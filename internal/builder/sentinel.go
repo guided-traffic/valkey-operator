@@ -390,10 +390,21 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 	sentinelTerminationGrace := int64(30)
 	spec.TerminationGracePeriodSeconds = &sentinelTerminationGrace
 
+	// spec.sentinel.resources goes to every container of the pod, the init container
+	// included: a namespace with a cpu/memory ResourceQuota refuses a pod in which any
+	// container lacks the values, and the init container's request never adds to the
+	// pod's effective request while it equals the main container's.
+	for i := range spec.InitContainers {
+		spec.InitContainers[i].Resources = v.GetSentinelResources()
+	}
+	for i := range spec.Containers {
+		spec.Containers[i].Resources = v.GetSentinelResources()
+	}
+
 	// Last, after every container exists (docs/adr/0032-generated-pods-run-rootless.md, D1).
 	// No ownership repair and no pre-flight: every volume a Sentinel pod mounts is
 	// an emptyDir, fresh with every pod.
-	applyValkeyPodSecurity(&spec)
+	applyValkeyPodSecurity(&spec, v)
 
 	return spec
 }

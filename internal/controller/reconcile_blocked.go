@@ -61,13 +61,20 @@ func isAdmissionRejection(err error) bool {
 // applied twice: it also clears only when a human acts, so it outranks the
 // admission gate — but a foreign object means nothing under that name is ours at
 // all, which has to be said first
-// (docs/adr/0023-volume-claim-templates-are-immutable.md).
+// (docs/adr/0023-volume-claim-templates-are-immutable.md). A Localhost seccomp
+// profile outside the allow-list and a dropped hostUsers rank with it: both clear
+// only when a human acts, and the refused write comes first because nothing of the
+// spec was applied at all (ADR 0033 D3, D9).
 func reconcileBlockedReason(err error) string {
 	switch {
 	case errors.Is(err, errForeignObject):
 		return vkov1.ReasonForeignObject
 	case errors.Is(err, errRecreateRequired):
 		return vkov1.ReasonRecreateRequired
+	case errors.Is(err, errSeccompProfileNotAllowed):
+		return vkov1.ReasonSeccompProfileNotAllowed
+	case errors.Is(err, errUserNamespacesDropped):
+		return vkov1.ReasonUserNamespacesUnsupported
 	case isAdmissionRejection(err):
 		return vkov1.ReasonAdmissionWebhookDenied
 	default:

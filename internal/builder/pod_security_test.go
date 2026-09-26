@@ -187,8 +187,11 @@ func TestPodSecurity_DataAndSentinelPodsRunAsTheValkeyUser(t *testing.T) {
 		require.NotNil(t, sc.SeccompProfile, kind)
 		assert.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, sc.SeccompProfile.Type, kind)
 		if kind == "observer" {
-			assert.Nil(t, sc.RunAsUser, "the observer keeps its image's numeric nonroot user")
-			assert.Nil(t, sc.FSGroup, "the observer mounts no data volume")
+			// ADR 0033 D4: pinned to the operator image's numeric nonroot user rather
+			// than inheriting whatever an image built from another base declares.
+			assert.Equal(t, ptr.To(OperatorUID), sc.RunAsUser, kind)
+			assert.Equal(t, ptr.To(OperatorUID), sc.RunAsGroup, kind)
+			assert.Equal(t, ptr.To(OperatorUID), sc.FSGroup, kind)
 			continue
 		}
 		assert.Equal(t, ptr.To(ValkeyUID), sc.RunAsUser, kind)

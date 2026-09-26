@@ -30,6 +30,12 @@ const (
 	// re-groups the data volume to where the volume type supports it.
 	ValkeyGID int64 = 999
 
+	// OperatorUID is the numeric distroless `nonroot` user the operator image
+	// declares (USER 65532 in gcr.io/distroless/static-debian12:nonroot). The
+	// observer runs the operator image and is pinned to it, uid and gid, rather than
+	// inheriting whatever an image built from another base declares.
+	OperatorUID int64 = 65532
+
 	// DataWritableCheckContainerName is the pre-flight init container of every
 	// persistent data pod. It fails the pod, naming the fix, when the data volume
 	// holds anything uid 999 cannot write -- instead of letting valkey-server start
@@ -44,14 +50,37 @@ const (
 )
 
 // restrictedContainerSecurityContext is the container-level posture of every
-// generated container: no privilege escalation (no_new_privs), a read-only root
-// filesystem -- every path a process writes is a mounted volume -- and no
-// capability at all.
+// generated container: not privileged, no privilege escalation (no_new_privs), a
+// read-only root filesystem -- every path a process writes is a mounted volume --
+// and no capability at all. privileged: false is the API default; it is stated so
+// that the posture reads complete in the object and a scanner does not have to
+// know the default (ADR 0033 D4).
 func restrictedContainerSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
+		Privileged:               ptr.To(false),
 		AllowPrivilegeEscalation: ptr.To(false),
 		ReadOnlyRootFilesystem:   ptr.To(true),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+}
+
+// applyPodHardening sets what every generated pod shares beyond its securityContext
+// (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md):
+// no Service environment variables, and the opt-in user namespace. hostNetwork,
+// hostPID and hostIPC are not set because they are plain booleans whose zero value
+// is false -- the API cannot carry an explicit false, and no builder sets them.
+//
+// enableServiceLinks: false keeps kubelet from injecting the Docker-link style
+// variables (<SERVICE>_SERVICE_HOST, _SERVICE_PORT, _PORT, _PORT_<n>_<PROTO>...) for
+// every Service of the namespace into every container: an inventory of the
+// namespace no process here reads, and a name collision with variables the
+// containers do read. The API server's own KUBERNETES_SERVICE_* variables are
+// injected regardless.
+func applyPodHardening(spec *corev1.PodSpec, v *vkov1.Valkey) {
+	spec.EnableServiceLinks = ptr.To(false)
+	spec.HostUsers = nil
+	if v.UsesUserNamespaces() {
+		spec.HostUsers = ptr.To(false)
 	}
 }
 
@@ -76,27 +105,35 @@ func restrictContainers(spec *corev1.PodSpec) {
 // OnRootMismatch inspects only the volume root and would skip files a later root
 // writer left beneath a correctly owned root, and a Valkey data directory holds a
 // handful of files, so the recursive walk costs nothing worth saving.
-func applyValkeyPodSecurity(spec *corev1.PodSpec) {
+//
+// The seccomp profile is RuntimeDefault unless spec.podSecurity.seccompProfile
+// names a Localhost one; Unconfined is refused by the CRD (ADR 0033 D1).
+func applyValkeyPodSecurity(spec *corev1.PodSpec, v *vkov1.Valkey) {
 	spec.SecurityContext = &corev1.PodSecurityContext{
 		RunAsNonRoot:   ptr.To(true),
 		RunAsUser:      ptr.To(ValkeyUID),
 		RunAsGroup:     ptr.To(ValkeyGID),
 		FSGroup:        ptr.To(ValkeyGID),
-		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		SeccompProfile: v.GetSeccompProfile(),
 	}
 	restrictContainers(spec)
+	applyPodHardening(spec, v)
 }
 
-// applyObserverPodSecurity is the observer's posture: the operator image already
-// declares the numeric distroless `nonroot` user (65532), so runAsNonRoot can be
-// verified by kubelet without naming a uid, and the observer mounts no data volume
-// that would need an fsGroup.
-func applyObserverPodSecurity(spec *corev1.PodSpec) {
+// applyObserverPodSecurity is the observer's posture: the operator image's numeric
+// distroless `nonroot` user (65532) as uid, gid and fsGroup -- the fsGroup makes the
+// optional TLS Secret volume readable to that group whatever its mode -- the same
+// seccomp profile as the Valkey pods, and the restricted container posture.
+func applyObserverPodSecurity(spec *corev1.PodSpec, v *vkov1.Valkey) {
 	spec.SecurityContext = &corev1.PodSecurityContext{
 		RunAsNonRoot:   ptr.To(true),
-		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		RunAsUser:      ptr.To(OperatorUID),
+		RunAsGroup:     ptr.To(OperatorUID),
+		FSGroup:        ptr.To(OperatorUID),
+		SeccompProfile: v.GetSeccompProfile(),
 	}
 	restrictContainers(spec)
+	applyPodHardening(spec, v)
 }
 
 // dataWritableCheckScript fails when anything valkey-server has to write is not
@@ -186,6 +223,7 @@ func dataOwnershipRepairContainer(image string) corev1.Container {
 			RunAsUser:                ptr.To(int64(0)),
 			RunAsGroup:               ptr.To(int64(0)),
 			RunAsNonRoot:             ptr.To(false),
+			Privileged:               ptr.To(false),
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities: &corev1.Capabilities{
@@ -200,10 +238,12 @@ func dataOwnershipRepairContainer(image string) corev1.Container {
 // container of an already-built data StatefulSet. It is idempotent.
 //
 // It runs on the built object, after ComputePodSpecHash, and that ordering is the
-// whole design (ADR 0032 D2): the pod-spec hash never sees the repair, so adding it
-// while legacy pods exist and removing it once none is left rolls nothing. That is
-// a narrow, recorded exception to ADR 0005 D7 -- the container acts only at pod
-// start, and a pod that ran it is identical to one that did not need it.
+// whole design (ADR 0032 D2): the pod-spec hash never sees the repair, so neither
+// the template write that adds it while legacy pods exist nor the one that removes
+// it is itself a roll -- a narrow, recorded exception to ADR 0005 D7. The pods
+// created while it was in the template keep it in their immutable spec, and once it
+// has left the template the controller replaces them for that alone
+// (podCarriesRetiredRepair): the second roll of D2.
 func WithDataOwnershipRepair(sts *appsv1.StatefulSet) {
 	spec := &sts.Spec.Template.Spec
 	if HasDataOwnershipRepair(spec) {
@@ -267,12 +307,23 @@ func containerSecurityContextChanged(desired, current *corev1.SecurityContext) b
 	if current == nil {
 		current = &corev1.SecurityContext{}
 	}
-	return ptrDiffers(desired.AllowPrivilegeEscalation, current.AllowPrivilegeEscalation) ||
+	return ptrDiffers(desired.Privileged, current.Privileged) ||
+		ptrDiffers(desired.AllowPrivilegeEscalation, current.AllowPrivilegeEscalation) ||
 		ptrDiffers(desired.ReadOnlyRootFilesystem, current.ReadOnlyRootFilesystem) ||
 		ptrDiffers(desired.RunAsNonRoot, current.RunAsNonRoot) ||
 		ptrDiffers(desired.RunAsUser, current.RunAsUser) ||
 		ptrDiffers(desired.RunAsGroup, current.RunAsGroup) ||
 		capabilitiesDiffer(desired.Capabilities, current.Capabilities)
+}
+
+// podHardeningChanged compares the two pod-level fields applyPodHardening sets.
+// hostUsers is compared exactly, not as a subset: turning spec.podSecurity.
+// userNamespaces off leaves desired unset, and a subset comparison would never
+// converge the persisted false back -- the capabilities.add argument, for a field
+// whose unset value is the weaker one.
+func podHardeningChanged(desired, current *corev1.PodSpec) bool {
+	return ptrDiffers(desired.EnableServiceLinks, current.EnableServiceLinks) ||
+		!ptr.Equal(desired.HostUsers, current.HostUsers)
 }
 
 // ptrDiffers reports whether desired sets a value current does not carry.

@@ -32,10 +32,10 @@
 //   - The rootless migration (docs/adr/0032-generated-pods-run-rootless.md) on
 //     real root-written data: this is the only test that starts from pods and
 //     volumes a released operator built as uid 0. Every rolled cluster ends
-//     rootless with its keys on every replica; the persistent members' pods ran
-//     the ownership repair on the way up, and the repair then leaves the template
-//     without a second roll; the persistent single pod restarts once, the
-//     non-persistent one is not restarted at all and reports the deferral.
+//     rootless with its keys on every replica; the ownership repair re-owns the
+//     persistent volumes on the way up, leaves the template, and a second roll
+//     replaces the pods that still carry it; the persistent single pod restarts,
+//     the non-persistent one is not restarted at all and reports the deferral.
 package e2e
 
 import (
@@ -352,6 +352,43 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 		}
 	})
 
+	t.Run("the second roll replaced every pod that carried the repair", func(t *testing.T) {
+		// ADR 0032 D2: the pods the migration created keep fix-data-ownership in
+		// their spec; once the template has dropped it they are outdated for that
+		// alone and roll a second time. Done means: the template is clean, every pod
+		// of the tier exists, is Ready and carries no repair.
+		for _, m := range fleet {
+			if !m.persistent {
+				continue
+			}
+			pollUntil(t, rollingUpdatePollInterval, rollingUpdateTimeout, func() (bool, string) {
+				sts := tc.getStatefulSet(t, m.namespace, m.name)
+				for _, c := range sts.Spec.Template.Spec.InitContainers {
+					if c.Name == dataOwnershipRepairContainer {
+						return false, "the template still carries the repair"
+					}
+				}
+				for i := 0; i < m.replicas; i++ {
+					name := fmt.Sprintf("%s-%d", m.name, i)
+					pod, err := tc.kube.CoreV1().Pods(m.namespace).Get(context.Background(), name, metav1.GetOptions{})
+					if err != nil {
+						return false, name + " missing"
+					}
+					for _, c := range pod.Spec.InitContainers {
+						if c.Name == dataOwnershipRepairContainer {
+							return false, name + " still carries the repair"
+						}
+					}
+					if !podReady(pod) {
+						return false, name + " not Ready"
+					}
+				}
+				return true, ""
+			}, "%s/%s: the second roll did not finish", m.namespace, m.name)
+			tc.waitForValkeyPhaseAfterRollingUpdate(t, m.namespace, m.name, "OK")
+		}
+	})
+
 	t.Run("no data was lost", func(t *testing.T) {
 		for _, m := range fleet {
 			master := tc.findFleetMaster(t, m)
@@ -392,24 +429,40 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 		}
 	})
 
-	t.Run("the persistent pods ran the ownership repair, and it left the template", func(t *testing.T) {
+	t.Run("the repair re-owned the root-written data", func(t *testing.T) {
+		// The premise put uid-0 files on every persistent volume (shapeLegacyVolumes),
+		// and Kind's hostPath gets no fsGroup: only fix-data-ownership can have made
+		// them 999's.
 		for _, m := range fleet {
 			if !m.persistent {
 				continue
 			}
 			for i := 0; i < m.replicas; i++ {
-				tc.requireRepairRan(t, m.namespace, fmt.Sprintf("%s-%d", m.name, i))
+				pod := fmt.Sprintf("%s-%d", m.name, i)
+				owners := strings.Fields(kubectlExec(t, m.namespace, pod, "valkey", "sh", "-c",
+					"stat -c %u /data /data/* /data/appendonlydir /data/appendonlydir/* 2>/dev/null | sort -u"))
+				assert.Equal(t, []string{"999"}, owners, "%s/%s: every entry owned by 999", m.namespace, pod)
 			}
-			pollUntil(t, pollInterval, testTimeout, func() (bool, string) {
-				sts := tc.getStatefulSet(t, m.namespace, m.name)
-				for _, c := range sts.Spec.Template.Spec.InitContainers {
-					if c.Name == dataOwnershipRepairContainer {
-						return false, "the template still carries " + dataOwnershipRepairContainer
-					}
-				}
-				return true, ""
-			},
-				"%s/%s: with every pod rootless the repair must leave the template", m.namespace, m.name)
+		}
+	})
+
+	t.Run("persistent data tiers rolled twice, the others once", func(t *testing.T) {
+		// Two completions, not one roll that replaced every pod twice: the repair
+		// stays in the template while the first roll is recorded (ADR 0032 D4), so
+		// the first roll finalizes -- topology check, state clear, this Event --
+		// before the removal outdates its pods. The first version of D4 let the
+		// repair leave on the last replacement's pre-flight, and this subtest then
+		// measured one completion per persistent tier.
+		for _, m := range fleet {
+			if m.replicas == 1 {
+				continue
+			}
+			want := 1
+			if m.persistent {
+				want = 2
+			}
+			assert.Equal(t, want, tc.countValkeyEventsSince(t, m.namespace, m.name, "RollingUpdateComplete", upgradeStarted),
+				"%s/%s: data-tier rolls completed since the upgrade", m.namespace, m.name)
 		}
 	})
 
@@ -463,7 +516,7 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 		}
 	})
 
-	t.Run("the repair leaving the template rolls nothing", func(t *testing.T) {
+	t.Run("after the second roll nothing rolls again", func(t *testing.T) {
 		settled := map[string]map[string]string{}
 		for _, m := range fleet {
 			settled[m.name] = tc.podUIDs(t, m.namespace, m.name, m.replicas)
@@ -471,12 +524,11 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 				settled[m.name+"-sentinel"] = tc.podUIDs(t, m.namespace, m.name+"-sentinel", 3)
 			}
 		}
-		// Several reconcile passes: the template write that removes the repair has
-		// long happened, and a second roll would have deleted a pod by now.
+		// Several reconcile passes: a third roll would have deleted a pod by now.
 		time.Sleep(90 * time.Second)
 		for _, m := range fleet {
 			assert.Equal(t, settled[m.name], tc.podUIDs(t, m.namespace, m.name, m.replicas),
-				"%s/%s: no second roll", m.namespace, m.name)
+				"%s/%s: nothing rolls after the migration", m.namespace, m.name)
 			if m.sentinel {
 				assert.Equal(t, settled[m.name+"-sentinel"], tc.podUIDs(t, m.namespace, m.name+"-sentinel", 3),
 					"%s/%s-sentinel rolled exactly once", m.namespace, m.name)
@@ -484,7 +536,7 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 		}
 	})
 
-	t.Run("single pods: the persistent one restarted once, the ephemeral one not at all", func(t *testing.T) {
+	t.Run("single pods: the persistent one restarted, the ephemeral one not at all", func(t *testing.T) {
 		for _, m := range fleet {
 			if m.replicas != 1 {
 				continue
@@ -492,6 +544,7 @@ func TestE2E_FleetUpgrade(t *testing.T) {
 			uids := tc.podUIDs(t, m.namespace, m.name, 1)
 			pod := m.name + "-0"
 			if m.persistent {
+				// Twice: the posture, then the retired repair (ADR 0032 D2, D3).
 				assert.NotEqual(t, m.dataPodUIDs[pod], uids[pod],
 					"%s: a persistent single pod is replaced at the upgrade", pod)
 				continue
@@ -677,28 +730,6 @@ func (tc *testClients) requireRootlessPods(t *testing.T, namespace, stsName stri
 		require.NotNil(t, sc.RunAsUser, "%s/%s", namespace, pod.Name)
 		assert.Equal(t, int64(999), *sc.RunAsUser, "%s/%s", namespace, pod.Name)
 	}
-}
-
-// requireRepairRan asserts the pod carries the ownership repair and that it
-// exited 0. Pod specs are immutable, so the init container on the pod is the
-// durable proof the template carried it when the pod was created.
-func (tc *testClients) requireRepairRan(t *testing.T, namespace, podName string) {
-	t.Helper()
-	pod := tc.getPod(t, namespace, podName)
-	found := false
-	for _, c := range pod.Spec.InitContainers {
-		found = found || c.Name == dataOwnershipRepairContainer
-	}
-	require.True(t, found, "%s/%s was created without the ownership repair", namespace, podName)
-	for _, st := range pod.Status.InitContainerStatuses {
-		if st.Name != dataOwnershipRepairContainer {
-			continue
-		}
-		require.NotNil(t, st.State.Terminated, "%s/%s: the repair has not finished", namespace, podName)
-		assert.Equal(t, int32(0), st.State.Terminated.ExitCode, "%s/%s: the repair failed", namespace, podName)
-		return
-	}
-	t.Errorf("%s/%s reports no status for the repair init container", namespace, podName)
 }
 
 // findFleetMaster returns the current master pod of a fleet member, using the

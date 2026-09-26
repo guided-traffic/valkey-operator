@@ -708,10 +708,14 @@ func TestHandleMasterFailover_SurfacesTheStateWriteFailure(t *testing.T) {
 }
 
 // Same for the timestamp: it is the only thing that makes a hung failover
-// retryable, so a failover is not triggered without it.
+// retryable, so a failover is not triggered without it. Since 2026-09-26 the state
+// and the timestamp are one write (setFailoverTriggered), so the failure this test
+// injects is that write's, and what it pins is that nothing is left half-armed:
+// no state without its timestamp -- which annotationTimestampExceeded would read as
+// never expiring (ADR 0025 D9, ADR 0010).
 func TestHandleMasterFailover_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	writes := 0
-	funcs := failCRUpdateFrom(2, &writes)
+	funcs := failCRUpdateFrom(1, &writes)
 	r, c, v, pods := midFailoverCluster(t, "hmf-tsfail", nil, &funcs)
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
@@ -725,7 +729,10 @@ func TestHandleMasterFailover_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	require.NotNil(t, result)
 	require.Error(t, result.Error)
 	assert.Empty(t, router.targetsFor("SENTINEL FAILOVER"))
-	assert.Empty(t, crGet(t, c, "hmf-tsfail").Annotations[annotationFailoverTimestamp])
+	stored := crGet(t, c, "hmf-tsfail").Annotations
+	assert.Empty(t, stored[annotationFailoverTimestamp])
+	assert.NotEqual(t, stateFailoverTriggered, stored[annotationRollingUpdateState],
+		"the state must not stand without the timestamp that bounds it")
 }
 
 // A rejected SENTINEL FAILOVER is expected traffic (cooldown, NOGOODSLAVE): the
@@ -857,10 +864,12 @@ func TestHandleFailoverRetrigger_SurfacesTheStateWriteFailure(t *testing.T) {
 	assert.Equal(t, stateFailoverReset, crGet(t, c, "hfr-statefail").Annotations[annotationRollingUpdateState])
 }
 
+// The retrigger arms state and timestamp in one write too (setFailoverTriggered):
+// when it fails, the reset state and its old deadline stand together.
 func TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	before := rfc3339Ago(failoverResetMinWait + time.Minute)
 	writes := 0
-	funcs := failCRUpdateFrom(2, &writes)
+	funcs := failCRUpdateFrom(1, &writes)
 	r, c, v, _ := midFailoverCluster(t, "hfr-tsfail", map[string]string{
 		annotationRollingUpdateState: stateFailoverReset,
 		annotationFailoverTimestamp:  before,
@@ -872,8 +881,11 @@ func TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure(t *testing.T) 
 
 	require.Error(t, result.Error)
 	assert.Empty(t, router.targetsFor("SENTINEL FAILOVER"))
-	assert.Equal(t, before, crGet(t, c, "hfr-tsfail").Annotations[annotationFailoverTimestamp],
+	stored := crGet(t, c, "hfr-tsfail").Annotations
+	assert.Equal(t, before, stored[annotationFailoverTimestamp],
 		"the old deadline stands when the new one could not be written")
+	assert.Equal(t, stateFailoverReset, stored[annotationRollingUpdateState],
+		"and so does the state it bounds")
 }
 
 func TestHandleFailoverRetrigger_RejectedFailoverCommandIsNotFatal(t *testing.T) {

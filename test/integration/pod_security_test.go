@@ -7,9 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
@@ -42,18 +40,19 @@ func TestPodSecurity_TemplatesSurviveAPIServerDefaulting_Integration(t *testing.
 		},
 	}
 
-	roundTrip := func(t *testing.T, desired client.Object, readBack client.Object) {
+	// The object Create decodes the API server's answer into is the stored object,
+	// defaulting included. k8sClient reads through the manager's cache, so a Get
+	// right after the Create could miss the object and fail the test for nothing.
+	roundTrip := func(t *testing.T, obj client.Object) {
 		t.Helper()
-		require.NoError(t, k8sClient.Create(ctx, desired))
-		t.Cleanup(func() { _ = k8sClient.Delete(ctx, desired) })
-		require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{
-			Name: desired.GetName(), Namespace: desired.GetNamespace()}, readBack))
+		require.NoError(t, k8sClient.Create(ctx, obj))
+		t.Cleanup(func() { _ = k8sClient.Delete(ctx, obj) })
 	}
 
 	t.Run("data StatefulSet", func(t *testing.T) {
 		desired := builder.BuildStatefulSet(v, "ghcr.io/guided-traffic/valkey-operator:test")
-		stored := &appsv1.StatefulSet{}
-		roundTrip(t, desired.DeepCopy(), stored)
+		stored := desired.DeepCopy()
+		roundTrip(t, stored)
 		assert.False(t, builder.StatefulSetHasChanged(desired, stored),
 			"the API server must not default anything inside the posture the comparison reads")
 		require.NotNil(t, stored.Spec.Template.Spec.SecurityContext)
@@ -64,8 +63,8 @@ func TestPodSecurity_TemplatesSurviveAPIServerDefaulting_Integration(t *testing.
 		desired := builder.BuildStatefulSet(v, "ghcr.io/guided-traffic/valkey-operator:test")
 		desired.Name = "posture-it-repair"
 		builder.WithDataOwnershipRepair(desired)
-		stored := &appsv1.StatefulSet{}
-		roundTrip(t, desired.DeepCopy(), stored)
+		stored := desired.DeepCopy()
+		roundTrip(t, stored)
 		assert.False(t, builder.StatefulSetHasChanged(desired, stored))
 		assert.True(t, builder.HasDataOwnershipRepair(&stored.Spec.Template.Spec),
 			"the API server accepts a root init container with CAP_CHOWN in an otherwise rootless pod")
@@ -73,15 +72,15 @@ func TestPodSecurity_TemplatesSurviveAPIServerDefaulting_Integration(t *testing.
 
 	t.Run("Sentinel StatefulSet", func(t *testing.T) {
 		desired := builder.BuildSentinelStatefulSet(v)
-		stored := &appsv1.StatefulSet{}
-		roundTrip(t, desired.DeepCopy(), stored)
+		stored := desired.DeepCopy()
+		roundTrip(t, stored)
 		assert.False(t, builder.SentinelStatefulSetHasChanged(desired, stored))
 	})
 
 	t.Run("observer Deployment", func(t *testing.T) {
 		desired := builder.BuildObserverDeployment(v, "ghcr.io/guided-traffic/valkey-operator:test")
-		stored := &appsv1.Deployment{}
-		roundTrip(t, desired.DeepCopy(), stored)
+		stored := desired.DeepCopy()
+		roundTrip(t, stored)
 		assert.False(t, builder.ObserverDeploymentHasChanged(desired, stored))
 	})
 }

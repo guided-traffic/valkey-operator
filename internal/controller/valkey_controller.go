@@ -99,6 +99,12 @@ type ValkeyReconciler struct {
 	// reconcileControllerOptions.
 	MaxConcurrentReconciles int
 
+	// AllowedSeccompLocalhostProfiles are the Localhost seccomp profiles a Valkey
+	// resource may name in spec.podSecurity.seccompProfile
+	// (--allowed-seccomp-localhost-profiles). Empty refuses every Localhost profile
+	// (seccompProfileAllowed, ADR 0033 D9).
+	AllowedSeccompLocalhostProfiles []string
+
 	// nudges tracks first-seen timestamps for two disjoint key sets: how long
 	// each StatefulSet has been short of pods (nudgeShortStatefulSets), and the
 	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
@@ -1287,8 +1293,14 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 			builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
 			return nil
 		}
+		// A Localhost seccomp profile outside the allow-list is refused at the write,
+		// on create and on update alike, and this step is its one reporter; the
+		// Sentinel and observer steps only withhold their writes (ADR 0033 D9).
+		if err := r.seccompProfileAllowed(v); err != nil {
+			return err
+		}
 		logger.Info("Creating StatefulSet", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "StatefulSet", true)
 	}
 	if err != nil {
 		return err
@@ -1334,10 +1346,20 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 
 	// The ownership repair rides the template while a data pod an earlier operator
 	// built as root still exists, and is inserted after the builder so the pod-spec
-	// hash never sees it: coming and going, it rolls nothing (ADR 0032 D2). Before
-	// the drift detection, which is what writes it in and out.
+	// hash never sees it: neither template write is itself a roll. What its removal
+	// does start is the second roll, of the pods created while it was in the
+	// template (podCarriesRetiredRepair, ADR 0032 D2). Before the drift detection,
+	// which is what writes it in and out.
 	if r.dataOwnershipRepairNeeded(ctx, v, current) {
 		builder.WithDataOwnershipRepair(desired)
+	}
+
+	// The allow-list gate (ADR 0033 D9), after every proof and guard above -- the
+	// ownership proof, the claim guard whose level is re-measured every pass, the
+	// TLS record -- and before the drift detection, so that a template already
+	// carrying a profile the list no longer holds is reported too, not only a new one.
+	if err := r.seccompProfileAllowed(v); err != nil {
+		return err
 	}
 
 	// Detect drift and update.
@@ -1347,7 +1369,7 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "StatefulSet", false)
 	}
 
 	return nil
@@ -1443,8 +1465,12 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 			builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
 			return nil
 		}
+		// Reported by the data StatefulSet step, which runs first (ADR 0033 D9).
+		if r.seccompProfileAllowed(v) != nil {
+			return nil
+		}
 		logger.Info("Creating Sentinel StatefulSet", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "StatefulSet", true)
 	}
 	if err != nil {
 		return err
@@ -1484,13 +1510,19 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 		return nil
 	}
 
+	// Withheld at the write, after the ownership proof and the claim guard; the
+	// data StatefulSet step reports it (ADR 0033 D9).
+	if r.seccompProfileAllowed(v) != nil {
+		return nil
+	}
+
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Sentinel StatefulSet", "name", desired.Name)
 		current.Spec.Replicas = desired.Spec.Replicas
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "StatefulSet", false)
 	}
 
 	return nil
@@ -2008,8 +2040,12 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 	current := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// Reported by the data StatefulSet step (ADR 0033 D9).
+		if r.seccompProfileAllowed(v) != nil {
+			return nil
+		}
 		logger.Info("Creating Observer Deployment", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "Deployment", true)
 	}
 	if err != nil {
 		return err
@@ -2027,12 +2063,16 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 		return nil
 	}
 
+	// Withheld at the write, after the ownership proof (ADR 0033 D9).
+	if r.seccompProfileAllowed(v) != nil {
+		return nil
+	}
 	if builder.ObserverDeploymentHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Observer Deployment", "name", desired.Name)
 		current.Spec = desired.Spec
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "Deployment", false)
 	}
 
 	return nil

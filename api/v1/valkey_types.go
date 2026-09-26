@@ -287,6 +287,24 @@ const (
 	// put back (docs/adr/0023-volume-claim-templates-are-immutable.md).
 	ReasonRecreateRequired = "RecreateRequired"
 
+	// ReasonUserNamespacesUnsupported is the ReconcileBlocked reason for
+	// spec.podSecurity.userNamespaces on a cluster whose API server drops hostUsers
+	// from a pod template: its UserNamespacesSupport feature gate is off, the default
+	// before Kubernetes 1.33. The write succeeds and the field is silently gone, so
+	// the pods run without the user namespace the spec asks for. It clears when the
+	// gate is on or the field is set back to false
+	// (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md).
+	ReasonUserNamespacesUnsupported = "UserNamespacesUnsupported"
+
+	// ReasonSeccompProfileNotAllowed is the ReconcileBlocked reason for a
+	// spec.podSecurity.seccompProfile naming a Localhost profile the operator was not
+	// started with (--allowed-seccomp-localhost-profiles, empty by default). Nothing
+	// failed: the operator refuses to write the data StatefulSet, the Sentinel
+	// StatefulSet and the observer, and the running pods keep their template. It
+	// clears when an administrator allows the profile or the spec names another
+	// (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md, D9).
+	ReasonSeccompProfileNotAllowed = "SeccompProfileNotAllowed"
+
 	// ReasonVolumeClaimTemplatesImmutable is the StorageSpecNotApplied reason for a
 	// size, storage class or access mode that differs from the live claims while the
 	// claims themselves are the ones the spec asks for. It never blocks a reconcile:
@@ -483,6 +501,60 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	DisableAuth bool `json:"disableAuth,omitempty"`
+
+	// Resources defines the compute resource requirements of every container in a
+	// Sentinel pod: the sentinel container and its init container. Both get the same
+	// values, so a namespace with a cpu/memory ResourceQuota admits the pod. No
+	// default: omitted means no requests and no limits, as before the field existed.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// PodSecuritySpec configures hardening of every pod the operator generates for a
+// Valkey resource beyond the fixed rootless posture: the data pods, the Sentinel
+// pods and the observer. Omitted means RuntimeDefault seccomp and no user
+// namespace (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md).
+type PodSecuritySpec struct {
+	// SeccompProfile is the seccomp profile of every generated pod. Omitted means
+	// RuntimeDefault. Unconfined is not accepted: the pods always run under a
+	// seccomp filter, and Pod Security "restricted" stays satisfiable.
+	// +optional
+	SeccompProfile *SeccompProfileSpec `json:"seccompProfile,omitempty"`
+
+	// UserNamespaces runs every generated pod in a user namespace of its own
+	// (hostUsers: false): the uid a container runs as (999 on the data and Sentinel
+	// pods, 65532 on the observer) maps to an unprivileged uid on the node. It needs node support - Kubernetes 1.33 or later (1.30 with the
+	// UserNamespacesSupport feature gate), a container runtime with user-namespace
+	// support (containerd 2.0 or later, CRI-O 1.25 or later), and idmap-mount support
+	// in the kernel for tmpfs (Linux 6.3) and for the file system of every data
+	// volume, which NFS does not have. A pod on a node without it does not start.
+	// Changing it rolls every data and Sentinel pod.
+	// +kubebuilder:default=false
+	// +optional
+	UserNamespaces bool `json:"userNamespaces,omitempty"`
+}
+
+// SeccompProfileSpec selects the seccomp profile of the generated pods.
+// +kubebuilder:validation:XValidation:rule="self.type == 'Localhost' ? (has(self.localhostProfile) && size(self.localhostProfile) > 0) : !has(self.localhostProfile)",message="localhostProfile is required when type is Localhost and must not be set otherwise"
+// +kubebuilder:validation:XValidation:rule="!has(self.localhostProfile) || (!self.localhostProfile.startsWith('/') && !self.localhostProfile.matches('(^|/)[.][.](/|$)'))",message="localhostProfile must be a relative path below the kubelet's seccomp directory, without '..'"
+type SeccompProfileSpec struct {
+	// Type is RuntimeDefault, the container runtime's default filter, or Localhost,
+	// a profile file installed on every node below the kubelet's seccomp directory.
+	// A Localhost profile that is missing on a node keeps a pod scheduled there from
+	// starting; it has to allow what every generated container does - including the
+	// chown of the migration-only fix-data-ownership init container.
+	// +kubebuilder:validation:Enum=RuntimeDefault;Localhost
+	// +kubebuilder:default=RuntimeDefault
+	Type corev1.SeccompProfileType `json:"type"`
+
+	// LocalhostProfile is the path of the profile relative to the kubelet's seccomp
+	// directory (for example profiles/valkey.json): not absolute, no '..' element.
+	// Required for Localhost, forbidden otherwise. The operator writes it only when
+	// its --allowed-seccomp-localhost-profiles lists the path (empty by default, so
+	// every Localhost profile is refused until an administrator allows one): a profile
+	// that allows every syscall would be as good as no filter.
+	// +optional
+	LocalhostProfile *string `json:"localhostProfile,omitempty"`
 }
 
 // AuthSpec defines authentication configuration for Valkey.
@@ -564,7 +636,10 @@ type TLSSpec struct {
 const (
 	// DefaultMetricsExporterImage is the exporter image used when spec.metrics.image is empty.
 	// oliver006/redis_exporter supports Valkey and exposes standard Redis/Valkey metrics.
-	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0"
+	// Pinned by the digest of the multi-arch image index behind the tag, so a re-pushed
+	// tag cannot change what runs in the pods (ADR 0033 D5); the tag stays for the
+	// reader and for the version it names.
+	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1"
 
 	// DefaultMetricsExporterPort is the default port the exporter serves /metrics on.
 	DefaultMetricsExporterPort int32 = 9121
@@ -1010,6 +1085,11 @@ type ValkeySpec struct {
 	// two replicas across nodes.
 	// +optional
 	AntiAffinity *AntiAffinitySpec `json:"antiAffinity,omitempty"`
+
+	// PodSecurity configures the seccomp profile and an opt-in user namespace of
+	// every generated pod. Omitted means RuntimeDefault and no user namespace.
+	// +optional
+	PodSecurity *PodSecuritySpec `json:"podSecurity,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -1332,6 +1412,34 @@ func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: resource.MustParse("64Mi"),
 		},
 	}
+}
+
+// GetSentinelResources returns the compute resources of every Sentinel pod
+// container; empty when spec.sentinel.resources is not set.
+func (v *Valkey) GetSentinelResources() corev1.ResourceRequirements {
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Resources != nil {
+		return *v.Spec.Sentinel.Resources
+	}
+	return corev1.ResourceRequirements{}
+}
+
+// GetSeccompProfile returns the seccomp profile of every generated pod:
+// spec.podSecurity.seccompProfile, RuntimeDefault when unset.
+func (v *Valkey) GetSeccompProfile() *corev1.SeccompProfile {
+	if v.Spec.PodSecurity == nil || v.Spec.PodSecurity.SeccompProfile == nil ||
+		v.Spec.PodSecurity.SeccompProfile.Type != corev1.SeccompProfileTypeLocalhost {
+		return &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	}
+	profile := ""
+	if p := v.Spec.PodSecurity.SeccompProfile.LocalhostProfile; p != nil {
+		profile = *p
+	}
+	return &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &profile}
+}
+
+// UsesUserNamespaces reports whether the generated pods run with hostUsers: false.
+func (v *Valkey) UsesUserNamespaces() bool {
+	return v.Spec.PodSecurity != nil && v.Spec.PodSecurity.UserNamespaces
 }
 
 // GetSyncTimeout returns the configured sync timeout for rolling updates,

@@ -624,7 +624,7 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 
 	// Last, after every container exists, so none of them can be missed
 	// (docs/adr/0032-generated-pods-run-rootless.md, D1).
-	applyValkeyPodSecurity(&spec)
+	applyValkeyPodSecurity(&spec, v)
 
 	return spec
 }
@@ -1285,7 +1285,8 @@ func podSpecChanged(desired, current corev1.PodSpec) bool {
 	// comparison converges an out-of-band edit of the persisted template's
 	// securityContext back (ADR 0032) -- the gap the automount line above closes
 	// for its field.
-	if podSecurityContextChanged(desired.SecurityContext, current.SecurityContext) {
+	if podSecurityContextChanged(desired.SecurityContext, current.SecurityContext) ||
+		podHardeningChanged(&desired, &current) {
 		return true
 	}
 	if containersChanged(desired.Containers, current.Containers) {

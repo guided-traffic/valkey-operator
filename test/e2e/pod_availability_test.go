@@ -221,3 +221,51 @@ func pollUntil(t *testing.T, interval, timeout time.Duration, cond func() (bool,
 		})
 	require.NoError(t, err, "%s (last observed: %s)", fmt.Sprintf(format, args...), last)
 }
+
+// TestE2E_RollingUpdate_TwoSentinelsRollSerially covers ADR 0024 D10: a Sentinel
+// tier of two has no spare vote, so the quorum guard could never pass and the tier
+// never rolled. It now rolls one Sentinel at a time, each only while the other is
+// available, and the whole update completes.
+func TestE2E_RollingUpdate_TwoSentinelsRollSerially(t *testing.T) {
+	t.Parallel()
+	tc := newTestClients(t)
+
+	ns := "e2e-two-sentinels"
+	cleanup := tc.createNamespace(t, ns)
+	defer cleanup()
+
+	name := "two-sen"
+	sentinelSts := name + "-sentinel"
+	tc.createValkey(t, ns, buildValkeyObject(name, ns, map[string]interface{}{
+		"replicas": int64(3),
+		"image":    testimages.UpgradeFrom,
+		"sentinel": map[string]interface{}{"enabled": true, "replicas": int64(2)},
+	}))
+	defer tc.deleteValkey(t, ns, name)
+
+	tc.waitForStatefulSetReady(t, ns, name, 3)
+	tc.waitForStatefulSetReady(t, ns, sentinelSts, 2)
+	tc.waitForValkeyPhase(t, ns, name, "OK")
+	master := tc.findMasterPod(t, ns, name, 3)
+	tc.waitForConnectedReplicas(t, ns, master, 6379, 2)
+	assert.Equal(t, "OK", tc.valkeyExec(t, ns, master, 6379, "SET", "two-sentinels", "kept"))
+	sentinelUIDs := tc.dataPodUIDs(t, ns, sentinelSts, 2)
+
+	tc.updateValkeyImage(t, ns, name, testimages.UpgradeTo)
+
+	t.Run("both Sentinels are replaced and the update completes", func(t *testing.T) {
+		tc.waitForAllPodsImage(t, ns, name, 3, testimages.UpgradeTo)
+		tc.waitForValkeyCondition(t, ns, name, "SentinelUpdatePending", "False", rollingUpdateTimeout)
+		after := tc.dataPodUIDs(t, ns, sentinelSts, 2)
+		for pod, uid := range sentinelUIDs {
+			assert.NotEqual(t, uid, after[pod], "%s must have been replaced", pod)
+			assert.Equal(t, testimages.UpgradeTo, containerImage(tc.getPod(t, ns, pod), "sentinel"))
+		}
+		tc.waitForValkeyPhaseAfterRollingUpdate(t, ns, name, "OK")
+	})
+
+	t.Run("the data survived", func(t *testing.T) {
+		newMaster := tc.findMasterPod(t, ns, name, 3)
+		assert.Equal(t, "kept", tc.valkeyExec(t, ns, newMaster, 6379, "GET", "two-sentinels"))
+	})
+}

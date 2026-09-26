@@ -24,25 +24,17 @@ spec:
     spec:
       serviceAccountName: {{ include "valkey-operator.fullname" . }}-upgrade
       restartPolicy: Never
-      securityContext:
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
+      {{- include "valkey-operator.podHardening" . | nindent 6 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: migrate
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ include "valkey-operator.image" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["./manager", "migrate"]
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
+          {{- include "valkey-operator.containerSecurityContext" . | nindent 10 }}
           {{- with .Values.preUpgradeHook.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

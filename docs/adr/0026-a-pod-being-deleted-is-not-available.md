@@ -99,8 +99,13 @@ window, and after the image was put back the operator replaced the stuck pod its
 condition `False/PodAvailable`, 100 keys on every replica. It then passed inside both full local
 suites on that cluster, `make test-e2e E2E_VALKEY_LINE=9` (51/51, 588 s) and
 `make test-e2e E2E_VALKEY_LINE=8` (51/51, 536 s), and was re-run green on the final image against
-valkey 9.1.1. All of these ran locally; the branch has not been through the pipeline, so no CI leg
-has run it yet. The Sentinel-tier half is unit-only by design: the image is shared with the data tier, whose stall
+valkey 9.1.1. All of these ran locally; ~~the branch has not been through the pipeline, so no CI leg
+has run it yet~~ *(corrected 2026-09-26: the branch was pushed as `e2ce8bb`, where two gate jobs
+failed — [ADR 0017](0017-test-and-ci-policy.md) D49; what that run's E2E legs reported is not
+recorded in this repository, and CI has not run on the fixed working tree)*. *(Rerun 2026-09-26
+on one operator image built from the final code of the branch — Kind, Kubernetes 1.36.1,
+containerd 2.3.1, runc 1.4.2, Linux 6.10: green inside both full suites, 53/53 on Valkey 9 and
+53/53 on Valkey 8.)* The Sentinel-tier half is unit-only by design: the image is shared with the data tier, whose stall
 now holds the Sentinel roll, and `SentinelSpec` has exactly `enabled`,
 `replicas`, `podLabels`, `podAnnotations`, `allowUnencrypted` and `disableAuth` — no field that
 could stop a Sentinel pod from starting on its own.
@@ -108,9 +113,33 @@ could stop a Sentinel pod from starting on its own.
 Open, and named as such: the steady-state master authority reads no `DeletionTimestamp` at all
 (D10 and *Residual risks*); this ADR binds the rolling update only. For D11: a Sentinel pod that
 is missing rather than unavailable still waits unbounded; a single pod that never starts is not
-reported; a paused data roll releases the Sentinel roll in the pass that pauses; and a tier of
+reported; a paused data roll releases the Sentinel roll in the pass that pauses; ~~and a tier of
 one or two Sentinels can never replace a Ready outdated Sentinel — pre-existing, reached by T31's
-fleet-wide Sentinel roll, and **not decided** (all four in *Residual risks*).
+fleet-wide Sentinel roll, and **not decided** (all four in *Residual risks*).~~ *(decided
+2026-09-26, see the next paragraph; the other three stay open, all in* Residual risks*.)*
+
+Amended 2026-09-26, after the T32 amendment was committed: **a tier of one or two Sentinels
+rolls serially** — decided by Hans, and the home of the decision is
+[ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10. Such a tier's quorum
+`replicas/2 + 1` equals its size, so the D8 guard refused every delete that spends a vote and
+the roll requeued forever with nothing named. The guard in `dispatchSentinelRollingUpdate` is
+now `sentinelDeleteKeepsVotes`: unchanged at three or more Sentinels, and on a tier of one or
+two it admits a delete that leaves `total - 1` available Sentinels — one at a time, and only
+while every other one is available. The D5 delete gate still applies, and a non-voting target
+still costs nothing. D8 is extended, D11's Sentinel paragraph notes what is left of the quorum
+wait, one Consequence records the cost, and the residual entry is closed in place. Implemented
+on branch `feat/rootless`, not yet released. Unit coverage
+`TestSentinelRollingUpdate_SmallTiersRollSerially` and `TestSentinelDeleteKeepsVotes` in
+[`pod_availability_test.go`](../../internal/controller/pod_availability_test.go),
+mutation-checked as the T32 ticket and ADR 0024 D10 record: the mutation the first test names,
+the quorum rule at every size, fails its first two rows — confirmed here by reading, not re-run;
+field coverage `TestE2E_RollingUpdate_TwoSentinelsRollSerially` in
+[`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go), written and
+~~**not yet run**~~ *(run 2026-09-26, locally on Kind and not in CI: green on both Valkey lines in
+an earlier run and again inside both full suites on one operator image built from the final code;
+it asserts that both Sentinels are replaced, the update completes and a key survives, not the
+serial order)*. Verified 2026-09-26: `make test-unit` green on the working tree, both unit
+tests included.
 
 ## Context
 
@@ -338,8 +367,10 @@ return the surplus ordinals a concurrent scale-down is draining, so a 5-to-3 sca
 together with an image bump would hold every delete for the whole drain of pods the roll never
 touched.
 
-**D8 — the Sentinel invariant is the quorum guard, not "one at a time".** A Sentinel pod that is
-already **gone** (NotFound, not terminating) is skipped by the scan, which lowers `readyCount`
+**D8 — the Sentinel invariant is the quorum guard, not "one at a time".** *(Narrowed 2026-09-26
+to a tier of three or more Sentinels: a tier of one or two rolls one at a time, see the second
+extension below.)* A Sentinel pod that is already **gone** (NotFound, not terminating) is
+skipped by the scan, which lowers `readyCount`
 and advances `firstOutdatedPod`; at five Sentinels with quorum three the arithmetic then permits
 deleting the next one while the previous replacement is still booting, and the gate cannot see it
 because the `DeletionTimestamp` is gone by then. That is accepted: it is the same quorum ADR 0004
@@ -368,8 +399,31 @@ old arithmetic charged it while the unavailable pod was still there, and the boo
 is `unavailableCurrent`, never a target. What the gate does not serialise is the boot: once a
 deleted non-voting pod is gone, the next non-voting outdated pod can be deleted while the first
 replacement is still starting. That spends nothing, since neither holds a vote. Traced by
-reading. On a tier of one or two Sentinels `quorum` equals `replicas`, so the guard refuses every
-delete that spends a vote — an open item, not a decision (*Residual risks*).
+reading. ~~On a tier of one or two Sentinels `quorum` equals `replicas`, so the guard refuses every
+delete that spends a vote — an open item, not a decision (*Residual risks*).~~ *(decided
+2026-09-26, see the next paragraph)*
+
+*Extended 2026-09-26 ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10).*
+**On a tier of one or two Sentinels the invariant is "one at a time", because there is no
+spare vote to keep.** `quorum = replicas/2 + 1` equals `replicas` there (the CRD minimum is
+one), so `readyCount - cost < quorum` refused every delete that spends a vote, and such a tier
+never replaced a Ready outdated Sentinel — no image change, no certificate rotation
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)), not
+the rootless posture ([ADR 0032](0032-generated-pods-run-rootless.md)). The guard is now
+`sentinelDeleteKeepsVotes(readyCount, cost, quorum, total)`, still applied only to a delete with
+`cost > 0`: while `quorum < total` it is the quorum rule above, unchanged; when `quorum == total`
+it admits the delete while `readyCount - cost >= total - 1`, which at a cost of one means every
+Sentinel of the tier, the target included, is available. A single Sentinel is replaced whenever
+the roll reaches it; of two, the second only once the first replacement is available. Unlike the
+quorum rule this has no five-Sentinel hole: a replacement that is gone, booting or terminating is
+not in `readyCount`, so it holds the next paid delete by itself. The price is the one such a tier
+pays for any single Sentinel failure: while one Sentinel restarts, the survivor of a pair cannot
+reach the majority a failover leader needs
+([ADR 0022](0022-sentinel-identity-is-pinned-to-the-pod.md) measured what that costs), and a
+one-Sentinel tier has no Sentinel at all for those seconds. Unit-tested
+(`TestSentinelRollingUpdate_SmallTiersRollSerially`, `TestSentinelDeleteKeepsVotes`); the e2e
+~~has not run~~ *(updated 2026-09-26)* is green locally on both Valkey lines, not in CI; what it
+does and does not assert is in *Residual risks*.
 
 **D9 — the manual-failover old-master delete is exempt, and the exemption is written down.** The
 pod deleted at the end of `handleManualFailover` is `pods[masterIdx]`, the master the function
@@ -402,7 +456,15 @@ self-defeating: after a spec fix the replacement that never came up on the broke
 outdated and the youngest, so it is `candidates[0]`, and only a human `kubectl delete pod` moved
 the roll on. The wait's one recorded reason (`91ca86d`, the first rolling update: "was recently
 replaced") applies to no outdated pod, because a replaced pod matches the template by
-construction.
+construction. *(Qualified 2026-09-26: the template it was created from.
+[ADR 0032](0032-generated-pods-run-rootless.md) D2's second roll moves the template under a
+replaced pod with no spec change — the migration's ownership repair leaves it once every ordinal
+holds a migrated pod, and a pod still carrying the repair is outdated from then on
+(`podCarriesRetiredRepair`, part of `podOutdated`). ~~A migrated pod was one past its pre-flight,
+which does not require it to be available, so the pod could be replaced while still coming
+up.~~ *(Tightened later on 2026-09-26: a migrated pod is Ready, and the repair stays while a
+data-tier roll is recorded (ADR 0032 D4), so the pod the second roll replaces has served, and the
+first roll has finalized.)* Traced by reading and unit-tested.)*
 
 **Replacement.** Deleting an outdated pod asks only whether it is being deleted — then
 `terminationWait` — and whether any pod of its tier is (the D5 gate). Readiness is no longer
@@ -473,6 +535,13 @@ waits that are not the delete gate — the quorum wait and the completion hold i
 `terminationWait`, a current pod that exists and is not available — the one with the oldest
 clock (D6) — goes to `availabilityWait`, since it is what a quorum wait is really waiting for
 while the target it refuses is a healthy outdated pod; anything else gets the plain requeue.
+*(Extended 2026-09-26, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10.)*
+Until then "anything else" also held the quorum wait of a tier of one or two Sentinels, where
+every pod was available and there was nothing to name. Since D8's extension that wait fires
+there only while some Sentinel of the tier is not available — never an unavailable outdated one,
+which is taken as the target at no cost — so it waits on a terminating Sentinel
+(`terminationWait`), an unavailable current one (`availabilityWait`), or a missing one, the plain
+requeue of *Residual risks*. Traced by reading.
 `runSentinelRollingUpdate` applies the Sentinel result's `DeferredRequeueAfter`, merged with the
 steady-state split-brain check's pending result by `soonerRequeue` (the sooner wins), where
 `handlePostRollingUpdateChecks` used to drop it and a stalled Sentinel wait scheduled no recheck
@@ -572,6 +641,11 @@ alert was added for it.
   urgent — the old Sentinels keep running and keep their quorum — but it changes what
   `PodTerminationStalled` and `PodRecreationStalled` leave running on that topology, and their
   API type comments say so.
+* A tier of one or two Sentinels now rolls, serially (D8, since 2026-09-26), and every step costs
+  it automatic failover for the seconds one Sentinel restarts — a one-Sentinel tier has no
+  Sentinel at all then. That is what any single Sentinel failure already costs a tier sized to
+  tolerate none; the alternative was a tier that never received a Sentinel change. At the T31
+  upgrade every such cluster pays it once per Sentinel.
 * One condition carries one reason for two tiers, and that is accepted. A data-tier stall raised
   over a standing Sentinel report replaces it, and a Sentinel report is not re-measured while the
   data tier rolls, because the Sentinel evaluator is not reached then; a standing one stands until
@@ -670,8 +744,10 @@ spare vote. Rejected.
   wait and the completion hold the plain requeue — T10's class
   ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D16) on the Sentinel tier. D11
   bounds only a pod that exists.
-* **A Sentinel tier of one or two Sentinels can never replace a Ready outdated Sentinel. Open,
-  awaiting Hans's decision; nothing is decided here.** `quorum = replicas/2 + 1` equals `replicas`
+* ~~**A Sentinel tier of one or two Sentinels can never replace a Ready outdated Sentinel. Open,
+  awaiting Hans's decision; nothing is decided here.**~~ **Closed 2026-09-26: such a tier rolls
+  serially (D8, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10).** As
+  recorded until then: `quorum = replicas/2 + 1` equals `replicas`
   for one and two Sentinels (the CRD minimum is one), so a Ready target costs a vote and
   `readyCount - 1 < quorum` holds on every pass. The quorum wait then has nothing to name — no
   terminating pod, no unavailable current pod — and `sentinelWait` gives the plain requeue: the
@@ -679,7 +755,15 @@ spare vote. Rejected.
   not caused by D11 — only an unavailable outdated Sentinel, which costs nothing, gets through.
   It stops being dormant with T31: [ADR 0032](0032-generated-pods-run-rootless.md) rolls every
   Sentinel tier once at the operator upgrade, so every such cluster reaches it then. The wds18
-  fleet runs only three-Sentinel tiers, checked read-only on 2026-09-26.
+  fleet runs only three-Sentinel tiers, checked read-only on 2026-09-26. What remains open: the
+  serial roll is ~~unit-tested only — `TestE2E_RollingUpdate_TwoSentinelsRollSerially` is written
+  and has not run on any cluster~~ *(updated 2026-09-26: covered end to end by
+  `TestE2E_RollingUpdate_TwoSentinelsRollSerially`, green locally on Kind on both Valkey lines,
+  in an earlier run and inside both full suites on the final image of the branch; not in CI)*,
+  and it asserts that both Sentinels are replaced, the update
+  completes and the data survives, not the one-at-a-time order, which only the unit tests drive.
+  No cluster of the wds18 fleet exercises the rule, and the failover cost of each step (D8) is
+  argued, not measured.
 * **A paused data roll releases the Sentinel roll in the pass that pauses.** `pauseRollingUpdate`
   returns an empty `RollingUpdateResult` — no requeue, no `DeferredRequeueAfter` — so
   `reconcileWorkload` passes the data tier as not holding and the Sentinel roll runs in that pass,
@@ -733,18 +817,25 @@ spare vote. Rejected.
   unavailable but not `candidates[0]` does not stop the delete of a healthy candidate.
   Pre-existing; D11 neither causes nor fixes it — the unavailable pod it deletes is
   `candidates[0]` and already down.
-* **The D11 e2e has run only locally, not on a CI leg.** `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced`
+* **The D11 e2e has run only locally, ~~not on a CI leg~~ with no CI result recorded** *(corrected 2026-09-26)*. `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced`
   drives the data tier onto an unpullable image and back on a 3+3 Sentinel cluster with
   `syncTimeout` 60 s. It passed on 2026-09-26 on Kind with a control plane and three workers
   (Kubernetes v1.36.1) against valkey 9.1.1 (Status), then inside both full local suites on that
   cluster — the Valkey 9 and the Valkey 8 line, 51/51 each — and once more on the final image
-  against valkey 9.1.1. Neither single-node CI leg has run it, because the branch has not been
-  through the pipeline, and it has not run on a single-node cluster at all. Until it has, these
+  against valkey 9.1.1. ~~Neither single-node CI leg has run it, because the branch has not been
+  through the pipeline~~ *(corrected 2026-09-26: the branch was pushed as `e2ce8bb`, where two
+  gate jobs failed, ADR 0017 D49; what that run's E2E legs reported is not recorded in this
+  repository)*, and it has not run on a single-node cluster at all. It passed again inside both
+  full suites on one operator image built from the final code (2026-09-26, 53/53 on Valkey 9 and
+  on Valkey 8; ~~the node count of that Kind cluster is not recorded here~~ *(corrected
+  2026-09-26: control plane + 3 workers again — the run created it with `make kind-create`, and
+  its output prepares four nodes)*). Until it has, these
   local runs on one multi-node Kind cluster are the field evidence for the data-tier half —
   including that the Sentinel UIDs stay unchanged under the hold.
 * **D8 is a real hole, accepted.** At five or more Sentinels the quorum arithmetic permits a
   second delete while a replacement is booting, and the gate cannot see a pod that is already
-  gone. No fleet cluster runs more than three.
+  gone. No fleet cluster runs more than three. A tier of one or two does not have it: its serial
+  rule refuses a paid delete while any Sentinel is missing (D8, 2026-09-26).
 * **D4's non-Sentinel asymmetry.** `RollingUpdateComplete` can still fire over a terminating pod
   on the non-Sentinel path. Bounding `finalizeMultiReplicaRollingUpdate` is the follow-up if that
   matters.
@@ -794,7 +885,10 @@ spare vote. Rejected.
   `availabilityWait`, `reportAvailabilityStall`, `expiredUnavailablePod`,
   `firstUnavailableExisting`, `notAvailableNote`, `dispatchDataRollingUpdate`,
   `sentinelScan.observe`, `sentinelScan.deleteTarget`, the `cost > 0` quorum guard in
-  `dispatchSentinelRollingUpdate`, `sentinelWait`, `finishSentinelRollingUpdate`; for the
+  `dispatchSentinelRollingUpdate` and, since 2026-09-26, `sentinelDeleteKeepsVotes`
+  (D8's serial rule for a tier of one or two Sentinels), `sentinelWait`,
+  `finishSentinelRollingUpdate`, and `podOutdated` / `podCarriesRetiredRepair` (the template
+  moving under a replaced pod, D11, since 2026-09-26); for the
   residual risks `pauseRollingUpdate` (the known release of the Sentinel roll) and
   `verifyNewMasterReady` (the unrefused `DBSIZE`)
 * [`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go) — the D2 construction site
@@ -802,17 +896,17 @@ spare vote. Rejected.
 * [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go) — the `PodAvailabilityStalled` row and its ownership rule, and the extended `PodTerminationStalled` clear site
 * [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) — `ConditionTypePodTerminationStalled`; for D11 `ConditionTypePodAvailabilityStalled`, `ReasonValkeyPodNotAvailable`, `ReasonSentinelPodNotAvailable`, `ReasonPodAvailable`, `RollingUpdateSpec.SyncTimeout`
 * [`internal/controller/pod_termination_test.go`](../../internal/controller/pod_termination_test.go) — the unit rules
-* [`internal/controller/pod_availability_test.go`](../../internal/controller/pod_availability_test.go) — the D11 unit rules
+* [`internal/controller/pod_availability_test.go`](../../internal/controller/pod_availability_test.go) — the D11 unit rules, and D8's serial rule (`TestSentinelRollingUpdate_SmallTiersRollSerially`, `TestSentinelDeleteKeepsVotes`)
 * [`test/e2e/pod_termination_test.go`](../../test/e2e/pod_termination_test.go) — the field rule
-* [`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — the D11 field rule for the data tier, green in both full local Kind suites (Valkey 9 and 8) on 2026-09-26, not yet on a CI leg
+* [`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — the D11 field rule for the data tier, green in both full local Kind suites (Valkey 9 and 8) on 2026-09-26, ~~not yet on a CI leg~~ no CI result recorded; and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` for D8's serial rule, ~~not yet run~~ green locally on both Valkey lines (2026-09-26)
 * [ADR 0004](0004-opt-in-poddisruptionbudgets.md) — the Sentinel quorum this reuses
 * [ADR 0007](0007-failover-aware-rolling-update.md) — the rolling update and its D9 on what readiness may mean, whose second half follows D11
 * [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — every wait is bounded; D5 and D11 are deliberate exceptions to its *mechanism*, not to its rule; D6 and D13 spend the budget D11 shares, D16 the third stall the D11 hold covers, D17 the same bound from that ADR's side
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the steady-state check a stalled pass used to suspend
 * [ADR 0017](0017-test-and-ci-policy.md) — D18, why the Sentinel quorum-wait fixtures changed and their assertions did not
 * [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) — `vko_valkey_status_condition`, where `PodAvailabilityStalled` is alertable
-* [ADR 0022](0022-sentinel-identity-is-pinned-to-the-pod.md) — what a Sentinel tier without a majority costs
-* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — the completion marker D6 changes; its D1 ordering, which the D11 hold restores except in the pass that pauses a data roll
+* [ADR 0022](0022-sentinel-identity-is-pinned-to-the-pod.md) — what a Sentinel tier without a majority costs, which is the price of each step of D8's serial roll
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — the completion marker D6 changes; its D1 ordering, which the D11 hold restores except in the pass that pauses a data roll; its D10, the home of the serial roll of a tier of one or two Sentinels (D8)
 * [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — the carve-out and the zero-Warning promise
 * [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — a level with two evaluators and the ownership rule it owes
-* [ADR 0032](0032-generated-pods-run-rootless.md) — T31, released only after D11; its fleet-wide roll of every Sentinel tier is what reaches the open one- and two-Sentinel residual
+* [ADR 0032](0032-generated-pods-run-rootless.md) — T31, released only after D11; its fleet-wide roll of every Sentinel tier is what reached the one- and two-Sentinel residual, closed 2026-09-26 by the serial roll (D8)

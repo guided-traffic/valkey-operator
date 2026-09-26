@@ -58,6 +58,7 @@ func TestDataOwnershipRepairNeeded(t *testing.T) {
 		rootlessPod
 		foreignLegacy
 		rootlessNeverStarted
+		rootlessNotReadyYet
 	)
 	for _, tc := range []struct {
 		name           string
@@ -89,6 +90,10 @@ func TestDataOwnershipRepairNeeded(t *testing.T) {
 			[]podShape{rootlessPod, rootlessPod, rootlessNeverStarted}, true},
 		{"not carried, a rootless pod not started yet: no evidence", true, false, false,
 			[]podShape{rootlessPod, rootlessPod, rootlessNeverStarted}, false},
+		// Past the pre-flight is not migrated: the removal starts the second roll, and
+		// that roll must not delete the replacement the first one is still waiting on.
+		{"carried, the last replacement past its pre-flight but not Ready: kept", true, true, false,
+			[]podShape{rootlessPod, rootlessPod, rootlessNotReadyYet}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := newTestValkey("ev", "default", func(v *vkov1.Valkey) {
@@ -118,6 +123,12 @@ func TestDataOwnershipRepairNeeded(t *testing.T) {
 					legacy(pod).OwnerReferences = nil
 				case rootlessNeverStarted:
 					rootless(pod).Status.Conditions = nil // e.g. ImagePullBackOff before any init container
+				case rootlessNotReadyYet:
+					rootless(pod).Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+					pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+						Name:  builder.DataWritableCheckContainerName,
+						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+					}}
 				}
 				objs = append(objs, pod)
 			}
@@ -128,11 +139,51 @@ func TestDataOwnershipRepairNeeded(t *testing.T) {
 	}
 }
 
-// TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll drives the StatefulSet
-// step through a migration: legacy pods bring the repair in, a second pass writes
-// nothing (no flip-flop), rootless pods take it out again, and the pod-spec hash on
-// the persisted template never moves -- which is what makes both edges roll nothing.
-func TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll(t *testing.T) {
+// TestDataOwnershipRepairNeeded_StaysWhileARollIsRecorded pins the ordering half of
+// ADR 0032 D4: with every ordinal migrated, the repair still stays in the template
+// while the data tier records a roll. reconcileStatefulSet runs before the rolling
+// update in the same pass, so removing it under the first roll outdates every pod
+// before that roll finalized, and clearStaleRollingUpdateState then discards its
+// state -- on the non-Sentinel path in the middle of the topology restoration. The
+// state is a gate on keeping the repair only: it is never evidence for adding one.
+func TestDataOwnershipRepairNeeded_StaysWhileARollIsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		carried bool
+		state   string
+		want    bool
+	}{
+		{"carried, the first roll restoring the topology: kept", true, stateRestoringTopology, true},
+		{"carried, the first roll replacing the master: kept", true, stateReplacingMaster, true},
+		{"carried, no roll recorded: goes", true, "", false},
+		{"not carried, a roll recorded: no evidence", false, stateReplacingReplicas, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, sts := persistentCluster("ord", 3)
+			if tc.state != "" {
+				v.Annotations = map[string]string{annotationRollingUpdateState: tc.state}
+			}
+			if tc.carried {
+				builder.WithDataOwnershipRepair(sts)
+			}
+			objs := []client.Object{v, sts}
+			for i := 0; i < 3; i++ {
+				objs = append(objs, rootless(podFromStsTemplate(v, sts, i)))
+			}
+			r, _ := newTestReconciler(objs...)
+
+			assert.Equal(t, tc.want, r.dataOwnershipRepairNeeded(context.Background(), v, sts))
+		})
+	}
+}
+
+// TestReconcileStatefulSet_RepairComesAndGoesAndTheRetiredRepairRolls drives the
+// StatefulSet step through a migration: legacy pods bring the repair in, a second
+// pass writes nothing (no flip-flop), rootless pods take it out again, and the
+// pod-spec hash on the persisted template never moves -- so neither template write
+// is itself a roll. What rolls afterwards are the pods that still carry the repair
+// in their spec: the second roll of ADR 0032 D2.
+func TestReconcileStatefulSet_RepairComesAndGoesAndTheRetiredRepairRolls(t *testing.T) {
 	v, sts := persistentCluster("mig", 3)
 	pods := []*corev1.Pod{
 		legacy(podFromStsTemplate(v, sts, 0)),
@@ -171,9 +222,15 @@ func TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll(t *testing.T) {
 	require.NoError(t, r.reconcileStatefulSet(ctx, crGet(t, c, "mig")))
 	assert.Equal(t, rv, getSts(t, c, "mig").ResourceVersion, "and stays gone")
 
+	// Before the pods carry it, nothing is outdated: no roll on a clean tier.
+	result := r.checkAndHandleRollingUpdate(ctx, crGet(t, c, "mig"))
+	require.NoError(t, result.Error)
+	assert.False(t, result.NeedsRequeue, "a tier whose pods carry no repair does not roll")
+
 	// The pods created while the template carried the repair keep it in their
-	// immutable spec. The rolling update must not read that as drift: it compares
-	// containers and hashes, never init containers.
+	// immutable spec: root on every sandbox restart, and refused by Pod Security
+	// "restricted". Now that the template is clean they are outdated for that alone,
+	// and the failover-aware roll replaces them (ADR 0032 D2, second roll).
 	for i := range pods {
 		live := &corev1.Pod{}
 		require.NoError(t, c.Get(ctx, types.NamespacedName{Name: pods[i].Name, Namespace: "default"}, live))
@@ -182,12 +239,49 @@ func TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll(t *testing.T) {
 		}}, live.Spec.InitContainers...)
 		require.NoError(t, c.Update(ctx, live))
 	}
-	result := r.checkAndHandleRollingUpdate(ctx, crGet(t, c, "mig"))
+	result = r.checkAndHandleRollingUpdate(ctx, crGet(t, c, "mig"))
 	require.NoError(t, result.Error)
-	assert.False(t, result.NeedsRequeue, "no roll after the repair left the template")
+	assert.True(t, result.NeedsRequeue, "the retired repair starts the second roll")
+	deleted := 0
 	for i := range pods {
-		assert.True(t, podExists(t, c, pods[i].Name), "%s must not be replaced a second time", pods[i].Name)
+		if !podExists(t, c, pods[i].Name) {
+			deleted++
+		}
 	}
+	assert.Equal(t, 1, deleted, "one pod at a time, like every roll")
+	assert.False(t, builder.HasDataOwnershipRepair(&getSts(t, c, "mig").Spec.Template.Spec),
+		"a missing pod during the second roll is no evidence: the repair does not come back")
+	require.NoError(t, r.reconcileStatefulSet(ctx, crGet(t, c, "mig")))
+	assert.False(t, builder.HasDataOwnershipRepair(&getSts(t, c, "mig").Spec.Template.Spec))
+}
+
+func TestPodCarriesRetiredRepair(t *testing.T) {
+	v, sts := persistentCluster("retired", 1)
+	with := podFromStsTemplate(v, sts, 0)
+	with.Spec.InitContainers = append([]corev1.Container{{Name: builder.DataOwnershipRepairContainerName}},
+		with.Spec.InitContainers...)
+	without := podFromStsTemplate(v, sts, 0)
+
+	assert.True(t, podCarriesRetiredRepair(with, sts), "pod carries it, template does not: outdated")
+	assert.False(t, podCarriesRetiredRepair(without, sts))
+
+	carrying := sts.DeepCopy()
+	builder.WithDataOwnershipRepair(carrying)
+	assert.False(t, podCarriesRetiredRepair(with, carrying), "during the migration it is not outdated")
+}
+
+// A persistent single pod migrated with the repair is replaced once more when the
+// repair leaves the template -- the second restart the decision accepted.
+func TestHandleStandaloneRollingUpdate_ReplacesAPodCarryingTheRetiredRepair(t *testing.T) {
+	v, sts := persistentCluster("second", 1)
+	pod := rootless(podFromStsTemplate(v, sts, 0))
+	pod.Spec.InitContainers = append([]corev1.Container{{Name: builder.DataOwnershipRepairContainerName}},
+		pod.Spec.InitContainers...)
+	r, c := newTestReconciler(v, sts, pod)
+
+	result := r.handleStandaloneRollingUpdate(context.Background(), crGet(t, c, "second"), sts)
+	require.NoError(t, result.Error)
+	assert.False(t, podExists(t, c, "second-0"))
 }
 
 func getSts(t *testing.T, c client.Client, name string) *appsv1.StatefulSet {
@@ -412,4 +506,45 @@ func TestCheckAndHandleRollingUpdate_NoPodSecurityConditionWithoutADeferral(t *t
 	result := r.checkAndHandleRollingUpdate(context.Background(), v)
 	require.NoError(t, result.Error)
 	assert.Nil(t, podSecurityPendingCondition(t, c, "replaced"))
+}
+
+// TestCompletedRoll_AsksForThePassThatRemovesTheRepair: the repair stays while a
+// roll is recorded, so it can only leave in the pass after the completion -- and a
+// completing pass schedules none (the CR watch is generation-gated, there is no Pod
+// watch). Measured on Kind before this recheck existed: the persistent tiers kept
+// the repair after their first roll and the second roll never started.
+//
+// Revert check: deleting the requestRecheck branch of finishDataRoll (the
+// completion step dispatchDataRollingUpdate calls) fails the first row.
+func TestCompletedRoll_AsksForThePassThatRemovesTheRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		carried     bool
+		wantRecheck bool
+	}{
+		{"template still carries the repair: a follow-up pass is requested", true, true},
+		{"no repair: the completing pass asks for nothing", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, sts := persistentCluster("fin", 1)
+			v.Annotations = map[string]string{annotationRollingUpdateState: stateReplacingReplicas}
+			if tc.carried {
+				builder.WithDataOwnershipRepair(sts)
+			}
+			pod := rootless(podFromStsTemplate(v, sts, 0))
+			r, c := newTestReconciler(v, sts, pod)
+			state := &passState{}
+			ctx := withPassState(context.Background(), state)
+
+			result := r.checkAndHandleRollingUpdate(ctx, crGet(t, c, "fin"))
+			require.NoError(t, result.Error)
+			require.True(t, result.Completed, "premise: the recorded roll completes in this pass")
+			assert.Empty(t, crGet(t, c, "fin").Annotations[annotationRollingUpdateState])
+			if tc.wantRecheck {
+				assert.Equal(t, rollingUpdateRequeueDelay, state.interval())
+			} else {
+				assert.Zero(t, state.interval())
+			}
+		})
+	}
 }

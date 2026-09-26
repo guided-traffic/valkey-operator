@@ -7,6 +7,46 @@ image:
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""
+  # digest pins the image, as sha256:<64 hex>. The reference becomes
+  # repository:tag@digest for the operator, the pre-upgrade hook and, through
+  # --operator-image, the sidecar and observer containers the operator generates.
+  # Empty pulls by tag, which a re-pushed tag can change underneath.
+  digest: ""
+
+# podSecurity hardens the operator and pre-upgrade hook pods beyond the fixed
+# posture (uid/gid/fsGroup 65532, runAsNonRoot, no privilege escalation, read-only
+# root filesystem, no capabilities). It does not reach the Valkey pods: those take
+# spec.podSecurity on each Valkey resource.
+podSecurity:
+  seccompProfile:
+    # type is RuntimeDefault or Localhost. Unconfined is refused at render time:
+    # the operator always runs under a seccomp filter.
+    type: RuntimeDefault
+    # localhostProfile is the profile path relative to the kubelet's seccomp
+    # directory, required with Localhost: not absolute and without a '..'
+    # element, or the render fails. A node missing the file cannot start the
+    # operator pod.
+    localhostProfile: ""
+  # userNamespaces sets hostUsers: false, so root in the container would not be
+  # root on the node. Needs Kubernetes 1.33 or later, containerd 2.0 or CRI-O 1.25
+  # or later, and Linux 6.3 or later on every node the pod can land on; without
+  # that support the pod does not start.
+  userNamespaces: false
+
+# valkeyPodSecurity bounds what spec.podSecurity on a Valkey resource may ask for.
+valkeyPodSecurity:
+  # allowedSeccompLocalhostProfiles lists the Localhost seccomp profiles, as paths
+  # relative to the kubelet's seccomp directory, that a Valkey resource may name in
+  # spec.podSecurity.seccompProfile. Empty refuses every Localhost profile: the
+  # operator does not write the workloads of a Valkey resource naming an unlisted
+  # one - its pods keep their template - and reports
+  # ReconcileBlocked/SeccompProfileNotAllowed on it. RuntimeDefault needs no entry.
+  #
+  # Security note: list only profiles at least as strict as you accept for every
+  # Valkey pod in the cluster. Every Valkey author may pick any listed profile, a
+  # profile that allows every syscall is as good as no filter, and Pod Security
+  # "restricted" accepts every Localhost profile.
+  allowedSeccompLocalhostProfiles: []  # default
 
 imagePullSecrets: []
 nameOverride: ""

@@ -7,10 +7,22 @@ Accepted. Date: 2026-08-21.
 Implemented. Open items live at the decision that owns them; D6 and D25 each carry one. The
 abandon-path e2e, listed here as CODE-COMPLETE / **NOT EXECUTED** (D30) when this ADR was
 written, has run since: D50 records it on CI legs, and it passed in both local full-suite runs
-of 2026-09-26 (Kind, Valkey 9 and Valkey 8).
+of 2026-09-26 (Kind, Valkey 9 and Valkey 8) *(and in both full suites on the last image of that
+day, with [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9's
+clock: 53/53 on Valkey 8, 52/53 on Valkey 9, the one failure in another test — D50 as amended)*.
 The `generated-manifests` CI job has since run green on a runner, but only its passing path
 ([ADR 0014](0014-rbac-lives-in-three-places.md)) — a CI run outcome observed in the Actions UI,
 not reproducible from this repository, which carries the workflow definition and no run record.
+*(Its failing path fired on 2026-09-26, on `feat/rootless` at `e2ce8bb`: see the D49 amendment.)*
+
+Amended 2026-09-26, ~~three~~ four times on `feat/rootless` *(the fourth added the same day)*:
+**D35** is scoped to hand-written code
+(`make cyclo` ignores `zz_generated`); **D49** puts the version into every tool path, after a
+stale local `controller-gen` turned `Generated Manifests Up To Date` red; **D55** follows the
+fleet-upgrade e2e through the second roll of ADR 0032 D2; **D50** records a second instance of
+its fixture rule, `TestE2E_SidecarFailoverDrainMaster`, found by the last full e2e run of the
+day and fixed. Each is recorded at its decision. The same day also made D52 to D55 new and
+amended D6 and D42 (the paragraphs below).
 
 Amended 2026-08-22: **D42 and D43 are new.** The operator runs shell inside an image it does
 not build, and nothing checked that the image still contained what the shell executes -- the
@@ -78,9 +90,49 @@ server enforces, and no tier could evaluate it: the unit tier could only restate
 imagetools tier checked that tools exist but not who runs them, and the only test that starts
 from data a root process wrote runs outside CI. Each new decision covers what the tier below it
 cannot see. D52 and D53 ran green on 2026-09-26; D54 and D55 ran green the same day, locally on
-Kind and not in CI (the branch has not been through the pipeline), so both stay open. The
+Kind and not in CI (~~the branch has not been through the pipeline~~ *(corrected 2026-09-26: it
+was pushed as `e2ce8bb`, where two gate jobs failed — D49; what that run's E2E legs reported is
+not recorded in this repository, and CI has not run on the fixed working tree)*), so both stay
+open. D55's run
+is of its first version, before the amendment that follows. The
 open items above grow with it: D6 now carries two (the root skip joins the second skip). The
 new e2e waits do not add to D25's: they were written against it (Residual risks).
+
+Amended 2026-09-26, later the same day: **D55 is amended, ~~and two e2e are NOT EXECUTED (D30)~~** *(both executed since, the same day — see the end of this paragraph)*.
+Hans decided two questions the amendment above had left open. The persistent data pods the
+migration creates keep the root repair in their immutable spec, and a second roll now replaces
+them ([ADR 0032](0032-generated-pods-run-rootless.md) D2). D55's fleet e2e therefore waits for
+that roll and reads the re-owned files, and its no-second-roll assertion is gone. A Sentinel tier of one or two now rolls serially
+([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10), and the new
+`TestE2E_RollingUpdate_TwoSentinelsRollSerially` covers it. ~~Neither e2e has run.~~ *(Both have
+run since, locally on Kind and not in CI: see D55 and Residual risks, updated 2026-09-26.)* The
+D55 run recorded below stays true for the code it ran against (Residual risks).
+
+Amended 2026-09-26, last on the day: **D50 gains a second instance.** The last full e2e run of
+the day went red once, on the single-node Valkey 9 leg, in `TestE2E_SidecarFailoverDrainMaster`.
+Every wait after its master delete was already met by the terminating old master, which kubelet
+keeps Ready ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)) *(the diagnosis, from the
+test code and its timing, not traced in the failed run — noted 2026-09-26)*; the test now waits
+for the replacement by UID. The diagnosis, the experiment behind it and the five sites of the
+same shape still unaudited (T34) are recorded at D50.
+
+**What "the final image" means in this ADR** *(clarified 2026-09-26)*. Every site that says
+"the final image" or "the final code" means the last image at the time that site was written,
+and several images of that day were once the last. The sites that name the image of the 53/53
+pair of full suites — under D54, D55, the Consequences and the Residual risks — mean one built before
+[ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9's clock and the
+single failover write of [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D14; each of
+those sites is marked, as "the code before ADR 0025 D9's clock" or, for short, "pre-clock". The last image of the day was built with both, and its suites ran before
+the D50 fix above, which changes test code only. Run on Kind (Kubernetes 1.36.1, containerd
+2.3.1, runc 1.4.2, Linux 6.10), not in CI:
+`TestE2E_FleetUpgrade` from 1.12.8 green; the full suite 53/53 on Valkey 8 and 52/53 on Valkey 9,
+the one failure the D50 instance; two further Valkey 8 runs of D54's test and ADR 0033's hardening
+e2e green. No full suite has run on the D50 fix. The CI-parity gates — `make generate-all` (no diff
+with a fresh controller-gen v0.22.0), `make lint` (golangci-lint v2.14.0, 0 issues), `make cyclo`,
+`make gosec` (v2.29.0, 0 issues), `make vuln` (no vulnerabilities), the unit and integration
+coverage targets, `make test-image-tools` and `make test-release-tooling` — are recorded green
+from a clean-copy run on the code **before** the clock, the single write and the D50 fix. Their
+rerun on the final code had not finished when this was written, and nothing here claims it.
 
 ## Context
 
@@ -131,9 +183,35 @@ and `golangci-lint` already did, and `govulncheck` gains the renovate-managed pi
 **Prerequisites are expanded when a rule is read, not when it runs**, so the tool-path and
 tool-version variables move above the first target that names one; only the `$(LOCALBIN)` mkdir
 rule stays where it was, because a rule placed above `all: build` becomes the default goal.
+
+*(Amended 2026-09-26.)* **The tool path carries the version** (`bin/controller-gen-v0.22.0`,
+`bin/golangci-lint-v2.14.0`, …). `go-install-tool` installs only when its file is missing (make
+may start the recipe more often, because `$(LOCALBIN)` is a normal prerequisite and newer than
+the tools, but the `[ -f ]` guard skips it), so a version bump never reached an existing `bin/`: Renovate moved `CONTROLLER_GEN_VERSION` to v0.22.0 (#209), a local
+`bin/controller-gen` v0.21.0 regenerated the CRDs on `feat/rootless` and stamped
+`controller-gen.kubebuilder.io/version: v0.21.0` back into them, and `Generated Manifests Up To
+Date` — which installs fresh — failed on exactly that line (reproduced locally: regenerating the
+pushed commit with v0.22.0 changes the two stamps and nothing else). The same stale file served
+`make lint` a golangci-lint older than the pinned v2.14.0. With the version in the name a bump
+is a missing file; `go-install-tool` installs into a directory of its own (`<path>.install`) and
+moves the binary onto the versioned path, because `go install` names it after the package. The
+tool-path variables stay above the first target and expand the version lazily. Unversioned
+binaries an older checkout left in `bin/` are no longer read by any target.
+*(2026-09-26, the fix verified end to end.)* The CI-parity rerun on the final tree — ADR 0025 D9's own clock, the one-write arming and the
+D50 drain fix included; only comments and the retrigger arming test changed after it — ran every
+gate target in a fresh clean copy with an empty `bin/`: `make generate-all` (no diff), `make lint`
+(golangci-lint v2.14.0, 0 issues), `make cyclo`, `make gosec` (v2.29.0, 0 issues), `make vuln`
+(no vulnerabilities), `make test-unit-coverage`, `make test-integration-coverage`,
+`make test-image-tools` and `make test-release-tooling`, all green (2026-09-26); `make test-unit`
+and `make test-integration` green again after the last test and comment changes. CI itself has
+not run on it.
 Naming a tool in a target's prerequisites while its variable is still undefined expands to
 nothing and silently drops the dependency — which is how the first attempt at this decision
-failed.
+failed. *(Verified 2026-09-26: `make generate-all` in a clean copy of the working tree with an
+empty `bin/`, so controller-gen v0.22.0 installed fresh the way the CI job installs it, leaves no
+diff. CI itself has not run on the fix.)* *(That clean copy predates the last three changes of the
+day — ADR 0025 D9's clock, ADR 0010 D14's single failover write and the D50 fixture fix; the rerun
+on the final code is not recorded here, Status.)*
 
 **D2 — Three tiers with fixed responsibilities.** Unit tests cover all reconciliation logic;
 integration tests (envtest) cover what only a real API server decides — CRD defaulting (D14),
@@ -458,6 +536,40 @@ operator is concurrently replacing, "which pod" is part of the assertion and has
 expressed as identity -- image, UID or `deletionTimestamp` -- not inferred from a controller
 state that outlives the object.
 
+*(Amended 2026-09-26: a second instance, found and fixed.)* The rule binds a fixture that
+deletes a pod itself just as much. `TestE2E_SidecarFailoverDrainMaster`
+([`sidecar_test.go`](../../test/e2e/sidecar_test.go)) deletes the master of a 3+3 Sentinel
+cluster and then waited for the StatefulSet at 3/3, phase `OK`, every pod Ready and exactly one
+pod answering master. The **terminating** old master satisfies every one of those: kubelet keeps
+it Ready for its whole termination ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)),
+and it still answers master. On the single-node Valkey 9 leg of the last full e2e run of the day
+the delete subtest passed in 0.38 s. "Data survives failover" then picked the dying pod as the
+master holding the keys, and its `DBSIZE`, sent by pod name, reached the empty replacement and
+read 0. The operator log of that cluster shows no operator action between its creation and its
+deletion. The pod logs were lost with the CR, so this diagnosis is read from the test code and
+its timing, supported by the experiment below and not traced in the red run itself.
+
+**Experiment, on Kind.** The unchanged test run alone went green 10 of 10, but 5 of the 10 took
+the vacuous path, with the delete subtest finishing in 0.28–0.30 s. A watcher recorded role and
+`DBSIZE` ~~of every pod~~ once a second *(corrected 2026-09-26: what is recorded is what it
+showed for the new master and the replacement; that it covered every pod is not)*. It showed the new master holding all 50 keys, and the
+replacement reading `dbsize=0` for several seconds while it resynchronised. So on the vacuous
+path the verdict is timing: the `DBSIZE` is green when it reaches the dying master or a
+resynchronised replacement, and red inside that window (inferred from the two observations, not
+measured on one run).
+
+**The fix names the pod by identity.** The subtest records the deleted pod's UID and waits for a
+Ready pod of that name with a different UID (`waitForPodRecreated`) before any role or data
+check. The fixed test ran 8 of 8 green on Valkey 9, with the delete subtest taking 8.3–10.3 s.
+**Not verified:** no full suite has run on the fix, and 8 green runs on one host are a streak,
+not a failure rate (the same limit as D50 itself, Residual risks). ~~Five more e2e sites wait on
+controller state after deleting a pod~~ *(corrected 2026-09-26, read: five more e2e sites delete a
+pod and none of them then waits for the replacement by UID; whether their waits can be met by the
+terminating pod is what the audit has to establish)*, in `sidecar_test.go` (the replica drain),
+`admission_recovery_test.go`, `sentinel_stale_master_test.go`, `pod_termination_test.go` and
+`topology_abandon_test.go`. They are filed unaudited as T34 on
+[the ticket board](../tickets/local_BOARD.md).
+
 **D51 — Endpoint membership is read through `discovery.k8s.io/v1` EndpointSlice.** `v1 Endpoints`
 is deprecated since Kubernetes 1.33 and each client using it logs
 `Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice` once.
@@ -491,6 +603,13 @@ Gated by `make cyclo` and its CI job. This is why the split-brain evidence rules
 nameable and testable predicates (`couldNotHaveSelfElected`, `recordedGaveUpTheRole`,
 `recreatedAfter`) rather than inline conditions — the paths where an unreviewable branch tree
 turns into a data-loss bug are exactly the ones the ceiling forces apart.
+*(Amended 2026-09-26, scope.)* "Every function" means every function a person writes:
+`make cyclo` ignores `zz_generated` files as it ignores `_test.go`. controller-gen's
+`(*ValkeySpec).DeepCopyInto` gains one branch per optional pointer field and reached 16 with
+`spec.podSecurity` ([ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md));
+nobody reviews or edits that code, so the ceiling's reason does not apply to it, and the only
+ways to satisfy it would have been an API shaped around a counter or a `nolint`, which this rule
+refuses. Hand-written code stays under the ceiling without exception.
 
 **D36 — Every claim is labelled by how it was verified: run, read-only, or hypothesis.** "No
 cluster was touched" is a normal and acceptable statement; an assumption travelling as a fact
@@ -749,8 +868,20 @@ It is a plain `e2e`-tagged test. Both single-node legs run it, and the multi-nod
 `E2E_RUN` leaves it out (D31). It ran green on 2026-09-26, locally and not in CI: in the full
 `make test-e2e` on Kind (control plane + 3 workers, Kubernetes v1.36.1, containerd) with
 `E2E_VALKEY_LINE=9` and with `E2E_VALKEY_LINE=8` (51/51 each), both re-run green on the final
-operator image. Every subtest above passed, the positive control included. It stays open until
-both CI legs that run it have recorded a green run.
+operator image. Every subtest above passed, the positive control included. *(Rerun 2026-09-26 on
+one operator image built from ~~the final code of the branch~~ the code before ADR 0025 D9's
+clock *(corrected 2026-09-26, Status)* — ADR 0033's allow-list and CEL path
+rule and ADR 0025 D9 included — on Kind with Kubernetes 1.36.1, containerd 2.3.1, runc 1.4.2 and
+Linux 6.10: green inside both full suites, 53/53 on each line, and in two further Valkey 8 runs
+of this test ~~alone~~ outside the suite, together with ADR 0033's hardening e2e (`E2E_RUN`
+naming both; corrected 2026-09-26). The suite count grew from 51 by
+`TestE2E_RollingUpdate_TwoSentinelsRollSerially` and ADR 0033's
+`TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest`; 53 is every `Test` function
+under the `e2e` tag without `fleetupgrade` or `e2e_helm`, read from the build tags of
+`test/e2e`.)* *(Rerun again 2026-09-26 on the last image of the day, with ADR 0025 D9's clock:
+green inside both full suites — 53/53 on Valkey 8, 52/53 on Valkey 9 with another test failing
+(D50) — and in two further Valkey 8 runs with the hardening e2e.)* It stays open until both CI
+legs that run it have recorded a green run.
 
 **D55 — The fleet-upgrade e2e is the migration proof. Its premise is asserted first, and it
 runs locally only.** `TestE2E_FleetUpgrade` (tags `e2e,fleetupgrade`) is the only test that
@@ -765,12 +896,46 @@ process wrote it. The test then asserts:
 
 * every rolled data and Sentinel pod is built rootless (pod `runAsNonRoot: true`,
   `runAsUser: 999`);
+* the **second roll** of ADR 0032 D2 finished on every persistent member: the template and
+  every ordinal are free of `fix-data-ownership`, every ordinal is Ready, and the phase is `OK`;
 * keys are intact on every replica, not only on the master;
-* every persistent pod carries the repair in its spec with exit code 0, and the repair is gone
-  from the template afterwards;
-* pod UIDs stay unchanged over a 90 s window after that, so no second roll happened;
+* on every ordinal of a persistent member, everything `stat -c %u` reads (`/data`, its entries,
+  `appendonlydir` and its entries) is owned by uid 999;
+* every multi-replica data tier completed its roll, counted as `RollingUpdateComplete` Events
+  since the upgrade: the two non-persistent members exactly one, the persistent 3-replica
+  members exactly two (~~at least one~~, restored 2026-09-26 with the ordering fix below); and
+  each Sentinel tier exactly one (`SentinelUpdateComplete`);
+* data and Sentinel pod UIDs stay unchanged over a 90 s window after that, so no third roll
+  happened;
 * the persistent single pod was replaced (its UID changed), and the non-persistent one was not
   replaced and reports `PodSecurityUpdatePending=True/PodRunsAsRoot`.
+
+**Amended 2026-09-26, the same day, when the open question of ADR 0032 D2 was decided.** The
+first version of this list asserted the opposite of the second roll: every persistent pod
+carried the repair in its spec with exit code 0 (`requireRepairRan`, now removed), and the 90 s
+window showed that *no second* roll happened. The second roll deletes the pods whose status
+held that exit code, so the evidence moved from the container to its effect. Before the
+upgrade `shapeLegacyVolumes` requires a root-owned `/data` and files written by uid 0; a
+`hostPath` volume gets no `fsGroup`, and uid 999 cannot take over what root owns. A 999-owned
+`/data` afterwards is therefore something only the repair (uid 0, `CAP_CHOWN` and nothing else)
+can have produced. The persistent single pod now restarts twice; the test asserts that it was
+replaced, not the count, and the second restart shows only as the repair-free pod the
+second-roll wait demands.
+
+~~A persistent tier's completed rolls are asserted as at least one, not two.~~ *(Superseded
+2026-09-26, later the same day: the first run of the changed test measured one completion per
+persistent tier where it expected two, which is the defect this paragraph had rationalised. ADR
+0032 D4 now keeps the repair while a data-tier roll is recorded and counts a pod as migrated
+only once Ready, so the first roll finalizes before the second starts, and the count is exactly
+two again. The count is therefore a test of the ordering, not noise to be loosened around; the
+superseded reasoning follows unchanged.)* The repair leaves the
+template as soon as every ordinal holds a migrated pod, and the last one counts once its
+pre-flight has exited 0, before it is Ready (`dataOwnershipRepairNeeded`). That can be before
+the roll that replaced it has finished, so whether the second roll ends in an Event of its own
+depends on the state that roll is in; the test's comment names the path on which it simply
+continues the first. That is read from the code and has not been measured. The count is
+asserted exactly only for the non-persistent members, where nothing can vary it. The proof that
+the second roll happened is the wait above, which requires that no pod carries the repair.
 
 **The premise is checked before any of that (D29).** kubelet applies no `fsGroup` to a
 `hostPath` volume, so on Kind the repair is the only thing that can re-own root-written data.
@@ -780,17 +945,32 @@ PV bound to `data-<name>-0` of any persistent member is not `hostPath`.
 
 The other premise, that the data really is root-written, is asserted from the other end. If
 `E2E_UPGRADE_FROM` ever moves past the release that ships ADR 0032, no legacy pod exists and the
-repair is never inserted. `requireRepairRan` then fails instead of passing.
+repair is never inserted. The test then fails instead of passing, in two places:
+`shapeLegacyVolumes` before the upgrade, because it requires a root-owned `/data` and files
+written by uid 0, and the ownership read after it, because without the repair nothing re-owns
+the volume root Kind creates as root (D53), so `/data` still reads uid 0. Both are read from
+the code; no run has started from such a release. Until the amendment above, `requireRepairRan`
+was the check after the upgrade. The roll count is not one: it asks a persistent tier for at
+least one roll, which a later from-version can still produce.
 
-The no-second-roll window is sampled, not proved (D9). The deterministic guard that the repair
-never enters the hash is `TestWithDataOwnershipRepair_IsHashNeutral`.
+The no-third-roll window is sampled, not proved (D9). The deterministic guards are in the unit
+tier. `TestWithDataOwnershipRepair_IsHashNeutral` shows the repair never enters the hash, so
+neither template write is itself a roll.
+`TestReconcileStatefulSet_RepairComesAndGoesAndTheRetiredRepairRolls` shows a tier whose pods
+carry no repair does not roll, a tier whose pods carry the retired one deletes one pod, and the
+repair does not return to the template. `TestPodCarriesRetiredRepair` and
+`TestHandleStandaloneRollingUpdate_ReplacesAPodCarryingTheRetiredRepair` pin the comparison and
+the single pod. All four passed in `make test-unit` on 2026-09-26 with zero SKIPs, every package
+from the test cache, so not the `-count=1` run D6 asks for. Only the hash test's doc comment
+names a revert check, and none of the four records a failure message (D7).
 
 **It is not a CI job**, for the reason the file gives: it reinstalls the operator that every
 other e2e runs against, so it needs a cluster of its own (`make e2e-fleet-upgrade-local`).
 Whether it becomes a CI job is a separate decision. Until then it proves the migration only on
 runs someone records.
 
-**Recorded run, 2026-09-26, local Kind** (control plane + 3 workers, Kubernetes v1.36.1,
+**Recorded run, 2026-09-26, local Kind, of the first version of the test** against the operator
+before the second roll existed (control plane + 3 workers, Kubernetes v1.36.1,
 containerd): `make test-e2e-fleet-upgrade E2E_UPGRADE_FROM=1.12.8` passed in 253 s, from the
 released chart 1.12.8 to the local chart. The default starting point 1.10.48 has **not** run:
 its released images are amd64-only, and the arm64 host answers "no match for platform in
@@ -798,7 +978,7 @@ manifest". 1.12.8 ran with its amd64 image loaded into Kind under emulation. The
 members on Valkey 9.1.1: 3+3 Sentinel with TLS, a plain 3-replica cluster with the observer,
 3-replica AOF and RDB persistent clusters, a persistent single pod and a non-persistent one;
 every persistent volume root was set to `0755` root before the upgrade (`shapeLegacyVolumes`).
-Green, beyond the list above:
+Green, on that version and not on the amended list above:
 
 * the Kind PV is `hostPath`;
 * every multi-replica and Sentinel cluster converged, all pods rootless, keys on every replica;
@@ -816,6 +996,27 @@ Three pre-existing bugs in the test were fixed on the way: the cleanup scope, ch
 resolved relative to the package directory, and a hook assertion that demanded a Job the chart
 deletes on success. One local run on one host is what this item records; it is still not a CI
 job.
+
+~~**The amended test is NOT EXECUTED (D30).**~~ *(Executed 2026-09-26, locally on Kind and not
+in CI, from 1.12.8 as above.)* Two data points of the run above describe the
+behaviour ADR 0032 D2 then turned down: no pod replaced in the 90 s after the repair left the
+template, and a persistent single pod restarted once. They stay recorded as what that code did.
+The run checklist for the amended test is under Residual risks.
+
+**Runs of the amended test, 2026-09-26.** The first two runs failed, each on a defect in the
+order of the two data-tier rolls, not in the test: first one `RollingUpdateComplete` per
+persistent tier where the list above demands two, then the repair stranded in the template after
+the first roll. Both are fixed in [ADR 0032](0032-generated-pods-run-rootless.md) D4. The rerun on
+the fix passed, and so did a run on one operator image built from ~~the final code of the
+branch~~ the code before ADR 0025 D9's clock *(corrected 2026-09-26, Status)* (ADR 0033's
+allow-list and CEL path rule, ADR 0025 D9), on Kind with Kubernetes 1.36.1,
+containerd 2.3.1, runc 1.4.2 and Linux 6.10. Every assertion in the list above is exact where it
+says so, so a green run means each held: the second roll finished on all three persistent
+members, `fleet-aof` and `fleet-rdb` completed exactly two data-tier rolls, `fleet-ha` and
+`fleet-plain` exactly one, each Sentinel tier exactly one, every ownership read on a persistent pod was uid 999,
+and nothing rolled in the 90 s after the second roll. *(Green again 2026-09-26 from 1.12.8 on the
+last image of the day, with ADR 0025 D9's clock and ADR 0010 D14's single failover write.)* Still
+a local run on one host; it is not a CI job.
 
 ## Consequences
 
@@ -866,15 +1067,24 @@ job.
   E2E legs run per push, and one intermittent failure in any of them stops the queue where
   it used to be waved through. D50 removes the one known instance; the policy answer for the
   next one is to fix or quarantine it, never to drop the context.
-* `bin/` now holds seven tools instead of four (D49); a stale one is deleted, not upgraded in
+* `bin/` now holds seven tools instead of four (D49); ~~a stale one is deleted, not upgraded in
   place, because `go-install-tool` skips whenever the file exists. A version bump therefore
-  needs `rm bin/<tool>` locally — CI starts from an empty `bin/` and never sees it.
+  needs `rm bin/<tool>` locally — CI starts from an empty `bin/` and never sees it.~~
+  *(Superseded 2026-09-26 by the D49 amendment: the path carries the version, so a bump is a
+  missing file and installs itself; nobody had run the `rm`, and the stale controller-gen turned
+  `Generated Manifests Up To Date` red.)* Every bump leaves the previous binary behind in
+  `bin/`, unreferenced.
 * The unit tier now depends on `k8s.io/pod-security-admission` and, through it,
   `k8s.io/component-base` (D52). Both are test-only and move with the `k8s.io/*` group.
 * **The migration path of ADR 0032 has no CI gate that starts from real legacy data** (D55).
-  CI covers its parts: the evidence and the hash neutrality in the unit tier, and the repair on
-  a Docker volume in the imagetools tier. The whole path, from a released operator's pods to a
-  rootless fleet, is proved only on runs someone performs and records by hand.
+  CI covers its parts: the evidence, the hash neutrality and the second roll in the unit tier,
+  and the repair on a Docker volume in the imagetools tier. The whole path, from a released
+  operator's pods to a rootless fleet, is proved only on runs someone performs and records by
+  hand.
+* The fleet e2e now waits for a second roll of every persistent member (D55), so it runs longer
+  than the 253 s recorded for its first version. ~~How much longer has not been measured~~
+  *(measured 2026-09-26, one run on the ~~final~~ pre-clock image, Status: 288 s)*; the `make` target's 45 min timeout
+  was not changed.
 
 ## Alternatives Considered
 
@@ -1029,7 +1239,7 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   replica with `masterauth` set against a master with no `requirepass` must abort the handshake
   at AUTH — follows from the Valkey/Redis handshake and was first exercised by the test itself:
   D50 records it on CI legs, and it passed in both local full-suite runs of 2026-09-26 (Kind,
-  Valkey 9 and Valkey 8). A premise that does not bite fails loudly at the
+  Valkey 9 and Valkey 8) *(and in both on the last image of that day, Status)*. A premise that does not bite fails loudly at the
   `TopologyRestored=False` wait and cannot pass falsely, so those passes are the measurement.
 * **No automated rule forbids a new `testing.Short()` gate** — D3 rests on convention plus a
   grep.
@@ -1065,7 +1275,8 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   shows the jam landing between the demote and the delete, and the new gate cannot match that
   pod; what has *not* been done is running the test enough times to show the failure rate is
   now zero. A test that failed intermittently needs a green streak, not one green run, and the
-  streak is what CI will or will not produce.
+  streak is what CI will or will not produce. *(The 2026-09-26 instance of the D50 amendment
+  has the same limit: 8 green runs of the fixed test on one host.)*
 * **D50 leaves the window itself intact.** The jam still has to land between pod-0 becoming
   Ready and Phase 1 observing a healthy link -- roughly ten seconds in the runs measured. It is
   now the *only* window rather than one of two, and the read-back makes a missed jam retry
@@ -1088,12 +1299,75 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   and D54 sees only the Kubernetes version the Kind image of CI runs.
 * **D55 checks its `hostPath` premise on ordinal 0 only.** File ownership before the upgrade is
   read on every ordinal of the persistent members (`shapeLegacyVolumes`: `/data` root-owned,
-  files of uid 0), and a from-version past ADR 0032 fails loudly (D55).
+  files of uid 0), and so is ownership after it (uid 999). A from-version past ADR 0032 fails
+  loudly (D55).
 * **The new e2e waits honour D25.** The T31 and T32 e2e code of 2026-09-26 waits through
   `pollUntil` (`test/e2e/pod_availability_test.go`), a `wait.PollUntilContextTimeout` wrapper
   with an explicit interval and budget that fails with the last observed value; the eleven
   `require.Eventually` sites the first version had were converted before the change landed. The
-  pre-existing sites of D25's open item are untouched.
+  pre-existing sites of D25's open item are untouched. The later amendment of the same day keeps
+  to it: D55's second-roll wait is a `pollUntil`, and the two-Sentinel e2e waits through
+  `PollUntilContextTimeout` helpers. Like the first T32 e2e, it still reaches `findMasterPod`
+  and `waitForConnectedReplicas`, two pre-existing `require.Eventually` helpers of that open
+  item.
+* ~~**Two e2e of the later 2026-09-26 amendment are NOT EXECUTED (D30).**~~ *(Both executed
+  2026-09-26, locally on Kind and not in CI, and green on one operator image built from ~~the final
+  code of the branch~~ the code before ADR 0025 D9's clock *(corrected 2026-09-26, Status; both
+  green again on the last image of the day)*; per checklist below, what was recorded and what was
+  not.)* Both run
+  checklists name what to check beyond PASS:
+  * The amended `TestE2E_FleetUpgrade` (D55). Run it the way the recorded run did
+    (`make test-e2e-fleet-upgrade E2E_UPGRADE_FROM=1.12.8` on an arm64 host, where 1.10.48 has
+    no image) and record: the second-roll subtest passing for all three persistent members; the
+    `RollingUpdateComplete` counts (exactly 1 for `fleet-ha` and `fleet-plain`, asserted; ~~1 or
+    2 for `fleet-aof` and `fleet-rdb`, which the test accepts either way, so write down which~~
+    *(corrected 2026-09-26: exactly 2, asserted since the ordering fix of ADR 0032 D4, see D55)*);
+    the ownership read printing exactly `999` on every ordinal; and the runtime against 253 s.
+    Also check `fleet-aof` and `fleet-rdb` for a `TopologyRestoreAbandoned` Warning. By reading,
+    not by any run: `handlePostManualFailover` asks `podOutdated` of the new pod-0, the repair
+    leaves the template once that pod's pre-flight exits 0, and from then on the pod counts as
+    not yet replaced and nothing in that state deletes it. So the first roll could wait out
+    `syncTimeout` (5 min by default) and abandon the restoration before the second roll starts.
+    The test fails on no Warning, so only the Events show it.
+    *(Recorded 2026-09-26: the run on the ~~final~~ pre-clock image *(Status)* is green, so the second-roll wait passed for
+    all three persistent members, the counts held exactly — 1, 1, 2, 2 — and every ownership read
+    was `999`; all three are assertions. ~~Not recorded: the runtime, and whether `fleet-aof` or
+    `fleet-rdb` carried a `TopologyRestoreAbandoned` Warning — the green counts do not exclude one,
+    because an abandon hands over to `verifying-topology`, whose exit still emits
+    `RollingUpdateComplete` (`abandonTopologyRestoration`, read).~~ *(Both read 2026-09-26 from
+    that run's output and operator log: `TestE2E_FleetUpgrade` took 288 s, against 252.77 s for
+    its first version. The green counts alone would not exclude an abandon, for the reason just
+    struck, but the log does: it holds no `Topology restoration stalled` line — which
+    `abandonTopologyRestoration` logs immediately before it emits `TopologyRestoreAbandoned` — for
+    any fleet namespace, only the two of the dedicated abandon e2e.)* The path read above no longer
+    exists as described: since ADR 0032 D4 the repair stays in the template while any data-tier
+    roll is recorded (`dataOwnershipRepairNeeded` returns true while the template carries it and a
+    rolling-update state is set, read), so it cannot leave before the first roll finalizes.)*
+  * `TestE2E_RollingUpdate_TwoSentinelsRollSerially`
+    ([`pod_availability_test.go`](../../test/e2e/pod_availability_test.go),
+    [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10). A plain `e2e` test:
+    both single-node legs run it, and the multi-node leg's `E2E_RUN` leaves it out (D31). It rolls
+    a cluster of 3 data pods and 2 Sentinels from `UpgradeFrom` to `UpgradeTo` and asserts both
+    Sentinels replaced and on the new image, `SentinelUpdatePending=False`, phase `OK` and a key
+    kept. It does not observe that the deletes were serial; that is the unit tier's claim
+    (`TestSentinelRollingUpdate_SmallTiersRollSerially`, whose doc comment names its mutation,
+    and `TestSentinelDeleteKeepsVotes`, both green in the cached `make test-unit` above). So the
+    run reads the operator log: two `Deleting sentinel pod for rolling update` lines for
+    `two-sen-sentinel-*`, the second after the first replacement reported Ready. Its positive
+    control (D11) is the guard before ADR 0024 D10. With it the tier never rolls, and by reading
+    the code the test then fails at the `SentinelUpdatePending=False` wait; that revert has not
+    been run. *(Recorded 2026-09-26: green inside both full suites on the ~~final~~ pre-clock image *(Status)*, Valkey 9
+    and Valkey 8, and in an earlier run on both lines. ~~Not recorded: the operator-log read of the
+    two serial deletes, so the one-at-a-time order still rests on the unit tier~~ *(read the same
+    day from the ~~final~~ pre-clock run's operator log: per leg exactly two such lines, `two-sen-sentinel-0`
+    then `two-sen-sentinel-1`, eight seconds apart in separate reconciles — 12:33:42 and 12:33:50
+    UTC on Valkey 9, 12:43:30 and 12:43:38 on Valkey 8. The log does not print the replacement's
+    readiness; that the second delete waited for it is `sentinelDeleteKeepsVotes`
+    (`readyCount-cost >= total-1` on a tier of two), read. The e2e still does not assert the
+    order)*; the positive control is still not run.)*
+
+## References
+
 * [`Makefile`](../../Makefile) — every target, and the recorded reason `-short` is absent
 * [`internal/controller/`](../../internal/controller/) — `newTestReconciler`, `fakeValkeyServer`, `stsForValkey`, `podFromStsTemplate`, `failOnlyCRUpdate`
 * [`internal/sidecar/`](../../internal/sidecar/) — `scriptedRoleDetector`, the D10 call-count fixture for the drain retry path
@@ -1102,6 +1376,7 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
 * `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
 * [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamPod0Replication` and the D50 identity gate
+* [`test/e2e/sidecar_test.go`](../../test/e2e/sidecar_test.go) — `TestE2E_SidecarFailoverDrainMaster`, the second D50 instance (2026-09-26); `waitForPodRecreated` lives in [`e2e_test.go`](../../test/e2e/e2e_test.go)
 * [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
 * [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
@@ -1112,6 +1387,9 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`internal/builder/image_requirements_test.go`](../../internal/builder/image_requirements_test.go) — `commandsUsedBy` and `valkeyImageScripts`, the D42 walker and its 2026-09-26 command positions
 * [`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go) — the D53 restricted runtime and the pre-flight → repair → pass sequence
 * [`test/e2e/pod_security_test.go`](../../test/e2e/pod_security_test.go) — `TestE2E_PodSecurity_RestrictedNamespace` (D54)
-* [`test/e2e/fleet_upgrade_test.go`](../../test/e2e/fleet_upgrade_test.go) — `TestE2E_FleetUpgrade`, `requireHostPathVolume`, `requireRepairRan` (D55)
+* [`test/e2e/fleet_upgrade_test.go`](../../test/e2e/fleet_upgrade_test.go) — `TestE2E_FleetUpgrade`, `requireHostPathVolume`, `shapeLegacyVolumes`, `countValkeyEventsSince` (D55; `requireRepairRan` was removed on 2026-09-26)
+* [`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — `pollUntil` (D25) and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` (~~NOT EXECUTED, D30~~ green 2026-09-26 on both Valkey lines, locally)
+* [`internal/controller/pod_security_migration_test.go`](../../internal/controller/pod_security_migration_test.go) — the unit guards of the second roll (D55)
 * [`go.mod`](../../go.mod) — the test-only `k8s.io/pod-security-admission` pin (D52)
-* [ADR 0032](0032-generated-pods-run-rootless.md) — the posture and the migration these guards test
+* [ADR 0032](0032-generated-pods-run-rootless.md) — the posture and the migration these guards test, D2 the second roll
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a Sentinel tier of one or two

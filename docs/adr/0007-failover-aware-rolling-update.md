@@ -42,6 +42,13 @@ It never has.** The function reads `DBSIZE`, logs it and refuses only when the c
 unreadable — true since the read was introduced in commit `5214d56`. The claim is struck
 through in place; the gap is not closed by T32 and is recorded under Residual risks.
 
+Updated 2026-09-26, no decision of this ADR changed: D8 gains a pointer to its Sentinel-path
+counterpart, [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9
+(no split-brain resolution while the roll's own Sentinel failover is in flight); the residual
+risk on a Sentinel tier of one or two is closed in place by
+[ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10; the D9 guards record their
+final e2e runs.
+
 Guards, per decision:
 
 * D2, D3 — the five tests of
@@ -109,8 +116,11 @@ Guards, per decision:
   ([`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go)) passed on
   2026-09-26 on Kind (control plane + 3 workers, Kubernetes v1.36.1, Valkey 9.1.1): after a
   Sentinel cluster's image was put back from an unpullable one, the operator replaced the
-  stuck replica itself and every replica held the 100 written keys. The full suite and the
-  Valkey 8 leg had not finished at the time of writing.
+  stuck replica itself and every replica held the 100 written keys. ~~The full suite and the
+  Valkey 8 leg had not finished at the time of writing.~~ *(Updated 2026-09-26: it passed inside
+  both full local suites the same day, 51/51 on Valkey 9 and on Valkey 8, and again inside both
+  full suites on one operator image built from the final code of the branch, 53/53 on each line —
+  Kind, Kubernetes 1.36.1, containerd 2.3.1, runc 1.4.2, Linux 6.10; locally, not in CI.)*
 
 Amended 2026-08-22: **D10 is new.** D1 and D9 both say the failover waits on replication
 state, and the code asked only `master_sync_in_progress`, which a replica that has not
@@ -289,6 +299,16 @@ picks the lowest ordinal (the old master that was just deleted) and demotes the 
 pod, destroying the data it holds. Any new rolling-update state that promotes must thread
 the promoted pod through the same way.
 
+*Pointer added 2026-09-26:* the Sentinel path has no promoted-pod annotation to thread — Sentinel's
+leader, not the operator, picks the candidate — and resolves against Sentinel's live master
+(`getSentinelMasterPodName`). During the roll's own Sentinel failover that authority still names
+the old master while the candidate already answers master, so in `failover-triggered` the
+resolver is not called at all: the double master is reported, not resolved
+(`resolveSplitBrainUnlessFailingOver`,
+[ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9). That is the
+Sentinel-path counterpart of this decision, found on Kind on 2026-09-26 as a failover the resolver
+kept undoing.
+
 **D9 — Readiness reflects server liveness, not replication health.** A pod with a broken
 replication link stays Ready: the readiness probe is a plain PING against a config with
 `replica-serve-stale-data yes`, and the sidecar `/readyz` is sticky once a role has been
@@ -318,7 +338,10 @@ one — and the quorum guard applies only to a delete that spends a vote
 (`cost > 0 && readyCount-cost < quorum`): a target that is not available holds no vote and
 is replaced even when the quorum is already lost — two of three Sentinels stuck on a broken
 spec leave `readyCount` at 1, and a guard that still compared that against the quorum
-refused forever. The delete gate serialises those deletes. The delete spends nothing the
+refused forever. *(On a tier of one or two Sentinels, whose quorum equals its size, a paid
+delete is refused unless `readyCount-cost >= total-1` since 2026-09-26 —
+`sentinelDeleteKeepsVotes`, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md)
+D10.)* The delete gate serialises those deletes. The delete spends nothing the
 roll was not about to spend: masters are never replica candidates, `replaceRemainingPods`
 deletes the former master only behind `verifyNewMasterReady` (a replication gate, not a key
 count — see Residual risks), the PVC survives a pod delete, a replica re-syncs from its
@@ -496,8 +519,11 @@ readiness a second, partial source of truth about replication.
   code comments still describe the check as present: the header of `replaceRemainingPods`
   ("has actual data (DBSIZE > 0)"), the inline comment in `verifyNewMasterReady`, and the
   comment above the pre-promotion check in `handleManualFailover`.
-* **A Sentinel tier of one or two Sentinels never replaces a Ready outdated Sentinel — open,
-  awaiting a decision.** `quorum = replicas/2 + 1` equals `replicas` for both sizes, so the
+* ~~**A Sentinel tier of one or two Sentinels never replaces a Ready outdated Sentinel — open,
+  awaiting a decision.**~~ **Closed 2026-09-26: such a tier rolls serially**
+  ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10, `sentinelDeleteKeepsVotes`;
+  unit-tested, and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` green locally on both Valkey
+  lines). As recorded until then: `quorum = replicas/2 + 1` equals `replicas` for both sizes, so the
   D9 guard refuses every delete that spends a vote (`readyCount` is at most `replicas`), and
   on a healthy tier every pass ends on the plain requeue of `sentinelWait` before the status
   write, without a bound. `spec.sentinel.replicas` carries `Minimum=1`, so both sizes are
@@ -521,3 +547,5 @@ readiness a second, partial source of truth about replication.
 * [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — the bounds on every wait this sequence introduces
 * [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — D1 on what a spending site asks of a pod, D11 on the replacement of an outdated pod and the availability wait (D9, D10)
 * [ADR 0032](0032-generated-pods-run-rootless.md) — D3, the single-pod rule for a pod that runs as root (D6, D7)
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a tier of one or two Sentinels (the closed residual risk)
+* [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — D9, the Sentinel-path counterpart of D8: no resolution while the roll's own Sentinel failover is in flight

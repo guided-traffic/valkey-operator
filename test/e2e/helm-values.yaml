@@ -16,3 +16,11 @@ resources:
 
 leaderElection:
   enabled: false
+
+# The Localhost seccomp profiles the e2e may name (ADR 0033 D9): the fixture
+# TestE2E_PodHardening installs on every node, and the path its negative control
+# names without installing it. Any other Localhost profile is refused.
+valkeyPodSecurity:
+  allowedSeccompLocalhostProfiles:
+    - profiles/vko-e2e.json
+    - profiles/vko-e2e-missing.json

@@ -841,3 +841,60 @@ func TestSentinelRollingUpdate_TerminationPriorityDoesNotRetractTheReport(t *tes
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	assert.Equal(t, vkov1.ReasonSentinelPodNotAvailable, cond.Reason)
 }
+
+// A tier of one or two Sentinels has no spare vote -- its quorum equals its size --
+// so the quorum guard could never pass and such a tier never rolled. It rolls
+// serially: one Sentinel at a time, only while every other one is available
+// (ADR 0024 D10, decided 2026-09-26).
+//
+// Mutation check: making sentinelDeleteKeepsVotes return readyCount-cost >= quorum
+// for every size keeps both pods and fails the first two rows.
+func TestSentinelRollingUpdate_SmallTiersRollSerially(t *testing.T) {
+	const oldImg = "valkey/valkey:8.0"
+	for _, tc := range []struct {
+		name        string
+		pods        func(v *vkov1.Valkey) []client.Object
+		wantDeleted int
+	}{
+		{"one Sentinel, outdated: replaced", func(v *vkov1.Valkey) []client.Object {
+			return []client.Object{createSentinelPod(v, 0, oldImg, true)}
+		}, 1},
+		{"two Sentinels, both outdated and Ready: one replaced", func(v *vkov1.Valkey) []client.Object {
+			return []client.Object{createSentinelPod(v, 0, oldImg, true), createSentinelPod(v, 1, oldImg, true)}
+		}, 1},
+		{"two Sentinels, the replacement still booting: the other is kept", func(v *vkov1.Valkey) []client.Object {
+			return []client.Object{
+				createSentinelPod(v, 0, sentinelTestNewImage, false), createSentinelPod(v, 1, oldImg, true),
+			}
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pods := tc.pods(newTestValkey("small", "default"))
+			replicas := int32(len(pods))
+			v := newTestValkey("small", "default", func(v *vkov1.Valkey) {
+				v.Spec.Replicas = 3
+				v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: replicas}
+			})
+			r, c := newTestReconciler(append([]client.Object{v, buildTestSentinelSts(v)}, tc.pods(v)...)...)
+
+			result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
+			require.NoError(t, result.Error)
+
+			deleted := 0
+			for i := 0; i < len(pods); i++ {
+				if !podExists(t, c, sentinelPodName(v, i)) {
+					deleted++
+				}
+			}
+			assert.Equal(t, tc.wantDeleted, deleted)
+		})
+	}
+}
+
+func TestSentinelDeleteKeepsVotes(t *testing.T) {
+	assert.True(t, sentinelDeleteKeepsVotes(3, 1, 2, 3), "three Sentinels: 2 voters remain")
+	assert.False(t, sentinelDeleteKeepsVotes(2, 1, 2, 3), "three Sentinels, one down: the quorum guard holds")
+	assert.True(t, sentinelDeleteKeepsVotes(2, 1, 2, 2), "two Sentinels, both up: serial delete")
+	assert.False(t, sentinelDeleteKeepsVotes(1, 1, 2, 2), "two Sentinels, one down: wait for it")
+	assert.True(t, sentinelDeleteKeepsVotes(1, 1, 1, 1), "one Sentinel: the only delete there is")
+}
