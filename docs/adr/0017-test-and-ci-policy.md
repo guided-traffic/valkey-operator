@@ -203,8 +203,11 @@ gate target in a fresh clean copy with an empty `bin/`: `make generate-all` (no 
 (golangci-lint v2.14.0, 0 issues), `make cyclo`, `make gosec` (v2.29.0, 0 issues), `make vuln`
 (no vulnerabilities), `make test-unit-coverage`, `make test-integration-coverage`,
 `make test-image-tools` and `make test-release-tooling`, all green (2026-09-26); `make test-unit`
-and `make test-integration` green again after the last test and comment changes. CI itself has
-not run on it.
+and `make test-integration` green again after the last test and comment changes. ~~CI itself has
+not run on it.~~ *(CI, 2026-09-26: every check green on `e6a9d7c` — Generated Manifests, Integration (envtest),
+Unit, Lint, GoSec, Vuln, Cyclo, Image Tools, Release Tooling, Coverage, both malware scans and all
+three E2E legs; the two jobs that were red on `e2ce8bb` pass. The two pushes between failed only
+`TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest` in the single-node legs, D5.)*
 Naming a tool in a target's prerequisites while its variable is still undefined expands to
 nothing and silently drops the dependency — which is how the first attempt at this decision
 failed. *(Verified 2026-09-26: `make generate-all` in a clean copy of the working tree with an
@@ -273,7 +276,10 @@ probe now also reads the probe pod's Warning Events and counts a pod that has no
 its two minutes as unsupported, with what it last showed.)* With the probe the test passes on the
 reproduced config (user-namespace subtest skipped) and fails with the variable set; on a local Kind
 cluster with overlayfs it runs the whole test, with the variable set, on both Valkey lines.
-So the user-namespace half is **verified locally only**, never in CI.
+So the user-namespace half is **verified locally only**, never in CI. *(CI on `e6a9d7c`: both
+single-node legs green, the probe logged `FailedCreatePodSandBox`, the user-namespace subtest was
+skipped by name and every other subtest passed; the D50 drain test's delete subtest now waited
+12.8 s and 22.8 s instead of returning in 0.3 s.)*
 
 **D6 — A pass's unit run must report zero SKIPs on the uncached run (`-count=1`)**, which is
 also repeated (`-count=2`) so no result comes from the cache. Zero SKIPs at `-count=1` is the

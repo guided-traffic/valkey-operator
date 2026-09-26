@@ -505,7 +505,8 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
   `hostUsers: false` does not start ("container ID … cannot be mapped to a host ID"; measured with
   the CI Kind config, [ADR 0017](0017-test-and-ci-policy.md) D5). The hardening e2e probes for
   support and, without it, runs everything but the user-namespace subtest, which it skips by
-  name (`E2E_REQUIRE_USER_NAMESPACES=true` makes that a failure). The same measurement is a node
+  name (`E2E_REQUIRE_USER_NAMESPACES=true` makes that a failure) — CI on `e6a9d7c` is green that
+  way, and the Localhost, digest, allow-list and restricted-namespace subtests ran there. The same measurement is a node
   requirement D2 did not name: the runtime's snapshotter must support idmapped mounts —
   overlayfs does, `native` does not.
 
