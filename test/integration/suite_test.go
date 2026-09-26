@@ -44,6 +44,11 @@ var (
 	k8sClient  client.Client
 	testEnv    *envtest.Environment
 
+	// apiReader reads straight from the API server. k8sClient reads through the
+	// manager's cache, which is right for polls and wrong for "this object was never
+	// created": a cache miss proves nothing.
+	apiReader client.Reader
+
 	// slowProbes is the InstanceChecker of the shared reconciler. It delegates to
 	// the real Checker unless a test arms it, so only the CR of
 	// TestReconcileConcurrency_StuckClusterDoesNotBlockOthers is ever delayed.
@@ -95,6 +100,9 @@ func TestMain(m *testing.M) {
 		Scheme:          mgr.GetScheme(),
 		OperatorImage:   "valkey-operator:test",
 		InstanceChecker: slowProbes,
+		// The allow-list the ADR 0033 D9 tests rely on: one listed profile, so
+		// both the admitted and the refused path run against the real API server.
+		AllowedSeccompLocalhostProfiles: []string{allowedTestSeccompProfile},
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic("failed to setup controller: " + err.Error())
@@ -119,6 +127,7 @@ func TestMain(m *testing.M) {
 	}
 
 	k8sClient = mgr.GetClient()
+	apiReader = mgr.GetAPIReader()
 
 	// Run all tests.
 	code := m.Run()

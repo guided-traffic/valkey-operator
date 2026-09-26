@@ -14,6 +14,41 @@ never registered here. The count is corrected in place and the rule it states is
 that input always did come from the persisted template, which is why a blocked StatefulSet
 write cannot turn a certificate rotation into a pod-delete loop.
 
+Amended 2026-09-26: **D9's second half counted the delete of an outdated pod among the
+sites that ask `available()`, and it no longer is one.**
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 (ticket T32): an outdated pod
+is replaced whether it is available or not, and only a terminating one is waited on. The wait
+it removes dates from the first rolling update and was justified as "was recently replaced",
+which no outdated pod ever is — and after a spec fix the replacement that never came up is
+exactly the outdated pod that wait held on, with nothing to end it but a human
+`kubectl delete pod`. On the Sentinel tier the quorum guard now charges only a delete that
+spends a vote. The superseded sentence is struck through in place. D10 gains a short passage
+separating its sync waits from the availability wait that sits in front of them in the same
+two functions and expires differently.
+
+Amended 2026-09-26 (ticket T31, [ADR 0032](0032-generated-pods-run-rootless.md) D3): **D6 and
+D7 no longer decide a single pod that runs as root.** The rootless posture is the change D7
+warned about — it moves the pod-spec hash of every pod — and the image-only test would have
+got it wrong both ways: on the Helm path the new sidecar image would have made it
+"sidecar-only" and deferred it, and on kustomize, where the sidecar does not move, a
+non-persistent pod would have been deleted with its data. A root pod is decided by
+`singlePodDeferral` now — on persistence first, then on whether the Valkey image, the TLS
+material record or the config hash changed; D6 and D7 keep their rule for rootless pods. The
+superseded sentences are marked in place.
+
+Corrected 2026-09-26, found by the adversarial review of the T32 implementation: **D10 said
+the Sentinel path has always verified the new master's key count in `verifyNewMasterReady`.
+It never has.** The function reads `DBSIZE`, logs it and refuses only when the count is
+unreadable — true since the read was introduced in commit `5214d56`. The claim is struck
+through in place; the gap is not closed by T32 and is recorded under Residual risks.
+
+Updated 2026-09-26, no decision of this ADR changed: D8 gains a pointer to its Sentinel-path
+counterpart, [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9
+(no split-brain resolution while the roll's own Sentinel failover is in flight); the residual
+risk on a Sentinel tier of one or two is closed in place by
+[ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10; the D9 guards record their
+final e2e runs.
+
 Guards, per decision:
 
 * D2, D3 — the five tests of
@@ -31,6 +66,13 @@ Guards, per decision:
 * D6 — [`internal/controller/sidecar_pending_condition_test.go`](../../internal/controller/sidecar_pending_condition_test.go)
   and the `isSidecarOnlyChange` cases in
   [`internal/controller/rolling_update_test.go`](../../internal/controller/rolling_update_test.go).
+  The root half, as amended 2026-09-26: `TestSinglePodDeferral` (every row of the three-way
+  rule, TLS and configuration drift included),
+  `TestSinglePodDeferral_ReadsPersistenceOffThePersistedStatefulSet`,
+  `TestHandleStandaloneRollingUpdate_ReplacesAPersistentRootPod`,
+  `TestCheckAndHandleRollingUpdate_DefersANonPersistentRootPodAndReportsIt` and
+  `TestCheckAndHandleRollingUpdate_NoPodSecurityConditionWithoutADeferral` in
+  [`pod_security_migration_test.go`](../../internal/controller/pod_security_migration_test.go).
 * D8 — `TestDetectAndResolveSplitBrain_PrefersPromotedPodDuringFailover` in
   [`internal/controller/manual_failover_known_master_test.go`](../../internal/controller/manual_failover_known_master_test.go).
 * D10 — the ten tests of
@@ -48,10 +90,37 @@ Guards, per decision:
   `TestE2E_RollingUpdate_MultiReplicaNoSentinel` and `TestE2E_RollingUpdate_HA_NoDataLoss`
   ([`test/e2e/rolling_update_test.go`](../../test/e2e/rolling_update_test.go)). Those two
   exist in this tree; whether they pass in CI is not checkable from the repository.
-* D7 and D9 — no dedicated test. Verified by reading `isSidecarOnlyChange`,
-  `buildPodContainers`, `ProbeCommand` and `HealthServer`; the sticky half of D9 is
-  pinned by `TestHealthServer_ReadyzReady`
-  ([`internal/sidecar/health_test.go`](../../internal/sidecar/health_test.go)).
+* D7 for a rootless pod and the first half of D9 — no dedicated test. Verified by reading
+  `isSidecarOnlyChange`, `buildPodContainers`, `ProbeCommand` and `HealthServer`; the sticky
+  half of D9 is pinned by `TestHealthServer_ReadyzReady`
+  ([`internal/sidecar/health_test.go`](../../internal/sidecar/health_test.go)). D7 for a root
+  pod is the D6 root half above.
+* D9's second half, as amended 2026-09-26 — one pair per delete site, the replace and the
+  terminating wait: `TestReplaceNextReplica_ReplacesACandidateThatIsNotReady` /
+  `_WaitsForACandidateThatIsTerminating` and
+  `TestReplaceRemainingPods_ReplacesAnOutdatedPodThatIsNotReady` /
+  `_WaitsForAnOutdatedPodThatIsTerminating` in
+  [`sentinel_failover_test.go`](../../internal/controller/sentinel_failover_test.go),
+  `TestHandleStandaloneRollingUpdate_ReplacesAnOutdatedPodThatIsNotReady` in
+  [`rolling_update_test.go`](../../internal/controller/rolling_update_test.go) with
+  `TestHandleStandaloneRollingUpdate_DoesNotReDeleteATerminatingPod` in
+  [`pod_termination_test.go`](../../internal/controller/pod_termination_test.go); on the
+  Sentinel tier `TestSentinelRollingUpdate_ReplacesTheUnavailableOutdatedSentinelFirst` and
+  `TestSentinelRollingUpdate_ReplacesANonVotingPodWhenQuorumIsAlreadyLost` in
+  [`pod_availability_test.go`](../../internal/controller/pod_availability_test.go). The
+  replace tests name their mutation in their comments. The T32 implementation run of
+  2026-09-26 reports `make test-unit` green and 36 mutation checks over the T32 and T31
+  guards, all killed; the per-test list is not recorded here, and this document did not
+  re-run them. End to end,
+  `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced`
+  ([`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go)) passed on
+  2026-09-26 on Kind (control plane + 3 workers, Kubernetes v1.36.1, Valkey 9.1.1): after a
+  Sentinel cluster's image was put back from an unpullable one, the operator replaced the
+  stuck replica itself and every replica held the 100 written keys. ~~The full suite and the
+  Valkey 8 leg had not finished at the time of writing.~~ *(Updated 2026-09-26: it passed inside
+  both full local suites the same day, 51/51 on Valkey 9 and on Valkey 8, and again inside both
+  full suites on one operator image built from the final code of the branch, 53/53 on each line —
+  Kind, Kubernetes 1.36.1, containerd 2.3.1, runc 1.4.2, Linux 6.10; locally, not in CI.)*
 
 Amended 2026-08-22: **D10 is new.** D1 and D9 both say the failover waits on replication
 state, and the code asked only `master_sync_in_progress`, which a replica that has not
@@ -155,8 +224,9 @@ master the annotation does not name — the rule that owns it is
 [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) D5.
 
 **D6 — A sidecar-only delta on a single-replica non-Sentinel cluster is deferred, never
-applied.** `handleStandaloneRollingUpdate` detects a change affecting exclusively the
-sidecar image on a true standalone (`isSidecarOnlyChange`), sets
+applied** *(for a pod that runs rootless; a root pod is decided by `singlePodDeferral` since
+2026-09-26, see the amendment below)*. `handleStandaloneRollingUpdate` detects a change
+affecting exclusively the sidecar image on a true standalone (`isSidecarOnlyChange`), sets
 `SidecarUpdatePending=True`, and leaves the pod running the old sidecar image. Restarting
 it would trade in-memory data for a sidecar bump. **Documentation must state that
 consequence and not the opposite** — an earlier draft of that README section claimed the
@@ -168,16 +238,57 @@ recoverable from this repository; only the correction is, in the message of comm
 Sentinel is not restarted for this"). Do not read the same phrase in the committed metrics
 note as the defect: there the pod really is restarted, which is D7's counter-case.
 
+*Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D3, ticket T31): a
+single pod that runs without `runAsNonRoot` — every pod an operator before the rootless
+release built — is no longer decided by `isSidecarOnlyChange` but by `singlePodDeferral`
+([`pod_security_migration.go`](../../internal/controller/pod_security_migration.go)), on
+whether its StatefulSet keeps a volume:
+
+* persistent: replaced at once, sidecar drift or not, with the ownership repair running on
+  its way up — one restart, the data kept on the volume;
+* not persistent, and the Valkey image, the TLS material record and the config hash all
+  unchanged: deferred until the pod is recreated for another reason (a delete, an eviction,
+  a node loss), reported as `PodSecurityUpdatePending=True/PodRunsAsRoot` naming the pod. The
+  deferral holds every change the pod-spec hash carries together with the posture, because
+  the two cannot be told apart; a sidecar drift is deferred with it and still reported as
+  `SidecarUpdatePending`;
+* not persistent, and the Valkey image, the TLS material record or the config hash changed:
+  replaced. None of the three moves on an operator upgrade alone — the image and the
+  configuration are the CR author's, and a certificate rotation is the single-pod data loss
+  [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
+  already accepted.
+
+The images, hashes and persistence it compares all come from the persisted StatefulSet, per
+D2 — persistence from its `volumeClaimTemplates`, not from `spec.persistence`, because a
+persistence toggle the operator refused to write
+([ADR 0023](0023-volume-claim-templates-are-immutable.md)) would otherwise read as persistent
+and delete the only pod together with its `emptyDir`. A rootless single pod goes through
+`isSidecarOnlyChange` exactly as described above.
+
 **D7 — The sidecar image must remain the only pod-spec delta an operator upgrade
-introduces for single-replica pods.** The D6 deferral compares **images only**, so the
+introduces for single-replica pods.** The D6 deferral compares **images only** *(for a
+rootless pod; a root pod is decided by `singlePodDeferral` since 2026-09-26)*, so the
 no-delete guarantee holds exactly while that is true. Any future change that alters a
 single-replica pod spec beyond the sidecar image breaks the guarantee and must be treated
 as a data-loss change. The counter-case stands, verified by reading `isSidecarOnlyChange`
 and `buildPodContainers`: enabling metrics adds the `exporter` container, which changes
 the pod-spec hash while the sidecar image stays current, so `isSidecarOnlyChange` returns
-false and the pod really is restarted. No test drives that combination — the
-`isSidecarOnlyChange` cases cover the function, not the metrics path — and it is not
-reproduced against a cluster.
+false and the pod really is restarted *(for a rootless pod or a persistent root one since
+2026-09-26; a non-persistent root pod defers it, see the amendment below)*. No test drives
+that combination — the `isSidecarOnlyChange` cases cover the function, not the metrics
+path — and it is not reproduced against a cluster.
+
+*Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D3): the rootless
+posture is the first such change, and it was treated as one — the D6 amendment above. The
+rule is unchanged and still load-bearing, because the image-only test decides every rootless
+pod, and after the migration that is every pod the operator builds: the next release that
+changes a single-replica pod spec beyond the sidecar image deletes a non-persistent rootless
+pod with its data unless it gets its own decision the way ADR 0032 D3 did. The metrics
+counter-case now holds for a rootless pod and for a persistent root one; on a non-persistent
+root pod enabling metrics is a pod-spec-hash change and waits with the posture under
+`PodSecurityUpdatePending`, whose message says that every other pending change of the pod
+spec applies on the next restart. Verified by reading `singlePodDeferral` and
+`ComputeConfigHash`, which metrics does not enter.
 
 **D8 — During an in-flight manual failover the split-brain resolver is told which pod
 was promoted.** `handleMultiReplicaRollingUpdate` passes `annotationPromotedPod` to
@@ -188,6 +299,16 @@ picks the lowest ordinal (the old master that was just deleted) and demotes the 
 pod, destroying the data it holds. Any new rolling-update state that promotes must thread
 the promoted pod through the same way.
 
+*Pointer added 2026-09-26:* the Sentinel path has no promoted-pod annotation to thread — Sentinel's
+leader, not the operator, picks the candidate — and resolves against Sentinel's live master
+(`getSentinelMasterPodName`). During the roll's own Sentinel failover that authority still names
+the old master while the candidate already answers master, so in `failover-triggered` the
+resolver is not called at all: the double master is reported, not resolved
+(`resolveSplitBrainUnlessFailingOver`,
+[ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9). That is the
+Sentinel-path counterpart of this decision, found on Kind on 2026-09-26 as a failover the resolver
+kept undoing.
+
 **D9 — Readiness reflects server liveness, not replication health.** A pod with a broken
 replication link stays Ready: the readiness probe is a plain PING against a config with
 `replica-serve-stale-data yes`, and the sidecar `/readyz` is sticky once a role has been
@@ -197,11 +318,37 @@ not on readiness.
 
 *Second half, added 2026-08-25:* readiness is not a proxy for **being spendable** either.
 kubelet keeps `PodReady=True` for the whole termination of a pod whose probe still passes,
-so a pod the operator itself has just deleted answers Ready until it is gone. Every site
+so a pod the operator itself has just deleted answers Ready until it is gone. ~~Every site
 that deletes, promotes or counts a pod therefore asks `podState.available()` rather than
-the Ready condition, and the four sites that only need to talk to a pod ask `reachable()`.
+the Ready condition~~ *(superseded 2026-09-26 for the delete of an outdated pod, see
+below)*, and the four sites that only need to talk to a pod ask `reachable()`.
 The full rule, the carve-out and the delete gate:
 [ADR 0026](0026-a-pod-being-deleted-is-not-available.md).
+
+*Amended 2026-09-26* ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11): every
+site that promotes a pod or counts it toward a quorum or a completion asks `available()` —
+except `countUpdatedPods`, which deliberately keeps `reachable()` (ADR 0026 D4) — and so does
+every delete except the replacement of an outdated pod. **An outdated pod is replaced
+whether it is available or not; only a terminating one is waited on**, through
+`terminationWait`, and the tier's delete gate still applies. The three sites are the
+standalone delete in `handleStandaloneRollingUpdate`, `replaceNextReplica` and
+`replaceRemainingPods`. On the Sentinel tier an outdated pod that is neither available nor
+terminating is the delete target — the lowest such ordinal, ahead of the lowest outdated
+one — and the quorum guard applies only to a delete that spends a vote
+(`cost > 0 && readyCount-cost < quorum`): a target that is not available holds no vote and
+is replaced even when the quorum is already lost — two of three Sentinels stuck on a broken
+spec leave `readyCount` at 1, and a guard that still compared that against the quorum
+refused forever. *(On a tier of one or two Sentinels, whose quorum equals its size, a paid
+delete is refused unless `readyCount-cost >= total-1` since 2026-09-26 —
+`sentinelDeleteKeepsVotes`, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md)
+D10.)* The delete gate serialises those deletes. The delete spends nothing the
+roll was not about to spend: masters are never replica candidates, `replaceRemainingPods`
+deletes the former master only behind `verifyNewMasterReady` (a replication gate, not a key
+count — see Residual risks), the PVC survives a pod delete, a replica re-syncs from its
+master, and a single pod without persistence loses nothing the same roll would not take
+from it the moment it turned Ready. `deleteNextPendingPod` (a leftover outdated
+second master) keeps `available()`, and a pod on the current template is never deleted — for
+that pod only the wait is bounded, not lifted.
 
 **D10 — Before a promotion, "synced" is the full replication answer, and the wait for it
 is bounded.** `waitForReplicasReady` and `verifyReplacedReplicasSynced` ask
@@ -223,14 +370,24 @@ proceed on it.
 update on expiry ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)). The
 direction is deliberate: a rolling update that stops half-done keeps a serviceable
 cluster and resumes on the next spec change, while a promotion onto a replica that never
-synced destroys the dataset and cannot be undone.
+synced destroys the dataset and cannot be undone. *Added 2026-09-26:* the wait in front of
+that question — a pod that exists, is not being deleted and is not available, so nothing
+can be asked yet — is a different wait with the same budget and a different expiry. The
+sync bound is armed only once a replica answers, so that wait runs on the pod's own
+not-Ready clock, and past `syncTimeout` it holds and reports `PodAvailabilityStalled`
+instead of pausing ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11). It never
+promotes either: the pass continues, the roll does not.
 
 **The last look is the key count** (`verifyPromotionCandidateHoldsData`): a candidate that
-holds no keys while the outgoing master holds some does not get promoted. The Sentinel path
+holds no keys while the outgoing master holds some does not get promoted. ~~The Sentinel path
 has verified exactly this since it was written and calls it a critical safety check
 (`verifyNewMasterReady`), but it runs *after* the failover, which is early enough there
-because the old master is only deleted afterwards; on the manual path the delete follows the
-promotion within seconds, so the check has to come before it. An empty master returns early
+because the old master is only deleted afterwards;~~ *(wrong since it was written, corrected
+2026-09-26: `verifyNewMasterReady` reads the new master's `DBSIZE`, logs it and refuses only
+when it is unreadable — it never reads the outgoing master's count and compares nothing. Its
+comment calls that a critical safety check; the check does not exist. See Residual risks.)*
+On the manual path the delete follows the promotion within seconds, so the check has to come
+before it. An empty master returns early
 -- a cluster that holds no data yet must still be able to roll -- and an unreadable count
 waits rather than assuming a yes (D3). The two counts are also logged on the way through,
 because after the delete of the outgoing master nothing can be asked about what the
@@ -280,6 +437,11 @@ promotion was based on.
 * The deferred sidecar update (D6) is a silent divergence between desired and running
   sidecar until the condition is noticed, which is why the condition must be clearable
   from the converged state ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D10).
+  The root deferral of the D6 amendment is wider: a non-persistent root single pod holds
+  every pod-spec-hash change with the posture — a resources change or enabling metrics
+  included — until it is recreated for another reason or an administrator deletes it, and
+  `PodSecurityUpdatePending` is the only signal. A persistent root single pod pays one
+  restart at the operator upgrade instead: downtime, not data loss.
 * Serving stale data from a disconnected replica is the accepted trade of D9: the `-r`
   Service keeps such a pod in rotation. Any future desire to fail readiness on a broken
   master link changes the availability profile of the read Service.
@@ -315,7 +477,9 @@ Rejected in favour of reusing `podNeedsUpdate`, so no comparison logic is duplic
 
 ### Restart the standalone pod for a sidecar-only delta
 
-Rejected for the data loss on an unreplicated standalone.
+Rejected for the data loss on an unreplicated standalone. A persistent one would lose only
+uptime, and D6 defers its sidecar bump all the same; only a root pod is replaced for having a
+volume ([ADR 0032](0032-generated-pods-run-rootless.md) D3).
 
 ### Let the connected-slaves heuristic decide during a rolling update
 
@@ -343,14 +507,45 @@ readiness a second, partial source of truth about replication.
   still hold the guard.
 * D7 is load-bearing as a regression guard, not just documentation: the single-replica
   no-data-loss guarantee silently degrades the day another pod-spec field starts changing
-  on upgrade.
+  on upgrade. Since 2026-09-26 that is true of rootless pods; a root pod is decided by
+  `singlePodDeferral` (D6 amendment), which is the one change that was caught.
+* **The Sentinel path deletes the former master with no key-count gate.** Before the
+  `replaceRemainingPods` delete, `verifyNewMasterReady` requires a current, available master
+  with at least one connected replica and no sync in progress, and reads its `DBSIZE` — but
+  compares it with nothing and never reads the outgoing master's count, so a Sentinel
+  failover that promoted an empty replica passes it. `verifyPromotionCandidateHoldsData`
+  exists on the manual path only. Pre-existing since commit `5214d56` (2026-02-18), found by
+  reading during the T32 review, not fixed by T32, not reproduced against a cluster. Three
+  code comments still describe the check as present: the header of `replaceRemainingPods`
+  ("has actual data (DBSIZE > 0)"), the inline comment in `verifyNewMasterReady`, and the
+  comment above the pre-promotion check in `handleManualFailover`.
+* ~~**A Sentinel tier of one or two Sentinels never replaces a Ready outdated Sentinel — open,
+  awaiting a decision.**~~ **Closed 2026-09-26: such a tier rolls serially**
+  ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10, `sentinelDeleteKeepsVotes`;
+  unit-tested, and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` green locally on both Valkey
+  lines). As recorded until then: `quorum = replicas/2 + 1` equals `replicas` for both sizes, so the
+  D9 guard refuses every delete that spends a vote (`readyCount` is at most `replicas`), and
+  on a healthy tier every pass ends on the plain requeue of `sentinelWait` before the status
+  write, without a bound. `spec.sentinel.replicas` carries `Minimum=1`, so both sizes are
+  admitted. Pre-existing and
+  unchanged by T32; T31 moves the pod-spec hash of every Sentinel tier
+  ([ADR 0032](0032-generated-pods-run-rootless.md)), so such a cluster hits it at the
+  operator upgrade. wds18 runs only three-Sentinel tiers (checked read-only on 2026-09-26);
+  other clusters were not checked. Verified by reading `dispatchSentinelRollingUpdate`,
+  `sentinelWait` and `runSentinelRollingUpdate`; not reproduced against a cluster.
 
 ## References
 
-* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `verifyNewMasterReady`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `runSentinelRollingUpdate` (the Sentinel-tier residual risk)
+* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26)
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `ComputePodSpecHash`, the readiness probe
 * [`internal/builder/configmap.go`](../../internal/builder/configmap.go) — `replica-serve-stale-data yes`
 * [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) — why the rolling update must survive its own rejected write
 * [ADR 0008](0008-known-master-annotation-is-the-recorded-authority.md) — how the promotion decision reaches the pods
 * [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) — why a promotion may not proceed unrecorded
 * [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — the bounds on every wait this sequence introduces
+* [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — D1 on what a spending site asks of a pod, D11 on the replacement of an outdated pod and the availability wait (D9, D10)
+* [ADR 0032](0032-generated-pods-run-rootless.md) — D3, the single-pod rule for a pod that runs as root (D6, D7)
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a tier of one or two Sentinels (the closed residual risk)
+* [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — D9, the Sentinel-path counterpart of D8: no resolution while the roll's own Sentinel failover is in flight

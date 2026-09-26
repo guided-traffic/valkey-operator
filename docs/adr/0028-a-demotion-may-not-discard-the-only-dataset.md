@@ -193,6 +193,18 @@ unbounded stall:
 | `stateVerifyingTopology` | `finalizationStallTimeout` | completes despite rogue masters, clears state; `checkSteadyStateSplitBrain` then refuses on its own rules |
 | Sentinel path | Sentinel reconfigures the returning pod itself | resolved without the operator |
 
+*(Added 2026-09-26.)* One Sentinel-path state does not reach the resolver at all: in
+`failover-triggered` the Sentinel rolling update reports the double master and does not call
+`detectAndResolveSplitBrain`, so neither the veto of D1 nor the stamp rule of D2 runs there
+([ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9,
+`resolveSplitBrainUnlessFailingOver`). ~~The window is bounded by `failoverRetryTimeout`, which
+hands a failover that does not complete to `failover-reset`, where the resolver runs again.~~
+*(Corrected 2026-09-26, read, not measured: `failoverRetryTimeout` bounds only the branch without
+a new-image master. With one, the state leaves for `replacing-master` — where the resolver runs
+again — once `verifyNewMasterReady` passes, or, with no connected replica, `replicaReconnectTimeout`
+forces every other reachable pod onto the new master; one wait of the first branch has no bound.
+ADR 0025 D9 carries the branches and that residual risk.)*
+
 **D9 — The amendments this makes to the two ADRs it touches.**
 
 * [ADR 0008](0008-known-master-annotation-is-the-recorded-authority.md) D10 said the named
@@ -268,7 +280,15 @@ unbounded stall:
 * **The Sentinel path is protected by D1 but not exercised by D2** in the way the non-Sentinel
   path is: Sentinel's live verdict names the data holder, so the veto is expected to stay inert
   there. An unreachable Sentinel returns an empty authority and lands on the tiebreak, which D4
-  covers.
+  covers. *(Narrowed 2026-09-26 by
+  [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9: during the
+  roll's own Sentinel failover the live verdict still names the pre-switch master while the
+  promoted replica already answers master. Both hold the data then, so D1 had nothing to refuse,
+  and the resolver demoted the replica Sentinel was promoting — measured on Kind as a
+  reset-and-retrigger cycle ~~of more than ten minutes~~ *(corrected 2026-09-26 against the
+  operator log: ten cycles on Valkey 8 over about nine and a half minutes, until the e2e's
+  ten-minute wait gave up — ADR 0025 D9)*. The fix is not a D1 rule but no resolution
+  in that state; that D1 could not have caught it is reasoned from D1's condition, not measured.)*
 
 ## References
 
@@ -286,4 +306,4 @@ unbounded stall:
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) D3, D5, D7, D10, D16, D18
 * [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) — the promotion nobody records
 * [ADR 0020](0020-write-only-what-the-operator-owns.md) D9 — the pod provenance the stamp rule needs
-* [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D2, D5 — why the resolver reports nothing
+* [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D2, D5 — why the resolver reports nothing; D9 — the Sentinel-path state in which the resolver, and with it every rule here, does not run

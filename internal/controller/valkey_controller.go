@@ -99,6 +99,12 @@ type ValkeyReconciler struct {
 	// reconcileControllerOptions.
 	MaxConcurrentReconciles int
 
+	// AllowedSeccompLocalhostProfiles are the Localhost seccomp profiles a Valkey
+	// resource may name in spec.podSecurity.seccompProfile
+	// (--allowed-seccomp-localhost-profiles). Empty refuses every Localhost profile
+	// (seccompProfileAllowed, ADR 0033 D9).
+	AllowedSeccompLocalhostProfiles []string
+
 	// nudges tracks first-seen timestamps for two disjoint key sets: how long
 	// each StatefulSet has been short of pods (nudgeShortStatefulSets), and the
 	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
@@ -337,11 +343,15 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	// A rolling-update wait that has outlived its bound without being resumed. The
 	// wait continues — nothing was deleted and nothing is retried early — but the
 	// pass must not end on it, or everything below stays suspended for as long as
-	// the stall lasts: the Sentinel roll, the no-master recovery, the steady-state
-	// split-brain check and the status write
-	// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5). The cadence is
-	// applied at the end of the pass, exactly like the one a post-update check asks
-	// for without taking it.
+	// the stall lasts: the no-master recovery, the steady-state split-brain check
+	// and the status write (docs/adr/0026-a-pod-being-deleted-is-not-available.md,
+	// D5). The cadence is applied at the end of the pass, exactly like the one a
+	// post-update check asks for without taking it.
+	//
+	// The Sentinel roll is deliberately not among what the stall buys back (ADR 0026
+	// D11): the data tier is still holding, and the tiers share spec.image, so a
+	// Sentinel roll released here takes a healthy Sentinel onto the spec the data
+	// tier is stuck on and spends the spare vote.
 	deferredRequeue := ctrl.Result{RequeueAfter: rollingResult.DeferredRequeueAfter}
 
 	// Check for sentinel pod updates (only when no Valkey rolling update is active).
@@ -350,7 +360,7 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 	// cadence the check needs but cannot take, because ending the pass here would
 	// skip the status write. It is applied at the very end, where every other
 	// requeue reason has already had its say.
-	pending, done, err := r.handlePostRollingUpdateChecks(ctx, valkey)
+	pending, done, err := r.handlePostRollingUpdateChecks(ctx, valkey, rollingResult.DeferredRequeueAfter > 0)
 	if done {
 		return pending, err
 	}
@@ -391,29 +401,18 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 // caller should return immediately, or (result, false, nil) if processing should
 // continue — where a non-zero result is a requeue the pass wants applied only
 // after updateStatus has run.
-func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey) (ctrl.Result, bool, error) {
-	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
-	// while verifying sentinel quorum before each deletion.
-	if v.IsSentinelEnabled() {
-		sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, v)
-		if sentinelResult.Error != nil {
-			_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
-			// The error is returned, not swallowed: without it the pass ends with
-			// no requeue and no error, and because status writes do not re-trigger
-			// (GenerationChangedPredicate) reconciliation stalls until an unrelated
-			// owned-object event arrives. Returning it hands the retry to the
-			// rate limiter, mirroring the data rolling-update error path.
-			return ctrl.Result{}, true, sentinelResult.Error
-		}
-		if sentinelResult.NeedsRequeue {
-			return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
-		}
-	} else {
-		// Disabling Sentinel mid-roll skips the check above forever, which would
-		// leave a standing SentinelUpdatePending=True as permanent drift (the T6
-		// class). Clearing it here is one map lookup on every non-Sentinel pass
-		// and a single write on the transition.
-		r.clearSentinelUpdatePending(ctx, v)
+//
+// dataTierHolding reports that the data tier's roll outlived a wait bound and
+// continued the pass rather than ending it. The Sentinel roll is skipped for that
+// pass, so the Sentinel tier rolls after the data tier
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11; ADR 0024 D1). One
+// exception is known and recorded there: a paused data roll (pauseRollingUpdate)
+// returns no requeue at all, so the pass that pauses does run the Sentinel roll.
+func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey,
+	dataTierHolding bool) (ctrl.Result, bool, error) {
+	sentinelDeferred, done, err := r.runSentinelRollingUpdate(ctx, v, dataTierHolding)
+	if done {
+		return sentinelDeferred, true, err
 	}
 
 	// For multi-replica non-Sentinel clusters, detect a no-master state and recover
@@ -438,7 +437,61 @@ func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v 
 	// confirm but not resolve asks for a recheck without ending the pass, because
 	// ending it would skip the status write. Dropping the result here would make
 	// that recheck unreachable just as surely as dropping it in reconcileWorkload.
-	return r.checkSteadyStateSplitBrain(ctx, v)
+	pending, done, err := r.checkSteadyStateSplitBrain(ctx, v)
+	if done {
+		return pending, done, err
+	}
+	return soonerRequeue(pending, sentinelDeferred), false, nil
+}
+
+// runSentinelRollingUpdate is the Sentinel half of handlePostRollingUpdateChecks.
+// It returns done == true when the pass must end on the Sentinel roll's result;
+// otherwise the returned result is the recheck cadence a Sentinel wait asked for
+// without ending the pass — the DeferredRequeueAfter of a stalled Sentinel wait,
+// which used to be dropped here, so a stalled Sentinel roll scheduled no recheck
+// of its own (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11).
+func (r *ValkeyReconciler) runSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey,
+	dataTierHolding bool) (ctrl.Result, bool, error) {
+	if !v.IsSentinelEnabled() {
+		// Disabling Sentinel mid-roll skips the roll below forever, which would
+		// leave a standing SentinelUpdatePending=True as permanent drift (the T6
+		// class). Clearing it here is one map lookup on every non-Sentinel pass
+		// and a single write on the transition. A standing Sentinel report of
+		// PodAvailabilityStalled leaves with the class for the same reason.
+		r.clearSentinelUpdatePending(ctx, v)
+		r.reportAvailabilityStall(ctx, v, common.ComponentSentinel, nil)
+		return ctrl.Result{}, false, nil
+	}
+	if dataTierHolding {
+		log.FromContext(ctx).Info("Data tier rolling update is holding; the Sentinel rolling update waits for it")
+		return ctrl.Result{}, false, nil
+	}
+
+	// Sentinel pods use OnDelete strategy — the operator replaces them one by one
+	// while verifying sentinel quorum before each deletion.
+	sentinelResult := r.checkAndHandleSentinelRollingUpdate(ctx, v)
+	if sentinelResult.Error != nil {
+		_ = r.updatePhase(ctx, v, vkov1.ValkeyPhaseError, fmt.Sprintf("Sentinel rolling update error: %v", sentinelResult.Error))
+		// The error is returned, not swallowed: without it the pass ends with
+		// no requeue and no error, and because status writes do not re-trigger
+		// (GenerationChangedPredicate) reconciliation stalls until an unrelated
+		// owned-object event arrives. Returning it hands the retry to the
+		// rate limiter, mirroring the data rolling-update error path.
+		return ctrl.Result{}, true, sentinelResult.Error
+	}
+	if sentinelResult.NeedsRequeue {
+		return ctrl.Result{RequeueAfter: sentinelResult.RequeueAfter}, true, nil
+	}
+	return ctrl.Result{RequeueAfter: sentinelResult.DeferredRequeueAfter}, false, nil
+}
+
+// soonerRequeue merges two recheck cadences a pass wants applied at its end: the
+// sooner non-zero one wins, and zero means "no recheck asked for".
+func soonerRequeue(a, b ctrl.Result) ctrl.Result {
+	if a.RequeueAfter == 0 || (b.RequeueAfter > 0 && b.RequeueAfter < a.RequeueAfter) {
+		return b
+	}
+	return a
 }
 
 // reconcileStep is one unit of work inside a reconcile pass: a display name, an
@@ -1240,8 +1293,14 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 			builder.ValkeyTLSSecretName(v), builder.SidecarContainerName) {
 			return nil
 		}
+		// A Localhost seccomp profile outside the allow-list is refused at the write,
+		// on create and on update alike, and this step is its one reporter; the
+		// Sentinel and observer steps only withhold their writes (ADR 0033 D9).
+		if err := r.seccompProfileAllowed(v); err != nil {
+			return err
+		}
 		logger.Info("Creating StatefulSet", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "StatefulSet", true)
 	}
 	if err != nil {
 		return err
@@ -1285,6 +1344,24 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 		return nil
 	}
 
+	// The ownership repair rides the template while a data pod an earlier operator
+	// built as root still exists, and is inserted after the builder so the pod-spec
+	// hash never sees it: neither template write is itself a roll. What its removal
+	// does start is the second roll, of the pods created while it was in the
+	// template (podCarriesRetiredRepair, ADR 0032 D2). Before the drift detection,
+	// which is what writes it in and out.
+	if r.dataOwnershipRepairNeeded(ctx, v, current) {
+		builder.WithDataOwnershipRepair(desired)
+	}
+
+	// The allow-list gate (ADR 0033 D9), after every proof and guard above -- the
+	// ownership proof, the claim guard whose level is re-measured every pass, the
+	// TLS record -- and before the drift detection, so that a template already
+	// carrying a profile the list no longer holds is reported too, not only a new one.
+	if err := r.seccompProfileAllowed(v); err != nil {
+		return err
+	}
+
 	// Detect drift and update.
 	if builder.StatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating StatefulSet", "name", desired.Name)
@@ -1292,7 +1369,7 @@ func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Va
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "StatefulSet", false)
 	}
 
 	return nil
@@ -1388,8 +1465,12 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 			builder.SentinelTLSSecretName(v), builder.SentinelContainerName) {
 			return nil
 		}
+		// Reported by the data StatefulSet step, which runs first (ADR 0033 D9).
+		if r.seccompProfileAllowed(v) != nil {
+			return nil
+		}
 		logger.Info("Creating Sentinel StatefulSet", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "StatefulSet", true)
 	}
 	if err != nil {
 		return err
@@ -1429,13 +1510,19 @@ func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *
 		return nil
 	}
 
+	// Withheld at the write, after the ownership proof and the claim guard; the
+	// data StatefulSet step reports it (ADR 0033 D9).
+	if r.seccompProfileAllowed(v) != nil {
+		return nil
+	}
+
 	if builder.SentinelStatefulSetHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Sentinel StatefulSet", "name", desired.Name)
 		current.Spec.Replicas = desired.Spec.Replicas
 		current.Spec.Template = desired.Spec.Template
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "StatefulSet", false)
 	}
 
 	return nil
@@ -1953,8 +2040,12 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 	current := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, current)
 	if apierrors.IsNotFound(err) {
+		// Reported by the data StatefulSet step (ADR 0033 D9).
+		if r.seccompProfileAllowed(v) != nil {
+			return nil
+		}
 		logger.Info("Creating Observer Deployment", "name", desired.Name)
-		return r.Create(ctx, desired)
+		return r.writeWorkload(ctx, desired, &desired.Spec.Template.Spec, "Deployment", true)
 	}
 	if err != nil {
 		return err
@@ -1972,12 +2063,16 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 		return nil
 	}
 
+	// Withheld at the write, after the ownership proof (ADR 0033 D9).
+	if r.seccompProfileAllowed(v) != nil {
+		return nil
+	}
 	if builder.ObserverDeploymentHasChanged(desired, current) || builder.OperatorVersionChanged(current, r.OperatorVersion) {
 		logger.Info("Updating Observer Deployment", "name", desired.Name)
 		current.Spec = desired.Spec
 		current.Labels = desired.Labels
 		builder.ApplyOperatorVersion(current, r.OperatorVersion)
-		return r.Update(ctx, current)
+		return r.writeWorkload(ctx, current, &current.Spec.Template.Spec, "Deployment", false)
 	}
 
 	return nil

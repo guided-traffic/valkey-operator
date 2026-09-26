@@ -156,10 +156,29 @@ var conditionRegistry = []conditionOwnership{
 		presenceGuarded: true,
 	},
 	{
-		conditionType:   vkov1.ConditionTypePodTerminationStalled,
-		kind:            conditionEdge,
-		evaluators:      1,
-		clearSite:       "clearPodTerminationStalled, from the delete gate and from clearRollingUpdateState",
+		conditionType: vkov1.ConditionTypePodTerminationStalled,
+		kind:          conditionEdge,
+		evaluators:    1,
+		// The Sentinel roll's quorum wait and completion hold route a terminating pod
+		// through terminationWait since ADR 0026 D11, and the completion hold passes
+		// no delete gate -- so sentinelWait and the Sentinel completion clear too.
+		clearSite:       "clearPodTerminationStalled, from the delete gate, from clearRollingUpdateState, from sentinelWait and from the Sentinel completion in finishSentinelRollingUpdate",
+		presenceGuarded: true,
+	},
+	{
+		// The ADR 0026 D5 shape applied to the pod that does not come up instead of
+		// the one that does not go away (ADR 0026 D11). A level, not an edge like its
+		// two siblings: nothing the roll does proves the stall is over, so each tier's
+		// evaluator re-measures it on every pass that reaches that tier's roll.
+		conditionType: vkov1.ConditionTypePodAvailabilityStalled,
+		kind:          conditionLevel,
+		evaluators:    2,
+		ownershipRule: "each tier reports and retracts only its own reason (ValkeyPodNotAvailable, SentinelPodNotAvailable); " +
+			"the data tier evaluates first, and the Sentinel tier's roll runs only in a pass the data tier neither ended " +
+			"nor held (ADR 0026 D11), so the two never contend within a pass -- except the pass a paused data roll " +
+			"ends, which returns no requeue and releases the Sentinel roll (ADR 0026 D11 residual risks)",
+		clearSite: "reportAvailabilityStall, from checkAndHandleRollingUpdate and checkAndHandleSentinelRollingUpdate on " +
+			"every non-error pass that reaches them; the Sentinel report also on class exit in runSentinelRollingUpdate",
 		presenceGuarded: true,
 	},
 	{
@@ -184,6 +203,17 @@ var conditionRegistry = []conditionOwnership{
 		// up to date the instant it appears, so "no pod needs updating" is not "the
 		// tier converged" (ADR 0002 D10b).
 		clearSite:       "clearRollingUpdatePaused, from the converged early return (tier-converged) and from the completion branch of checkAndHandleRollingUpdate",
+		presenceGuarded: true,
+	},
+	{
+		// ADR 0032 D3. A level rather than an edge like SidecarUpdatePending, its
+		// sibling deferral: the deferral is decided by the standalone dispatch target,
+		// which most passes never reach, so the evaluator sits one frame up in
+		// checkAndHandleRollingUpdate and re-measures on every non-error pass.
+		conditionType:   vkov1.ConditionTypePodSecurityUpdatePending,
+		kind:            conditionLevel,
+		evaluators:      1,
+		clearSite:       "reportPodSecurityUpdatePending, from checkAndHandleRollingUpdate on every non-error pass",
 		presenceGuarded: true,
 	},
 	{

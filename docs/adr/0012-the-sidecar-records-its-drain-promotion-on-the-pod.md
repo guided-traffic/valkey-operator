@@ -90,6 +90,21 @@ deleted, because the claim travelled into
 [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and a reader has to be able to
 find where it came from.
 
+Amended 2026-09-26: **D8 step 4 and D10 now run under
+[ADR 0032](0032-generated-pods-run-rootless.md), which runs every container of the data pod
+as uid 999 with `fsGroup: 999` (D1)** — the migration-only `fix-data-ownership` repair aside
+(D2), which mounts neither the token nor the drain-signal volume. No rule here changes; the
+identity both run under does. The sidecar used to run as its image's user (65532, the
+distroless `nonroot` of [`Containerfile`](../../Containerfile)) and `valkey-server` as root.
+The token projection keeps `DefaultMode 0644`; kubelet rewrites a projected token's mode under
+`fsGroup`. **Measured 2026-09-26** on a Kind node (Kubernetes v1.36.1) in the volume directory
+kubelet writes: `token` is `0640`, owner `999`, group `999`; `ca.crt` stays `0644`, group `999`.
+The sidecar reads it as uid 999, and the sidecar labelling roles in
+`TestE2E_PodSecurity_RestrictedNamespace` is the end-to-end proof (green on both e2e legs,
+locally, 2026-09-26). The drain marker handshake no longer crosses a uid boundary, and its
+preStop half passed under the restricted Docker posture on both pinned lines
+(`TestRestrictedRuntime_DrainPreStopReleases`, green 2026-09-26).
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -234,7 +249,10 @@ Four properties hold it together:
 * **Nothing but the sidecar needed the token.** `internal/sidecar` and `cmd/sidecar` make
   exactly one API call (D8's opening paragraph, re-verified); both init containers shell out
   to `valkey-cli` only and `RequiredImageTools` names no `kubectl`; the preStop drain hook is
-  a filesystem poll; the exporter speaks to Valkey.
+  a filesystem poll; the exporter speaks to Valkey. The two init containers
+  [ADR 0032](0032-generated-pods-run-rootless.md) D2 adds — `check-data-writable` (shell
+  builtins) and the migration-only `fix-data-ownership` (`find`, `chown`) — mount the data
+  volume and nothing else.
 * **The mount path is not ours to choose.** `rest.InClusterConfig` reads `token` and `ca.crt`
   under `/var/run/secrets/kubernetes.io/serviceaccount`, hard-coded. Getting it wrong is
   loud, not silent: the client fails to build, `sidecar.Run` errors and the readiness probe
@@ -247,6 +265,32 @@ Four properties hold it together:
   grows, but flipping `automountServiceAccountToken` back to `true` on a live StatefulSet
   changes no volume and no container. `podSpecChanged` compares it — the same hole
   `ObserverDeploymentHasChanged` had to close for step 2.
+
+**Under [ADR 0032](0032-generated-pods-run-rootless.md) (2026-09-26) the token is read by the
+uid every steady-state container runs as.** The projection keeps `DefaultMode 0644`
+(`sidecarTokenVolume`), but the pod now carries `fsGroup: 999`, and under `fsGroup` kubelet may
+rewrite the mode and owner of a projected ServiceAccount token — the T31 hypothesis is `0600`
+owned by the pod's uniform `runAsUser`, or group-readable through `fsGroup` when the uids
+differ, which they do in every pod created while the template carries the uid-0
+`fix-data-ownership` repair (ADR 0032 D2). **Measured 2026-09-26** on a Kind node (v1.36.1):
+`0640`, owner 999, group 999 — the owner is the pod's `runAsUser`. It would not have to be: the sidecar no longer runs as its image's user (65532) but as uid 999,
+group 999, fsGroup 999, like every other steady-state container of the pod (ADR 0032 D1), so
+each of those modes grants it read. The failure direction is loud — an unreadable token fails
+`rest.InClusterConfig`, which the sidecar calls at startup (`newKubernetesPodPatcher`), so
+`sidecar.Run` errors and the pod never becomes Ready; the comment on `sidecarTokenVolume`
+records the CrashLoopBackOff a wrong mode produced. The posture has no opt-out, so every e2e
+that waits for a data StatefulSet to become Ready exercises the read — the fleet-upgrade e2e's
+repaired pods the differing-uid branch — and the explicit proof is the sidecar labelling roles
+in a namespace enforcing `restricted` (`TestE2E_PodSecurity_RestrictedNamespace`,
+[`test/e2e/pod_security_test.go`](../../test/e2e/pod_security_test.go)). **All of these ran
+green on this posture, locally and not in CI** ([T31](../tickets/local_T31-generated-pods-run-as-root.md),
+Verification): the full suite on both e2e legs on Kind (Kubernetes v1.36.1), 2026-09-26, and
+`TestE2E_FleetUpgrade` from released chart 1.12.8, whose persistent pods ran
+`fix-data-ownership` and whose clusters converged; the fleet-upgrade e2e is not a CI job. A
+shared uid does not reopen what step 4 closed: the boundary is the mount, not the file mode.
+The token volume is mounted into the sidecar alone, and no generated pod sets
+`shareProcessNamespace` (grep over `internal/`), so no other container sees the sidecar's
+processes or reaches its filesystem through them.
 
 The cost is one data-tier roll on the operator upgrade, which
 [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11 already declares the
@@ -320,6 +364,23 @@ pod has nothing to fail over to. Neither pays a preStop on every deletion.
 version of it. Init containers with `restartPolicy: Always` are terminated *after* the
 regular containers, so Valkey would be guaranteed to be gone before the drain starts. That
 converts the race into a certainty.
+
+**Under [ADR 0032](0032-generated-pods-run-rootless.md) (2026-09-26) both halves of the
+handshake run as uid 999.** The sidecar writes the marker with mode `0600`
+(`signalDrainComplete`); the Valkey container's preStop only tests `[ -f … ]`, which needs
+search permission on `/var/run/vko`, never read permission on the file — so the file's mode
+never entered the handshake, neither before (sidecar 65532, Valkey root) nor now (both 999).
+The hook itself now runs under the restricted posture — uid 999, no capability, read-only root
+filesystem — and writes nothing. `TestRestrictedRuntime_DrainPreStopReleases`
+([`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go))
+runs the generated hook under the Docker rendering of that posture on both pinned lines, green
+2026-09-26. That test creates the marker itself, inside the same container; the cross-container
+write by the sidecar into a kubelet `emptyDir` under `fsGroup` is exercised on a node by every
+e2e drain failover — `TestE2E_NoSentinel_MasterKill_NoSplitBrain` as much as the
+restricted-namespace e2e's, because the posture has no opt-out — all of which passed on this
+posture on both e2e legs, locally on Kind on 2026-09-26 and not yet in CI, and each of which
+would pass on a marker that was never written, because the hook then releases at its 60 s
+bound (Residual risks).
 
 **D11 — The drain client holds the TLS material source, not a parsed config.** Added
 2026-08-26. D10's premise — "the drain handler can talk to the local Valkey" — fails a second
@@ -467,6 +528,16 @@ costs the injection seam the sidecar tests rely on.
   broken sidecar image, a volume that failed to mount, a sidecar OOM-killed before SIGTERM:
   each costs 60 s per pod deletion, and nothing surfaces the cause on the CR. The kubelet
   event for the expired hook is the only trace.
+* **The marker write under `fsGroup` is argued, not measured on a node
+  (D8 step 4, D10, [ADR 0032](0032-generated-pods-run-rootless.md)).** It and the token read
+  both rest on the sidecar and the Valkey container running as uid 999 with group and
+  `fsGroup` 999. The token read is measured (`0640`, owner 999, group 999 on a Kind node,
+  2026-09-26) and covered by every e2e that waits for a data pod to become Ready and
+  explicitly by the role labelling in `TestE2E_PodSecurity_RestrictedNamespace`, all green on
+  both e2e legs locally on 2026-09-26 and not yet in CI. The marker write under that posture
+  is caught by no test: the unit tests write it into a temporary directory as the test user,
+  and a sidecar that cannot write it on a real node costs each pod deletion the 60 s bound of
+  the bullet above and still passes every e2e drain failover.
 * **(Closed 2026-08-21) The sidecar Role is namespace-wide `patch`.** D8 is complete: the
   grant is `patch` on this cluster's own data pods by name, so a stolen sidecar token no
   longer reaches another cluster's pods — and therefore cannot forge the drain stamp the
@@ -550,3 +621,7 @@ costs the injection seam the sidecar tests rely on.
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the surrounding privilege model
 * [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) — D11, and why a process of ours re-reads its TLS material instead of being replaced
 * [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — the material source the drain client holds (D11)
+* [`internal/builder/pod_security.go`](../../internal/builder/pod_security.go) — the uid 999 / `fsGroup: 999` posture the token read (D8 step 4) and the drain handshake (D10) run under
+* [`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go) — `TestRestrictedRuntime_DrainPreStopReleases`, the preStop under the restricted Docker posture (D10)
+* [`test/e2e/pod_security_test.go`](../../test/e2e/pod_security_test.go) — role labelling and a drain failover in a namespace enforcing `restricted` (green on both e2e legs, locally on Kind, 2026-09-26; not yet in CI)
+* [ADR 0032](0032-generated-pods-run-rootless.md) — generated pods run rootless; D1 is the posture, D2 the migration-only repair

@@ -27,36 +27,31 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "valkey-operator.serviceAccountName" . }}
-      securityContext:
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
+      {{- include "valkey-operator.podHardening" . | nindent 6 }}
       terminationGracePeriodSeconds: 10
       containers:
         - name: manager
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ include "valkey-operator.image" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
-            - --operator-image={{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+            - --operator-image={{ include "valkey-operator.image" . }}
             - --max-concurrent-reconciles={{ .Values.maxConcurrentReconciles }}
+            {{- with .Values.valkeyPodSecurity.allowedSeccompLocalhostProfiles }}
+            - --allowed-seccomp-localhost-profiles={{ include "valkey-operator.allowedSeccompLocalhostProfiles" $ }}
+            {{- end }}
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             {{- end }}
           env:
             - name: OPERATOR_IMAGE
-              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              value: "{{ include "valkey-operator.image" . }}"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
+          {{- include "valkey-operator.containerSecurityContext" . | nindent 10 }}
           ports:
             - name: metrics
               containerPort: 8080

@@ -62,12 +62,18 @@ spec:
       app: sentinel
     podAnnotations:
       example.com/sentinel: "true"
+    resources:                # optional, no default (omitted = no requests, no limits);
+      requests:               # goes to every Sentinel container, init included, so a
+        cpu: "50m"            # cpu/memory ResourceQuota can admit the pod - ADR 0033 D7
+        memory: "32Mi"        # (values are an example)
   auth:
     secretName: my-valkey-secret
     secretPasswordKey: password
   metrics:
     enabled: true                 # adds a Prometheus exporter sidecar to each Valkey pod
-    image: oliver006/redis_exporter:v1.66.0  # optional; sensible default when omitted
+    image: oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1
+                                  # optional; this is the default when omitted, pinned by
+                                  # digest (DefaultMetricsExporterImage, ADR 0033 D5)
     port: 9121                    # optional; exporter /metrics port (default 9121)
     resources:                    # optional; compute resources for the exporter container
       limits:
@@ -108,6 +114,18 @@ spec:
     topologyKey: kubernetes.io/hostname  # optional, default kubernetes.io/hostname
                              # applies to data and sentinel pods, each repelling only
                              # its own kind; StatefulSets with < 2 replicas get no term
+  podSecurity:               # optional; data, Sentinel and observer pods - ADR 0033
+    seccompProfile:
+      type: RuntimeDefault   # default; RuntimeDefault | Localhost, Unconfined is refused
+      # localhostProfile: profiles/valkey.json  # required for Localhost, forbidden otherwise;
+                             # relative, no '..'; the workloads are written only if the
+                             # operator's allow-list names this exact path (default
+                             # empty: every Localhost profile refused) - ADR 0033 D9
+    userNamespaces: false    # default; true = hostUsers: false, needs node support
+                             # (Kubernetes 1.33, containerd 2.0 / CRI-O 1.25, Linux 6.3,
+                             # no NFS data volume); changing the effective profile or
+                             # this flag rolls the data and Sentinel tiers (an explicit
+                             # RuntimeDefault is no change)
   networkPolicy:
     enabled: true
     namePrefix: "my-prefix"
@@ -164,13 +182,17 @@ The CRD status must be visible in Lens and show the current operator task per in
 - A short description of the current task otherwise (e.g., `Rolling Update 2/3`,
   `Sentinel Rolling Update 1/3`, `Syncing`, `Failover in progress`)
 
-**With one exception, and it is deliberate:** while a managed write is being refused, the
-phase reports `Error` even on a perfectly healthy cluster, because a spec the operator
+**With one exception, and it is deliberate:** while a managed write is being refused — by the
+API server, an admission webhook, or the operator itself for a `Localhost` seccomp profile
+outside its allow-list (`SeccompProfileNotAllowed`) — or is stored without a field the spec
+asks for (`UserNamespacesUnsupported`: the API server dropped `hostUsers` without an error),
+the phase reports `Error` even on a perfectly healthy cluster, because a spec the operator
 accepted and cannot apply has to be visible. `phase` therefore carries two meanings and the
 blocked pass wins the field; the **`Ready` condition** carries only the data-plane verdict
 and stays `True`. That pair is not a contradiction — it reads as "your cluster is serving,
 and the operator cannot write something".
-→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D3, D5, D5a, D12
+→ [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D3, D5, D5a, D12;
+[ADR 0033](docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) D3, D9
 
 ## Testing
 
@@ -191,7 +213,16 @@ identity, never by controller state.** A rolling-update state annotation names a
 phase outlives the pod it is about: the abandon e2e jammed pod-0 on "state is one of three
 values and pod-0 answers `role:slave`", which the *outgoing* master also satisfies for the one
 second between the demote and the delete — runtime `CONFIG SET` dies with that pod, and the
-test failed on four runs in ten days, each on a different leg. Use the image, the UID or
+test failed on four runs in ten days, each on a different leg. Again on 2026-09-26, in the shape
+`waitForPodRecreated` was written for on 2026-08-22 (`TestE2E_NoSentinel_MasterKill_NoSplitBrain`,
+`cea8222`): `TestE2E_SidecarFailoverDrainMaster` waited, after deleting the master, on
+conditions the terminating old master already met (kubelet keeps it Ready, ADR 0026) — vacuous
+in 5 of 10 green runs of it alone on Kind, red once in a Valkey 9 suite by reading `DBSIZE 0`
+from the empty replacement (inferred from the test code and timing; that run's pod logs were
+lost) — and now waits for the new UID (`waitForPodRecreated`, 8/8 green alone on Valkey 9, and
+green in all six CI full-suite legs since `b13377e`); of the five sites of the same shape ~~, not
+yet audited,~~ two are vacuous (the replica drain in `sidecar_test.go`, the restart in
+`sentinel_stale_master_test.go`) and three fine *(audited 2026-09-26)*, T34. Use the image, the UID or
 `deletionTimestamp`, and read the effect back rather than trusting the write. Endpoint
 membership is read through `discovery.k8s.io/v1` EndpointSlice (`readyEndpointPodNames`); `v1
 Endpoints` is deprecated since 1.33 and the operator never used it.
@@ -228,7 +259,10 @@ Every pinned tool installs into `bin/` and is invoked by its path, never by bare
 `PATH` while installing into `GOPATH/bin` made `make cyclo`, `make gosec` and `make vuln` fail
 with `command not found` on any machine without that directory on `PATH`. A tool path or
 version variable must stay **above** the first target naming it: prerequisites expand when the
-rule is read, so a late definition silently drops the dependency.
+rule is read, so a late definition silently drops the dependency. *(2026-09-26)* **The path
+carries the version** (`bin/controller-gen-v0.22.0`): `go-install-tool` installs only a missing
+file, so an unversioned `bin/controller-gen` v0.21.0 outlived the bump to v0.22.0, stamped
+v0.21.0 into the CRDs and turned `Generated Manifests Up To Date` red on `e2ce8bb`.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D49
 
 ### No `-short`, no `testing.Short()` gates
@@ -248,12 +282,17 @@ not, fixture rules, coverage boundaries — is
 
 ### The Valkey image is a dependency, pinned in one place
 
-The operator runs shell **inside** the upstream Valkey image: two init container scripts, the
-auth-wrapped container command, the exec probes and the drain preStop hook. What those execute
-is declared in `RequiredImageTools`
+The operator runs shell **inside** the upstream Valkey image: the init container scripts (the
+config writers of both tiers, and ADR 0032's `check-data-writable` pre-flight and
+`fix-data-ownership` repair), the auth-wrapped container command, the exec probes and the drain
+preStop hook. What those execute is declared in `RequiredImageTools`
 ([`internal/builder/image_requirements.go`](internal/builder/image_requirements.go)) and
 checked against the real images by `make test-image-tools` — docker, no cluster, its own CI
-job. **A new tool in a generated script needs a line in that list**; a unit test walks the
+job — which since ADR 0032 also runs `valkey-server` and `valkey-sentinel` (on a hand-written
+config), the generated probe, drain hook, pre-flight and repair under the rootless posture
+([`test/imagetools/restricted_runtime_test.go`](test/imagetools/restricted_runtime_test.go));
+the config-writer scripts are not run there.
+**A new tool in a generated script needs a line in that list**; a unit test walks the
 generated scripts and fails otherwise, and the converse test fails on a declared tool nothing
 uses any more.
 
@@ -325,6 +364,15 @@ clusters, so spreading three replicas needs three schedulable workers.
   `test/e2e/affinity_test.go` into a failure, so a cluster that came up smaller
   than requested cannot pass as a green skip. The multi-node leg sets it, and it
   additionally greps the test output to prove both scenarios actually ran.
+- `E2E_REQUIRE_USER_NAMESPACES=true` turns the "this node cannot start a pod with
+  `hostUsers: false`" skip in `test/e2e/pod_hardening_test.go` into a failure. **No CI leg sets
+  it, because none can**: the legs run Kind inside Docker-in-Docker with containerd's `native`
+  snapshotter, where such a pod fails with "container ID … cannot be mapped to a host ID"
+  (measured 2026-09-26 with the CI Kind config), or already at its sandbox
+  (`FailedCreatePodSandBox`, seen only as an Event — CI logs). A probe pod decides, reading its
+  container states and its Warning Events; without support the
+  hardening e2e moves the cluster without the user namespace and skips only those assertions.
+  The user-namespace half runs on a local Kind cluster (`make kind-create`, overlayfs).
 - Locally: `make kind-create` already builds control-plane + 3 workers, so
   `make e2e-local` covers both.
 
@@ -373,12 +421,24 @@ promoting.
 → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D10
 
 **Completion is reported per tier.** `RollingUpdateComplete` means the data tier and fires
-before the first Sentinel pod is replaced; the Sentinel tier rolls afterwards, carries the
+before the first Sentinel pod is replaced — except in the pass where a data roll *pauses*
+(`pauseRollingUpdate` returns no requeue), which releases the Sentinel roll; a known exception,
+ADR 0026 D11. The Sentinel tier rolls afterwards, carries the
 `SentinelUpdatePending` condition while it does (phase `Sentinel Rolling Update i/n`), and
 emits `SentinelUpdateComplete` exactly when that condition flips back to False. Anything
 sequencing on "the update is finished" on a sentinel-enabled cluster waits for the Sentinel
 marker, not the data one.
-→ [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md)
+
+**A tier of one or two Sentinels rolls serially** (decided 2026-09-26). Its quorum
+`replicas/2+1` equals its size, so the quorum guard never let a Ready outdated Sentinel go: the
+roll requeued unbounded, the pass ended before the status write, and no Sentinel change — image,
+TLS rotation, the rootless posture — ever reached that tier. `sentinelDeleteKeepsVotes` keeps the
+quorum guard for three or more and asks a smaller tier for every *other* Sentinel available
+instead: one at a time, delete gate unchanged, a non-voting target still exempt. The cost is
+automatic failover for the seconds one Sentinel restarts, which is what any single Sentinel
+failure already costs a tier sized to tolerate none.
+→ [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md) (D10 for the small
+tier)
 
 ## A Warning named split-brain means one that did not resolve itself
 
@@ -397,7 +457,22 @@ because `writeStatusCondition` re-`Get`s the CR. **An unreachable pod carrying a
 `DeletionTimestamp` is not a master**: nothing clears the `instanceRole` label at delete time,
 so the label used to resurrect the pod the operator had just demoted and deleted. A clean
 rolling update emits **zero** Warning Events on either topology, and an e2e subtest per
-topology says so.
+topology says so. **While the roll's own Sentinel failover is in flight
+(`failover-triggered`), the double master is reported and not resolved**
+(`resolveSplitBrainUnlessFailingOver`, ADR 0025 D9, decided 2026-09-26): Sentinel's master
+pointer names the old master until `+switch-master`, and resolving in that window demoted the
+replica Sentinel was promoting — measured as a reset-and-retrigger loop ~~of over ten minutes~~
+*(corrected 2026-09-26 against the operator log, as in ADR 0025: ten cycles on Valkey 8, until
+the test's ten-minute wait gave up)* on an observer-enabled cluster. **The window carries its own
+clock** (`ownFailoverInFlight`): the state **and** a failover timestamp younger than 90 s; a
+state without a timestamp is no window. `setFailoverTriggered` writes state and timestamp in one
+update at both trigger sites — with a second write that fails, the first trigger was left with
+no stamp (a state that never expires) and a retrigger with the reset's stale one (timeouts that
+fire early), ADR 0010 D14; one test per site. ~~The final e2e runs of 2026-09-26 logged~~ *(corrected 2026-09-26: those
+were the runs with the guard, before its clock and the one-update arm, not the final one)* The
+e2e runs of 2026-09-26 with the guard logged, on that cluster `hard`, 4 failover triggers (one
+per run of the test), 0 demotions and 0 timeouts — 11, 11 and 9 in the run before D9, both legs
+together.
 → [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
 
 ## Every condition is a level, an edge or history
@@ -448,11 +523,12 @@ kubelet keeps `PodReady=True` for the **whole termination** of a pod whose readi
 still passes — measured on Kubernetes 1.36.1, no flip, right up to the moment the object is
 gone. `podState.ready` is therefore renamed `readyCondition` and read only through two
 accessors: **`available()` = Ready and not being deleted is the default**, and every site that
-*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it;
-`reachable()` = Ready alone is the carve-out for the four sites that only *talk* to a pod, of
-which `demoteRogueMaster` is the load-bearing one — refusing to demote a terminating master
-would leave it accepting writes for the rest of its termination. **The rule is the rename, not
-a list of sites**: it had been stated as a list three times and been incomplete every time.
+*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it — except the
+replacement of an outdated pod, below; `reachable()` = Ready alone is the carve-out for the four
+sites that only *talk* to a pod, of which `demoteRogueMaster` is the load-bearing one — refusing
+to demote a terminating master would leave it accepting writes for the rest of its termination.
+**The rule is the rename, not a list of sites**: it had been stated as a list three times and
+been incomplete every time.
 
 On top of it one invariant: **the operator never deletes a pod of a tier while any pod of that
 tier is terminating.** The gate sits immediately in front of each `deleteOwnedPod` and never at
@@ -461,11 +537,50 @@ label-selector List. The refusal is never resumed — the *observation* of it is
 pod's own `deletionTimestamp` (which the API server sets to `now + gracePeriodSeconds`, so
 `time.Since` of it is the overrun) rather than by `ensureWaitBound`. Past
 `podTerminationOverrun` = 2 min the pass stops ending on the wait and reports
-`PodTerminationStalled`, so the Sentinel roll, the no-master recovery, the steady-state
-split-brain check and the status write run again. **No Event on any of it** — ADR 0025 D7 still
+`PodTerminationStalled`, so the no-master recovery, the steady-state split-brain check and the
+status write run again — on a Sentinel cluster the status write alone. **The Sentinel roll is
+not among them: a holding data tier holds it**, for all three stall conditions
+(`PodTerminationStalled`, `PodRecreationStalled`, `PodAvailabilityStalled`), because the tiers
+share `spec.image` and a released Sentinel roll takes a healthy Sentinel onto the spec the data
+tier is stuck on and spends the spare vote. One known exception, a residual risk and not a rule:
+a data roll that *pauses* (`pauseRollingUpdate` returns no requeue) is not holding, so the pass
+that pauses runs the Sentinel roll. **No Event on any of it** — ADR 0025 D7 still
 promises zero Warnings on a clean roll. `countUpdatedPods` deliberately still counts a
 terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel path only.
-→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md)
+
+**An outdated pod is replaced, not waited for.** The three roll delete sites — the standalone
+delete, `replaceNextReplica`, `replaceRemainingPods` — ask of the pod they delete only whether it
+is terminating (`terminationWait`); its readiness is not asked. The tier gate above and the
+preconditions each site already had stay (`verifyReplacedReplicasSynced`,
+`verifyNewMasterReady` — which reads the new master's `DBSIZE` but does not refuse on it, a
+pre-existing gap T32 does not close). The old wait was justified as "recently replaced", which
+no outdated pod ever is, and after a spec fix the replacement that never came up *is* the next
+candidate, so the roll waited for it forever. The Sentinel roll
+deletes an unavailable outdated pod ahead of `firstOutdatedPod`, and its quorum guard
+(`sentinelDeleteKeepsVotes`, serial on one or two Sentinels — ADR 0024 D10) applies
+only to a delete that spends a vote (`cost > 0`): with the quorum already lost — two of three
+Sentinels stuck on the broken spec, `readyCount` 1 — a non-voting outdated pod is still
+replaced, and the delete gate still serialises those deletes. `deleteNextPendingPod` keeps
+`available()`, and a pod on the current template is only ever waited on — deleting it brings it
+back identical.
+
+**Every remaining wait on a pod that exists, is not terminating and is not available is
+bounded** (`availabilityWait`): budget `spec.rollingUpdate.syncTimeout`, clock the pod's own
+(`podNotReadySince`: `Ready.lastTransitionTime`, else `creationTimestamp` — nothing armed, no
+annotation). A Ready=False kubelet stamped at its first status sync (`stampedAtFirstSync`:
+`lastTransitionTime` no later than `status.startTime` + `firstSyncSlack` = 5 s) is not a transition — that pod was never
+Ready and keeps `creationTimestamp`, or a pod Pending past the budget would restart its clock
+when scheduled. Past the budget the pass continues and `PodAvailabilityStalled` is reported — a
+**level** with two evaluators, one per tier, the tier in the reason (`ValkeyPodNotAvailable`,
+`SentinelPodNotAvailable`). **Each tier retracts only its own report, and only on evidence**:
+`expiredUnavailablePod` must find no pod of the tier that exists, is not terminating and has
+been not-Ready past the budget. A pass that stopped at another wait first measured nothing, and
+retracting on its silence made the condition flap. One condition for two tiers is accepted: a
+data report overwrites a standing Sentinel one, which returns on the first Sentinel pass after
+the data tier finishes. The wait writes nothing; the tier's wrapper
+(`checkAndHandleRollingUpdate`, `checkAndHandleSentinelRollingUpdate`) does. No Event.
+→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) (D11 for the availability
+half), [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D17
 
 ## Reconcile concurrency
 
@@ -651,10 +766,11 @@ scheme that keeps the carrier in pod `metadata`.
   `BuildStatefulSet` so `ComputePodSpecHash` does not move with it - one rotation, one signal.
   `env` is not in the API server's `updatablePodSpecFields`, so the record is refused to every
   principal including the operator. The superseded `vko.gtrfc.com/tls-material-hash` annotation
-  is **read and never written**: the fallback is self-extinguishing and exists because Sentinel
-  pods never roll on a plain upgrade (ADR 0005 D11), so without it that tier would go silently
-  unmeasured. **`config-hash` and `pod-spec-hash` are still in metadata** - a filed follow-up,
-  not a decided non-goal.
+  is **read and never written**: the fallback is self-extinguishing and exists because a plain
+  upgrade rolls Sentinel pods only when the release changes their pod spec or configuration
+  (ADR 0005 D11, narrowed 2026-09-26 — the rootless release of ADR 0032 is one that does, and so,
+  by reading, was v1.11.0), so without it that tier would go silently unmeasured. **`config-hash`
+  and `pod-spec-hash` are still in metadata** - a filed follow-up, not a decided non-goal.
 - **The data pod hands its ServiceAccount token to the sidecar container alone.**
   `automountServiceAccountToken: false` plus a hand-declared projected volume at
   `/var/run/secrets/kubernetes.io/serviceaccount`; the volume name must **not** start with
@@ -675,6 +791,203 @@ D4, [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D10 and
 amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
 residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
 D11, and `SECURITY_ARCHITECTURE.md` sections 2, 6 and 9.
+
+## Every generated pod runs rootless, with no option
+
+Every container on the Valkey image used to run as uid 0 with the runtime's default
+capabilities, because `command:` bypasses the entrypoint that drops to the `valkey` user, and a
+namespace enforcing Pod Security `restricted` refused every generated pod. Now data and Sentinel
+pods run `runAsNonRoot` as uid/gid 999 with `fsGroup: 999` (`fsGroupChangePolicy` unset =
+`Always`) and ~~`seccompProfile: RuntimeDefault`~~ the seccomp profile of `spec.podSecurity`,
+`RuntimeDefault` unless set to a `Localhost` profile the operator's allow-list names
+*(configurable since 2026-09-26, ADR 0033 D1, D9)*, and
+every container and init container — the sidecar and the third-party exporter included — with
+`allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` and
+`capabilities.drop: [ALL]`; the observer gets `runAsNonRoot`, the same seccomp profile and the
+same container fields ~~under its image's numeric user~~, pinned to uid/gid/fsGroup 65532
+(`OperatorUID`) *(2026-09-26, ADR 0033 D4)*. ~~No CRD field~~ No CRD field that lowers it
+*(since 2026-09-26 `spec.podSecurity` exists, ADR 0033: it chooses a seccomp profile and a user
+namespace, never root and never `Unconfined`)*, no `baseline` level, no opt-out: root was a
+defect, and ADR 0005 D1 governs features, not the repair of one. **The posture is applied by
+one walk** (`applyValkeyPodSecurity`, `applyObserverPodSecurity`, last in each builder), so a new container
+inherits it by being in the pod — and a `securityContext` a container builder sets is
+overwritten.
+
+- **The only root process is the migration-only `fix-data-ownership` repair** (uid 0,
+  `drop: [ALL]` + `add: [CHOWN]`, `find /data ! -user 999 -exec chown -h 999:999 {} +`, always
+  exit 0), in front of the `check-data-writable` pre-flight that every persistent data pod runs
+  and that is the one gate. `WithDataOwnershipRepair` inserts it on the built object **after
+  `ComputePodSpecHash`**, so neither the template write that adds it nor the one that removes it
+  is itself a roll. On a persistent StatefulSet it
+  is added while the live template or a data pod proven ours runs without `runAsNonRoot` — the
+  evidence is the persisted template and the immutable pod spec, derived per pass and stored
+  nowhere (`dataOwnershipRepairNeeded`) — and **kept until every ordinal holds a pod proven ours,
+  rootless and Ready, and no data-tier roll is recorded** (~~rootless and past its pre-flight —
+  exited 0, or Ready~~ until the ordering fix of 2026-09-26); a missing pod, or a rootless one
+  that never became Ready, is not proof, or the repair drops between the last legacy pod's
+  delete and its replacement booting on a root-owned volume. The roll-state half orders the
+  second roll behind the first: `reconcileStatefulSet` runs before the rolling update in the same
+  pass, and a removal under a recorded roll outdated every pod before that roll finalized, so
+  `clearStaleRollingUpdateState` discarded its state — measured on Kind as one
+  `RollingUpdateComplete` per persistent tier instead of two. That gate alone then stranded the
+  repair: the pass that may remove it is the one after the completion, and a completing pass
+  schedules none (generation-gated CR watch, no Pod watch). **`finishDataRoll` therefore asks for
+  that pass (`requestRecheck`) while the template still carries the repair** (ADR 0032 D4,
+  amended 2026-09-26). It brought `find` and `chown` into `RequiredImageTools`; a new tool in a
+  generated script still needs its line there.
+- **The repair leaving the template starts a second roll** (decided 2026-09-26; until then this
+  section said removing it "rolls nothing"). The pods created during the migration keep it in
+  their immutable spec — root on every sandbox restart, a violator in a `restricted` dry-run —
+  so `podCarriesRetiredRepair` (pod carries it, persisted template no longer does) makes them
+  outdated for that alone. It sits inside `podOutdated`, the one question every data-tier site
+  asks (dispatch loop, `collectPodStates`, the standalone handler, the manual-failover master
+  check), and the replacement is the ordinary failover-aware roll. A pod missing mid-roll is no
+  evidence, so the repair does not come back. Leaving the pods to their next replacement was the
+  alternative, and lost. After the second roll no generated pod carries a root container.
+- **The single data pod of a `spec.replicas: 1` cluster without Sentinel that still runs as root
+  is decided by persistence** (`singlePodDeferral`, read off the persisted StatefulSet), not by
+  `isSidecarOnlyChange` (which still decides a rootless one): persistent is replaced at once, the
+  repair running on its way up; non-persistent is deferred and reported as
+  `PodSecurityUpdatePending=True/PodRunsAsRoot`, because an operator upgrade never discards a
+  dataset — unless its Valkey image, TLS material record or config hash changed, which the CR
+  author or a rotation caused and which replace it as they always did.
+- **The drift comparisons treat `securityContext` as a subset** (`podSpecChanged`,
+  `containerChanged`, `ObserverDeploymentHasChanged`): a field the operator does not set is not
+  compared, so a mutating admission policy is not fought over — **except `capabilities.add`**,
+  where the live template may not add what the desired one does not, or an out-of-band `NET_RAW`
+  would never converge back.
+
+The posture is in the pod-spec hash, so this release rolls every multi-replica data tier and
+every Sentinel tier once, and every persistent data tier a second time (above) — a persistent
+single data pod without Sentinel therefore restarts twice, two short downtimes with the data
+kept. A tier of one or two Sentinels, recorded here as open until 2026-09-26 because its roll
+could never delete a Ready Sentinel, now rolls serially
+([ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md) D10). A
+replacement that never comes up (NFS `root_squash` refusing the `chown`, so the pre-flight fails)
+is reported as `PodAvailabilityStalled`, which is why this ships together with ADR 0026 D11.
+→ [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) (D2 for the second roll), amending
+[ADR 0005](docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md) D1, D7, D11,
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D6, D7,
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 and
+[ADR 0017](docs/adr/0017-test-and-ci-policy.md), superseding
+[ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) D9
+
+## Pod hardening beyond rootless: a seccomp choice, an opt-in user namespace
+
+`spec.podSecurity` reaches the data, Sentinel and observer pods; the chart's `podSecurity`
+reaches the operator and its pre-upgrade hook, and neither reaches the other's pods.
+
+- **`Unconfined` cannot be expressed.** `seccompProfile.type` is `RuntimeDefault` (default) or
+  `Localhost`, enforced by the CRD enum plus two CEL rules on `SeccompProfileSpec` — one demands
+  `localhostProfile` exactly for `Localhost`, the other refuses an absolute path or a `..`
+  element — and `GetSeccompProfile` maps anything but `Localhost` to `RuntimeDefault`; for the
+  operator's own pods the chart fails the render on any other type, `Localhost` without a path
+  and a path without `Localhost`, ~~but not on an absolute path or a `..` element~~ and *(since
+  2026-09-26, `valkey-operator.podHardening`)* on an absolute path or a `..` element, and that
+  profile is not checked against the allow-list below.
+  Every generated pod therefore runs under a seccomp filter and `restricted` stays satisfiable.
+- **A `Localhost` profile is default-deny, and one step reports it** (decided 2026-09-26).
+  Pod Security `restricted` accepts every `Localhost` profile, and one that allows every syscall
+  is as good as no filter, so a `Localhost` profile a CR names is written into a workload only
+  if `--allowed-seccomp-localhost-profiles` lists that exact path (chart
+  `valkeyPodSecurity.allowedSeccompLocalhostProfiles`, default `[]` = every `Localhost` profile
+  refused; `RuntimeDefault` needs no entry). Otherwise `reconcileStatefulSet` returns
+  `errSeccompProfileNotAllowed` ~~before it writes anything~~ **at the write**, on create and
+  update alike, and is **the one reporter** once it reaches the gate:
+  `ReconcileBlocked=True/SeccompProfileNotAllowed`, phase `Error`; the Sentinel and observer
+  steps withhold their writes silently, and running pods keep their template. *(Gate moved
+  2026-09-26 from the head of the step, where it hid a name collision, froze
+  `StorageSpecNotApplied` and skipped the TLS record.)* `seccompProfileAllowed` runs after the
+  ownership proof, `guardVolumeClaimTemplates`, `ensureTLSMaterialRecord` and the repair decision
+  and before the drift detection (on create: after the TLS record, right before
+  `writeWorkload`); the Sentinel and observer steps withhold at the matching point after their
+  own proofs. So a foreign StatefulSet is still reported as `ForeignObject`, the
+  `StorageSpecNotApplied` level is still re-measured, and a CR whose profile the list no longer
+  holds is reported even when its live template has not drifted — the gate asks the spec, not
+  the difference. `TestSeccompProfileNotAllowed_GateSitsAtTheWrite` pins the first and the last;
+  the claim level rests on the position alone. The chart refuses at render an allow-list entry
+  that is empty, starts with `/`, contains a `,` or has a `..` element. A listed profile is
+  still node state the operator cannot see: it must exist on every node, allow the chown of
+  `fix-data-ownership`, and be as strict as whoever lists it accepts for every Valkey pod.
+  *(This replaces the earlier stance that the operator keeps no allow-list and an administrator
+  narrows the choice with an admission policy. Documenting the risk only — chosen first,
+  reversed the same day — and removing `Localhost` are the alternatives that lost, ADR 0033
+  D9.)*
+- **A user namespace is opt-in, and a dropped `hostUsers` blocks the pass.**
+  `userNamespaces: true` sets `hostUsers: false` (`applyPodHardening`); default off, because a
+  node without support never starts the pod. An API server with the `UserNamespacesSupport` gate
+  off drops the field **without an error**, so every create and update of the data and Sentinel
+  StatefulSets and the observer Deployment goes through `writeWorkload` (the nudge's
+  metadata-only merge patch carries no template), which reads the stored template out of the
+  write's answer and fails the step: `ReconcileBlocked=True/UserNamespacesUnsupported`, phase
+  `Error`, the rest of the template still applied. `hostUsers` is compared **exactly**
+  (`podHardeningChanged`), not as a subset, or an opt-out would never converge.
+- **A new generated container inherits `privileged: false` by being in the pod** — the ADR 0032
+  walk (`restrictContainers` → `restrictedContainerSecurityContext`) sets it, and the repair
+  container states its own. Every generated pod also gets `enableServiceLinks: false`;
+  `hostNetwork`/`hostPID`/`hostIPC` stay unset because the API cannot carry an explicit false,
+  and a unit test fails any builder that sets one.
+- **A digest is never a label value.** `ExtractVersionFromImage` returns the tag of
+  `repo:tag@sha256:…`, `""` for a digest-only reference, `latest` for a bare repository; before
+  this, a digest-pinned `spec.image` produced a 71-character `app.kubernetes.io/version` value
+  and could never be deployed. `DefaultMetricsExporterImage` is pinned by digest and
+  **not** maintained by Renovate; the chart pins the operator through `image.digest` (default
+  empty).
+- **Resources:** `spec.sentinel.resources` goes to every Sentinel container, init included, with
+  no default; no container gets a new default (the observer keeps its pre-existing 50m/64Mi
+  request, `GetObserverResources`), so the sidecar and the data pod's init containers still
+  state none and a cpu/memory `ResourceQuota` still refuses the data pods. No AppArmor profile is
+  set: an explicit one breaks nodes without AppArmor (read in upstream source, not measured).
+- **`make cyclo` ignores `zz_generated`**, as it ignores `_test.go` — controller-gen's
+  `(*ValkeySpec).DeepCopyInto` reached 16 with `spec.podSecurity`. Hand-written code stays under
+  15, no `nolint` ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D35, amended 2026-09-26).
+
+~~Unit and integration (envtest 1.29, which measured the silent drop) ran green, as recorded in the
+T31 ticket; `TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest`, the fleet-upgrade e2e
+and both full suites have **not yet run** with this change.~~ *(Superseded 2026-09-26 by the
+runs, on the code before the allow-list and the CEL path rule:)* unit, lint, cyclo and
+integration (envtest 1.29, which measured the silent drop) green, 8 of 8 mutations of the
+ADR 0033 code killed; on Kind (Kubernetes 1.36.1, containerd 2.3.1,
+runc 1.4.2, Linux 6.10) the fleet-upgrade e2e from 1.12.8 green, the full suite 53/53 on
+Valkey 8 and 52/53 on Valkey 9 — the one failure the hardening e2e's own `/data` owner
+assertion (Kind's hostPath root is root-owned `0777`, and a cluster this operator built never
+ran the repair); it now compares the root owner before and after the move and passed on
+Valkey 8 and, rerun alone, on Valkey 9. ~~**All of that predates the allow-list and the CEL path
+rule**: the allow-list's unit tests (`TestSeccompProfileAllowed`,
+`TestSeccompProfileNotAllowed_NoWorkloadIsWritten`, `TestProfileList`) pass in `make test-unit`;
+the CEL path rule has no unit test, only integration rows; no run of those rows or of
+`TestPodSecurity_LocalhostProfileAllowList_Integration` is recorded, and the e2e subtest "a
+Localhost profile the operator does not allow is refused and reported" has **not yet run**.~~
+*(Superseded 2026-09-26 by ~~the final runs, one image built from the final code~~ the runs on one
+image — allow-list, CEL path rule, the gate at the write and ADR 0025 D9 included (its guard, not
+yet its clock or the one-update arm; corrected 2026-09-26):)* on the same Kind versions the
+fleet-upgrade e2e from 1.12.8 green, both full suites 53/53 (Valkey 9 and Valkey 8), and two
+extra Valkey 8 runs of the hardening e2e and `TestE2E_PodSecurity_RestrictedNamespace` green; the
+allow-list refusal subtest was green on every run. Mutations killed: 8/8 of the ADR 0033
+hardening code, 7/7 of the ADR 0033 D9 allow-list code (gate position included). Integration
+(envtest 1.29) repeatedly green *(precised 2026-09-26, as in ADR 0033: those runs were on the
+tree before the gate moved to the write and before ADR 0025 D9; the clean-copy run below ran it
+again)* — that tier runs the CEL path rows and
+`TestPodSecurity_LocalhostProfileAllowList_Integration`, neither of which skips; the CEL rule
+still has no unit test. *(Final run, 2026-09-26, one image with ADR 0025 D9's clock and the
+one-update arm, before the drain e2e fix:)* on the same Kind versions the fleet-upgrade e2e from
+1.12.8 green, the full suite 53/53 on Valkey 8 and 52/53 on Valkey 9 — the one failure
+`TestE2E_SidecarFailoverDrainMaster`, a fixture waiting on controller state (section Testing),
+fixed afterwards and 8/8 green alone on Valkey 9 — and two extra Valkey 8 runs of the hardening
+and restricted-namespace e2e green; ~~no full suite has run on the drain fix~~ no local full
+suite has run on the drain fix, CI ran it in six single-node legs, all green *(corrected
+2026-09-26, T34)*.
+~~Of the CI-parity gates on the final code only `make generate-all` (a
+clean copy, empty `bin/`, fresh controller-gen v0.22.0: no diff) and `make test-release-tooling`
+are recorded green; `make test-unit`, lint, cyclo, gosec, vuln, the coverage targets and
+`make test-image-tools` are not recorded in this file.~~ *(Superseded 2026-09-26:)* a clean-copy
+run on the code before the clock, the one-update arm and the drain fix had `make generate-all`
+(fresh controller-gen v0.22.0: no diff), lint (golangci-lint v2.14.0, 0 issues), cyclo, gosec
+v2.29.0 (0 issues), vuln (no vulnerabilities), the unit and integration coverage targets, image
+tools and release tooling green; the rerun on the final code has no recorded result yet.
+→ [ADR 0033](docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+(D9 for the allow-list), extending [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) (D4 of
+0033 supersedes its observer user)
 
 ## Metrics / Exporter
 

@@ -4,6 +4,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -55,6 +56,9 @@ type operatorFlags struct {
 	enableLeaderElection    bool
 	operatorImage           string
 	maxConcurrentReconciles int
+	// allowedSeccompLocalhostProfiles is the comma-separated allow-list of Localhost
+	// seccomp profiles a Valkey resource may name (ADR 0033 D9).
+	allowedSeccompLocalhostProfiles string
 }
 
 // bindOperatorFlags declares the operator flags on fs and returns the struct
@@ -73,8 +77,25 @@ func bindOperatorFlags(fs *flag.FlagSet) *operatorFlags {
 		"How many Valkey resources are reconciled at the same time. One worker couples every "+
 			"cluster to the slowest of them, because a pass dials its pods with a 5 s timeout each. "+
 			"Passes for the same resource stay serialised at any value.")
+	fs.StringVar(&f.allowedSeccompLocalhostProfiles, "allowed-seccomp-localhost-profiles", "",
+		"Comma-separated Localhost seccomp profiles, as paths relative to the kubelet's seccomp "+
+			"directory, that a Valkey resource may name in spec.podSecurity.seccompProfile. Empty "+
+			"refuses every Localhost profile: the operator does not write a workload naming one, "+
+			"because a profile that allows every syscall is as good as no filter.")
 
 	return f
+}
+
+// profileList splits the --allowed-seccomp-localhost-profiles value into its
+// entries, dropping blanks, so that "a.json, b.json," reads as two profiles.
+func profileList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // managerOptions builds the controller-runtime manager options from the parsed flags.
@@ -99,6 +120,8 @@ func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string)
 		OperatorNamespace:       operatorNamespace,
 		OperatorVersion:         version,
 		MaxConcurrentReconciles: f.maxConcurrentReconciles,
+
+		AllowedSeccompLocalhostProfiles: profileList(f.allowedSeccompLocalhostProfiles),
 	}
 }
 

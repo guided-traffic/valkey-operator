@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
 	"github.com/guided-traffic/valkey-operator/internal/common"
@@ -25,6 +26,10 @@ func newTestValkey(name string) *vkov1.Valkey {
 }
 
 // --- ExtractVersionFromImage ---
+
+// testDigestHex is a well-formed sha256 digest: 64 hex characters, the length that
+// took "sha256:<hex>" past the 63-character limit of a label value.
+const testDigestHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func TestExtractVersionFromImage(t *testing.T) {
 	tests := []struct {
@@ -63,9 +68,24 @@ func TestExtractVersionFromImage(t *testing.T) {
 			expected: "latest",
 		},
 		{
-			name:     "digest reference",
-			image:    "valkey/valkey@sha256:abc123",
-			expected: "sha256:abc123",
+			name:     "digest reference has no version",
+			image:    "valkey/valkey@sha256:" + testDigestHex,
+			expected: "",
+		},
+		{
+			name:     "tag and digest yield the tag",
+			image:    "valkey/valkey:9.1.1@sha256:" + testDigestHex,
+			expected: "9.1.1",
+		},
+		{
+			name:     "registry with port, tag and digest",
+			image:    "registry.example.com:5000/valkey/valkey:8.0@sha256:" + testDigestHex,
+			expected: "8.0",
+		},
+		{
+			name:     "registry with port and digest only",
+			image:    "registry.example.com:5000/valkey/valkey@sha256:" + testDigestHex,
+			expected: "",
 		},
 		{
 			name:     "simple image with tag",
@@ -83,6 +103,9 @@ func TestExtractVersionFromImage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := common.ExtractVersionFromImage(tt.image)
 			assert.Equal(t, tt.expected, result)
+			// The result is a label value; the API server refuses any object whose
+			// label is not one, which is how a digest-pinned image used to fail.
+			assert.Empty(t, validation.IsValidLabelValue(result), "%q is not a valid label value", result)
 		})
 	}
 }

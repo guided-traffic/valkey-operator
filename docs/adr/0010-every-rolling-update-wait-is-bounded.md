@@ -12,9 +12,13 @@ and what a clear would destroy) are recorded under D15 as accepted rather than f
 Amended 2026-08-27: **D16 is new — the wait for a pod that was deleted and never recreated
 is a bounded observation.** The three recreation waits (`replaceNextReplica`,
 `replaceRemainingPods`, the standalone loop) were the last unbounded waits in the rolling
-update, found by the T10 wedge: an immutable-field sync error stops the StatefulSet
+update *(they were not — corrected 2026-09-26: the availability waits of D17 were unbounded
+too, and further requeues of another class still are, see Residual risks)*, found by the T10
+wedge: an immutable-field sync error stops the StatefulSet
 controller from creating the pod, the pass ended on the wait forever, and with it the status
-write, the steady-state split-brain check and the Sentinel roll. `recreationWait` now rides
+write, the steady-state split-brain check and the Sentinel roll *(superseded 2026-09-26 for the
+last of the three: the stall no longer buys the Sentinel roll back — a holding data tier holds
+it, see D16 and [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11)*. `recreationWait` now rides
 the D7/D8 `ensureWaitBound` infrastructure (there is no pod object to read a timestamp
 from), and past `podRecreationOverrun` = 2 min the pass stops ending on the wait —
 `DeferredRequeueAfter` plus the `PodRecreationStalled` condition, the ADR 0026 D5 shape
@@ -24,6 +28,124 @@ on the exists path so one roll's sequential waits each own their budget, and no 
 emitted (ADR 0025 D7). Also 2026-08-27: the `RollingUpdateComplete` Event now states the end
 state each of the three completion exits actually reached, and the verify-incomplete exit
 emits the completion marker it used to omit — the message drift D3/D5 owned is fixed (T17).
+
+Amended 2026-09-26: **D17 is new — the wait on a pod that exists, is not being deleted and is
+not available is a bounded observation on the pod's own clock, and an outdated pod is not
+waited on at all.** Filed as T32 out of the T31 analysis and made a prerequisite of T31's
+release, because T31 is the first change that rolls every multi-replica data tier and every
+Sentinel tier at the operator upgrade ([ADR 0032](0032-generated-pods-run-rootless.md)): a
+replacement that never came up — an unpullable image, a crash at boot, a request no node can
+schedule — held the roll with a plain requeue at every site that asks for an available
+pod, with no bound, no condition and no pod named, and the pass ended on it before the status
+write. Outdated pods are now replaced rather than waited for
+([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11, the primary home of the
+decision), which removes the waits a spec fix could never end; what remains waits on a pod a
+delete would not help, is bounded by `spec.rollingUpdate.syncTimeout` measured on the pod's
+own clock, and reports `PodAvailabilityStalled`. **D16 is amended with it:** a holding
+data tier no longer releases the Sentinel roll, for all three stall conditions, so the Sentinel
+roll left the list of what the stall shape buys back (marked in place above and in D16). The
+residual-risk entry on "a pod-0 that does not match the template for any other reason" is
+closed. Implemented on branch `feat/rootless`, not yet released. Guarded by the unit tests in
+[`internal/controller/pod_availability_test.go`](../../internal/controller/pod_availability_test.go);
+by the delete-site tests rewritten to the new rule, `TestReplaceNextReplica_ReplacesACandidateThatIsNotReady`
+and `TestReplaceRemainingPods_ReplacesAnOutdatedPodThatIsNotReady` in
+[`sentinel_failover_test.go`](../../internal/controller/sentinel_failover_test.go) and
+`TestHandleStandaloneRollingUpdate_ReplacesAnOutdatedPodThatIsNotReady` in
+[`rolling_update_test.go`](../../internal/controller/rolling_update_test.go); by
+`TestReconcileWorkload_StalledTerminationHoldsTheSentinelRoll` in
+[`pod_termination_test.go`](../../internal/controller/pod_termination_test.go), which replaced
+the test asserting the superseded release; and, end-to-end for the data tier on a 3+3 Sentinel
+cluster, by `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced` in
+[`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go). An adversarial
+review the same day, before anything was committed, changed the implementation in four places
+and narrowed one claim; the superseded wording never left the working tree, so D16's amendment,
+D17 and the Residual risks state the reviewed rule directly. The Sentinel quorum guard applies
+only to a delete that spends a vote; the report is retracted on evidence, never on a pass that
+stopped at another wait; a Ready=False kubelet stamped at its first sync is not a transition, so
+it does not restart the clock; the Sentinel scan names the pod down longest, not the lowest
+ordinal. The narrowed claim: the ordering "the Sentinel tier rolls after the data tier" has one
+known exception, the pass in which a data roll pauses. The four changes are guarded by
+`TestSentinelRollingUpdate_ReplacesANonVotingPodWhenQuorumIsAlreadyLost`,
+`TestReportAvailabilityStall_RetractsOnlyOnEvidence`,
+`TestSentinelRollingUpdate_TerminationPriorityDoesNotRetractTheReport`,
+`TestPodNotReadySince_FirstSyncIsNotATransition` and
+`TestSentinelRollingUpdate_ReportsTheLongestUnavailablePod`, all in `pod_availability_test.go`.
+The review also surfaced one pre-existing unbounded Sentinel wait, ~~**open and awaiting a
+decision**~~ *(decided 2026-09-26, see the next amendment)* (a tier of one or two Sentinels,
+see Residual risks). Verified 2026-09-26: `make test-unit` green,
+with 36 mutation checks across the T32 and T31 guards all killed; `make test-integration`,
+`make lint` and `make cyclo` green; the e2e above green on Kind (control plane + 3 workers,
+Kubernetes v1.36.1, Valkey 9.1.1) — `PodAvailabilityStalled=True/ValkeyPodNotAvailable` named
+the stuck replica about 64 s after the image change with `syncTimeout` 60 s, no Sentinel pod UID
+changed over the 30 s hold window, and after the image was put back the operator replaced the
+stuck pod itself, the phase returned to `OK`, the condition read `False/PodAvailable` and 100 keys
+were on every replica. The full e2e suite ran the same day, locally on that Kind cluster and
+not in CI (~~the branch has not been through the pipeline~~ *(corrected 2026-09-26: the branch
+was pushed as `e2ce8bb`, where two gate jobs failed — [ADR 0017](0017-test-and-ci-policy.md) D49;
+what that run's E2E legs reported is not recorded in this repository)*): `make test-e2e E2E_VALKEY_LINE=9`
+51/51 green and `make test-e2e E2E_VALKEY_LINE=8` 51/51 green on the final image, both
+including this e2e, which was also re-run green on the final image against Valkey 9.1.1.
+*(Clarified 2026-09-26: these runs predate the two decisions taken after the D17 commit — the
+serial roll of the next amendment and the second roll of a migrated persistent data tier,
+[ADR 0032](0032-generated-pods-run-rootless.md) D2 — which changed `rolling_update.go`,
+changed `TestE2E_FleetUpgrade` and added `TestE2E_RollingUpdate_TwoSentinelsRollSerially`.
+~~Neither of those two e2e tests has been run, so these runs say nothing about that code.~~)*
+*(Updated 2026-09-26: that code has run since, locally on Kind and not in CI, on one operator
+image built from ~~the final code of the branch~~ the code before D14's single failover write
+and [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9's clock
+*(corrected 2026-09-26: both came later the same day, see the D14 amendment below)* — Kubernetes
+1.36.1, containerd 2.3.1, runc 1.4.2, Linux 6.10: both full suites green, 53/53 on Valkey 9 and
+53/53 on Valkey 8, this e2e and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` included, and
+`TestE2E_FleetUpgrade` green from 1.12.8.)* *(Run again 2026-09-26 on one image built from the
+code with both, same Kind stack: `TestE2E_FleetUpgrade` green from 1.12.8, the full suite 53/53
+on Valkey 8 and 52/53 on Valkey 9, this e2e and the two-Sentinel e2e green on both lines. The
+one failure was `TestE2E_SidecarFailoverDrainMaster`, a fixture that waited on controller state
+after deleting a pod; fixed afterwards and green 8 of 8 on Valkey 9
+([ADR 0017](0017-test-and-ci-policy.md) D50).)*
+
+Amended 2026-09-26, after D17 was committed: **the Sentinel wait the review left open is
+decided — a tier of one or two Sentinels rolls serially
+([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10, the home of the
+decision).** Its quorum equals its size, so the guard refused every delete that spends a vote
+and the roll requeued forever with nothing named. The guard is now `sentinelDeleteKeepsVotes`:
+unchanged for three or more Sentinels, and on a tier of one or two it admits a delete that
+leaves `total-1` voters — one Sentinel at a time, only while every other one is available.
+What is left of that wait is the class this ADR already bounds or records: an unavailable
+current Sentinel through `availabilityWait` (D17), a terminating one through `terminationWait`,
+a missing one as the plain requeue of the Residual risks. The residual entry is closed in
+place, and D17's quote of the guard is corrected. Implemented on branch `feat/rootless`, not
+yet released. Guarded by `TestSentinelRollingUpdate_SmallTiersRollSerially` and
+`TestSentinelDeleteKeepsVotes` in
+[`pod_availability_test.go`](../../internal/controller/pod_availability_test.go), and
+end-to-end by `TestE2E_RollingUpdate_TwoSentinelsRollSerially` in
+[`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — that a
+two-Sentinel tier rolls, completes and keeps the data, not the one-at-a-time order, which only
+the unit test asserts — which ~~**has not been run yet**~~ *(green 2026-09-26, locally on Kind
+and not in CI, on both Valkey lines: in an earlier run and inside both full suites on ~~the final
+image of the branch~~ the image before D14's single write *(corrected 2026-09-26)*, and again
+inside both full suites on the image with it)*. Verified 2026-09-26: `make test-unit` green on
+the working tree, both unit tests included.
+
+Amended 2026-09-26, later the same day: **D14 — an arming write belongs in the same update as
+the state it bounds.** The two sites that enter `stateFailoverTriggered`,
+`handleMasterFailover` and `handleFailoverRetrigger`, wrote the state and then, in a second
+update, the failover timestamp; they now write both in one (`setFailoverTriggered`). Recorded
+at D14. Guarded by `TestHandleRollingUpdate_ArmsTheFailoverStateWithItsTimestamp` in
+[`split_brain_failover_test.go`](../../internal/controller/split_brain_failover_test.go) (the
+mutation that splits the write again is killed), and by
+`TestHandleMasterFailover_SurfacesTheTimestampWriteFailure` and
+`TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure` in
+[`sentinel_failover_test.go`](../../internal/controller/sentinel_failover_test.go), adapted to
+the single write. *(Scope, read 2026-09-26, not run: the arming test drives only
+`handleMasterFailover`, and the mutation it kills splits `setFailoverTriggered` itself. Two
+writes put back at `handleFailoverRetrigger` alone would fail none of the three tests, nor any
+other `handleFailoverRetrigger` test: the
+adapted retrigger test fails from the first write, which leaves the reset state and its old
+stamp standing under either shape.)* *(Closed the same day:
+`TestHandleFailoverRetrigger_ArmsTheFailoverStateWithAFreshTimestamp` requires the first write
+that names `failover-triggered` at the retrigger to carry a stamp other than the reset's; the
+mutation that puts the two writes back at `handleFailoverRetrigger` alone is killed.)* No e2e injects the failed write; the image with the change
+ran the suites above. Implemented on branch `feat/rootless`, not yet released.
 
 Implemented on branch `feat/support-pdb`, not yet released — no tag contains this
 branch's HEAD and none of the files named below exist on `origin/main`. Guarded by
@@ -200,11 +322,39 @@ consumers now share one annotation rather than one.
 
 **D14 — An arming write whose error is discarded is a defect, not a duplication to fold.**
 Of five inline RFC3339 stall checks, three are readability hygiene — their stamp is written
-by `setFailoverTimestamp`, which returns the `Update` error, and every caller checks it. The
+by `setFailoverTimestamp`, which returns the `Update` error, and every caller checks it
+*(since 2026-09-26 the two trigger sites write it through `setFailoverTriggered`, see the
+amendment below; `incrementReconnectResetCount` writes it too, in the update that carries the
+reset count, and its caller checks the error — read)*. The
 other two (`isSentinelAwarenessStalled`, `isSyncWaitTimedOut`) rest on an arming write whose
 error is discarded, are live unbounded stalls and are tracked as defects. Filing a live
 unbounded-requeue defect as a readability cleanup means it ships whenever nobody gets round
 to the cleanup.
+*(Amended 2026-09-26.)* A checked error was not enough for the failover stamp: both sites that
+enter `stateFailoverTriggered` wrote the state and then, in a second update, the timestamp. When
+the second write failed, the state stood without its stamp, and `annotationTimestampExceeded`
+reads a missing stamp as never expired — `isFailoverTimedOut` and `isReplicaReconnectTimedOut`
+never fired (read in code; no run reached it). *(Narrowed 2026-09-26, read: that holds at
+`handleMasterFailover`, the first trigger, where no stamp stands. At `handleFailoverRetrigger`
+the stamp `handleNoMasterFound` wrote for the reset stood instead, at least `failoverResetMinWait`
+= 20 s old, so there the bounds fired early rather than never — the pre-change
+`TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure` asserted exactly that old stamp
+standing.)* `setFailoverTriggered` now writes both in one
+update (`TestHandleRollingUpdate_ArmsTheFailoverStateWithItsTimestamp`; the mutation that splits
+the write again is killed). **An arming write belongs in the same update as the state it bounds.**
+The same missing stamp would also have held open the window of
+[ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) D9, which since
+carries its own clock and treats a missing stamp as no window.
+**Not applied everywhere yet:** `handleNoMasterFound` still writes the stamp and then
+`stateFailoverReset` in two updates. The stamp goes first, so a failed second write leaves
+`failover-triggered` standing with a fresh stamp *(or `replacing-master`, the other state
+`handlePostFailover` serves and that therefore reaches it; added 2026-09-26)* — ~~bounded,
+because~~ *(corrected 2026-09-26: not unbounded the way a missing stamp is, because the fresh
+stamp expires and)* the next pass past
+`failoverRetryTimeout` tries again, but each such failure in `failover-triggered` re-opens ADR
+0025 D9's window by 90 s
+(read; `TestHandleNoMasterFound_SurfacesTheStateWriteFailure` pins the state standing, not the
+stamp).
 
 **D15 — A one-shot verdict is written before the transition that ends its last writer, and
 a conflict fails the pass.** `TopologyRestored` has exactly two writers,
@@ -280,6 +430,123 @@ satisfied by the observation being bounded while the wait itself remains until t
 exists or a human clears the wedge. No Event (ADR 0025 D7); this is the ADR 0026 D5 shape
 applied to the absent pod instead of the terminating one.
 
+Amended 2026-09-26 (T32): **the stall shape no longer buys back the Sentinel roll.** D16 took
+the ADR 0026 D5 shape whole, and D5 listed the Sentinel roll among what `DeferredRequeueAfter`
+hands back to the pass; that item is superseded by
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11. `reconcileWorkload` passes
+`rollingResult.DeferredRequeueAfter > 0` to `handlePostRollingUpdateChecks`, and
+`runSentinelRollingUpdate` skips the Sentinel roll for that pass — for every data-tier stall,
+since `terminationWait`, `recreationWait` and D17's `availabilityWait` are the only producers of
+`DeferredRequeueAfter`. What the stall buys back is the status write, the no-master recovery
+(`checkAndRecoverNoMaster`) and the steady-state split-brain check; the last two self-gate on
+`IsMultiReplicaWithoutSentinel`, so on a Sentinel cluster it is the status write alone. The
+reason is D17's common case: `spec.image` is shared by both tiers, so a Sentinel roll released
+by a data replica stuck on a bad image takes a healthy Sentinel onto the same image, and the
+quorum guard stops only once the spare vote is spent *(on a tier of one or two Sentinels, which
+has none, after the first delete — the serial roll of ADR 0024 D10, 2026-09-26)*. Before D17 a
+replica stuck on a bad image never released the Sentinel roll, because that wait was unbounded;
+bounding it without this hold would have made the bad-image case worse on every Sentinel
+cluster. The ordering
+[ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) builds on — the Sentinel tier
+rolls after the data tier — holds again for every data-tier stall, **but not without
+exception**: `pauseRollingUpdate` returns an empty `RollingUpdateResult`, no `NeedsRequeue` and
+no `DeferredRequeueAfter`, so the pass in which a data roll pauses is not holding and runs the
+Sentinel roll (Residual risks).
+
+**D17 — The wait on a pod that exists, is not being deleted and is not available is a bounded
+observation on the pod's own clock; an outdated pod is not waited on at all.** Added
+2026-09-26 (T32). A replacement that never comes up — an unpullable image, a container that
+crashes at boot, a request no node can schedule — was waited for with a plain requeue at every
+site that asks for an available pod: no bound, no condition, no pod named, and the frozen tail
+of the pass the Context describes — and, unlike D16's wedge, produced by an ordinary spec
+mistake. Two halves:
+
+* **An outdated pod is replaced, not waited for.** The three delete sites —
+  `replaceNextReplica`, `replaceRemainingPods` and the standalone handler — delete an outdated
+  pod unless it is terminating (then `terminationWait`, ADR 0026 D5); readiness is no longer
+  asked. The standalone handler still defers what `singlePodDeferral` defers instead of
+  deleting — a sidecar-only change, and the move off root on a pod without persistence unless
+  its image, config or TLS material changed as well
+  ([ADR 0032](0032-generated-pods-run-rootless.md) D3). The Sentinel roll takes an outdated
+  Sentinel that is neither available nor terminating ahead of `firstOutdatedPod`, charges the target a vote only when it is available
+  (`sentinelScan.deleteTarget`), and applies the quorum guard only to a delete that spends one
+  (~~`cost > 0 && scan.readyCount-cost < quorum`~~ in `dispatchSentinelRollingUpdate`;
+  *corrected 2026-09-26: the guard is `cost > 0 && !sentinelDeleteKeepsVotes(...)`, the same
+  `readyCount-cost >= quorum` for three or more Sentinels and a serial delete on a tier of one
+  or two, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10*). With the
+  quorum already lost — two of three Sentinels stuck on the broken spec after the fix,
+  `readyCount` 1 — replacing a non-voting pod is the only way the quorum comes back, and a guard
+  charged against `readyCount` alone refused it forever; the delete gate (ADR 0026 D5) still
+  refuses the next delete while a Sentinel is terminating. After a spec fix the pod stuck on
+  the broken spec is exactly the one these sites now take, so the roll moves on by itself. The
+  rule and what it leaves unchanged live in ADR 0026 D11; it belongs here too because it removes
+  the waits no bound could have fixed — bounding the observation of a wait that only a human
+  `kubectl delete` ends still leaves the roll stuck.
+* **Every remaining wait on such a pod goes through `availabilityWait`.** What remains is a
+  pod on the current template, or a master, which a delete would not help:
+  `verifyReplacedReplicasSynced` and `waitForReplicasReady` through `waitForUnavailablePod`
+  (terminating → `terminationWait`, otherwise `availabilityWait`); the `replaceRemainingPods`
+  fall-through on `firstUnavailableExisting`, where the dispatch lands while a current pod keeps
+  `countUpdatedPods` below the total; the standalone wait on the current pod (`standaloneWait`),
+  reached only while rolling-update state is recorded — the standalone handler writes none, so a
+  current single pod that never starts takes the converged early return in
+  `dispatchDataRollingUpdate` and shows as phase `Provisioning`, not as this condition;
+  and the Sentinel quorum wait and completion hold through `sentinelWait`. Within
+  `spec.rollingUpdate.syncTimeout` (`GetSyncTimeout()`, default 5 m) the plain requeue is
+  unchanged. Past it the pass returns `DeferredRequeueAfter`, and the tier's evaluator —
+  `checkAndHandleRollingUpdate` for the data tier, `checkAndHandleSentinelRollingUpdate` for
+  the Sentinel tier, both through `reportAvailabilityStall` — reports `PodAvailabilityStalled`
+  (`ValkeyPodNotAvailable` / `SentinelPodNotAvailable`) naming the pod and the start of its
+  clock. On the Sentinel tier the named pod is the current unavailable one with the **oldest**
+  clock, not the lowest ordinal (`sentinelScan.observe`): a pod that just came back on the same
+  broken spec must not hide one that has been down for hours behind a fresh budget.
+  `availabilityWait` itself writes nothing.
+
+The clock is the pod's own (`podNotReadySince`): `PodReady.lastTransitionTime` while Ready is
+not True; `creationTimestamp` while the pod has no Ready condition yet, the time is zero, or the
+not-True Ready is the one kubelet stamped at its first status sync of the pod
+(`stampedAtFirstSync`: `lastTransitionTime` no later than `status.startTime` plus
+`firstSyncSlack` = 5 s); zero while the pod is Ready, and a zero clock is the plain requeue. The
+first-sync case is not a transition away from Ready — such a pod was never Ready, so it has been
+unavailable since it was created — and reading it as one reset the clock of a pod that sat
+Pending longer than the budget to the moment it was scheduled, retracting a standing report for
+a pod that never came up. A real transition back from Ready still restarts the clock (Residual
+risks). Like ADR 0026 D5 and unlike D16, this is **not** an `ensureWaitBound` member: kubelet
+(or, for `creationTimestamp`, the API server) writes the start time onto the pod, so nothing is
+armed and nothing can fail to arm (D7/D8), no CR write is spent, an operator restart loses
+nothing, and the deadline is per pod — which D16 had to buy with per-episode clears, because one
+roll waits on several pods in sequence. The budget is `syncTimeout` because D6
+already spends it on the same wait (the `!isPodReady` branch on pod-0) and the gates of D13
+spend it on the same pod once it answers, so a user who raised it for a slow full sync raised
+this one with it. D17 shares the value, not an annotation, and never calls
+`pauseRollingUpdate`: the D13 property is untouched, and no call site is reachable from the
+restore phases, which `dispatchMultiReplicaState` routes first.
+
+As in D16, the exit is not a state transition and the state annotation stays (D4): a pod on the
+current template comes back identical when deleted, so there is nothing to hand over to, and
+this ADR's rule is met by the observation being bounded while the wait itself remains. What the stall
+buys back is D16's list as amended the same day — a holding data tier holds the Sentinel roll.
+The Sentinel roll's own `DeferredRequeueAfter`, which `handlePostRollingUpdateChecks` used to
+drop, is now applied, merged with the steady-state check's recheck by `soonerRequeue` (the
+sooner wins). The condition is a **level**, not an edge like its two siblings
+([ADR 0027](0027-conditions-are-levels-edges-or-history.md)): nothing the roll does proves the
+stall is over, so each tier evaluates it on every non-error pass that reaches its roll. A tier
+retracts only its own reason — `False`/`PodAvailable`, written only over a standing `True` of
+that tier — and **only on evidence**: `expiredUnavailablePod` finds no pod of the tier (the
+ordinal range of its StatefulSet, ours only, cache reads) that exists, is not terminating, is
+not Ready and has been not-Ready longer than `syncTimeout`. A pass whose result carries no stall
+is not that evidence: one that stopped at another wait first — a terminating pod, a fresher
+replacement on its own budget — never looked at the reported pod, and retracting on its silence
+made the condition flap for as long as one stall lasted. The two tiers share one slot: a data
+report raised over a standing Sentinel report replaces it, and the first Sentinel pass after the
+data tier finishes that waits on the stuck pod reports it again at once, because that pod's clock
+is already old — accepted, traced by reading (ADR 0026 D11). The Sentinel report is also retracted
+on class exit in `runSentinelRollingUpdate`, through the same evidence check — so, traced by
+reading, it stands while a Sentinel pod left behind is still down past the budget, because the
+operator does not delete the Sentinel StatefulSet of a CR whose Sentinel is disabled. The message
+names the instant, never a running duration, so a stall that lasts a day costs one condition
+write. No Event (ADR 0025 D7).
+
 ## Consequences
 
 * The original topology is never restored on the abandon path, and the CR carries
@@ -311,6 +578,25 @@ applied to the absent pod instead of the terminating one.
 * The Event reason does not distinguish a failover stall from a Phase 1 sync timeout —
   operators read the message text, not the reason. A distinct reason string
   (`MasterNeverReturned`) is a one-line change if it is ever wanted.
+* An outdated pod that is not available is deleted at once rather than waited for (D17) —
+  the same roll replaces it either way, so what changes is only when.
+* A stuck replacement is reported only once `syncTimeout` has passed on its own clock: 5 min by
+  default, and longer wherever a user raised the budget for a slow full sync — the two cannot be
+  tuned apart. A current single pod is not reported at all (D17). `ValkeyPhaseNotOK` is the
+  fallback after 30 min, but whether it survives the alternating phase of the next bullet is not
+  checked.
+* On a Sentinel cluster every data-tier stall — terminating, absent or unavailable — now also
+  holds the Sentinel update (D16 as amended). Not urgent: the outdated Sentinels keep running.
+  A NotReady-node termination stall or a T10 wedge therefore delays the Sentinel tier for as
+  long as it lasts.
+* During a reported stall of any of the three kinds, the pass writes the phase twice —
+  `Rolling Update i/n` before dispatch, then `updateStatus`'s `Provisioning` while a pod is not
+  Ready — so the phase alternates for as long as the stall lasts. Inherited from D16 and ADR
+  0026 D5, not introduced by D17; traced by reading, not measured. `vko_valkey_status_phase`
+  carries one series per resource labelled with the current phase, so a scrape between the two
+  writes replaces the `Provisioning` series; whether that resets the `for: 30m` of
+  `ValkeyPhaseNotOK` has not been checked (ADR 0026 residual risks). The three stall conditions
+  are the stable signal.
 
 ## Alternatives Considered
 
@@ -397,6 +683,32 @@ self-inflicted conflict, and `retry.RetryOnConflict` covers a genuine competing 
 
 Rejected once the discarded error in two of the five was noticed — see D14.
 
+### Bound the availability wait through `ensureWaitBound`
+
+Rejected for D17: the pod carries a clock nothing has to arm. An annotation would bring back
+the D7/D8 arming failure for a wait that has no need of it, would be first-seen-wins per CR
+rather than per pod, and would need D16's per-episode clears, because one roll waits on several
+pods in sequence.
+
+### A fixed constant for D17, like `podTerminationOverrun` and `podRecreationOverrun`
+
+Rejected: not user-raisable, and D6 already bounds the same wait on pod-0 with `syncTimeout` —
+two budgets for one wait, picked by whichever state the roll happens to be in, would be
+arbitrary.
+
+### Bound the wait on an outdated pod instead of replacing it
+
+Rejected; recorded with the other options in ADR 0026 D11. After a spec fix the stuck pod is
+outdated, and a bounded observation of it still ends only when a human deletes the pod.
+
+### Let a data-tier stall release the Sentinel roll, as ADR 0026 D5 stood
+
+Rejected (D16 as amended): the tiers share `spec.image`, so the released roll takes a healthy
+Sentinel onto the image the data tier is stuck on, and the quorum guard stops only after the
+spare vote is gone *(on a tier of one or two Sentinels, after the first delete — ADR 0024 D10,
+2026-09-26)*. Holding the Sentinel roll for `PodAvailabilityStalled` alone was rejected
+too — it would give `DeferredRequeueAfter` two meanings depending on which wait produced it.
+
 ## Residual risks
 
 * **(Closed 2026-08-21) `ensureSentinelAwarenessTimestamp` and `ensureSyncWaitTimestamp` were
@@ -417,7 +729,7 @@ Rejected once the discarded error in two of the five was noticed — see D14.
   `TestClearSyncWaitTimestamp_ForgetsTheBound`).
 * **The in-memory half of a bound is per operator process**, so a restart before the
   annotation ever lands restarts the budget. Deliberate.
-* **The manual-failover hand-over does not bound the outer loop.** After Phase 2 consolidates
+* **(Closed 2026-09-26) The manual-failover hand-over does not bound the outer loop.** After Phase 2 consolidates
   and completes, the state clears; a pod-0 that then *exists* but does not match the live
   template — stuck `Terminating`, or otherwise not replaced — keeps `needsRollingUpdate` true,
   so the next pass re-enters at `replaceNextReplica` and requeues with no bound, and the "tail
@@ -425,12 +737,16 @@ Rejected once the discarded error in two of the five was noticed — see D14.
   *(Narrowed 2026-08-25.* The stuck-`Terminating` half of this item is now covered:
   [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5 routes every wait on a
   terminating pod — the delete gate and the `!available()` waits alike — through
-  `terminationWait`, which after `podTerminationOverrun` = 2 min stops setting `NeedsRequeue`
+  `terminationWait` *(all but one: the Sentinel completion hold did not, until
+  [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 routed it through `sentinelWait`
+  on 2026-09-26)*, which after `podTerminationOverrun` = 2 min stops setting `NeedsRequeue`
   and reports `PodTerminationStalled` instead, so the tail of the pass runs again. The
-  *refusal* is still not resumed, deliberately. What remains open here is a pod-0 that does not
-  match the template for any **other** reason, which still requeues unbounded.
+  *refusal* is still not resumed, deliberately. ~~What remains open here is a pod-0 that does
+  not match the template for any **other** reason, which still requeues unbounded.~~ *(Closed
+  2026-09-26, see the end of this entry.)*
   ADR 0026 D5 is also the one bounded rolling-update wait that does **not** go through
-  `ensureWaitBound`: it measures the pod's own `metadata.deletionTimestamp`, a timestamp the
+  `ensureWaitBound` *(one of two since 2026-09-26: D17's availability wait is the second, for
+  the same reason — it reads a clock the pod carries)*: it measures the pod's own `metadata.deletionTimestamp`, a timestamp the
   API server writes, so the D7/D8 failure this ADR is about — an arming write that fails
   silently — cannot occur there. The reasoning is recorded in that ADR rather than here.) A pod-0 that was never created is
   **not** that case: `checkAndHandleRollingUpdate` skips absent pods when deciding whether an
@@ -438,6 +754,98 @@ Rejected once the discarded error in two of the five was noticed — see D14.
   runs on through `handlePostRollingUpdateChecks` and `updateStatus`, and the short-StatefulSet
   nudge owns the requeue ([ADR 0003](0003-nudge-a-short-of-pods-statefulset.md)). Bounding the
   outer loop is explicitly a different item.
+  *(Closed 2026-09-26 by D17 and [ADR 0026](0026-a-pod-being-deleted-is-not-available.md)
+  D11.* The unbounded requeue left here was the `!available()` wait on `candidates[0]` in
+  `replaceNextReplica`: an outdated pod-0 that is not the master is a replica candidate, and
+  the roll waited for it to become available with a plain requeue. An outdated pod that is not
+  terminating is now deleted rather than waited for, and every wait left on that path is
+  bounded — a terminating pod by ADR 0026 D5, an absent one by D16, an unavailable pod on the
+  current template by D17, a replaced replica that answers but does not sync by the sync-wait
+  bound (D13). The closure covers the wait this entry named, not every requeue of the rolling
+  update: an outdated pod-0 that still counts as the master is not a candidate and reaches the
+  failover step, whose unbounded requeues are the next entry.)
+* **Unbounded requeues of another class remain.** A master or a promotion step that does not
+  answer still ends the pass with a plain requeue and no bound: "No master detected during
+  rolling update" (`handleRollingUpdate` and `dispatchMultiReplicaState`), and "No ready
+  updated replica available for promotion" and a failing `promoteAndRedirect` in
+  `handleManualFailover`. T32's analysis lists further sites of the same class —
+  `waitForWriteSync` on a `WAIT` or TLS error, the waits inside `verifyNewMasterReady`, the
+  `deleteNextPendingPod` fall-through — which were not re-read for this entry. None is filed.
+  D17 bounds the waits on a pod that does not come up, not on a pod that does not answer.
+* **The Sentinel failover's reset-and-retrigger cycle has no cap** *(added 2026-09-26, read)*.
+  Each step is bounded — `failover-triggered` hands over to `failover-reset` after
+  `failoverRetryTimeout` (30 s), `handleFailoverRetrigger` fires again after
+  `failoverResetMinWait` (20 s) — but nothing counts the cycles; ~~`maxReconnectResets` caps only
+  the no-replica branch~~ *(corrected 2026-09-26, read: `maxReconnectResets` counts only the
+  no-replica branch's resets, and caps no branch overall — the pass that reaches it clears the
+  count, so a new master that still has no connected replica starts it over)*. Before [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
+  D9 a Kind run went through ten triggers in about nine and a half minutes and was still cycling
+  when the test's ten-minute wait gave up. D9 removed the cause that drove that run; the loop
+  itself is unchanged. Not filed.
+* **A missing Sentinel pod still waits unbounded.** The Sentinel quorum wait and completion
+  hold route through `sentinelWait`, which falls back to the plain requeue when the scan names
+  neither a terminating pod nor an unavailable current one — and a pod the StatefulSet
+  controller never recreates is skipped by `scanSentinelPods`, so it is named by neither. That
+  is D16's class on the Sentinel tier; D17 bounds only a pod that exists.
+* **A pod whose readiness flaps restarts D17's clock** on every transition back from Ready, so
+  a pod that turns Ready at least once within every `syncTimeout` is never reported. Read from
+  `podNotReadySince`, not measured. The first-sync rule has a margin of its own:
+  `stampedAtFirstSync` assumes kubelet stamps the Ready condition within `firstSyncSlack` = 5 s
+  of `status.startTime`, and a first sync later than that reads as a transition and restarts the
+  clock at scheduling — the pre-review behaviour, for that pod only. The margin rests on the
+  code's reading of kubelet, not on a measurement; the e2e cannot tell the two clocks apart,
+  because an unpullable image does not delay scheduling. That kubelet keeps `lastTransitionTime`
+  across a kubelet restart is read from the upstream status manager, not measured on a node
+  either.
+* **A paused data roll releases the Sentinel roll in the pass that pauses.** The hold of D16 as
+  amended keys on the data result's `DeferredRequeueAfter`, and `pauseRollingUpdate` clears the
+  state annotation and returns an empty `RollingUpdateResult`, so `reconcileWorkload` passes
+  `dataTierHolding` false and `runSentinelRollingUpdate` runs the Sentinel roll in that pass.
+  The next pass that finds an outdated data pod dispatches the data roll again on a fresh
+  `syncTimeout` and ends on its waits, so the release recurs once per pause rather than holding
+  the Sentinel roll open — traced by reading, not measured. A pause is reached only through the
+  D13 consumers, and on a Sentinel cluster each of them runs only once the replicas it waits on
+  are available — `verifyReplacedReplicasSynced` and `waitForReplicasReady` check that first, and
+  the zero-acknowledgement branch of `waitForWriteSync` runs after `waitForReplicasReady`, and
+  `verifyPromotionCandidateHoldsData` is on the non-Sentinel path only; a replica that never
+  comes up goes to `availabilityWait` before the sync-wait bound is armed, so the bad-image case
+  the hold exists for does not take this path. Recorded, not fixed; the pause's shape is T23's
+  item.
+* **(Closed 2026-09-26 by [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md)
+  D10) A tier of one or two Sentinels never replaced a Ready outdated Sentinel.** The quorum is
+  `replicas/2+1`, which equals `replicas` for one and two, so the guard refused every delete
+  that spends a vote even with every Sentinel Ready; `sentinelWait` then found neither a
+  terminating pod nor an unavailable current one and returned the plain requeue. The roll
+  requeued with no bound and no pod named, and every pass ended on it before `updateStatus`,
+  with the phase standing at `Sentinel Rolling Update i/n`. Pre-existing — the guard's
+  arithmetic predates T32, which relaxed it only for a non-voting target — and admitted by the
+  CRD (`SentinelSpec.Replicas` has `Minimum=1`; its doc comment advises three or more). T31
+  makes it reachable at the operator upgrade, because that release rolls every Sentinel tier
+  once ([ADR 0032](0032-generated-pods-run-rootless.md)); the wds18 fleet has only
+  three-Sentinel tiers (checked read-only 2026-09-26). ~~No decision has been taken, and none is
+  recorded here.~~
+  *(Decided 2026-09-26: such a tier rolls serially.* `sentinelDeleteKeepsVotes` keeps
+  `readyCount-cost >= quorum` wherever `quorum < total`, and where the quorum equals the size it
+  requires `readyCount-cost >= total-1` — one Sentinel at a time, and only while every other one
+  is available. The delete gate still applies, and a non-voting target still costs nothing. The
+  price is automatic failover for the seconds one Sentinel restarts, which is what any single
+  Sentinel failure already costs a tier sized to tolerate none; without it, no Sentinel change —
+  an image, a certificate rotation ([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)),
+  the rootless posture — ever reached such a tier. The wait that remains is refused only while
+  another Sentinel is not available, and routes like every other Sentinel wait: a terminating pod
+  through `terminationWait`, an unavailable current one through `availabilityWait`, a missing one
+  to the plain requeue of "A missing Sentinel pod still waits unbounded" above. The rule and its
+  reasoning live in ADR 0024 D10.
+  Guarded at unit level by `TestSentinelRollingUpdate_SmallTiersRollSerially` and
+  `TestSentinelDeleteKeepsVotes`; `TestE2E_RollingUpdate_TwoSentinelsRollSerially` exists and
+  ~~has not been run~~ is green locally on both Valkey lines, 2026-09-26, without asserting the
+  serial order.)
+* **The Sentinel half of D17 has no e2e.** The image is shared with the data tier, whose stall
+  holds the Sentinel roll (D16 as amended), and `SentinelSpec` carries no field that could make
+  only a Sentinel pod fail to start (`enabled`, `replicas`, `podLabels`, `podAnnotations`,
+  `allowUnencrypted`, `disableAuth`). The target selection, the quorum cost and both bounded
+  Sentinel waits are verified at unit level only. The hold is the one Sentinel-side behaviour
+  the data-tier e2e covers: no Sentinel pod UID changed over its 30 s hold window.
 * **No e2e forces a pod-0 that never returns.** The Phase 1 escape is covered end-to-end by
   `TestE2E_RollingUpdate_TopologyRestoreAbandoned`
   ([`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go)), which
@@ -447,8 +855,14 @@ Rejected once the discarded error in two of the five was noticed — see D14.
 
 ## References
 
-* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `handleTopologyRestoration`, `verifyTopologyRestored`, `abandonTopologyRestoration`, `waitOrAbandonManualFailover`, `ensureWaitBound`, `waitBoundExceeded`, `armWaitBound`, `armTopologyRestoreBound`, `armFinalizationBound`, `armManualFailoverBound`, `waitBoundKey`, `forgetWaitBounds`, `finalizationStallTimeout`
-* [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) — `GetSyncTimeout()`
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `handleTopologyRestoration`, `verifyTopologyRestored`, `abandonTopologyRestoration`, `waitOrAbandonManualFailover`, `ensureWaitBound`, `waitBoundExceeded`, `armWaitBound`, `armTopologyRestoreBound`, `armFinalizationBound`, `armManualFailoverBound`, `waitBoundKey`, `forgetWaitBounds`, `finalizationStallTimeout`; D16: `recreationWait`, `clearRecreationWait`, `podRecreationOverrun`; D17: `podNotReadySince`, `stampedAtFirstSync`, `firstSyncSlack`, `availabilityWait`, `unavailablePod`, `reportAvailabilityStall`, `expiredUnavailablePod`, `waitForUnavailablePod`, `standaloneWait`, `firstUnavailableExisting`, `sentinelScan` (`observe`, `deleteTarget`), the quorum guard in `dispatchSentinelRollingUpdate` and `sentinelDeleteKeepsVotes` (the serial roll of ADR 0024 D10), `sentinelWait`, `finishSentinelRollingUpdate`, and the evaluator wrappers `checkAndHandleRollingUpdate` / `checkAndHandleSentinelRollingUpdate`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `reconcileWorkload`, `handlePostRollingUpdateChecks`, `runSentinelRollingUpdate`, `soonerRequeue` (the data-tier hold of D16 as amended); `pauseRollingUpdate` in `rolling_update.go` is its known exception
+* [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go) — the `PodAvailabilityStalled` row (level, two evaluators, ownership rule)
+* [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) — `GetSyncTimeout()`, `RollingUpdateSpec.SyncTimeout`, `ConditionTypePodAvailabilityStalled` and its three reasons
+* [`internal/controller/pod_availability_test.go`](../../internal/controller/pod_availability_test.go), [`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — D17's guards
+* [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — D5, the stall shape D16 and D17 apply; D11, the primary home of D17 and of the amendment to D16
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — the tier ordering the D16 amendment restores, except in the pass in which a data roll pauses; D10, the serial roll of a tier of one or two Sentinels, the one decision D17's review left open
+* [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — why `PodAvailabilityStalled` is a level with two evaluators
 * [ADR 0007](0007-failover-aware-rolling-update.md) — the sequence whose waits these are
 * [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) — the one wait that is deliberately *not* bounded, and why
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — what runs after the state clears, and why the hand-over target matters

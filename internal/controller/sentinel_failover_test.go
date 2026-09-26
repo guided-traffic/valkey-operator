@@ -18,7 +18,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sevents "k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -706,10 +708,14 @@ func TestHandleMasterFailover_SurfacesTheStateWriteFailure(t *testing.T) {
 }
 
 // Same for the timestamp: it is the only thing that makes a hung failover
-// retryable, so a failover is not triggered without it.
+// retryable, so a failover is not triggered without it. Since 2026-09-26 the state
+// and the timestamp are one write (setFailoverTriggered), so the failure this test
+// injects is that write's, and what it pins is that nothing is left half-armed:
+// no state without its timestamp -- which annotationTimestampExceeded would read as
+// never expiring (ADR 0025 D9, ADR 0010).
 func TestHandleMasterFailover_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	writes := 0
-	funcs := failCRUpdateFrom(2, &writes)
+	funcs := failCRUpdateFrom(1, &writes)
 	r, c, v, pods := midFailoverCluster(t, "hmf-tsfail", nil, &funcs)
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
@@ -723,7 +729,10 @@ func TestHandleMasterFailover_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	require.NotNil(t, result)
 	require.Error(t, result.Error)
 	assert.Empty(t, router.targetsFor("SENTINEL FAILOVER"))
-	assert.Empty(t, crGet(t, c, "hmf-tsfail").Annotations[annotationFailoverTimestamp])
+	stored := crGet(t, c, "hmf-tsfail").Annotations
+	assert.Empty(t, stored[annotationFailoverTimestamp])
+	assert.NotEqual(t, stateFailoverTriggered, stored[annotationRollingUpdateState],
+		"the state must not stand without the timestamp that bounds it")
 }
 
 // A rejected SENTINEL FAILOVER is expected traffic (cooldown, NOGOODSLAVE): the
@@ -855,10 +864,12 @@ func TestHandleFailoverRetrigger_SurfacesTheStateWriteFailure(t *testing.T) {
 	assert.Equal(t, stateFailoverReset, crGet(t, c, "hfr-statefail").Annotations[annotationRollingUpdateState])
 }
 
+// The retrigger arms state and timestamp in one write too (setFailoverTriggered):
+// when it fails, the reset state and its old deadline stand together.
 func TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	before := rfc3339Ago(failoverResetMinWait + time.Minute)
 	writes := 0
-	funcs := failCRUpdateFrom(2, &writes)
+	funcs := failCRUpdateFrom(1, &writes)
 	r, c, v, _ := midFailoverCluster(t, "hfr-tsfail", map[string]string{
 		annotationRollingUpdateState: stateFailoverReset,
 		annotationFailoverTimestamp:  before,
@@ -870,8 +881,11 @@ func TestHandleFailoverRetrigger_SurfacesTheTimestampWriteFailure(t *testing.T) 
 
 	require.Error(t, result.Error)
 	assert.Empty(t, router.targetsFor("SENTINEL FAILOVER"))
-	assert.Equal(t, before, crGet(t, c, "hfr-tsfail").Annotations[annotationFailoverTimestamp],
+	stored := crGet(t, c, "hfr-tsfail").Annotations
+	assert.Equal(t, before, stored[annotationFailoverTimestamp],
 		"the old deadline stands when the new one could not be written")
+	assert.Equal(t, stateFailoverReset, stored[annotationRollingUpdateState],
+		"and so does the state it bounds")
 }
 
 func TestHandleFailoverRetrigger_RejectedFailoverCommandIsNotFatal(t *testing.T) {
@@ -1070,15 +1084,48 @@ func TestReplaceRemainingPods_WaitsForAPodThatIsGone(t *testing.T) {
 	assert.Empty(t, crGet(t, c, "rrp-missing").Annotations[annotationRollingUpdateState])
 }
 
-func TestReplaceRemainingPods_WaitsForAPodThatIsNotReady(t *testing.T) {
+// An outdated pod that is not available is replaced, not waited for
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11). What protects the
+// data is the verified new master, not the readiness of the pod being deleted.
+// This test used to assert the wait (ADR 0017 D18: rewritten, not deleted).
+//
+// Mutation check: restoring `if !ps.available()` in front of the delete keeps the
+// pod and fails the first assertion.
+func TestReplaceRemainingPods_ReplacesAnOutdatedPodThatIsNotReady(t *testing.T) {
 	r, c, v, pods, _ := verifiedMasterCluster(t, "rrp-notready", masterInfo(2), nil)
 	pods[0].readyCondition = false
 
 	result := r.replaceRemainingPods(context.Background(), v, pods)
 
-	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
-	assert.True(t, podExists(t, c, "rrp-notready-0"))
-	assert.Empty(t, crGet(t, c, "rrp-notready").Annotations[annotationRollingUpdateState])
+	require.NoError(t, result.Error)
+	assert.False(t, podExists(t, c, "rrp-notready-0"),
+		"an outdated pod is replaced whether it is available or not")
+	assert.Equal(t, stateReplacingMaster, crGet(t, c, "rrp-notready").Annotations[annotationRollingUpdateState])
+}
+
+// The one outdated pod replaceRemainingPods still waits on is one that is already
+// going: it gets terminationWait, and nothing is deleted on top of it.
+//
+// The promoted pod answers master with no replica attached yet, so without the
+// terminating check verifyNewMasterReady would answer first with its plain
+// requeue and the stall would never be reported -- which is what makes this test
+// fail when the check is removed (the delete gate and verifyNewMasterReady's own
+// terminating fallback both sit behind that early return).
+func TestReplaceRemainingPods_WaitsForAnOutdatedPodThatIsTerminating(t *testing.T) {
+	r, c, v, pods, _ := verifiedMasterCluster(t, "rrp-term", masterInfo(0), nil)
+	pods[0] = stalledState(pods[0])
+	pods[0].readyCondition = false
+
+	result := r.replaceRemainingPods(context.Background(), v, pods)
+
+	assert.False(t, result.NeedsRequeue)
+	assert.Equal(t, rollingUpdateRequeueDelay, result.DeferredRequeueAfter)
+	assert.True(t, podExists(t, c, "rrp-term-0"))
+	assert.Empty(t, crGet(t, c, "rrp-term").Annotations[annotationRollingUpdateState])
+	cond := meta.FindStatusCondition(crGet(t, c, "rrp-term").Status.Conditions,
+		vkov1.ConditionTypePodTerminationStalled)
+	require.NotNil(t, cond)
+	assert.Contains(t, cond.Message, "rrp-term-0")
 }
 
 // The guard that keeps the rolling update from losing the dataset: as long as the
@@ -2001,22 +2048,55 @@ func TestReplaceNextReplica_ReturnsNilWhenOnlyTheMasterIsLeft(t *testing.T) {
 	assert.True(t, podExists(t, c, "rnr-done-0"))
 }
 
-// A candidate that is not ready yet is waited for, not deleted: deleting it would
-// take a second replica out at the same time.
-func TestReplaceNextReplica_WaitsForACandidateThatIsNotReady(t *testing.T) {
+// A candidate that is not available is replaced, not waited for
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11). It is already
+// down, so its delete takes no second replica out; and after a spec fix it is the
+// replacement that never came up, which is exactly candidates[0] -- waiting for it
+// waited forever. The test used to assert that wait, on the stated reason that the
+// delete "would take a second replica out"; rewritten, not deleted (ADR 0017 D18).
+//
+// Mutation check: restoring `if !ps.available()` in front of the delete keeps
+// rnr-notready-2 and fails the first assertion.
+func TestReplaceNextReplica_ReplacesACandidateThatIsNotReady(t *testing.T) {
 	r, c, v, pods := midFailoverCluster(t, "rnr-notready", nil, nil)
 	pods[2].needsUpdate = true
 	pods[2].readyCondition = false
 	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
 		"rnr-notready-1": replicaInfo(),
 	}}
+	rec := k8sevents.NewFakeRecorder(10)
+	r.Recorder = rec
 
 	result := r.replaceNextReplica(context.Background(), v, pods)
 
 	require.NotNil(t, result)
-	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
-	assert.True(t, podExists(t, c, "rnr-notready-2"))
-	assert.Empty(t, crGet(t, c, "rnr-notready").Annotations[annotationRollingUpdateState])
+	require.NoError(t, result.Error)
+	assert.False(t, podExists(t, c, "rnr-notready-2"),
+		"an outdated, not-Ready, non-terminating candidate is deleted")
+	assert.Equal(t, stateReplacingReplicas, crGet(t, c, "rnr-notready").Annotations[annotationRollingUpdateState])
+	require.Len(t, rec.Events, 1)
+	event := <-rec.Events
+	assert.Contains(t, event, "Normal RollingUpdate")
+	assert.Contains(t, event, "the pod was not available",
+		"the Event says why a pod that never came up was deleted")
+}
+
+// The candidate that is already going is still waited on: terminationWait, no
+// delete on top of it.
+func TestReplaceNextReplica_WaitsForACandidateThatIsTerminating(t *testing.T) {
+	r, c, v, pods := midFailoverCluster(t, "rnr-term", nil, nil)
+	pods[2].needsUpdate = true
+	pods[2] = terminatingState(pods[2])
+	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
+		"rnr-term-1": replicaInfo(),
+	}}
+
+	result := r.replaceNextReplica(context.Background(), v, pods)
+
+	require.NotNil(t, result)
+	assert.True(t, result.NeedsRequeue)
+	assert.True(t, podExists(t, c, "rnr-term-2"))
+	assert.Empty(t, crGet(t, c, "rnr-term").Annotations[annotationRollingUpdateState])
 }
 
 // The state is claimed before the first replica is deleted, so a concurrent pass
