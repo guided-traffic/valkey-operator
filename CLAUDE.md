@@ -248,12 +248,17 @@ not, fixture rules, coverage boundaries — is
 
 ### The Valkey image is a dependency, pinned in one place
 
-The operator runs shell **inside** the upstream Valkey image: two init container scripts, the
-auth-wrapped container command, the exec probes and the drain preStop hook. What those execute
-is declared in `RequiredImageTools`
+The operator runs shell **inside** the upstream Valkey image: the init container scripts (the
+config writers of both tiers, and ADR 0032's `check-data-writable` pre-flight and
+`fix-data-ownership` repair), the auth-wrapped container command, the exec probes and the drain
+preStop hook. What those execute is declared in `RequiredImageTools`
 ([`internal/builder/image_requirements.go`](internal/builder/image_requirements.go)) and
 checked against the real images by `make test-image-tools` — docker, no cluster, its own CI
-job. **A new tool in a generated script needs a line in that list**; a unit test walks the
+job — which since ADR 0032 also runs `valkey-server` and `valkey-sentinel` (on a hand-written
+config), the generated probe, drain hook, pre-flight and repair under the rootless posture
+([`test/imagetools/restricted_runtime_test.go`](test/imagetools/restricted_runtime_test.go));
+the config-writer scripts are not run there.
+**A new tool in a generated script needs a line in that list**; a unit test walks the
 generated scripts and fails otherwise, and the converse test fails on a declared tool nothing
 uses any more.
 
@@ -373,7 +378,9 @@ promoting.
 → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D10
 
 **Completion is reported per tier.** `RollingUpdateComplete` means the data tier and fires
-before the first Sentinel pod is replaced; the Sentinel tier rolls afterwards, carries the
+before the first Sentinel pod is replaced — except in the pass where a data roll *pauses*
+(`pauseRollingUpdate` returns no requeue), which releases the Sentinel roll; a known exception,
+ADR 0026 D11. The Sentinel tier rolls afterwards, carries the
 `SentinelUpdatePending` condition while it does (phase `Sentinel Rolling Update i/n`), and
 emits `SentinelUpdateComplete` exactly when that condition flips back to False. Anything
 sequencing on "the update is finished" on a sentinel-enabled cluster waits for the Sentinel
@@ -448,11 +455,12 @@ kubelet keeps `PodReady=True` for the **whole termination** of a pod whose readi
 still passes — measured on Kubernetes 1.36.1, no flip, right up to the moment the object is
 gone. `podState.ready` is therefore renamed `readyCondition` and read only through two
 accessors: **`available()` = Ready and not being deleted is the default**, and every site that
-*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it;
-`reachable()` = Ready alone is the carve-out for the four sites that only *talk* to a pod, of
-which `demoteRogueMaster` is the load-bearing one — refusing to demote a terminating master
-would leave it accepting writes for the rest of its termination. **The rule is the rename, not
-a list of sites**: it had been stated as a list three times and been incomplete every time.
+*spends* a pod (deletes, promotes, counts toward a quorum or a completion) uses it — except the
+replacement of an outdated pod, below; `reachable()` = Ready alone is the carve-out for the four
+sites that only *talk* to a pod, of which `demoteRogueMaster` is the load-bearing one — refusing
+to demote a terminating master would leave it accepting writes for the rest of its termination.
+**The rule is the rename, not a list of sites**: it had been stated as a list three times and
+been incomplete every time.
 
 On top of it one invariant: **the operator never deletes a pod of a tier while any pod of that
 tier is terminating.** The gate sits immediately in front of each `deleteOwnedPod` and never at
@@ -461,11 +469,49 @@ label-selector List. The refusal is never resumed — the *observation* of it is
 pod's own `deletionTimestamp` (which the API server sets to `now + gracePeriodSeconds`, so
 `time.Since` of it is the overrun) rather than by `ensureWaitBound`. Past
 `podTerminationOverrun` = 2 min the pass stops ending on the wait and reports
-`PodTerminationStalled`, so the Sentinel roll, the no-master recovery, the steady-state
-split-brain check and the status write run again. **No Event on any of it** — ADR 0025 D7 still
+`PodTerminationStalled`, so the no-master recovery, the steady-state split-brain check and the
+status write run again — on a Sentinel cluster the status write alone. **The Sentinel roll is
+not among them: a holding data tier holds it**, for all three stall conditions
+(`PodTerminationStalled`, `PodRecreationStalled`, `PodAvailabilityStalled`), because the tiers
+share `spec.image` and a released Sentinel roll takes a healthy Sentinel onto the spec the data
+tier is stuck on and spends the spare vote. One known exception, a residual risk and not a rule:
+a data roll that *pauses* (`pauseRollingUpdate` returns no requeue) is not holding, so the pass
+that pauses runs the Sentinel roll. **No Event on any of it** — ADR 0025 D7 still
 promises zero Warnings on a clean roll. `countUpdatedPods` deliberately still counts a
 terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel path only.
-→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md)
+
+**An outdated pod is replaced, not waited for.** The three roll delete sites — the standalone
+delete, `replaceNextReplica`, `replaceRemainingPods` — ask of the pod they delete only whether it
+is terminating (`terminationWait`); its readiness is not asked. The tier gate above and the
+preconditions each site already had stay (`verifyReplacedReplicasSynced`,
+`verifyNewMasterReady` — which reads the new master's `DBSIZE` but does not refuse on it, a
+pre-existing gap T32 does not close). The old wait was justified as "recently replaced", which
+no outdated pod ever is, and after a spec fix the replacement that never came up *is* the next
+candidate, so the roll waited for it forever. The Sentinel roll
+deletes an unavailable outdated pod ahead of `firstOutdatedPod`, and its quorum guard applies
+only to a delete that spends a vote (`cost > 0`): with the quorum already lost — two of three
+Sentinels stuck on the broken spec, `readyCount` 1 — a non-voting outdated pod is still
+replaced, and the delete gate still serialises those deletes. `deleteNextPendingPod` keeps
+`available()`, and a pod on the current template is only ever waited on — deleting it brings it
+back identical.
+
+**Every remaining wait on a pod that exists, is not terminating and is not available is
+bounded** (`availabilityWait`): budget `spec.rollingUpdate.syncTimeout`, clock the pod's own
+(`podNotReadySince`: `Ready.lastTransitionTime`, else `creationTimestamp` — nothing armed, no
+annotation). A Ready=False kubelet stamped at its first status sync (`stampedAtFirstSync`:
+`lastTransitionTime` no later than `status.startTime` + `firstSyncSlack` = 5 s) is not a transition — that pod was never
+Ready and keeps `creationTimestamp`, or a pod Pending past the budget would restart its clock
+when scheduled. Past the budget the pass continues and `PodAvailabilityStalled` is reported — a
+**level** with two evaluators, one per tier, the tier in the reason (`ValkeyPodNotAvailable`,
+`SentinelPodNotAvailable`). **Each tier retracts only its own report, and only on evidence**:
+`expiredUnavailablePod` must find no pod of the tier that exists, is not terminating and has
+been not-Ready past the budget. A pass that stopped at another wait first measured nothing, and
+retracting on its silence made the condition flap. One condition for two tiers is accepted: a
+data report overwrites a standing Sentinel one, which returns on the first Sentinel pass after
+the data tier finishes. The wait writes nothing; the tier's wrapper
+(`checkAndHandleRollingUpdate`, `checkAndHandleSentinelRollingUpdate`) does. No Event.
+→ [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) (D11 for the availability
+half), [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D17
 
 ## Reconcile concurrency
 
@@ -651,10 +697,11 @@ scheme that keeps the carrier in pod `metadata`.
   `BuildStatefulSet` so `ComputePodSpecHash` does not move with it - one rotation, one signal.
   `env` is not in the API server's `updatablePodSpecFields`, so the record is refused to every
   principal including the operator. The superseded `vko.gtrfc.com/tls-material-hash` annotation
-  is **read and never written**: the fallback is self-extinguishing and exists because Sentinel
-  pods never roll on a plain upgrade (ADR 0005 D11), so without it that tier would go silently
-  unmeasured. **`config-hash` and `pod-spec-hash` are still in metadata** - a filed follow-up,
-  not a decided non-goal.
+  is **read and never written**: the fallback is self-extinguishing and exists because a plain
+  upgrade rolls Sentinel pods only when the release changes their pod spec or configuration
+  (ADR 0005 D11, narrowed 2026-09-26 — the rootless release of ADR 0032 is one that does, and so,
+  by reading, was v1.11.0), so without it that tier would go silently unmeasured. **`config-hash`
+  and `pod-spec-hash` are still in metadata** - a filed follow-up, not a decided non-goal.
 - **The data pod hands its ServiceAccount token to the sidecar container alone.**
   `automountServiceAccountToken: false` plus a hand-declared projected volume at
   `/var/run/secrets/kubernetes.io/serviceaccount`; the volume name must **not** start with
@@ -675,6 +722,62 @@ D4, [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D10 and
 amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
 residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
 D11, and `SECURITY_ARCHITECTURE.md` sections 2, 6 and 9.
+
+## Every generated pod runs rootless, with no option
+
+Every container on the Valkey image used to run as uid 0 with the runtime's default
+capabilities, because `command:` bypasses the entrypoint that drops to the `valkey` user, and a
+namespace enforcing Pod Security `restricted` refused every generated pod. Now data and Sentinel
+pods run `runAsNonRoot` as uid/gid 999 with `fsGroup: 999` (`fsGroupChangePolicy` unset =
+`Always`) and `seccompProfile: RuntimeDefault`, and every container and init container — the
+sidecar and the third-party exporter included — with `allowPrivilegeEscalation: false`,
+`readOnlyRootFilesystem: true` and `capabilities.drop: [ALL]`; the observer gets
+`runAsNonRoot`, `RuntimeDefault` and the same container fields under its image's numeric user.
+No CRD field, no `baseline` level, no opt-out: root was a defect, and ADR 0005 D1 governs
+features, not the repair of one. **The posture is applied by one walk**
+(`applyValkeyPodSecurity`, `applyObserverPodSecurity`, last in each builder), so a new container
+inherits it by being in the pod — and a `securityContext` a container builder sets is
+overwritten.
+
+- **The only root process is the migration-only `fix-data-ownership` repair** (uid 0,
+  `drop: [ALL]` + `add: [CHOWN]`, `find /data ! -user 999 -exec chown -h 999:999 {} +`, always
+  exit 0), in front of the `check-data-writable` pre-flight that every persistent data pod runs
+  and that is the one gate. `WithDataOwnershipRepair` inserts it on the built object **after
+  `ComputePodSpecHash`**, so adding and removing it rolls nothing. On a persistent StatefulSet it
+  is added while the live template or a data pod proven ours runs without `runAsNonRoot` — the
+  evidence is the persisted template and the immutable pod spec, derived per pass and stored
+  nowhere (`dataOwnershipRepairNeeded`) — and **kept until every ordinal holds a pod proven ours,
+  rootless and past its pre-flight** (exited 0, or Ready); a missing pod, or a rootless one that
+  never got that far, is not proof, or the repair drops between the last legacy pod's delete and
+  its replacement booting on a root-owned volume. It brought `find` and `chown` into
+  `RequiredImageTools`; a new tool in a generated script still needs its line there.
+- **The single data pod of a `spec.replicas: 1` cluster without Sentinel that still runs as root
+  is decided by persistence** (`singlePodDeferral`, read off the persisted StatefulSet), not by
+  `isSidecarOnlyChange` (which still decides a rootless one): persistent is replaced at once, the
+  repair running on its way up; non-persistent is deferred and reported as
+  `PodSecurityUpdatePending=True/PodRunsAsRoot`, because an operator upgrade never discards a
+  dataset — unless its Valkey image, TLS material record or config hash changed, which the CR
+  author or a rotation caused and which replace it as they always did.
+- **The drift comparisons treat `securityContext` as a subset** (`podSpecChanged`,
+  `containerChanged`, `ObserverDeploymentHasChanged`): a field the operator does not set is not
+  compared, so a mutating admission policy is not fought over — **except `capabilities.add`**,
+  where the live template may not add what the desired one does not, or an out-of-band `NET_RAW`
+  would never converge back.
+
+The posture is in the pod-spec hash, so this release rolls every multi-replica data tier and
+every Sentinel tier once, and restarts every persistent single data pod without Sentinel once.
+**Open, awaiting a decision:** a tier of one or two Sentinels (quorum equals replicas) can never
+delete a Ready outdated Sentinel, so its roll requeues unbounded and the pass ends before the
+status write — pre-existing, and this release is what reaches it
+([ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md), *Residual risks*). A
+replacement that never comes up (NFS `root_squash` refusing the `chown`, so the pre-flight fails)
+is reported as `PodAvailabilityStalled`, which is why this ships together with ADR 0026 D11.
+→ [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md), amending
+[ADR 0005](docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md) D1, D7, D11,
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D6, D7,
+[ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 and
+[ADR 0017](docs/adr/0017-test-and-ci-policy.md), superseding
+[ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) D9
 
 ## Metrics / Exporter
 

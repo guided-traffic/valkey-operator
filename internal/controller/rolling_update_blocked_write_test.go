@@ -71,7 +71,10 @@ func podFromStsTemplate(v *vkov1.Valkey, sts *appsv1.StatefulSet, ordinal int) *
 			// createPodForSts for what a missing LabelManagedBy silently hid.
 			Labels: common.SelectorLabels(v, common.ComponentValkey),
 		},
-		Spec: corev1.PodSpec{Containers: containers},
+		// The posture too: a pod the current template creates is rootless
+		// (ADR 0032), and a fixture that means a pod an earlier operator built says
+		// so explicitly (legacy() in pod_security_migration_test.go).
+		Spec: corev1.PodSpec{Containers: containers, SecurityContext: sts.Spec.Template.Spec.SecurityContext.DeepCopy()},
 		Status: corev1.PodStatus{
 			Phase:      corev1.PodRunning,
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},

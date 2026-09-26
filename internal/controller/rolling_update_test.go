@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	k8sevents "k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -815,22 +816,34 @@ func TestHandleStandaloneRollingUpdate_AllUpdated(t *testing.T) {
 	assert.False(t, result.NeedsRequeue)
 }
 
-func TestHandleStandaloneRollingUpdate_PodNotReady(t *testing.T) {
+// An outdated single pod that is not Ready is replaced, not waited for
+// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11): after a spec fix
+// it is the pod that never came up on the broken spec, and waiting for it to turn
+// Ready waited forever. This test used to assert that wait; it passed on the
+// requeue alone, so it now asserts the pod is gone (ADR 0017 D18).
+//
+// Mutation check: putting standaloneWait back in front of the delete keeps test-0
+// and fails the pod assertion.
+func TestHandleStandaloneRollingUpdate_ReplacesAnOutdatedPodThatIsNotReady(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Image = "valkey/valkey:9.0"
 	})
-	// Pod has old image but is not ready — should wait.
 	pod0 := createPodForSts(v, 0, "valkey/valkey:8.0", false)
 
-	r, _ := newTestReconciler(v, pod0)
+	r, c := newTestReconciler(v, pod0)
 	reconcileOnce(t, r, "test", "default")
 
 	sts := &appsv1.StatefulSet{}
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, sts))
 
 	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
-	assert.True(t, result.NeedsRequeue, "Should requeue waiting for pod to become ready")
+	require.NoError(t, result.Error)
+	assert.True(t, result.NeedsRequeue)
 	assert.False(t, result.Completed)
+	pod := &corev1.Pod{}
+	assert.True(t, apierrors.IsNotFound(c.Get(context.Background(),
+		types.NamespacedName{Name: "test-0", Namespace: "default"}, pod)),
+		"an outdated pod is replaced whether it is Ready or not")
 }
 
 func TestHandleStandaloneRollingUpdate_DeletesPodWithOldImage(t *testing.T) {
@@ -1888,13 +1901,16 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Image = "valkey/valkey:9.0"
 	})
-	// Pod runs the correct valkey image but an outdated sidecar.
+	// Pod runs the correct valkey image but an outdated sidecar. It is rootless, so
+	// the sidecar-only rule decides it rather than the root-pod rule (ADR 0032 D3).
 	pod0 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "default"},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{
-			{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
-			{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
-		}},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true)},
+			Containers: []corev1.Container{
+				{Name: builder.ValkeyContainerName, Image: "valkey/valkey:9.0"},
+				{Name: builder.SidecarContainerName, Image: "operator:v1.0"},
+			}},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			Conditions: []corev1.PodCondition{
@@ -1920,6 +1936,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
 
 	// Deferred: no requeue, not completed (pending).
+	assert.Empty(t, result.rootDeferredPod, "a rootless pod is not deferred on account of the posture")
 	assert.False(t, result.NeedsRequeue, "Sidecar-only change must not trigger requeue")
 	assert.False(t, result.Completed, "Not completed while sidecar update is pending")
 	assert.Nil(t, result.Error)
@@ -2291,6 +2308,11 @@ func TestCheckAndHandleSentinelRollingUpdate_DeletesOutdatedPod(t *testing.T) {
 
 func TestCheckAndHandleSentinelRollingUpdate_WaitsWhenQuorumWouldBeLost(t *testing.T) {
 	// quorum=2, readyCount=2, readyCount-1=1 < 2 → must wait to avoid quorum loss.
+	//
+	// The not-Ready pod is on the current spec -- a replacement still booting. It
+	// used to be outdated too, and since ADR 0026 D11 an outdated pod that is not
+	// available is itself the delete target and costs no vote, so that fixture no
+	// longer exercises the guard (ADR 0017 D18: the fixture changes, not the claim).
 	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
@@ -2299,7 +2321,7 @@ func TestCheckAndHandleSentinelRollingUpdate_WaitsWhenQuorumWouldBeLost(t *testi
 	sts := buildTestSentinelSts(v)
 	p0 := createSentinelPod(v, 0, oldImg, true)
 	p1 := createSentinelPod(v, 1, oldImg, true)
-	p2 := createSentinelPod(v, 2, oldImg, false) // not ready — reduces readyCount to 2
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, false) // booting replacement — reduces readyCount to 2
 
 	r, c := newTestReconciler(v, sts, p0, p1, p2)
 
@@ -2551,7 +2573,8 @@ func TestCheckAndHandleSentinelRollingUpdate_SteadyStateWritesNothing(t *testing
 
 func TestCheckAndHandleSentinelRollingUpdate_QuorumWaitKeepsConditionTrue(t *testing.T) {
 	// quorum=2, readyCount=2 → the delete is deferred, but the roll is still in
-	// flight and must be recorded as such.
+	// flight and must be recorded as such. The unready pod is current for the
+	// reason given in ..._WaitsWhenQuorumWouldBeLost.
 	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
@@ -2560,7 +2583,7 @@ func TestCheckAndHandleSentinelRollingUpdate_QuorumWaitKeepsConditionTrue(t *tes
 	sts := buildTestSentinelSts(v)
 	p0 := createSentinelPod(v, 0, oldImg, true)
 	p1 := createSentinelPod(v, 1, oldImg, true)
-	p2 := createSentinelPod(v, 2, oldImg, false)
+	p2 := createSentinelPod(v, 2, sentinelTestNewImage, false)
 
 	r, c := newTestReconciler(v, sts, p0, p1, p2)
 
@@ -2605,7 +2628,7 @@ func TestHandlePostRollingUpdateChecks_SentinelDisabledClearsCondition(t *testin
 	})
 	r, c := newTestReconciler(v)
 
-	_, done, err := r.handlePostRollingUpdateChecks(context.Background(), v)
+	_, done, err := r.handlePostRollingUpdateChecks(context.Background(), v, false)
 	require.NoError(t, err)
 	assert.False(t, done)
 

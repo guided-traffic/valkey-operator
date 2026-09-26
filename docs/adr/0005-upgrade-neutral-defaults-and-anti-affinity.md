@@ -21,6 +21,24 @@ on any cluster shape, and all four run in both CI legs, since the multi-node fil
 `TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget`. Whether a CI run of either leg went
 green is not verifiable from this repository — no run record is committed.
 
+Amended 2026-09-26 by [ADR 0032](0032-generated-pods-run-rootless.md) (ticket T31, rootless
+pods): three decisions change scope, none is reversed. **D1** governs features, not the repair
+of a defect — root was a defect, and existing clusters move with the upgrade. **D7** gains one
+recorded exception: the migration-only `fix-data-ownership` init container is inserted after
+`ComputePodSpecHash`, so it comes and goes without a roll; the refusal to compare `Affinity`
+field by field stands, and is no longer generalised to every field. **D11**: the release that
+makes pods rootless rolls the Sentinel tier once, because the posture is in the Sentinel
+pod-spec hash. The superseded sentences are struck through in place. D10 holds unchanged: the
+new condition `PodSecurityUpdatePending` is written `False` only over a standing `True`
+(`reportPodSecurityUpdatePending`). **Verified locally, not in CI:** the fleet-upgrade e2e
+(`TestE2E_FleetUpgrade`, `make test-e2e-fleet-upgrade E2E_UPGRADE_FROM=1.12.8`) passed on
+2026-09-26 on Kind (control plane + 3 workers, Kubernetes v1.36.1) on a real `helm upgrade`
+from the released chart 1.12.8 to the local chart: each Sentinel tier completed exactly one
+roll, every persistent pod ran `fix-data-ownership` and the repair then left the template, and
+no pod was replaced in the 90 s after it did. It is not a CI job, and the branch has not been
+through the pipeline. **Not verified:** the run does not attribute the Sentinel roll to the
+posture (see D11); what backs that part is the code read.
+
 ## Context
 
 Two separate pressures produced the same rule.
@@ -45,7 +63,19 @@ exist, so a "helpful" default is a fleet-wide mutation with no CR edit behind it
 **D1 — New CRD features default to off, so an operator upgrade changes nothing.**
 `podDisruptionBudget.enabled: false`, `tls.enabled: false`, `antiAffinity.mode: off`.
 A feature the user did not opt into produces no object and no behavioural change.
-Every behavioural change must be traceable to a CR edit.
+~~Every behavioural change must be traceable to a CR edit.~~ *(superseded 2026-09-26 in
+scope, see below)*
+
+*Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D1): **D1 governs
+features, not the repair of a defect.** Every behavioural change a *feature* brings must be
+traceable to a CR edit. The repair of a defect is not a feature: it has no CRD field, no opt-in
+and no opt-out, and it reaches existing clusters with the operator upgrade. Running every
+container on the Valkey image as uid 0 with the runtime's default capabilities was such a
+defect — each of them sets `command:`, which bypasses the entrypoint that would have dropped to
+the `valkey` user; the sidecar, the observer and the exporter ran as their images' non-root
+users — so the rootless posture is rendered unconditionally (`applyValkeyPodSecurity`,
+`applyObserverPodSecurity`) and rolls onto every cluster, apart from the deferred single pods
+of the D11 amendment. The three defaults above are features and stay off.
 
 **D2 — `spec.antiAffinity.mode` is an enum `off;soft;hard`, defaulting to `off`.**
 Off renders no term at all. `soft` renders
@@ -87,10 +117,38 @@ the selector). A hand-written second selector could drift and produce a term tha
 the wrong set, or matches nothing and silently gives no spread.
 
 **D7 — Anti-affinity changes ride the pod-spec hash; `podSpecChanged` is deliberately
-not extended to compare `Affinity`.** The hash annotation already covers the whole
-`PodSpec`, so a field-by-field comparison would be a second, partial source of truth
+not extended to compare `Affinity`.** The hash annotation ~~already covers the whole
+`PodSpec`~~ *(corrected 2026-09-26: covers the whole `PodSpec` that `buildPodSpec` /
+`buildSentinelPodSpec` produce; two things are stamped onto the built object afterwards, see
+below)*, so a field-by-field comparison would be a second, partial source of truth
 that has to be extended for every future pod-spec feature — exactly the drift the hash
 exists to avoid.
+
+*Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D2): **one recorded
+exception rolls nothing.** While `dataOwnershipRepairNeeded` finds a data pod of a persistent
+cluster proven ours running without `runAsNonRoot` — and until every ordinal holds a pod proven
+ours and rootless — `reconcileStatefulSet` inserts the migration-only init container
+`fix-data-ownership` with `WithDataOwnershipRepair` on the *built* StatefulSet, after
+`ComputePodSpecHash`. Adding and removing it writes the StatefulSet (`containersChanged`
+compares init containers) but never moves the pod-spec-hash annotation, so no pod becomes
+outdated on its account. The justification is narrow: the container acts only at pod start,
+and a pod that ran it is identical to one that did not need it; inside the hash every
+persistent cluster would roll twice. Guards: `TestWithDataOwnershipRepair_IsHashNeutral` (the
+data pod's posture inside the hash, the repair outside it) and
+`TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll`. The other post-builder stamp,
+the TLS material record of [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)
+D3, is not an exception of this kind and was never recorded here: it stays out of the hash so
+that one rotation moves one signal, and it rolls pods through its own per-pod comparison.
+**Anything else stamped after the hash is invisible to the roll and owes the same recorded
+justification.**
+
+The refusal to compare `Affinity` field by field stands, but it does not generalise to every
+field: the hash detects a change of the *desired* spec, while only a field comparison converges
+an out-of-band edit of the *persisted* template back. `podSpecChanged` therefore compares
+`AutomountServiceAccountToken` ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+D8 step 4) and the pod- and container-level `securityContext` fields the operator sets (ADR
+0032 D5), with subset semantics except for `capabilities.add`, which the live template may not
+grow — the out-of-band edit there is a capability grant.
 
 **D8 — Hard mode's degraded state is `Pending`, and it is documented at the field.**
 With fewer schedulable topology domains than replicas, surplus pods stay `Pending`;
@@ -130,12 +188,39 @@ multi-replica data StatefulSet** with one controlled failover per cluster. A pod
 change that rides along in that same pass adds nothing and earns no release note. The
 boundaries are recorded rather than glossed:
 
-* Sentinel pods carry no sidecar, so the Sentinel StatefulSet is the one pod class a
-  plain operator upgrade does not roll.
+* ~~Sentinel pods carry no sidecar, so the Sentinel StatefulSet is the one pod class a
+  plain operator upgrade does not roll.~~ *(superseded 2026-09-26, see below)* Sentinel
+  pods carry no sidecar, so the Sentinel StatefulSet is the one pod class a plain operator
+  upgrade does not roll **unless the release changes the Sentinel pod spec or the generated
+  configuration** — `sentinelPodNeedsUpdate` compares the pod-spec hash and the config hash,
+  and `ComputeConfigHash` covers `sentinel.conf` as well as `valkey.conf`.
 * On the kustomize path and on a Helm install with a floating `image.tag`, the sidecar
   image is a static string that no upgrade changes — there a pod-spec change *is* a new
   roll. That path sits outside the canonical upgrade path and is the deviating admin's
   responsibility ([ADR 0014](0014-rbac-lives-in-three-places.md) D8).
+
+*Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D1, Consequences):
+**the release that makes pods rootless rolls the Sentinel tier once.** `buildSentinelPodSpec`
+calls `applyValkeyPodSecurity` last and `ComputeSentinelPodSpecHash` digests that spec, so the
+posture moves the Sentinel pod-spec hash, `sentinelPodNeedsUpdate` reports every Sentinel pod
+that carries a hash annotation outdated, and the Sentinel roll replaces each one once. The
+absence of a sidecar never exempted the tier; the absence of a Sentinel pod-spec or
+configuration change did — by reading, v1.11.0 (`458605b`, an explicit
+`terminationGracePeriodSeconds`) moved that hash too. The same release goes beyond the baseline
+in two more places: it is a new data-tier roll on the kustomize/floating-tag path of the second
+bullet, and it restarts every persistent single-pod cluster without Sentinel once (ADR 0032
+D3), where a single pod whose only drift is the sidecar image is deferred (ADR 0007 D6).
+Non-persistent single pods without Sentinel are deferred while their Valkey image is unchanged,
+and reported by `PodSecurityUpdatePending`. **Not verified:** that the posture alone moves the
+Sentinel hash rests on reading `podSpecDigest` (the JSON of the whole built spec); no unit test
+pins it for the Sentinel spec. `TestE2E_FleetUpgrade` passed locally on 2026-09-26 (Kind, not
+CI) from the released chart 1.12.8: the Sentinel tier completed exactly one roll — one
+`SentinelUpdateComplete` Event — and no pod was replaced in the 90 s after the ownership repair
+left the template. Its default starting release 1.10.48 could not run on the arm64 host used
+(the released images are amd64-only), and from there it could not have attributed the roll to
+the posture anyway, because v1.11.0 lies on that path. From 1.12.8, v1.11.0 is off the path;
+whether nothing else between 1.12.8 and this branch moves the Sentinel hash was not checked, so
+the run shows that the tier rolled once, not why.
 
 ## Consequences
 
@@ -165,7 +250,9 @@ boundaries are recorded rather than glossed:
   normal and desirable layout on small clusters.
 * Any new pod-spec-level feature inherits rolling-update detection for free (D7), but
   only as long as the hash keeps covering the whole `PodSpec`. The hash tests are the
-  guard.
+  guard. Since 2026-09-26 the ownership repair is deliberately outside it (D7 amendment);
+  `TestWithDataOwnershipRepair_IsHashNeutral` pins both directions for the data pod — the
+  posture inside the hash, the repair outside it.
 * Users see a controlled failover per multi-replica cluster on **every** operator
   upgrade, permanently (D11). The only written mention is the README upgrade paragraph
   "What it does to running clusters", which names the sidecar operator image as the
@@ -218,7 +305,9 @@ pod, which is valid and desirable on small clusters.
 ### Add `Affinity` to the explicit `podSpecChanged` comparison
 
 Rejected: duplicates what the hash already guarantees and must then be maintained per
-field.
+field. *(Narrowed 2026-09-26: the hash guarantees that a change of the desired spec is
+detected, not that an out-of-band edit of the persisted template converges back. For
+`Affinity` that gap is accepted; for `securityContext` it was not — see the D7 amendment.)*
 
 ### Secure-by-default (TLS on, PDBs on)
 
@@ -248,13 +337,25 @@ object in the boot path.
 * `hard` mode can leave pods `Pending` indefinitely on a cluster with fewer topology
   domains than replicas.
 * Clusters that never opt in get no spread guarantee at all.
+* **The feature/defect line of the D1 amendment is a judgement, not a mechanism.** Nothing in
+  the code tells the two apart; the next change that calls itself the repair of a defect takes
+  the same door — a fleet-wide roll with no CR edit behind it — and has to argue it the way
+  [ADR 0032](0032-generated-pods-run-rootless.md) did.
 
 ## References
 
 * [`internal/builder/affinity.go`](../../internal/builder/affinity.go) — `BuildPodAntiAffinity`
 * [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) — `AntiAffinityMode()`, `IsAntiAffinityEnabled()`, `NeedsDataAntiAffinity`, `NeedsSentinelAntiAffinity`, `MinAntiAffinityReplicas`
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `ComputePodSpecHash`, `buildSidecarContainer`, the data-pod wiring of `BuildPodAntiAffinity`
-* [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — the Sentinel wiring of `BuildPodAntiAffinity`, `ComputeSentinelPodSpecHash` (no sidecar, no operator image)
+* [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — the Sentinel wiring of `BuildPodAntiAffinity`, `ComputeSentinelPodSpecHash` (no sidecar, no operator image; `applyValkeyPodSecurity` inside `buildSentinelPodSpec`, so the posture is in that hash)
+* [`internal/builder/pod_security.go`](../../internal/builder/pod_security.go) — `applyValkeyPodSecurity`, `applyObserverPodSecurity`, `WithDataOwnershipRepair` (the D7 exception), `podSecurityContextChanged`, `containerSecurityContextChanged`
+* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `dataOwnershipRepairNeeded`, `singlePodDeferral`, `reportPodSecurityUpdatePending`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `reconcileStatefulSet`, where the repair is inserted after the builder
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `sentinelPodNeedsUpdate`, `podSpecHashChanged`
+* Tests: [`internal/builder/pod_security_test.go`](../../internal/builder/pod_security_test.go) (`TestWithDataOwnershipRepair_IsHashNeutral`), [`internal/controller/pod_security_migration_test.go`](../../internal/controller/pod_security_migration_test.go) (`TestReconcileStatefulSet_RepairComesAndGoesWithoutARoll`), [`test/e2e/fleet_upgrade_test.go`](../../test/e2e/fleet_upgrade_test.go) (passed locally on Kind 2026-09-26 from chart 1.12.8; not a CI job)
 * [ADR 0004](0004-opt-in-poddisruptionbudgets.md) — the same opt-in and replica-minimum shape
-* [ADR 0007](0007-failover-aware-rolling-update.md) — what a hash change actually costs
+* [ADR 0007](0007-failover-aware-rolling-update.md) — what a hash change actually costs; D6, the sidecar-only deferral of a single pod
+* [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 — the `AutomountServiceAccountToken` line in `podSpecChanged`
 * [ADR 0016](0016-authentication-and-tls-posture.md) — the security defaults this rule produces, and their cost
+* [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) D3 — the TLS material record, stamped after the hash with a signal of its own
+* [ADR 0032](0032-generated-pods-run-rootless.md) — the amendment of D1, D7 and D11: rootless pods, the ownership repair, the one-time Sentinel roll

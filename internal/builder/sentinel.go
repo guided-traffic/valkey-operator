@@ -1,9 +1,7 @@
 package builder
 
 import (
-	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -392,6 +390,11 @@ func buildSentinelPodSpec(v *vkov1.Valkey) corev1.PodSpec {
 	sentinelTerminationGrace := int64(30)
 	spec.TerminationGracePeriodSeconds = &sentinelTerminationGrace
 
+	// Last, after every container exists (docs/adr/0032-generated-pods-run-rootless.md, D1).
+	// No ownership repair and no pre-flight: every volume a Sentinel pod mounts is
+	// an emptyDir, fresh with every pod.
+	applyValkeyPodSecurity(&spec)
+
 	return spec
 }
 
@@ -576,11 +579,7 @@ func SentinelStatefulSetHasChanged(desired, current *appsv1.StatefulSet) bool {
 // built for this Valkey CR. Works identically to ComputePodSpecHash but for
 // sentinel pods.
 func ComputeSentinelPodSpecHash(v *vkov1.Valkey) string {
-	spec := buildSentinelPodSpec(v)
-	data, _ := json.Marshal(spec)
-	h := fnv.New32a()
-	_, _ = h.Write(data)
-	return fmt.Sprintf("%08x", h.Sum32())
+	return podSpecDigest(buildSentinelPodSpec(v))
 }
 
 // buildSentinelInitCommand constructs the shell script for the init-sentinel-config

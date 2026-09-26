@@ -915,7 +915,7 @@ func TestHoldDeleteWhileTerminating_PastTheOverrunDefersInsteadOfEndingThePass(t
 
 	require.NotNil(t, result)
 	assert.False(t, result.NeedsRequeue,
-		"the pass tail -- Sentinel roll, no-master recovery, steady-state split brain, status -- must run again")
+		"the pass tail -- no-master recovery, steady-state split brain, status -- must run again")
 	assert.Equal(t, rollingUpdateRequeueDelay, result.DeferredRequeueAfter)
 	assert.Empty(t, rec.all(),
 		"ADR 0025 promises a clean rolling update emits zero Warnings; the stall reports through the condition")
@@ -987,11 +987,17 @@ func TestHoldDeleteWhileTerminating_DoesNotStampTheConditionOnACleanCR(t *testin
 		"a cluster that never stalled must not gain the condition")
 }
 
-// TestReconcileWorkload_StalledTerminationStillRunsTheSentinelRoll is the S4 fix
-// end to end: a NeedsRequeue return leaves everything after it suspended, and on
-// a NotReady node the DeletionTimestamp never clears, so that blackout is
-// permanent. Past the overrun the pass tail runs again.
-func TestReconcileWorkload_StalledTerminationStillRunsTheSentinelRoll(t *testing.T) {
+// TestReconcileWorkload_StalledTerminationHoldsTheSentinelRoll is the S4 fix as
+// amended by ADR 0026 D11: past the overrun the pass no longer ends on the
+// termination wait -- the status write runs again -- but the Sentinel roll is not
+// among what the stall buys back. The tiers share spec.image, so a Sentinel roll
+// released by a holding data tier would take a healthy Sentinel onto the spec the
+// data tier is stuck on. It used to assert the opposite
+// (...StillRunsTheSentinelRoll); rewritten, not deleted (ADR 0017 D18).
+//
+// Mutation check: passing false instead of rollingResult.DeferredRequeueAfter > 0
+// in reconcileWorkload deletes sentinel-0 and fails the first assertion.
+func TestReconcileWorkload_StalledTerminationHoldsTheSentinelRoll(t *testing.T) {
 	v := newTestValkey("e5f", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
@@ -1008,6 +1014,10 @@ func TestReconcileWorkload_StalledTerminationStillRunsTheSentinelRoll(t *testing
 	terminatingFor(dataPods[1], 75*time.Second, 75*time.Second+podTerminationOverrun+time.Minute)
 
 	sentinelSts := buildTestSentinelSts(v)
+	// The Sentinel StatefulSet reports its pods, so the nudge does not supply a
+	// requeue of its own and the pass cadence below is the rolling update's.
+	sentinelSts.Status.Replicas = 3
+	sentinelSts.Status.ReadyReplicas = 3
 	sentinelPods := []*corev1.Pod{
 		createSentinelPod(v, 0, "valkey/valkey:8.0", true),
 		createSentinelPod(v, 1, sentinelTestNewImage, true),
@@ -1024,19 +1034,29 @@ func TestReconcileWorkload_StalledTerminationStillRunsTheSentinelRoll(t *testing
 		},
 	}
 
-	_, err := r.reconcileWorkload(context.Background(), v)
+	result, err := r.reconcileWorkload(context.Background(), v)
 	require.NoError(t, err)
 
+	assert.True(t, podExists(t, c, sentinelPods[0].Name),
+		"a holding data tier holds the Sentinel roll: the outdated Sentinel must not be deleted")
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v))
-	assert.NotNil(t, meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending),
-		"the Sentinel roll sits behind the rolling-update return and must be reached while the data tier stalls")
+	assert.Nil(t, meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypeSentinelUpdatePending),
+		"the Sentinel roll was not entered at all")
+	cond := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypePodTerminationStalled)
+	require.NotNil(t, cond, "the data-tier stall is reported")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	assert.True(t, podExists(t, c, dataPods[2].Name),
 		"and the data delete is still refused")
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter,
+		"the pass continued and applied the deferred cadence at its end")
+	assert.NotContains(t, string(v.Status.Phase), string(vkov1.ValkeyPhaseRollingUpdate),
+		"updateStatus ran after the rolling update and wrote its own verdict over the roll's phase")
 }
 
 // TestWaitForUnavailablePod_BootingPodStillGetsThePlainRequeue is the control
-// for the split: only a terminating pod earns the bounded observation. A booting
-// pod keeps the wait it always had, and never touches the stall condition.
+// for the split: a booting pod inside its budget -- here one without a clock at
+// all -- keeps the plain requeue it always had, and never touches either stall
+// condition. The availability bound of ADR 0026 D11 applies past the budget only.
 func TestWaitForUnavailablePod_BootingPodStillGetsThePlainRequeue(t *testing.T) {
 	v := newTestValkey("wup", "default")
 	r, c := newTestReconciler(v)
@@ -1049,6 +1069,7 @@ func TestWaitForUnavailablePod_BootingPodStillGetsThePlainRequeue(t *testing.T) 
 	assert.Zero(t, result.DeferredRequeueAfter)
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, v))
 	assert.Nil(t, meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypePodTerminationStalled))
+	assert.Nil(t, result.availabilityStall)
 }
 
 // TestVerifyNewMasterReady_StalledTerminatingCandidateDefers closes the last

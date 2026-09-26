@@ -93,10 +93,14 @@ for a forger: a pod with the env never consults the annotation, and every pod th
 writes from now on has the env.
 
 Without it the **Sentinel tier** would go silently unmeasured. Sentinel pods carry no sidecar,
-so a plain operator upgrade never rolls them (ADR 0005 D11); they would keep the annotation,
-the reader would see no env, and a rotation in that window would neither replace them nor
-report them — the exact silent failure ADR 0030 exists to prevent, reintroduced by the change
-meant to harden it.
+so a plain operator upgrade rolls them only when the release changes their pod spec or
+configuration (ADR 0005 D11); they would keep the annotation, the reader would see no env, and
+a rotation in that window would neither replace them nor report them — the exact silent failure
+ADR 0030 exists to prevent, reintroduced by the change meant to harden it. (Amended 2026-09-26:
+the sentence said "never rolls them". The rootless release of
+[ADR 0032](0032-generated-pods-run-rootless.md) changes the Sentinel pod spec and rolls every
+Sentinel tier once, which replaces every remaining annotation-only Sentinel pod with one that
+carries the env; the fallback stays for any pod that release does not reach.)
 
 **D6 — This rule is not a licence to move every hash.** `config-hash` and `pod-spec-hash` stay
 in pod metadata for now. Moving them is a separate change with its own risks (see

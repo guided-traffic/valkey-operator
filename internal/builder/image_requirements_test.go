@@ -67,6 +67,12 @@ func valkeyImageScripts(v *vkov1.Valkey) []string {
 	}
 
 	data := BuildStatefulSet(v, testOperatorImage)
+	// The ownership repair is inserted by the controller while legacy pods exist,
+	// never by BuildStatefulSet, so the walk has to insert it itself -- otherwise
+	// find and chown would read as declared but unused (ADR 0032 D2).
+	if v.IsPersistenceEnabled() {
+		WithDataOwnershipRepair(data)
+	}
 	collect(data.Spec.Template.Spec.InitContainers)
 	collect(data.Spec.Template.Spec.Containers)
 
@@ -96,15 +102,22 @@ func imageRequirementFixtures() []*vkov1.Valkey {
 			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 			v.Spec.Auth = &vkov1.AuthSpec{SecretName: "creds", SecretPasswordKey: "password"}
 		}),
+		// Persistence brings the pre-flight and, during a migration, the repair.
+		newTestValkey("persistent", func(v *vkov1.Valkey) {
+			v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true}
+		}),
 	}
 }
 
 // commandsUsedBy returns the catalog entries that appear at a command position in
-// the script: at the start, after a pipe, after a separator, or inside $( ).
+// the script: at the start, after a pipe, after a separator, inside $( ), as the
+// first word of an `sh -c` one-liner, or as the command `find -exec` runs. The last
+// two came with the ownership repair (ADR 0032 D2), a one-liner whose find and
+// chown the narrower pattern could not see.
 func commandsUsedBy(script string) map[string]bool {
 	used := map[string]bool{}
 	for _, tool := range shellCommandCatalog {
-		pattern := regexp.MustCompile(`(^|[|;&(\n]|\$\(|&&|\|\|)\s*` + regexp.QuoteMeta(tool) + `\s`)
+		pattern := regexp.MustCompile(`(^|[|;&(\n]|\$\(|&&|\|\||^sh -c|-exec)\s*` + regexp.QuoteMeta(tool) + `\s`)
 		if pattern.MatchString(script) {
 			used[tool] = true
 		}

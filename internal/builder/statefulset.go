@@ -211,7 +211,9 @@ func buildPodSpec(v *vkov1.Valkey, operatorImage string) corev1.PodSpec {
 	// sidecar always runs, and buildPodSpec sits at the gocyclo ceiling.
 	volumes = append(volumes, sidecarTokenVolume())
 
-	var initContainers []corev1.Container
+	// The pre-flight goes first, so a data volume uid 999 cannot write stops the pod
+	// before anything else touches it (ADR 0032 D2). Empty without persistence.
+	initContainers := dataWritableCheck(v)
 
 	// In HA mode, use an init container to select the right config (master vs replica).
 	if v.IsSentinelEnabled() {
@@ -620,6 +622,10 @@ echo "replica-announce-port %[7]d" >> %[2]s/%[3]s`,
 		spec.InitContainers = initContainers
 	}
 
+	// Last, after every container exists, so none of them can be missed
+	// (docs/adr/0032-generated-pods-run-rootless.md, D1).
+	applyValkeyPodSecurity(&spec)
+
 	return spec
 }
 
@@ -827,8 +833,13 @@ func buildValkeyContainer(v *vkov1.Valkey) corev1.Container {
 	}
 
 	container := corev1.Container{
-		Name:         ValkeyContainerName,
-		Image:        v.Spec.Image,
+		Name:  ValkeyContainerName,
+		Image: v.Spec.Image,
+		// The image's WORKDIR, stated rather than inherited: without persistence the
+		// config carries no dir directive, so a replica's full-sync RDB lands in the
+		// working directory, and that has to be the writable data mount now that the
+		// root filesystem is read-only (ADR 0032).
+		WorkingDir:   DataDir,
 		Command:      cmd,
 		Lifecycle:    drainPreStop(v),
 		Ports:        valkeyContainerPorts,
@@ -1215,7 +1226,12 @@ func buildVolumeClaimTemplates(v *vkov1.Valkey) []corev1.PersistentVolumeClaim {
 // vars, etc.) is detected by the rolling update logic — even though the
 // StatefulSet uses the OnDelete update strategy.
 func ComputePodSpecHash(v *vkov1.Valkey, operatorImage string) string {
-	spec := buildPodSpec(v, operatorImage)
+	return podSpecDigest(buildPodSpec(v, operatorImage))
+}
+
+// podSpecDigest is the recipe both pod-spec hashes use: FNV-32a over the JSON of
+// the whole built PodSpec (ADR 0005 D7).
+func podSpecDigest(spec corev1.PodSpec) string {
 	data, _ := json.Marshal(spec)
 	h := fnv.New32a()
 	_, _ = h.Write(data)
@@ -1248,7 +1264,8 @@ func podTemplateChanged(desired, current corev1.PodTemplateSpec) bool {
 
 // podSpecChanged returns true if two PodSpecs differ in rolling-update-relevant ways.
 // It covers all containers (including sidecar), init containers, volumes,
-// ServiceAccountName, AutomountServiceAccountToken, and TerminationGracePeriodSeconds.
+// ServiceAccountName, AutomountServiceAccountToken, TerminationGracePeriodSeconds
+// and the pod- and container-level securityContext fields the operator sets.
 func podSpecChanged(desired, current corev1.PodSpec) bool {
 	if desired.ServiceAccountName != current.ServiceAccountName {
 		return true
@@ -1262,6 +1279,13 @@ func podSpecChanged(desired, current corev1.PodSpec) bool {
 		return true
 	}
 	if !terminationGracePeriodEqual(desired.TerminationGracePeriodSeconds, current.TerminationGracePeriodSeconds) {
+		return true
+	}
+	// The pod-spec hash carries a posture change to the StatefulSet, but only this
+	// comparison converges an out-of-band edit of the persisted template's
+	// securityContext back (ADR 0032) -- the gap the automount line above closes
+	// for its field.
+	if podSecurityContextChanged(desired.SecurityContext, current.SecurityContext) {
 		return true
 	}
 	if containersChanged(desired.Containers, current.Containers) {
@@ -1299,7 +1323,8 @@ func containersChanged(desired, current []corev1.Container) bool {
 	return false
 }
 
-// containerChanged returns true if two containers differ in rolling-update-relevant fields.
+// containerChanged returns true if two containers differ in rolling-update-relevant fields,
+// the securityContext fields the operator sets included.
 func containerChanged(desired, current corev1.Container) bool {
 	if desired.Name != current.Name || desired.Image != current.Image {
 		return true
@@ -1314,6 +1339,9 @@ func containerChanged(desired, current corev1.Container) bool {
 		return true
 	}
 	if !containerPortsEqual(desired.Ports, current.Ports) {
+		return true
+	}
+	if containerSecurityContextChanged(desired.SecurityContext, current.SecurityContext) {
 		return true
 	}
 	dRes := desired.Resources

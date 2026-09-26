@@ -63,5 +63,12 @@ func RequiredImageTools() []string {
 		// whatever the ConfigMap happened to say -- a running Sentinel that
 		// authenticates against nothing, not a crash somebody notices.
 		"sed",
+
+		// The migration-only ownership repair (docs/adr/0032-generated-pods-run-rootless.md,
+		// D2): re-owns root-written data to uid 999 on storage without fsGroup support.
+		// Without them the repair fails and the pre-flight holds the pod -- loud, but
+		// on every legacy persistent pod of such storage at once.
+		"find",
+		"chown",
 	}
 }

@@ -17,8 +17,9 @@ Related: [README.md](README.md) (user-facing reference) and
 [docs/adr/](docs/adr/README.md), which holds the decisions behind this document —
 [ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) (the privilege model),
 [ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md) (how the rules stay in sync),
-[ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) (auth and TLS) and
-[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (the delete guards).
+[ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) (auth and TLS),
+[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (the delete guards) and
+[ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) (the workload pod posture).
 A `DEVELOPER.md` does not exist yet.
 
 ---
@@ -31,7 +32,7 @@ A `DEVELOPER.md` does not exist yet.
 | **Pre-upgrade hook** | ServiceAccount `<release>-upgrade`, cluster-wide, created and deleted per `helm upgrade` ([`pre-upgrade-rbac.yaml`](deploy/helm/valkey-operator/templates/pre-upgrade-rbac.yaml)) | Cluster-wide, lifetime of the hook Job | `valkeys` get/list/patch/update and `customresourcedefinitions` get/list/patch/update |
 | **Sidecar** | ServiceAccount `<cr-name>-sidecar`, one per Valkey CR ([`BuildSidecarServiceAccount`](internal/builder/rbac.go)) | **This cluster's own data pods**, by name: `pods` patch with `resourceNames` (section 4.2) | Patching `instanceRole` on its own pod and the drain stamp on a peer pod |
 | **Observer** | Its **own** ServiceAccount `<cr-name>-observer`, bound to no Role, with `automountServiceAccountToken: false` ([`BuildObserverServiceAccount`](internal/builder/observer.go)) | None — no Role, and no token mounted | Nothing — it makes no Kubernetes API call at all (verified: no `client-go` import in `internal/observer` or `cmd/observer`) |
-| **Valkey pods** | The pod runs as `<cr-name>-sidecar`, but the token reaches the **`sidecar` container only**: `automountServiceAccountToken: false` plus a projected volume mounted into that one container ([`sidecarTokenVolume`](internal/builder/statefulset.go)) | Same as the sidecar row, for that container | `valkey`, `exporter` and both init containers hold no credential at all |
+| **Valkey pods** | The pod runs as `<cr-name>-sidecar`, but the token reaches the **`sidecar` container only**: `automountServiceAccountToken: false` plus a projected volume mounted into that one container ([`sidecarTokenVolume`](internal/builder/statefulset.go)) | Same as the sidecar row, for that container | `valkey`, `exporter` and every init container hold no Kubernetes credential (the cluster password is section 2); the migration-only root repair (section 4.5) holds neither — no token and no environment |
 | **Sentinel pods** | The namespace `default` ServiceAccount, with `automountServiceAccountToken: false` ([`sentinel.go`](internal/builder/sentinel.go)) | None — no token mounted | Nothing — Sentinel pods carry no labeler sidecar and never call the Kubernetes API |
 | **CR author** | Any principal with `create valkeys` in a namespace | That namespace | Chooses images, the auth Secret name, the TLS mode — see section 3 for what that buys them |
 
@@ -111,7 +112,9 @@ Consequences worth naming: the password is visible in every one of those
 containers' environments (`kubectl exec ... env`, and in the pod spec as a
 reference, not a value), and the `--requirepass "$VALKEY_PASSWORD"` form means the
 **expanded password appears in the `valkey-server` process arguments** inside the
-container, so any process in that pod can read it from `/proc`. Both are the
+container, so any process in that container can read it from `/proc` — not one in
+another container of the pod, because no generated pod shares its process namespace
+(section 4.5). Both are the
 standard Redis/Valkey deployment pattern; neither is a defect, but neither is a
 secret store either.
 
@@ -258,6 +261,14 @@ password.
 - The observer runs under `<cr-name>-observer`, which is bound to no Role and
   mounts no token at all
   ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 2).
+- Every pod template the operator renders is rootless since 2026-09-26 — uid 999 on data and
+  Sentinel pods, no capability, `no_new_privs`, `RuntimeDefault` seccomp, a read-only root
+  filesystem — and the unit tier checks every rendered template against Pod Security
+  `restricted` (`make test-unit`, green 2026-09-26; section 4.5,
+  [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D1). **On a node it is verified
+  locally only** — Kind with containerd, 2026-09-26, not in CI (section 9). It does not hold
+  for a pod an earlier operator built until the migration replaces it, nor for the one root
+  init container of a pod created while the migration repair was on the template (below).
 - `spec.networkPolicy.enabled` writes ingress-only NetworkPolicies
   ([`internal/builder/networkpolicy.go`](internal/builder/networkpolicy.go)):
   the data port accepts traffic from Valkey pods, Sentinel pods, observer pods and
@@ -316,13 +327,27 @@ password.
   D6). Nothing narrower is expressible for the label and the drain stamp: those
   are the writes the sidecar exists to make
   ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).
-- **The workload pods have no securityContext at all.** No `runAsNonRoot`, no
+- ~~**The workload pods have no securityContext at all.** No `runAsNonRoot`, no
   `readOnlyRootFilesystem`, no `capabilities: drop [ALL]`, no
   `seccompProfile` — verified by the absence of any `SecurityContext` in
   `internal/builder`. The operator's *own* Deployment sets all four
   ([`deployment.yaml`](deploy/helm/valkey-operator/templates/deployment.yaml)); the
   clusters it creates inherit whatever the namespace's Pod Security admission
-  level allows. A restricted-PSA namespace will reject these pods outright.
+  level allows. A restricted-PSA namespace will reject these pods outright.~~
+  **Superseded 2026-09-26 by [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D1:
+  every pod template the operator renders is rootless, with no option (section 4.5).** The struck list was
+  also short by one: it named four controls and omitted `allowPrivilegeEscalation: false`,
+  the fifth the operator's own Deployment sets
+  ([ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) D8) and every generated
+  container now carries. What still does not hold is the **migration window**: a pod an
+  earlier operator built keeps running its Valkey-image containers as uid 0 with the
+  runtime's default capabilities until the roll replaces it; a non-persistent
+  `spec.replicas: 1` pod and a pod too old to carry a `pod-spec-hash` annotation are not
+  replaced by the roll at all and stay root until they are deleted for another reason — a
+  container restart keeps the pod spec; and every data pod created while the template
+  carries the ownership repair keeps that root init container in its spec until the pod is
+  next replaced, which after the upgrade is every persistent data pod the migration roll
+  created (section 4.5).
 - ~~**The data pod mounts the sidecar token into every container.**
   `automountServiceAccountToken` is disabled on the observer pod and nowhere else,
   so the `valkey` and `exporter` containers carry the sidecar token too. It is a
@@ -337,8 +362,14 @@ password.
   ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
   step 4).
 - **A CR author picks the image.** `spec.image` and `spec.metrics.image` are
-  arbitrary strings with no registry allowlist, and the pods run with the
-  namespace's default security posture.
+  arbitrary strings with no registry allowlist, and ~~the pods run with the
+  namespace's default security posture~~ (superseded 2026-09-26 by
+  [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D1) whatever user the image
+  declares, its containers run as uid 999 with no capability, `no_new_privs` and
+  `RuntimeDefault` seccomp (section 4.5). The choice no longer buys root inside the
+  container; it still buys arbitrary code next to the cluster password and the dataset —
+  and in a pod created while the migration repair was on the template, `spec.image` is also
+  the image of the one root init container.
 - **Every managed object name is derived from the CR name, and the pod door is
   still open.** There is no admission webhook constraining CR names
   ([ADR 0015](docs/adr/0015-one-crd-validated-by-schema-only.md)), so whoever may
@@ -471,8 +502,8 @@ it mounts no token to steal.
 **Since 2026-08-27 the grant reaches one container, not the whole data pod.** The pod
 still runs as `<cr-name>-sidecar` — a pod has one identity — but it sets
 `automountServiceAccountToken: false` and hands the token to the `sidecar` container
-through a projected volume it declares itself. `valkey-server`, both init containers
-and the third-party `redis_exporter` now hold no credential. Sentinel pods, which
+through a projected volume it declares itself. `valkey-server`, every init container
+and the third-party `redis_exporter` now hold no token. Sentinel pods, which
 never call the API, set the same flag and declare no projection. This is D8 step 4 of
 [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md);
 section 3 lists what the grant still permits the sidecar itself.
@@ -510,6 +541,150 @@ default `false`). Neither changes reachability: the container port is declared w
 or without them, so anything that can route to the operator pod already reads
 `:8080`. What they add is a stable name and a scrape target.
 
+### 4.5 Workload pod posture
+
+Since 2026-09-26 every pod template the operator renders is rootless, with no CRD field and no
+opt-out; the migration repair below is the one root container it still adds
+([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D1, superseding
+[ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md) D9). Before that no generated
+pod set a `securityContext`, and because every container on the Valkey image sets `command:` —
+which replaces the entrypoint that would have dropped to the `valkey` user — `valkey-server`,
+`valkey-sentinel` and the init scripts ran as uid 0 under `Unconfined` seccomp; for
+`valkey-server`, measured in Docker on both pinned lines, with fourteen capabilities
+(`NET_RAW`, `DAC_OVERRIDE` and `SETUID` among them) and `NoNewPrivs: 0`.
+
+| Pod | Pod level | Every container and init container |
+|---|---|---|
+| data `<cr>-N` | `runAsNonRoot: true`, `runAsUser: 999`, `runAsGroup: 999`, `fsGroup: 999`, `seccompProfile: RuntimeDefault` | `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]` |
+| Sentinel `<cr>-sentinel-N` | same as data | same |
+| observer | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` — no uid: the operator image's distroless `nonroot` user (65532) is numeric, so kubelet can verify it; no `fsGroup`: no data volume | same |
+
+- **One walk, not per-container code.** `applyValkeyPodSecurity` and `applyObserverPodSecurity`
+  ([`pod_security.go`](internal/builder/pod_security.go)) run last in each builder over the
+  assembled `PodSpec`, so a container added later inherits the posture by being in the pod.
+  The unit tier evaluates every rendered template of the topology × TLS × auth × metrics ×
+  persistence matrix with the checks the API server's PodSecurity admission runs
+  (`k8s.io/pod-security-admission`,
+  [`pod_security_test.go`](internal/builder/pod_security_test.go)).
+- **One uid per pod.** The sidecar and the exporter run as 999 too, not as their images'
+  users (65532, 59000), so the data volume has one owner. No generated pod shares its process
+  namespace, so the common uid does not let one container see, signal or trace another's
+  processes, and the ServiceAccount token stays a mount of the sidecar container alone
+  (section 4.2).
+- **`fsGroup: 999` with `fsGroupChangePolicy` unset** (= `Always`): `OnRootMismatch` inspects
+  only the volume root and would skip files a later root writer left beneath a correctly
+  owned one.
+
+**What it changes, and what it does not.** A compromised process in a generated pod holds no
+capability, cannot regain one through a setuid binary or file capabilities in its image
+(`no_new_privs`), runs under a syscall filter, and finds nothing writable outside its mounted
+volumes. It still holds everything the container is given: the cluster password in its
+environment (section 2), the dataset, and unrestricted egress (section 3).
+
+**The drift comparison checks only what the operator sets.** `podSpecChanged`/`containerChanged`
+(both StatefulSets) and `ObserverDeploymentHasChanged` compare the pod- and container-level
+fields the builder sets, with subset semantics, so a field a mutating admission policy adds is
+not a drift the operator rewrites on every pass (ADR 0032 D5). One field is deliberately not a
+subset: a live template may not *add* a capability, so an out-of-band `NET_RAW` grant is
+converged back. Everything the builder leaves unset is not compared at all — container-level
+`runAsUser`, `runAsNonRoot` and `seccompProfile` included, which the restricted container
+posture leaves to the pod level, and `fsGroupChangePolicy`. An out-of-band or admission-added
+`runAsUser: 0` or `seccompProfile: Unconfined` on a container, or an `OnRootMismatch` that
+narrows kubelet's `fsGroup` re-owning to the volume root, therefore stays on the template
+until the operator writes it for another reason. Checked read-only on wds18 only (2026-09-26,
+ADR 0032 residual risks): no Kyverno mutate rule there rewrites a StatefulSet template. A
+namespace enforcing `restricted` refuses a pod carrying either regardless (section 9).
+
+**How existing clusters move.** The posture is part of the built `PodSpec`, so both pod-spec
+hashes change with the operator upgrade: every multi-replica data tier and every Sentinel tier
+rolls once, failover-aware — the Sentinel tier included, which a plain upgrade otherwise never
+rolls — and the observer Deployment is rewritten through its own `securityContext` comparison.
+Until a pod is replaced it runs as before; a container restart keeps the pod spec and so does
+not apply the posture. A pod so old that it carries no `pod-spec-hash` annotation is not
+recognised as outdated (`podSpecHashChanged` falls back to comparing resources) and keeps
+running as root until it is deleted for another reason — and on a persistent tier it keeps the
+repair below on the template for as long.
+
+**The pre-flight `check-data-writable`** is the first init container of every persistent data
+pod (only the repair below goes in front of it). It runs as uid 999 with shell builtins only and
+fails the pod when `/data`, `/data/appendonlydir` or a regular file directly in either is not
+writable, naming the fix in the termination message (`FallbackToLogsOnError`, so `kubectl
+describe pod` shows it). It turns a silent failure into a loud one: on an RDB volume whose root
+is `0755 root`, a uid-999 pod starts, answers reads — and then every `BGSAVE` fails and, with the
+generated `stop-writes-on-bgsave-error yes`, every write returns `MISCONF` while the pod stays
+Ready (measured, T31). Nested directories and non-regular files are not checked.
+
+**`fix-data-ownership` is the one root process the operator still creates** (ADR 0032 D2, D4).
+
+- *When.* Only in the data StatefulSet, only with persistence, and only while a data pod proven
+  ours (`podIsOurs`) in the live StatefulSet's ordinal range runs without `runAsNonRoot: true` —
+  a pod an earlier operator built. Once carried it stays until every ordinal holds a pod proven
+  ours and rootless; a missing or foreign pod is not proof, which closes the race on the last
+  pod of a tier (`dataOwnershipRepairNeeded`,
+  [`pod_security_migration.go`](internal/controller/pod_security_migration.go)). No Sentinel,
+  observer or non-persistent pod gets it: their volumes are fresh `emptyDir`s.
+- *What.* uid 0 and gid 0, `runAsNonRoot: false`, `capabilities: drop [ALL], add [CHOWN]`,
+  `allowPrivilegeEscalation: false` (`no_new_privs`), `readOnlyRootFilesystem: true`, under the
+  pod's `RuntimeDefault` seccomp, running `find /data ! -user 999 -exec chown 999:999 {} +`.
+  It mounts only the data volume and receives no environment and no token. Its image is the
+  `valkey` container's, i.e. `spec.image`.
+- *Why.* kubelet applies `fsGroup` on some volume types and not on others: not on `hostPath`
+  (Kind's local-path provisioner — asserted by the fleet-upgrade e2e, green in one local run
+  on 2026-09-26, not a CI job), NFS or a CSI driver with `fsGroupPolicy: None`. There,
+  `root:root 0644` files and a `0755`
+  `appendonlydir` an earlier operator wrote stay unwritable for uid 999, and an AOF pod exits
+  at start. `CAP_CHOWN` alone suffices because the legacy files are owned by the uid the
+  repair runs as (measured, T31).
+- *Why it never rolls a pod.* `reconcileStatefulSet` inserts it into the *built* StatefulSet
+  (`WithDataOwnershipRepair`) after `ComputePodSpecHash` ran, so the pod-spec hash never covers
+  it: adding it and removing it are two writes of the StatefulSet and no pod replacement. Root
+  therefore enters only a pod *created* while the template carries it — the replacements of
+  the migration roll, and any pod deleted for another reason in that window, a chaos kill
+  included — as one `find`.
+- *What rolling nothing leaves behind.* A pod that received the container keeps it in its
+  spec after the template drops it, until the pod is next replaced — after the upgrade that is
+  every persistent data pod the migration roll created. Kubernetes re-runs a pod's init
+  containers whenever it gives the pod a new sandbox (a node reboot, say), so the repair runs
+  again there as root with `CAP_CHOWN`, finding nothing left to re-own. And
+  `spec.initContainers[*].image` stays writable by a pod update like the container images
+  (section 3), so a stolen sidecar token can point that root container at an image of its
+  choice for its next run. Neither was measured. No root process runs in a pod created after
+  the template dropped the repair.
+
+The evidence is the pod's `securityContext`, which no pod update can change: no label or
+annotation — nothing the sidecar token can patch (section 3) — can switch the repair on, and it
+survives an operator restart. Detaching a pod by deleting a selector label does make it "not
+provably ours" and so keeps a repair that is already carried on the template; that extends the
+migration window, it cannot start one. A template carrying the repair passes Pod Security `baseline` and fails `restricted`
+(`TestPodSecurity_TheRepairIsBaselineButNotRestricted`), which is why the namespace label waits
+for the migration (section 9).
+
+Two ways the repair itself fails, and both hold the pod in its init phase until the roll
+reports `PodAvailabilityStalled` naming it after `spec.rollingUpdate.syncTimeout`
+([ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) D11) — before the pre-flight
+gets to name the fix. The repair sets no `FallbackToLogsOnError`, so its refusal is in
+`kubectl logs <pod> -c fix-data-ownership`, not in `kubectl describe pod`:
+
+- **NFS with `root_squash`.** Root is squashed, so `chown` is refused; the fix is a server-side
+  `chown -R 999:999` before the upgrade. Root-squash itself was not measured; the exit status is
+  the Docker measurement below.
+- **A symlink on the data volume.** Measured in Docker on 2026-09-26 (`valkey/valkey:9.1.1`, GNU
+  coreutils 9.7): `chown` without `-h` follows a symlink, so the repair tries to re-own the
+  link's *target* inside its own container rather than the link; and any `chown` failure — a
+  dangling link, a target on the read-only root — makes `find`, and with it the repair, exit 1.
+  Valkey writes no symlinks; placing one takes write access to the volume. Which writable targets a
+  node offers beyond the read-only root (kubelet's per-pod files) was **not measured**.
+
+**Single-pod clusters decide by persistence** (ADR 0032 D3, `singlePodDeferral`). A persistent
+`spec.replicas: 1` pod still running as root is replaced at the upgrade — one restart, data
+kept, the repair running on its way up. A non-persistent one is **not** replaced unless its
+Valkey image changed as well, because replacing it would discard the dataset: it keeps running
+as root until it is deleted for another reason (a node drain, say — a container restart keeps
+the pod spec), and `PodSecurityUpdatePending=True` (reason `PodRunsAsRoot`) names it. Deleting
+the pod applies the posture at once and discards the dataset. The condition is a level with one
+evaluator, is written `False/PodSecurityUpdateApplied` only over a standing True, and emits no
+Event.
+
 ---
 
 ## 5. Validation story
@@ -545,6 +720,7 @@ What that means in practice:
 | `spec.tls.secretName` (different Secret) | Yes | The name is part of the pod spec, so the hash changes and the pods roll |
 | **Password change inside the auth Secret** | **No** | See below |
 | `spec.auth.secretName` (different Secret) | Yes | Same reason as the TLS Secret name |
+| Workload `securityContext` (the operator upgrade onto [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md)) | Yes, once — **except a non-persistent single pod** | Part of the built `PodSpec`, so both pod-spec hashes move: every multi-replica data tier and every Sentinel tier rides one failover-aware roll, a persistent single pod is replaced once, and the observer Deployment follows through its own `securityContext` comparison. A non-persistent `spec.replicas: 1` pod stays root until it is deleted, under `PodSecurityUpdatePending`, and a pod without a `pod-spec-hash` annotation is not recognised as outdated (section 4.5) |
 
 **The password rotation gap, stated precisely.** The Secret is watched
 ([`findValkeyForSecret`, `valkey_controller.go:2861`](internal/controller/valkey_controller.go),
@@ -759,10 +935,63 @@ analysis.
       deletes them at six call sites — the NA61 StatefulSet guard did not cover it,
       because a StatefulSet can be provably ours while the pod under `<cr>-N` is not.
       All are guarded now, and the six deletes carry the UID precondition.
-- [ ] **Give the workload pods a securityContext.** `runAsNonRoot`,
-      `readOnlyRootFilesystem` where the data path allows it, `drop: [ALL]`,
-      `seccompProfile: RuntimeDefault` — the operator already runs that way itself.
-      Without it the clusters cannot be admitted into a `restricted` PSA namespace.
+- [x] **Give the workload pods a securityContext**
+      ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D1, implemented 2026-09-26).
+      Every data, Sentinel and observer pod template carries the five controls the operator's own
+      Deployment has, plus `runAsUser`/`runAsGroup`/`fsGroup: 999` on data and Sentinel
+      pods, with no option to turn it off (section 4.5). Two corrections to what this item
+      asked for: `readOnlyRootFilesystem` holds on every container, not only "where the data
+      path allows it", because every path a process writes is a mounted volume; and the item
+      named four controls, omitting `allowPrivilegeEscalation: false`, which is set too.
+      **Verified on a node locally only** (Kind with containerd, not in CI) — see "Do not
+      treat the rootless posture as proven" below.
+- [ ] **Finish the rootless migration where it cannot finish itself**
+      ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D3, D7, section 4.5). Before the
+      upgrade, `chown -R 999:999` every Valkey volume on NFS exported with `root_squash`, on
+      the server side — no pod can re-own it, and the first replacement never starts. After
+      it, three kinds of pod still run as root: a non-persistent single pod
+      (`PodSecurityUpdatePending` names it; deleting it discards its data), a pod so old that
+      it carries no `pod-spec-hash` annotation (delete it), and the pods of a tier whose
+      roll holds on a replacement that never became available (`PodAvailabilityStalled`).
+- [ ] **Enforce Pod Security `restricted` on each namespace once it is migrated**
+      ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D6). The posture is a
+      property of what the operator renders; the label makes the API server refuse
+      everything else, including a container-level `runAsUser: 0` or
+      `seccompProfile: Unconfined` the subset drift comparison does not converge back
+      (section 4.5). List the violators first with
+      `kubectl label --dry-run=server --overwrite ns <ns> pod-security.kubernetes.io/enforce=restricted`,
+      then label for real. Expect the dry run to name the persistent data pods the migration
+      roll created: their spec keeps the completed repair (section 4.5). They do not block the
+      label — enforcement acts at admission and evicts no running pod, and their replacements
+      come from the repair-free template — so the precondition is the template, not the
+      pods: no data StatefulSet in the namespace may still carry `fix-data-ownership`. Not
+      earlier: a data template carrying the migration repair is `baseline`, not
+      `restricted`, so the pods the roll would create are refused at admission and the roll
+      waits on an absent pod (`PodRecreationStalled`). The operator does not label
+      namespaces.
+- [ ] **Do not treat the rootless posture as proven on your runtime.** As of 2026-09-26 it
+      is guarded against the Pod Security checks in the unit tier (`make test-unit`, green
+      2026-09-26) and against API-server defaulting in envtest (no run recorded), and run
+      under `--user 999:999 --read-only --cap-drop ALL --security-opt no-new-privileges`
+      against both pinned Valkey lines in Docker
+      (`make test-image-tools`, green 2026-09-26). **On a node it ran locally only, not in
+      CI** — the branch has not been through the pipeline: on Kind (control plane + 3 workers,
+      Kubernetes v1.36.1, containerd) on 2026-09-26, `make test-e2e` was green on both Valkey
+      lines (51/51 each). That includes `TestE2E_PodSecurity_RestrictedNamespace`: the
+      namespace refused an unrestricted pod (server-side dry run), every generated pod was
+      admitted under `enforce=restricted` and became Ready, the `valkey` and `sentinel`
+      containers showed `Uid 999`, `CapEff 0`, `CapBnd 0`, `NoNewPrivs 1`, and the sidecar's
+      projected token was measured on the node at `0640`, owner and group 999 (kubelet
+      rewrote the `0644` `DefaultMode` under `fsGroup`). The fleet-upgrade e2e (the migration
+      itself) passed once, from released chart 1.12.8 with its amd64 image under emulation
+      (the default start, 1.10.48, cannot run on the arm64 host used): every tier converged
+      rootless, every persistent pod ran the repair before it left the template, the migrated
+      persistent masters wrote and snapshotted without `MISCONF`, and the non-persistent single
+      pod kept running as root under `PodSecurityUpdatePending`. It is still not a CI job. Not
+      covered at all: CRI-O's smaller default capability set, and
+      OpenShift — **its `restricted-v2` SCC refuses a fixed `runAsUser: 999` outside the
+      namespace's UID range**, so these pods are not admitted there; nothing in this
+      repository targets OpenShift today.
 - [x] **Give the observer its own ServiceAccount and stop mounting its token**
       ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 2,
       done 2026-08-21). `<cr-name>-observer` is bound to no Role and the pod sets

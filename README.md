@@ -15,6 +15,7 @@ A Kubernetes operator for deploying and managing production-grade [Valkey](https
 - **Authentication** — password from Kubernetes Secret
 - **Observability** — CRD status visible in `kubectl` and Lens, Kubernetes Events
 - **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
+- **Rootless pods** — every generated pod runs as a non-root user with all capabilities dropped, a read-only root filesystem and the `RuntimeDefault` seccomp profile, so once the one-time upgrade migration is through it is admitted in a namespace enforcing Pod Security `restricted`; no option, no opt-out ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md))
 - **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
 - **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
@@ -66,6 +67,100 @@ Updating the operator image on its own — `kubectl set image`, or a bumped tag
 applied against an older chart — leaves the CRD and the ClusterRole behind and is
 not a supported upgrade path.
 
+> **One-time migration: the release that makes generated pods rootless.** Upgrading
+> from an operator that still ran Valkey as root rolls every multi-replica data tier
+> and **every Sentinel tier** once, restarts persistent single-pod clusters without
+> Sentinel once, and re-owns data an older operator wrote as root. On NFS with `root_squash`, act
+> **before** the upgrade. Details below and in
+> [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md).
+
+<details>
+<summary>One-time migration to rootless pods: what rolls, what restarts, what to do first</summary>
+
+Every data and Sentinel pod now runs as uid/gid 999 with `fsGroup: 999`, the observer
+as its image's non-root user, and every container — the sidecar and the exporter
+included — with all capabilities dropped, no privilege escalation, a read-only root
+filesystem and the `RuntimeDefault` seccomp profile — the one exception is the
+migration-only repair container below. There is no CRD field for it and no opt-out.
+The posture is part of the pod spec, so the upgrade moves each cluster once:
+
+| Cluster | What the upgrade does |
+|---|---|
+| Multi-replica data tier | Rolls once through the failover-aware rolling update — lossless, like every roll. |
+| Sentinel tier | Rolls once, behind the quorum guard. Sentinel pods carry no sidecar, so an operator upgrade rolls them only when the release changes their pod spec or configuration — this one does. |
+| Observer Deployment | Restarts once; it holds no data. |
+| Single replica without Sentinel, persistent | The only pod is replaced at the upgrade — **downtime**, data kept (it reloads its RDB/AOF). The sidecar-only deferral described further down does not hold it back. |
+| Single replica without Sentinel, not persistent | **Not restarted**, because that would discard the dataset. The pod keeps running as root and the CR carries `PodSecurityUpdatePending=True` (reason `PodRunsAsRoot`) naming it until the pod restarts for any other reason. `kubectl delete pod <name>-0` applies the posture now and discards the dataset. A new `spec.image`, a certificate rotation or a configuration change still replaces the pod, as it always did. |
+
+"Persistent" is what the data StatefulSet was created with, not what `spec.persistence`
+says now: a toggle the operator refused to apply (see [`spec.persistence`](#specpersistence))
+does not turn an `emptyDir` pod into one that may be restarted.
+
+**Open, not yet decided: a Sentinel tier of one or two pods does not finish this
+roll.** Its quorum equals its pod count, so the quorum guard refuses to delete any
+Ready Sentinel, and the roll requeues without end with the status frozen on
+`Sentinel Rolling Update`. That predates this release — any change to the Sentinel pod
+spec hits it — but this release is the first to roll every Sentinel tier of a fleet.
+Tiers of three or more are not affected. Recorded in the residual risks of
+[ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) and
+[ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
+
+**Data an older operator wrote as root.** Where kubelet applies `fsGroup` to the
+volume type (CSI drivers with an `fsType`, in-tree `local`), it re-groups the files
+itself. Where it does not — `hostPath` (Kind's local-path provisioner), NFS,
+CSI drivers with `fsGroupPolicy: None` — the files stay root-owned, so the data
+StatefulSet of every persistent cluster carries the migration-only init container
+`fix-data-ownership` while the migration runs. It runs as root with `CAP_CHOWN` as its
+only capability, re-owns everything under `/data` that uid 999 does not own, and
+leaves the template once every data pod runs rootless and has got past its
+pre-flight. It cannot tell the two kinds of storage apart, so it runs on both. A pod
+created while the template carries it keeps it in its spec until that pod is next
+replaced, and runs it again on a sandbox restart; it is best-effort and always exits 0,
+so the pre-flight below is the one gate. Adding and removing it restarts nothing — it
+is outside the pod-spec hash.
+
+**The pre-flight stays.** Every persistent data pod now runs the init container
+`check-data-writable` (uid 999, permanent, not migration-only) before Valkey starts. If
+`/data`, `/data/appendonlydir` or a file directly in either is still not writable, it
+fails the pod and names the fix in the termination message `kubectl describe pod`
+shows. Without it an RDB-mode pod would start, answer reads, and reject every write
+with `MISCONF` while staying Ready.
+
+**NFS with `root_squash`: re-own the data before upgrading.** Root is squashed on the
+server, so no pod can re-own the files. Run `chown -R 999:999` on every Valkey volume
+server-side first. Otherwise the pre-flight holds the first replaced pod: on a
+multi-replica cluster the roll stops there while the pods not yet replaced keep
+serving, and `PodAvailabilityStalled` names the held pod once it has been unavailable
+for longer than [`syncTimeout`](#specrollingupdate); a persistent single-pod cluster is
+down until the files are re-owned. After a late fix, delete the held pod so it starts
+again without waiting out its crash backoff.
+
+**The root filesystem is read-only.** Debug with `kubectl debug` (an ephemeral
+container), not by writing into a running container.
+
+**Rollback** to the previous operator is safe for the data: its pods run as root and
+can write the re-owned files.
+
+**Afterwards a namespace can enforce Pod Security `restricted`.** Once no Valkey pod
+in it runs without `runAsNonRoot` — every cluster back to `PHASE=OK`, no
+`PodSecurityUpdatePending=True`, and no data StatefulSet still listing
+`fix-data-ownership`, whose pods `restricted` would refuse — label it, server-side dry
+run first; the dry run lists the pods that would violate. It also lists the persistent
+data pods created during the migration, which keep `fix-data-ownership` in their spec
+until they are next replaced: enforcing does not evict running pods, and their
+replacement comes from the clean template. The operator does not label namespaces.
+
+```bash
+kubectl get statefulset -n <ns> -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.template.spec.initContainers[*].name}{"\n"}{end}'
+kubectl label --dry-run=server --overwrite ns <ns> pod-security.kubernetes.io/enforce=restricted
+kubectl label --overwrite ns <ns> pod-security.kubernetes.io/enforce=restricted
+```
+
+Not covered: OpenShift, whose `restricted-v2` SCC refuses a fixed `runAsUser` outside
+the namespace's UID range. Nothing in this repository targets it.
+
+</details>
+
 <details>
 <summary>What the upgrade does, how to verify it, rollback and uninstall</summary>
 
@@ -92,7 +187,10 @@ pod keeps the old sidecar until something restarts it, which means a manual
 (a new `spec.image`, for example). Force it when you want it — but the restart is
 not free on the only pod of the cluster: it has no failover target, so an instance
 without `persistence.enabled` comes back empty (with persistence it reloads its
-RDB/AOF). This is the same exception as the metrics note further down.
+RDB/AOF). This is the same exception as the metrics note further down. **The
+rootless release does restart a persistent single-replica cluster**: a pod that still
+runs as root is decided by persistence, not by the sidecar image — see the one-time
+migration above.
 
 ```bash
 kubectl get valkey <name> -o jsonpath='{range .status.conditions[?(@.type=="SidecarUpdatePending")]}{.status}{"\n"}{end}'
@@ -118,7 +216,12 @@ kubectl get valkey -A
 
 Every instance returns to `PHASE=OK` with `READY` equal to `REPLICAS`. `Rolling
 Update` means the migration above is still running; `kubectl describe valkey
-<name>` shows the current step and any `ReconcileBlocked` condition.
+<name>` shows the current step and any `ReconcileBlocked` condition. A roll stuck on
+a pod that does not come up carries `PodAvailabilityStalled` once the pod has been
+unavailable for longer than [`syncTimeout`](#specrollingupdate), naming that pod: read its events with
+`kubectl describe pod` and fix the cause — after a spec fix the operator replaces the
+stuck pod itself. A single-pod cluster without Sentinel does not carry that condition;
+its replacement that does not come up shows as phase `Provisioning`.
 
 **Upgrading from the released chart repository** instead of a checked-out tree:
 
@@ -905,19 +1008,32 @@ PersistentVolumeClaim and sets no `persistentVolumeClaimRetentionPolicy`, so the
 old claims and their RDB/AOF files outlive the migration. They are reattached if a
 persistent cluster of the same name is created again, and removed only by hand.
 
+**Every persistent data pod runs the init container `check-data-writable` before Valkey starts.**
+The pods run as uid 999 ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md)); if
+`/data`, `/data/appendonlydir` or a regular file directly in either is not writable by
+that uid, the pre-flight fails the pod and names the fix in the termination message
+`kubectl describe pod` shows — instead of an RDB-mode Valkey starting, serving reads
+and answering every write with `MISCONF` while the pod stays Ready. The usual cause is a volume an
+older operator wrote as root on storage no pod can re-own (NFS with `root_squash`), or
+a StatefulSet recreated by hand over claims that were never migrated; `chown -R
+999:999` on the volume fixes both. See the one-time migration under
+[Upgrade the Operator](#upgrade-the-operator).
+
 ### `spec.rollingUpdate`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting |
+| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting, and how long a rolling update waits on a pod that never becomes available before it reports that pod |
 
 `syncTimeout` bounds the two points in a rolling update where the operator waits
-for a full dataset transfer, and it does something different at each:
+for a full dataset transfer, and one wait that has nothing to do with a transfer —
+on a pod that does not come up at all. It does something different at each:
 
 | Wait | On timeout |
 |------|------------|
 | A replaced replica syncing from the master, before the next pod is replaced | The wait ends and is **reported** (`RollingUpdatePaused` condition, phase `Error` for that pass). It is a report, not a halt: the pass clears the rolling-update state, so a later pass that still finds outdated pods starts the state machine again on a fresh `syncTimeout` budget, and the phase returns to `OK` as soon as the cluster is Ready. A spec change restarts the roll from the beginning. |
 | The former master (pod-0) syncing back after the failover, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
+| A pod the roll waits on that exists, is not being deleted and does not become available — an unpullable image, a container that crashes at boot, a request no node can schedule | The wait **continues** and is **reported** (`PodAvailabilityStalled`, naming the pod); the report stands until no pod of that tier is unavailable past the budget any more, not merely until a pass stops at a different wait. The budget is measured from the pod's own clock — when its `Ready` condition last turned false, or its creation if it has never been Ready (no `Ready` condition yet, or only the `Ready=False` kubelet stamps at its first status sync of the pod) — so neither an operator restart nor the moment a long-`Pending` pod is finally scheduled resets it. Nothing is deleted for it: a pod on the current spec comes back identical. Past the budget the reconcile pass stops ending on the wait, so the status write runs again; on a Sentinel cluster the Sentinel roll still waits for the data tier. |
 
 The second case never force-promotes pod-0. An unsynced pod-0 would come up as an
 empty master and discard every write the promoted replica accepted since the
@@ -925,6 +1041,21 @@ failover, so the operator gives up the canonical topology rather than the data.
 The cluster stays fully usable — the `-rw`/`-r` Services select the master by
 label, not by ordinal. Raise `syncTimeout` for large datasets whose initial sync
 does not fit in five minutes.
+
+The third case never lifts the wait, and it does not have to for a spec fix to take
+effect: before replacing an **outdated** pod the roll asks only whether a pod of that
+tier is terminating, and never waits for the outdated pod itself to become available
+(the one exception, unchanged, is a leftover outdated second master, replaced only
+while it is available). The waits on the *other* pods are unchanged: the previous
+replacement's sync, the check on the new master before the former master is
+replaced, and the Sentinel quorum guard for a delete that spends a vote. Replacing a
+Sentinel that is not Ready spends none, so it goes ahead even when the quorum is already lost — after a spec
+fix with two of three Sentinels stuck on the broken spec, it is the only way back to
+a quorum, and the terminating-pod gate still takes those deletes one after the
+other. The pod that never came up on the broken spec is outdated once the
+spec is fixed, so the operator replaces it by itself, no `kubectl delete pod`
+needed. The budget is shared: raising `syncTimeout` for a slow sync also delays this
+report.
 
 ### `spec.auth`
 
@@ -952,14 +1083,16 @@ does not fit in five minutes.
 | `RollingUpdatePaused` | A rolling update stopped waiting because a replaced pod did not sync within `spec.rollingUpdate.syncTimeout`. **It reports an expired wait, not a halted operator:** the pause clears the rolling-update state, so a later pass that still finds outdated pods dispatches again on a fresh budget and sets the condition again; a spec change restarts the roll from the beginning rather than resuming it. It goes `False` with reason `Completed` when a roll finishes and with reason `Converged` when there is no roll left to run — the usual cause being a spec put back to what the pods already run. Both clears sit in `checkAndHandleRollingUpdate`, so every topology reaches them; before that the only clear was on the Sentinel path. Written only on a cluster that paused — clusters that never did carry no such condition. See [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10. |
 | `TopologyRestored` | The last data-tier rolling update of a multi-replica non-Sentinel cluster handed the master role back to pod-0. `False` means the operator gave up waiting for pod-0 and left the promoted replica as master — the cluster is healthy, its master is just not pod-0. **This is a verdict about that update, not a live statement about the topology now.** Nothing outside a rolling update writes it, so a later steady-state adoption (a drain that promoted another pod, for instance) moves the master without touching the condition, and a `True` can sit next to a non-pod-0 master indefinitely. **Read `status.masterPod` for the master; read this for what the last update did.** It is never written on a Sentinel-enabled or single-replica cluster, and never cleared when a cluster becomes one. See [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D15. |
 | `SidecarUpdatePending` | A single-replica cluster's pod carries an outdated sidecar image. The operator does not restart the only pod for a sidecar-only change; the update applies on the next pod restart. The message names the pod and the `spec.replicas` the deferral was decided on. It clears itself at either of the two sites that prove every pod matches the live StatefulSet template: the pass that finds nothing to update, and the pass that completes a rolling update. A cluster whose `spec.replicas` is above 1 never gains it — the sidecar image is part of the pod-spec hash, so a sidecar change rides the ordinary rolling update. Note the condition follows `spec.replicas`, not the number of running pods: those two can differ while a StatefulSet write is being refused (see [`spec.persistence`](#specpersistence)), which is why the message states the replica count it decided on. See [ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D10 and D10a. |
+| `PodSecurityUpdatePending` | The only data pod of a single-replica cluster without Sentinel, whose StatefulSet keeps no volume, was built by an operator from before generated pods became rootless and still runs as root — and the operator deliberately does **not** replace it: with no replica to fail over to and no volume to keep the data, the restart would discard the dataset, and an operator upgrade alone never does that. Reason `PodRunsAsRoot`; the message names the pod. The rootless posture applies on the pod's next restart for any other reason, and so does every other pending change of that pod's spec, which the operator cannot tell apart from the posture; `kubectl delete pod` applies them now and discards the dataset. A new `spec.image`, a certificate rotation or a configuration change replaces the pod anyway, as it always did. A persistent single pod is replaced at the upgrade (one restart, data kept) and a multi-replica cluster rides the failover-aware roll, so neither carries it. It can stand next to `SidecarUpdatePending` when the same release also moved the sidecar image. It is a **level**, re-measured on every pass; it goes `False` with reason `PodSecurityUpdateApplied` only over a standing `True`, so clusters that never deferred carry no such condition. No Event accompanies it. See [Upgrade the Operator](#upgrade-the-operator) and [ADR 0032](docs/adr/0032-generated-pods-run-rootless.md) D3. |
 | `ReconcileBlocked` | A managed resource could not be written, or the operator refused to write it. The reason says which, because they end differently: `AdmissionWebhookDenied` (a cluster-side admission gate rejected the write, or a fail-closed webhook could not be called — clears itself once the gate reopens), `ForeignObject` (one of the generated names is held by an object this `Valkey` does not control — clears when someone deletes or renames it), `RecreateRequired` (a StatefulSet whose immutable `volumeClaimTemplates` no longer match `spec.persistence` — clears when the StatefulSet is recreated or the spec is put back, see [`spec.persistence`](#specpersistence)), `WriteFailed` (any other write failure: RBAC, quota, conflict, API server unreachable). When one pass produces several, the reason reported is the one that needs a human: `ForeignObject` before `RecreateRequired` before `AdmissionWebhookDenied`. |
 | `StorageSpecNotApplied` | The storage `spec.persistence` asks for is not the storage the cluster runs on, because a StatefulSet's `volumeClaimTemplates` are immutable. Reason `RecreateRequired` means the operator writes nothing to that StatefulSet at all until it is recreated (`ReconcileBlocked` carries the same reason); reason `VolumeClaimTemplatesImmutable` means only `size`/`storageClass`/access modes are stuck while every other change still applies. The message names the difference. It goes `False` with reason `StorageSpecApplied` once the live claims match again, and is written only on a cluster that had a conflict — clusters that never had one carry no such condition. **On a Sentinel-enabled cluster both StatefulSet reconcilers evaluate it, and only the data one may resolve it:** a tier whose `volumeClaimTemplates` are empty by construction can never prove that the storage the spec asks for is the storage that runs. See [`spec.persistence`](#specpersistence) and [ADR 0023](docs/adr/0023-volume-claim-templates-are-immutable.md) D4a. |
 | `SentinelPeersStale` | At least one Sentinel knows more other Sentinels than the cluster has. Sentinel never forgets a peer it has seen, and the majority a failover leader needs is computed over that whole table — so the surplus is failover capacity that is already gone, not a display issue. The message names each pod and its count. Clear it with `SENTINEL RESET <cluster-name>` on one Sentinel at a time **while the master is healthy** (a reset with the master unreachable leaves that Sentinel knowing nothing and unable to rediscover), or leave it to the next Sentinel roll. Only written while all Valkey and Sentinel pods are Ready; a pass where no Sentinel answers leaves the previous value. A cluster reporting `True` is re-checked every 5 minutes, so a reset shows up as a cleared condition within the maintenance window rather than at the next cache resync. See [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md). |
-| `SentinelUpdatePending` | The Sentinel tier is being rolled: at least one Sentinel pod runs an outdated spec, or a replacement pod is not Ready yet. The `RollingUpdateComplete` event covers the **data tier only** and fires before the first Sentinel pod is replaced — the update as a whole is finished when this condition goes `False` with reason `Completed`, which is also the moment the `SentinelUpdateComplete` event is emitted. Reason `SentinelDisabled` means Sentinel was disabled while the condition stood (no completion event in that case). Written only on a cluster whose Sentinel tier actually rolled; clusters that never rolled carry no such condition. See [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md). |
-| `PodTerminationStalled` | A pod of the tier being rolled has been `Terminating` for more than two minutes past its own graceful deletion deadline, and the rolling update of that tier is holding: the operator never deletes a pod of a tier while another pod of that tier is on its way out. **The condition does not lift the hold and nothing resumes it** — deleting a second pod because the first is wedged is what the hold prevents. What it marks is that the operator stopped ending the reconcile pass on the wait, so the Sentinel roll, the no-master recovery, the steady-state split-brain check and the status write run again while the stall lasts. The message names the pod and how far past its deadline it is. Look at that pod: a `NodeNotReady` node, a stuck finalizer and a container ignoring SIGTERM are the usual causes. It clears itself with reason `PodTerminationCleared` once the pod is gone, and the roll continues on its own. No Event accompanies it. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md). |
+| `SentinelUpdatePending` | The Sentinel tier is being rolled: at least one Sentinel pod runs an outdated spec, or a replacement pod is not Ready yet. The `RollingUpdateComplete` event covers the **data tier only** and fires before the first Sentinel pod is replaced — except when a data roll pauses on its sync timeout: that pass runs the Sentinel roll ([ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) D11). The update as a whole is finished when this condition goes `False` with reason `Completed`, which is also the moment the `SentinelUpdateComplete` event is emitted. Reason `SentinelDisabled` means Sentinel was disabled while the condition stood (no completion event in that case). Written only on a cluster whose Sentinel tier actually rolled; clusters that never rolled carry no such condition. See [ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md). |
+| `PodTerminationStalled` | A pod of the tier being rolled has been `Terminating` for more than two minutes past its own graceful deletion deadline, and the rolling update of that tier is holding: the operator never deletes a pod of a tier while another pod of that tier is on its way out. **The condition does not lift the hold and nothing resumes it** — deleting a second pod because the first is wedged is what the hold prevents. What it marks is that the operator stopped ending the reconcile pass on the wait, so the no-master recovery, the steady-state split-brain check and the status write run again while the stall lasts. The Sentinel roll is not among them: on a Sentinel cluster a holding data tier holds the Sentinel update too, which rolls after the data tier ([ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) D11; the one recorded exception is the pass in which a data roll pauses on its sync timeout, which does run the Sentinel roll). The message names the pod and how far past its deadline it is. Look at that pod: a `NodeNotReady` node, a stuck finalizer and a container ignoring SIGTERM are the usual causes. It clears itself with reason `PodTerminationCleared` once the pod is gone, and the roll continues on its own. No Event accompanies it. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md). |
 | `TLSMaterialStale` | At least one pod is still running the TLS material from before the last certificate rotation. **This is True for the length of every ordinary rotation roll and is not urgent**: cert-manager renews 30 days before expiry and the previous certificate keeps working for those 30 days, so the pods have a month of slack and the shipped alert waits three days before firing. The message names the pods and their tier. It clears itself with reason `TLSMaterialCurrent` once every measured pod carries the current fingerprint. What it exists to catch is the roll that **never starts** — the operator missed the Secret event, cannot write the StatefulSet, or is blocked for an unrelated reason — because no other signal fires in that case and the pods then keep the old certificate until it expires. Only written on TLS clusters (a cluster that turns TLS off has a standing `True` retracted once, with reason `TLSMaterialNotApplicable`), and only measured for pods that already carry the fingerprint (`VKO_TLS_MATERIAL_HASH` on the sidecar container, or the superseded `vko.gtrfc.com/tls-material-hash` annotation on pods from before 2026-08-27); pods created by an older operator are unmeasured, not stale — when such pods exist and nothing is stale, the condition stays `False` with reason `TLSMaterialUnmeasured` and names them: a rotation will not replace those pods until something else does. The all-clear (`TLSMaterialCurrent`) is only written when **both** tiers could be measured; stale pods are reported even while the other tier cannot be. See [Certificate rotation](#certificate-rotation). |
 | `MultipleMasters` | More than one data pod answered that it is the master while a rolling update was in flight. This is **not by itself a fault**: every controlled failover has a window in which the promoted pod and the outgoing one both answer master, and the operator closes it on the same pass. The reason tells the two apart — `MultipleMastersTransitional` is inside the 90 s bound and carries no Event, `MultipleMastersPersisted` is past it and is the moment the `SplitBrainDetected` **Warning** event fires. The message names the pods and the authority. It goes `False` with reason `SingleMaster` on the first pass that sees at most one master; a rolling update abandoned with rogue masters still present leaves it `True` until the next one, and so does a resolution the operator **refused** because demoting would have discarded the only dataset ([ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)) — a refusal carries no Event of its own, so a `MultipleMasters` that outlives the 90 s bound is how it surfaces. Written only during a rolling update — clusters that never saw two masters carry no such condition. See [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md). |
-| `PodRecreationStalled` | The rolling update deleted a pod and the StatefulSet controller has not recreated it for over two minutes — which means that controller cannot create it at all; the measured cause is an immutable-field sync error wedging pod creation on the lowest mismatching ordinal (see [`spec.persistence`](#specpersistence)). The roll holds; like `PodTerminationStalled`, the condition marks that the operator stopped ending the reconcile pass on the wait, so the status write and the steady-state checks keep running while the wedge lasts. The message names the pod and points at the StatefulSet events (`FailedCreate`/`FailedUpdate`). It clears itself with reason `PodRecreated` once the pod exists again. Written only on a cluster that stalled; no Event accompanies it. See [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D16. |
+| `PodRecreationStalled` | The rolling update deleted a pod and the StatefulSet controller has not recreated it for over two minutes — which means that controller cannot create it at all; the measured cause is an immutable-field sync error wedging pod creation on the lowest mismatching ordinal (see [`spec.persistence`](#specpersistence)). The roll holds; like `PodTerminationStalled`, the condition marks that the operator stopped ending the reconcile pass on the wait, so the status write and the steady-state checks keep running while the wedge lasts — but not the Sentinel roll, which waits for the data tier ([ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) D11). The message names the pod and points at the StatefulSet events (`FailedCreate`/`FailedUpdate`). It clears itself with reason `PodRecreated` once the pod exists again. Written only on a cluster that stalled; no Event accompanies it. See [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D16. |
+| `PodAvailabilityStalled` | A rolling update has been waiting on a pod that exists, is not being deleted and has not been available for longer than [`spec.rollingUpdate.syncTimeout`](#specrollingupdate) — a replacement on an unpullable image, a container that crashes at boot, a request no node can schedule, a data volume the `check-data-writable` pre-flight refuses. The clock is the pod's own: when its `Ready` condition last turned false, or its creation if it has never been Ready (no `Ready` condition yet, or only the `Ready=False` kubelet stamps at its first status sync), so a pod that sat `Pending` past the budget is not given a fresh one when it is finally scheduled. The reason names the tier: `ValkeyPodNotAvailable` for a data pod, `SentinelPodNotAvailable` for a Sentinel pod; when several Sentinel pods on the current spec are down, the message names the one down longest. **The condition does not lift the wait** — a pod on the current spec comes back identical when deleted — it marks that the operator stopped ending the reconcile pass on it, the `PodTerminationStalled` shape: the status write and the steady-state checks run again, and on a Sentinel cluster a holding data tier holds the Sentinel roll too, because both tiers run `spec.image`. The message names the pod and the moment it stopped being available. Look at that pod's events (`kubectl describe pod`); once the spec is fixed the operator replaces the stuck pod itself, because an outdated pod is replaced whether it is available or not. It is a **level**, re-measured by each tier's roll on every pass that reaches it, and each tier retracts only its own report — **on evidence, not on silence**: it goes `False` with reason `PodAvailable` only once no pod of that tier (the ordinal range of its StatefulSet) is still unavailable past the budget, so a pass that stopped at another wait first leaves it standing. The Sentinel evaluator keeps running after Sentinel is disabled, so a Sentinel report is retracted on the same evidence then. **One condition carries both tiers**: a data-tier report replaces a standing Sentinel one, and the Sentinel report returns on the first Sentinel pass after the data tier has finished — the stuck pod's clock is already past the budget by then. Written only on a cluster that stalled; no Event accompanies it. A single-pod cluster without Sentinel does not normally carry it: its roll records no state, so once the only pod has been replaced the next pass finds nothing to roll, and a replacement that does not come up shows as phase `Provisioning`. See [ADR 0026](docs/adr/0026-a-pod-being-deleted-is-not-available.md) D11 and [ADR 0010](docs/adr/0010-every-rolling-update-wait-is-bounded.md) D17. |
 | `RWServiceEmpty` | No data pod carries the `instanceRole=master` label on a settled cluster (every pod ready, no rolling update in flight) — so the `<name>-rw` Service, whose selector is exactly that label, has no endpoints and serves no writes. The operator never writes that label; each pod's sidecar does, so this is a report about the sidecars: check their container logs on the data pods (the measured cause was sidecars dying once per second on expired TLS client material, invisible on every other status surface). A brief `True` during a Sentinel failover is possible and harmless — the label follows the promotion within seconds. It clears itself with reason `MasterLabeled`; written only on a cluster that exhibited the state. See [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D12. |
 
 #### Phase Values
@@ -970,7 +1103,7 @@ does not fit in five minutes.
 | `Provisioning` | Initial setup in progress |
 | `Syncing` | Replication sync in progress |
 | `Rolling Update X/Y` | Data-tier rolling update progress |
-| `Sentinel Rolling Update X/Y` | Sentinel-tier rolling update progress (runs after the data tier, or alone on Sentinel-only spec changes) |
+| `Sentinel Rolling Update X/Y` | Sentinel-tier rolling update progress (runs after the data tier — except in the pass in which a data roll pauses on its sync timeout — or alone on Sentinel-only spec changes) |
 | `Failover in progress` | Sentinel-triggered leader switch |
 | `Error` | Error state (see `message` for details). **Covers two different things:** a data plane the operator cannot verify (an unreachable instance, a failed cluster health check, a paused roll), and a healthy cluster whose spec the operator cannot converge because a managed write is being refused. Read `message` and the `ReconcileBlocked` condition to tell them apart — and read the `Ready` condition for the data plane, which stays `True` in the second case on purpose. |
 

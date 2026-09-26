@@ -152,13 +152,18 @@ const (
 	// The refusal itself is never lifted -- deleting a second pod while the first
 	// is wedged is the failure the refusal exists to prevent. What the condition
 	// marks is the moment the operator stops ending the reconcile pass on the
-	// wait, so the rest of the pass (the Sentinel roll, no-master recovery, the
-	// steady-state split-brain check and the status write) runs again while the
-	// stall lasts. It clears by itself once the pod is gone.
+	// wait, so the rest of the pass (no-master recovery, the steady-state
+	// split-brain check and the status write) runs again while the stall lasts.
+	// It clears by itself once the pod is gone.
 	//
 	// There is no Event: a clean rolling update must emit zero Warnings
 	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md).
 	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
+	//
+	// Until 2026-09-26 the list above also named the Sentinel roll. A stalled data
+	// tier no longer releases it (ADR 0026 D11): the Sentinel update waits until
+	// the data tier has converged, as ADR 0024 D1 says -- with one known exception,
+	// the pass in which a data roll pauses (RollingUpdatePaused).
 	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
 
 	// ConditionTypePodRecreationStalled reports that the rolling update deleted a
@@ -167,10 +172,51 @@ const (
 	// it at all: the measured cause is an immutable-field sync error wedging pod
 	// creation on the lowest mismatching ordinal (T10). The roll of that tier
 	// holds; the rest of the pass -- the status write, the steady-state
-	// split-brain check, the Sentinel roll -- keeps running, the ADR 0026 D5
-	// shape applied to the absent pod instead of the terminating one. Cleared
-	// the moment the pod exists again.
+	// split-brain check and the no-master recovery -- keeps running, the ADR 0026
+	// D5 shape applied to the absent pod instead of the terminating one. The
+	// Sentinel roll is not among them: it waits for the data tier (ADR 0026 D11).
+	// Cleared the moment the pod exists again.
 	ConditionTypePodRecreationStalled ConditionType = "PodRecreationStalled"
+
+	// ConditionTypePodAvailabilityStalled reports that the rolling update of a tier
+	// is waiting on a pod that exists, is not being deleted and has not been
+	// available for longer than spec.rollingUpdate.syncTimeout -- a replacement on
+	// an unpullable image, a container that crashes at boot, a request no node can
+	// schedule. The clock is the pod's own: the lastTransitionTime of its Ready
+	// condition, or its creationTimestamp while it has none.
+	//
+	// The wait itself is not lifted: a pod on the current template comes back
+	// identical when deleted, so only the observation is bounded. What the condition
+	// marks is the moment the operator stops ending the reconcile pass on the wait,
+	// so the status write, the no-master recovery and the steady-state split-brain
+	// check run again while the stall lasts. The Sentinel roll does not: a holding
+	// data tier holds it too, because both tiers share spec.image. An outdated pod
+	// is never waited on at all -- it is replaced whether it is available or not --
+	// which is what lets a spec fix move a stalled roll on by itself.
+	//
+	// The reason names the tier: ValkeyPodNotAvailable for a data pod,
+	// SentinelPodNotAvailable for a Sentinel pod. It is a level: each tier's roll
+	// re-measures it on every pass that reaches it and retracts only its own
+	// report. The False reason PodAvailable is written only over a standing True,
+	// never onto a cluster that did not carry the condition. There is no Event.
+	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11.
+	ConditionTypePodAvailabilityStalled ConditionType = "PodAvailabilityStalled"
+
+	// ConditionTypePodSecurityUpdatePending reports that the only data pod of a
+	// spec.replicas: 1 cluster without persistence still runs as root -- it was
+	// built by an operator before every generated pod became rootless -- and that
+	// the operator deliberately does not replace it: there is no replica to fail
+	// over to and no volume to keep the data, so the restart would discard the
+	// dataset. The rootless posture applies on the pod's next restart for any other
+	// reason; deleting the pod applies it at once, with the data.
+	//
+	// A persistent single pod is not deferred -- it is replaced at the upgrade, with
+	// a restart but with its data -- and a multi-replica cluster is migrated by the
+	// ordinary failover-aware rolling update, so neither ever carries the condition.
+	// It is a level re-measured on every pass; the False reason
+	// PodSecurityUpdateApplied is written only over a standing True. There is no
+	// Event. See docs/adr/0032-generated-pods-run-rootless.md, D3.
+	ConditionTypePodSecurityUpdatePending ConditionType = "PodSecurityUpdatePending"
 
 	// ConditionTypeTLSMaterialStale reports that at least one pod is still running
 	// with TLS material older than the one in the TLS Secret it mounts.
@@ -340,6 +386,31 @@ const (
 	// ReasonPodRecreated clears PodRecreationStalled once the awaited pod exists
 	// again. Only written over an existing condition.
 	ReasonPodRecreated = "PodRecreated"
+
+	// ReasonValkeyPodNotAvailable is the PodAvailabilityStalled reason while the
+	// data tier's roll waits on a data pod that has not been available for longer
+	// than spec.rollingUpdate.syncTimeout. The message names the pod and the moment
+	// it stopped being available.
+	ReasonValkeyPodNotAvailable = "ValkeyPodNotAvailable"
+
+	// ReasonSentinelPodNotAvailable is the same report for the Sentinel tier's roll.
+	// The tier is in the reason because the two tiers evaluate the condition
+	// independently and each retracts only its own report.
+	ReasonSentinelPodNotAvailable = "SentinelPodNotAvailable"
+
+	// ReasonPodAvailable clears PodAvailabilityStalled once the tier that reported
+	// it no longer waits on an unavailable pod. Only written over a standing True.
+	ReasonPodAvailable = "PodAvailable"
+
+	// ReasonPodRunsAsRoot is the PodSecurityUpdatePending reason while the only data
+	// pod of a non-persistent single-pod cluster runs as root and its replacement is
+	// deferred. The message names the pod.
+	ReasonPodRunsAsRoot = "PodRunsAsRoot"
+
+	// ReasonPodSecurityUpdateApplied clears PodSecurityUpdatePending once no data pod
+	// update is deferred on account of the rootless migration any more. Only written
+	// over a standing True.
+	ReasonPodSecurityUpdateApplied = "PodSecurityUpdateApplied"
 
 	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
 	// cluster has no data pod carrying the instanceRole=master label, so the -rw
@@ -865,6 +936,9 @@ type PersistenceSpec struct {
 type RollingUpdateSpec struct {
 	// SyncTimeout is the maximum duration to wait for a replaced pod to
 	// complete replication sync before pausing the rolling update.
+	// The same budget bounds how long the rolling update waits on a pod that
+	// exists but never becomes available (an unpullable image, a crash at boot)
+	// before it reports the PodAvailabilityStalled condition naming that pod.
 	// Default: 5m.
 	// +optional
 	SyncTimeout *metav1.Duration `json:"syncTimeout,omitempty"`

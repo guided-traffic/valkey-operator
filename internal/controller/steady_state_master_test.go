@@ -1275,7 +1275,7 @@ func TestPostRollingUpdateChecks_RunsSteadyStateCheck(t *testing.T) {
 	var dialed []string
 	wireDemotionTarget(t, r, &dialed)
 
-	result, done, err := r.handlePostRollingUpdateChecks(context.Background(), v)
+	result, done, err := r.handlePostRollingUpdateChecks(context.Background(), v, false)
 
 	require.NoError(t, err)
 	assert.True(t, done)

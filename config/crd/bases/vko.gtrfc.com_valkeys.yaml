@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.22.0
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: valkeys.vko.gtrfc.com
 spec:
   group: vko.gtrfc.com
@@ -588,6 +588,9 @@ spec:
                     description: |-
                       SyncTimeout is the maximum duration to wait for a replaced pod to
                       complete replication sync before pausing the rolling update.
+                      The same budget bounds how long the rolling update waits on a pod that
+                      exists but never becomes available (an unpullable image, a crash at boot)
+                      before it reports the PodAvailabilityStalled condition naming that pod.
                       Default: 5m.
                     type: string
                 type: object
