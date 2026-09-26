@@ -366,7 +366,9 @@ clusters, so spreading three replicas needs three schedulable workers.
   `hostUsers: false`" skip in `test/e2e/pod_hardening_test.go` into a failure. **No CI leg sets
   it, because none can**: the legs run Kind inside Docker-in-Docker with containerd's `native`
   snapshotter, where such a pod fails with "container ID … cannot be mapped to a host ID"
-  (measured 2026-09-26 with the CI Kind config). A probe pod decides; without support the
+  (measured 2026-09-26 with the CI Kind config), or already at its sandbox
+  (`FailedCreatePodSandBox`, seen only as an Event — CI logs). A probe pod decides, reading its
+  container states and its Warning Events; without support the
   hardening e2e moves the cluster without the user namespace and skips only those assertions.
   The user-namespace half runs on a local Kind cluster (`make kind-create`, overlayfs).
 - Locally: `make kind-create` already builds control-plane + 3 workers, so

@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/ptr"
 
 	"github.com/guided-traffic/valkey-operator/test/testimages"
@@ -151,28 +152,47 @@ func (tc *testClients) userNamespacesSupported(t *testing.T, namespace string) (
 		_ = tc.kube.CoreV1().Pods(namespace).Delete(ctx, probe.Name, metav1.DeleteOptions{})
 	}()
 
-	supported, reason := false, ""
-	pollUntil(t, 2*time.Second, 2*time.Minute, func() (bool, string) {
+	// Two ways a node refuses, both measured on 2026-09-26: the container fails
+	// (CreateContainerError, local Kind with the native snapshotter) or the pod
+	// sandbox does (FailedCreatePodSandBox, the CI legs in Docker-in-Docker) -- and
+	// the second one shows only as an Event, the container stays ContainerCreating.
+	// A probe that has not started when the window closes counts as unsupported too,
+	// with whatever it last showed; E2E_REQUIRE_USER_NAMESPACES turns that into a
+	// failure where support is expected.
+	supported, reason := false, "did not start within 2m"
+	_ = wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, probe.Name, metav1.GetOptions{})
 		if err != nil {
-			return false, err.Error()
+			return false, nil
 		}
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodRunning {
 			supported = true
-			return true, string(pod.Status.Phase)
+			return true, nil
 		}
 		for _, st := range pod.Status.ContainerStatuses {
 			if w := st.State.Waiting; w != nil && w.Reason != "ContainerCreating" && w.Reason != "PodInitializing" {
 				reason = w.Reason + ": " + w.Message
-				return true, reason
+				return true, nil
 			}
 			if term := st.State.Terminated; term != nil && term.ExitCode != 0 {
 				reason = term.Reason + ": " + term.Message
-				return true, reason
+				return true, nil
 			}
 		}
-		return false, string(pod.Status.Phase)
-	}, "the user-namespace probe neither started nor reported why")
+		events, err := tc.kube.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: "involvedObject.name=" + probe.Name,
+		})
+		if err == nil {
+			for _, ev := range events.Items {
+				if ev.Type == corev1.EventTypeWarning {
+					reason = ev.Reason + ": " + ev.Message
+					return true, nil
+				}
+			}
+		}
+		reason = "did not start within 2m, phase " + string(pod.Status.Phase)
+		return false, nil
+	})
 	return supported, reason
 }
 

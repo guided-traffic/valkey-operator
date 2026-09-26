@@ -262,10 +262,17 @@ v1.33.4, containerd 2.1.3, `snapshotter = "native"`, single node): the init cont
 "mount callback failed … container ID 1109000192 cannot be mapped to a host ID", the observer's
 container with Kind's `createContainer` hook "permission denied", the roll held at its first
 replica, and the CR reported `PodAvailabilityStalled=True/ValkeyPodNotAvailable` — ADR 0026 D11
-doing its job. The CI log itself was not readable here (no API credentials); that the legs failed
+doing its job. ~~The CI log itself was not readable here (no API credentials); that the legs failed
 on this test is inferred from the reproduction and from the multi-node leg, which does not run the
-test, going green. With the probe the test passes on that config (user-namespace subtest skipped)
-and fails with the variable set; on a local Kind cluster with overlayfs it runs the whole test.
+test, going green.~~ *(Confirmed from the CI logs, 2026-09-26: on `b13377e` and on `a04e2d0` this
+test was the only failure of both single-node legs. In CI the refusal comes one step earlier than
+in the reproduction: the pod sandbox itself fails (`FailedCreatePodSandBox … OCI runtime create`),
+the container stays `ContainerCreating`, and the reason shows only as an Event — so the first probe
+on `a04e2d0`, which read container states alone, saw a pod stuck in `Pending` and timed out. The
+probe now also reads the probe pod's Warning Events and counts a pod that has not started within
+its two minutes as unsupported, with what it last showed.)* With the probe the test passes on the
+reproduced config (user-namespace subtest skipped) and fails with the variable set; on a local Kind
+cluster with overlayfs it runs the whole test, with the variable set, on both Valkey lines.
 So the user-namespace half is **verified locally only**, never in CI.
 
 **D6 — A pass's unit run must report zero SKIPs on the uncached run (`-count=1`)**, which is
