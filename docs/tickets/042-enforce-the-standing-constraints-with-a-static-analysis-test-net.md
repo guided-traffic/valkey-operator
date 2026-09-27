@@ -3,7 +3,10 @@
 Ticket 042, formerly S1 (`local_standing_constraints_enforcement.md`); renamed on 2026-09-27 when
 the tickets were numbered.
 
-> **Status: OPEN, nothing built. Verified 2026-08-26 on `HEAD` = `1c309d8`.** Index:
+> **Status: OPEN, nothing built. Verified 2026-08-26 on `HEAD` = `1c309d8`; re-verified
+> 2026-09-27 on `HEAD` = `4a7543e`, corrections in place below. One decision is open
+> ([Options](#options)); tests 1 and 2 need none ([Work list](#work-list)). Urgency: `later`
+> *(re-derived 2026-09-27, see History; the board row had `icebox`)*. Effort: M.** Index:
 > [`archive/039-findings-from-the-1-11-0-fleet-rollout.md`](archive/039-findings-from-the-1-11-0-fleet-rollout.md) (archived 2026-09-27, no longer maintained). Keep this line current — update it
 > in the same change that touches this ticket.
 >
@@ -16,22 +19,36 @@ the tickets were numbered.
 > **All three constraints still hold today — this is preventive work, not a repair:**
 >
 > * **Constraint 1** (no fleet-wide reconciler state): the baseline scan comes out **exactly
->   as this ticket predicts**. Non-test files in `internal/controller` have three
+>   as this ticket predicts**. Non-test files in `internal/controller` have ~~three~~
+>   *(corrected 2026-09-27: five — ADR 0033 added two sentinel errors,
+>   [`pod_hardening.go:22`](../../internal/controller/pod_hardening.go#L22) and
+>   [`:46`](../../internal/controller/pod_hardening.go#L46))*
 >   package-level `var`s and no unexpected mutable state:
->   [`condition_registry.go:84`](../../internal/controller/condition_registry.go#L84) (a
+>   ~~[`condition_registry.go:84`](../../internal/controller/condition_registry.go#L84)~~
+>   [`condition_registry.go:92`](../../internal/controller/condition_registry.go#L92)
+>   *(line corrected 2026-09-27)* (a
 >   constant-like table), [`foreign_object.go:71`](../../internal/controller/foreign_object.go#L71)
 >   and [`volumeclaim_conflict.go:46`](../../internal/controller/volumeclaim_conflict.go#L46)
 >   (two sentinel errors). Seeding the allowlist is therefore cheap and surfaces **no
 >   findings** — the stop-and-discuss point this ticket builds in is very likely a no-op.
+>   *(Added 2026-09-27: [ADR 0019](../adr/0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md)
+>   D3 states the rule for all of `internal/` (`0019:80`); outside `internal/controller` the one
+>   package-level `var` is the table
+>   [`internal/builder/tls_material.go:41`](../../internal/builder/tls_material.go#L41).)*
 > * **Constraint 2** (no metric written from a reconcile pass): no `prometheus`/`promauto`
 >   import anywhere in `internal/controller` or `internal/sidecar`.
-> * **Constraint 3** (a new managed kind inherits the ownership guard): **64** non-test
->   client-verb / `SetControllerReference` call sites against **76** guard-identifier
->   references. This is the real work in the ticket; tests 1 and 2 are a few hours together.
+> * **Constraint 3** (a new managed kind inherits the ownership guard): ~~**64**~~ non-test
+>   client-verb / `SetControllerReference` call sites against ~~**76**~~ guard-identifier
+>   references *(corrected 2026-09-27: 71 sites — 65 client-verb, `Status().Update` and
+>   `SetControllerReference` calls plus 6 calls of `writeWorkload`, which since 2026-09-26
+>   carries every StatefulSet and Deployment write — against 82 guard-identifier references)*.
+>   This is the real work in the ticket; tests 1 and 2 are a few hours together.
 >
 > **Effort: M (1–2 days).** Zero production code changes. It slips to L only if allowlist
 > seeding for constraint 3 exceeds ~15 entries, which this ticket already makes a
-> stop-and-discuss point rather than something to pad through.
+> stop-and-discuss point rather than something to pad through. *(2026-09-27: seeded by the
+> rule as written it comes to 19 pairs, so the stop point triggers; the structural exemption
+> recommended under [Options](#options) brings it to 4.)*
 >
 > **Why it is worth doing even though nothing is broken:** constraint 1 is the safety
 > argument for `--max-concurrent-reconciles=4`. One future package-level map breaks
@@ -78,7 +95,13 @@ stdlib only, same style of "test as lint" as `rbac_drift_test.go`). They run und
 
 Parse every non-test file in `internal/controller`. Fail on any package-level `var` whose
 declared or inferred type is mutable (map, slice, chan, pointer, or a struct type — anything
-a concurrent reconcile pass could observe another pass through).
+a concurrent reconcile pass could observe another pass through). *(Added 2026-09-27: ADR 0019
+D3 states the rule for all of `internal/` (`0019:80`), and the reconciler calls into
+`internal/builder`, `internal/health` and `internal/valkeyclient`, so scan every package under
+`internal/`; the one extra allowlist entry is `internal/builder/tls_material.go:41`. With every
+existing `var` allowlisted by name, "any package-level `var` not on the allowlist fails" is
+enough and needs no type inference from syntax. `errors.New` returns a pointer, so the type rule
+as written would flag the sentinels and lean on the allowlist anyway.)*
 
 Allowlist, checked by variable name and asserted immutable-by-use:
 
@@ -116,17 +139,32 @@ The ambitious one, and the one that pays for the ticket. Scope it precisely:
 - Walk every function in `internal/controller` (non-test files). Collect every call site of
   the reconciler's client verbs: `r.Create`, `r.Update`, `r.Patch`, `r.Delete`, and the
   `controllerutil.SetControllerReference` stamp (a write like any other — it decides what the
-  garbage collector takes with the CR, ADR 0020 NA62).
+  garbage collector takes with the CR, ADR 0020 NA62). *(Added 2026-09-27: also
+  `r.Status().Update` / `r.Status().Patch`, and `r.writeWorkload`
+  ([`pod_hardening.go:54`](../../internal/controller/pod_hardening.go#L54)), through which every
+  StatefulSet and Deployment write goes since 2026-09-26 —
+  [`valkey_controller.go:1303`](../../internal/controller/valkey_controller.go#L1303), `:1372`,
+  `:1473`, `:1525`, `:2048`, `:2075`. Without it a new unguarded caller of `writeWorkload`
+  escapes the net.)*
 - For each call site, require **either** that the enclosing function's body (directly, not
   transitively) references at least one guard identifier —
   `IsControlledBy`, `deleteIfOwned`, `deleteOwnedPod`, `podIsOurs`, `podUnderNameIsOurs`,
   `ownedDataStatefulSet`, `filterOwnedPods` — **or** that the `(function, verb)` pair is on
-  the explicit allowlist.
+  the explicit allowlist. *(Added 2026-09-27: all seven exist,
+  [`foreign_object.go:182`](../../internal/controller/foreign_object.go#L182), `:226`, `:238`,
+  `:264`, `:283`, `:305`; add `legacySentinelSecretIsOurs`
+  ([`valkey_controller.go:1733`](../../internal/controller/valkey_controller.go#L1733)), the
+  proof `deleteLegacySentinelSecret` uses, or that guarded delete shows as unguarded.)*
 - The allowlist is a `map[string]string` in the test: key `"funcName/verb"`, value a
   one-line justification. Legitimate entries fall into known families:
   - writes to the CR itself and its status (`updateStatus`, `updatePhase`,
     `setStatusCondition`, annotation writes on `v` — the CR is the owner, guards do not
-    apply);
+    apply); *(corrected 2026-09-27: under the direct-body rule the pairs are the callees that
+    hold the write — `persistStatus`, `writePhase`, `writeStatusCondition`
+    ([`valkey_controller.go:2569`](../../internal/controller/valkey_controller.go#L2569), `:2627`,
+    `:2708`) — not their callers `updateStatus`, `updatePhase`, `setStatusCondition`
+    (`:2181`, `:2605`, `:2665`); how to exempt them is the open decision under
+    [Options](#options))*
   - pod writes/deletes in functions whose *caller* proved provenance and passed the proven
     object in (e.g. `deleteOwnedPod` itself; the rolling-update helpers that receive an
     already-filtered pod) — the justification names the proving caller;
@@ -167,8 +205,14 @@ padding it.
   including one honest sentence on what the test does **not** prove (guard-on-wrong-object,
   transitivity). Residual-risks entry for the allowlist mechanism: an unjustified allowlist
   line is the new way to defeat the net, and review of that line is the defence.
-- `CLAUDE.md`: one line under the reconcile-concurrency and metrics sections each, pointing
-  at the tests, so the next agent finds the net before re-deriving the rule.
+- ~~`CLAUDE.md`: one line under the reconcile-concurrency and metrics sections each, pointing
+  at the tests, so the next agent finds the net before re-deriving the rule.~~
+  *(corrected 2026-09-27: since
+  [ADR 0035](../adr/0035-the-readme-advertises-the-reference-lives-under-docs.md) contributor
+  knowledge lives in `docs/developer/` and `DEVELOPER.md`. The pointers go into the table of
+  convention-guarding tests,
+  [`docs/developer/testing.md:48-53`](../developer/testing.md), and into the managed-object
+  checklist, [`DEVELOPER.md:410-430`](../../DEVELOPER.md).)*
 
 ## Verification (Definition of Done)
 
@@ -178,10 +222,14 @@ Mutation checks, per the repo's revert-check policy (ADR 0017):
 2. **Mutation 1**: add `var passCounter = map[string]int{}` at package level in
    `internal/controller` → `TestNoPackageLevelMutableState` fails and names it. Revert.
 3. **Mutation 2**: add a `prometheus` import to `valkey_controller.go` →
-   `TestNoMetricsWrittenFromReconcile` fails. Revert.
+   `TestNoMetricsWrittenFromReconcile` fails. Revert. *(Added 2026-09-27: an unused import does
+   not compile, so the mutation needs a use inside a function body, e.g.
+   `_ = prometheus.NewRegistry()`; a package-level use would trip test 1 as well.)*
 4. **Mutation 3**: comment out the `IsControlledBy` check in one guarded reconcile function
    (e.g. `reconcileConfigMap`) → `TestEveryWriteAndDeleteIsGuardedOrAllowlisted` fails for
-   exactly that function/verb pair. Revert.
+   ~~exactly that function/verb pair~~ *(corrected 2026-09-27: every verb of that function, for
+   `reconcileConfigMap` the three pairs `SetControllerReference`, `Create` and `Update`, since the
+   rule asks per `(function, verb)` pair and the function holds one guard)*. Revert.
 5. **Mutation 4**: add a fictional `reconcileWidget` with a bare `r.Update` → same test
    fails; adding an allowlist line makes it pass (proving the review-hook mechanism). Revert.
 6. `make lint` and `make cyclo` green.
@@ -194,3 +242,130 @@ Mutation checks, per the repo's revert-check policy (ADR 0017):
 - Verifying guards act on the *right* object — that stays with unit tests and review.
 - The chart/RBAC net — exists (`rbac_drift_test.go`).
 - Any change to reconcile behaviour. This ticket adds tests and doc pointers only.
+
+## Seeding measurement (2026-09-27, `HEAD` = `4a7543e`)
+
+**Verified.** The measurement comes from a throwaway `go/ast` scan outside the repository (its
+source is not kept). It applies this ticket's own rule to the non-test files of
+`internal/controller`: the verbs above, including `writeWorkload` and `Status().Update`, and a
+guard counted when its identifier appears anywhere in the enclosing function body. The result is
+**71 call sites in 66 `(function, verb)` pairs, 19 of them unguarded**:
+
+- **14 pairs write the CR itself.** 11 are annotation writes in
+  [`rolling_update.go`](../../internal/controller/rolling_update.go): `persistKnownMaster`
+  `:1079`, `ensureWaitBound` `:1182`, `clearRecreationWait` `:2204`, `clearSyncWaitTimestamp`
+  `:2670`, `incrementReconnectResetCount` `:3254`, `clearReconnectResetCount` `:3266`,
+  `setRollingUpdateState` `:3415`, `clearRollingUpdateState` `:3468`, `setFailoverTriggered`
+  `:3512`, `setFailoverTimestamp` `:3521`, and `writeManualFailoverState` `:4143` and `:4158`.
+  The other 3 are status writes in
+  [`valkey_controller.go`](../../internal/controller/valkey_controller.go): `persistStatus`
+  `:2569`, `writePhase` `:2627` and `writeStatusCondition` `:2708`. Each of the 14 passes either
+  the parameter `v *vkov1.Valkey` or `fresh := &vkov1.Valkey{}` (`rolling_update.go:4153-4158`).
+- **2 pairs are `writeWorkload`'s own `Create` and `Update`**
+  ([`pod_hardening.go:59`](../../internal/controller/pod_hardening.go#L59), `:61`). Its callers
+  prove ownership.
+- **1 pair is `deleteOwnedPod`** ([`foreign_object.go:307`](../../internal/controller/foreign_object.go#L307)),
+  which is itself the guard; its callers prove the pod with `podIsOurs`.
+- **1 pair is `deleteLegacySentinelSecret`**
+  ([`valkey_controller.go:1716`](../../internal/controller/valkey_controller.go#L1716)). It is
+  guarded by `legacySentinelSecretIsOurs`, which is not in the guard list; adding it removes the
+  pair.
+- **1 pair is `deleteLegacyServices`**
+  ([`valkey_controller.go:936-962`](../../internal/controller/valkey_controller.go#L936-L962)).
+  It scans ownerReferences by UID, with no `IsControlledBy` and no UID precondition. This is the
+  known open item of [ADR 0006](../adr/0006-delete-only-what-the-operator-owns.md) (`0006:32`,
+  `:336`), and **no ticket carries it**. The filing rule wants a file for it; this enrichment did
+  not create one.
+
+Mutation 3 works as designed *(on three pairs, not one, see the DoD)*: `reconcileConfigMap` holds exactly one guard reference,
+`IsControlledBy` at [`valkey_controller.go:843`](../../internal/controller/valkey_controller.go#L843).
+Test 2 finds nothing today: `client_golang/prometheus` is imported only by
+`internal/metrics/collector.go` and `internal/observer/{observer,metrics,server}.go`.
+
+**Not verified:** `make test-unit`, `make lint` and `make cyclo` were not run. The scan matches
+guards by identifier, as this ticket's rule does, so its counts are that rule's result, not a
+soundness claim.
+
+## Options
+
+One decision, and it has to be taken before test 3 is written. Tests 1 and 2 do not wait on it.
+
+### Decision 1 — how test 3 treats a write on the CR itself
+
+- **A. Exempt it structurally.** A call whose object argument is an identifier the enclosing
+  function declares as a parameter of type `*vkov1.Valkey`, or assigns from `&vkov1.Valkey{}`,
+  counts as a CR self-write. `go/ast` reads that from `fd.Type.Params` and the assignment, so the
+  test stays stdlib-only. **(recommended)** The allowlist drops to 4 entries (`writeWorkload`
+  ×2, `deleteOwnedPod`, `deleteLegacyServices`), below the ~15 stop point, and each entry
+  documents a real caller-proves relation or a known residual. The rule matches all 14 CR writes
+  in the tree. A CR written through a differently typed variable would show up as unguarded,
+  which is the safe direction. The operator never writes another `Valkey`, so the exemption
+  hides no write. *(Review 2026-09-27: "object argument" has to be pinned per verb, or A opens
+  a hole. It is the argument after `ctx` for `Create`, `Update`, `Patch`, `Delete` and
+  `Status().Update`/`Patch`, and the **second** argument (the controlled object) of
+  `SetControllerReference(owner, controlled, scheme)`. All 13 `SetControllerReference` calls pass
+  `v` as the **first** argument, so a test that exempts a call when *any* argument is the CR
+  would exempt every ownerReference stamp, the write ADR 0020 D1 calls the one that decides what
+  the garbage collector takes. Mutation 3 catches it only if it expects every pair of
+  `reconcileConfigMap`: removing its one guard (`valkey_controller.go:843`) leaves three verbs
+  unguarded, `SetControllerReference` `:823`, `Create` `:831` and `Update` `:857`, not one, and
+  the `SetControllerReference` pair is the one an any-argument exemption would drop.)*
+- **B. Allowlist every pair, as the ticket was written.** 19 entries, 14 of them with the same
+  justification ("the CR is the owner"). That passes the ~15 stop point, and a line repeated 14
+  times weakens the review hook the ticket exists for.
+- **C. Exempt the CR writers by function name.** This is B with the list moved: every new
+  annotation helper still needs a line, and nothing is gained.
+- **D. Type-check with `go/types` instead of reading syntax.** Exact, but it needs the package's
+  imports: either `golang.org/x/tools/go/packages` (not in `go.mod`, so a new module
+  requirement, against the stdlib constraint) or the stdlib source importer, which type-checks
+  controller-runtime and client-go from source on every `make test-unit` (runtime not measured).
+
+## Decision
+
+Not yet decided.
+
+## Work list
+
+1. **[XS, no decision] Tests 1 and 2**, the first two tests of
+   `internal/controller/standing_constraints_test.go`:
+   - Test 1 scans every package under `internal/`, because ADR 0019 D3 states the rule for all of
+     `internal/` (`0019:80`), and fails on any package-level `var` not on the named allowlist.
+     The allowlist has 6 entries: `conditionRegistry`, `errForeignObject`,
+     `errSeccompProfileNotAllowed`, `errUserNamespacesDropped`, `errRecreateRequired` and
+     `tlsMaterialKeys`.
+   - Test 2 is written as designed.
+   - Status notes go on ADR 0019 D3 and ADR 0021 D3, and two rows into
+     `docs/developer/testing.md:48-53`.
+2. *(waits on Decision 1)* Test 3, with its seeded allowlist and mutations 3 and 4. It includes
+   the 2026-09-27 corrections to its design above, which need no decision: `writeWorkload`,
+   `Status().Update` and `Status().Patch` among the verbs, and `legacySentinelSecretIsOurs`
+   among the guards. Then the ADR 0020 status note and residual risk, and the pointer in
+   `DEVELOPER.md:410-430`.
+3. *(no decision; it is a filing, not an XS code item)* A ticket for `deleteLegacyServices`, the
+   ADR 0006 open item. Report it to Hans together with the seeded allowlist (DoD step 7).
+4. Close ([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md)): the rule is
+   already in ADRs 0019, 0020 and 0021, and the extraction is their status notes plus the two
+   developer pointers. Then `git grep -nwE 'T42|042|S1'` outside `docs/tickets/`, and move the
+   file to `archive/`.
+
+## History
+
+- 2026-09-27: adversarial review of the enrichment below. The ADR 0019 D3 rule sits at
+  `0019:80`, not `:79` (three places fixed before commit). Decision 1 A gains a note pinning
+  "object argument" per verb: every `SetControllerReference` passes the CR as its first
+  argument, so an exemption keyed on any argument would exempt every ownerReference stamp. The
+  DoD's mutation 3 is corrected in place: it fails three pairs of `reconcileConfigMap`, not one.
+  Recommendation, urgency and effort unchanged.
+- 2026-09-27: enriched - the status block is re-verified on `4a7543e` and corrected in place:
+  five package-level vars (was three), 71 call sites against 82 guard references (was 64 and
+  76). The test 3 design gains `writeWorkload`, `Status().Update` and
+  `legacySentinelSecretIsOurs`. The seeding measurement is added (19 unguarded pairs), with
+  Options for the one open decision, a work list marking tests 1 and 2 as XS with no decision,
+  and this History. The `CLAUDE.md` pointer is replaced by `docs/developer/testing.md` and
+  `DEVELOPER.md` (ADR 0035). **Urgency re-derived: `later`, was `icebox`** on the board row
+  ([archive/039](archive/039-findings-from-the-1-11-0-fleet-rollout.md), ICEBOX section). Rule 4
+  matches: the complete stdlib-only design is a cheap known fix, and the open decision is how
+  deep the matching goes, not a product call. **Effort stays M**; the board row's L assumed the
+  19-entry allowlist that Decision 1 A avoids.
+- 2026-09-27 - renamed from `local_standing_constraints_enforcement.md` (S1) to ticket 042 when
+  the tickets were numbered (recorded under the title).

@@ -4,8 +4,8 @@ title: records of who the master is lag the real master after a handover (seen o
 state: decided
 severity: low
 security: none
-urgency: later
-effort: M
+urgency: later        # rule 4 since 2026-09-27: both XS corrections (ADR 0002 D11, the valkey_controller.go comment) landed; changes 1 and 2 are decided and not built
+effort: L             # was M (History 2026-09-27)
 filed-from: check of the v1.13.0 upgrade on wds18-k8s-main, namespace database-examples, 2026-09-26
 opened: 2026-09-26
 decided: 2026-09-27
@@ -97,7 +97,15 @@ The three observations below are not caused by v1.13.0. Every mechanism involved
      ([`checker.go:115`](../../internal/health/checker.go)), and never reads the label. One
      field, two meanings — which is why B's status was right while A's was wrong.
    - That is its documented rule (the comment at `:2300-2322`): the label is the `-rw`
-     selector, so it names the pod that receives writes.
+     selector, so it names the pod that receives writes. *(2026-09-27: the comment starts at
+     [`:2289`](../../internal/controller/valkey_controller.go), and its second line — "The HA
+     path has its own answer (clusterState.MasterPod, from Sentinel)" — is false by reading, as
+     is the last sentence of [ADR 0002 D11](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md)
+     (`:331-332`, "the master as Sentinel reports it"): `findMaster` asks every data pod for
+     `INFO replication` and takes the one answering `role:master`, the most connected replicas
+     on a tie ([`checker.go:218-258`](../../internal/health/checker.go)); no Sentinel is asked.
+     Both corrections are XS and need no decision — Work list.)* *(Both landed 2026-09-27, History:
+     the comment and D11 now name `findMaster` and say that no Sentinel is asked.)*
    - At 20:45:43 that was still `valkey9-1`. The sidecar polls every 1 s and had not
      relabelled yet.
 2. **The pass saw the stale label and asked for nothing.** The branch at
@@ -263,6 +271,18 @@ unchanged between `v1.12.8` and `v1.13.0`: `git diff -U0` has no hunk there, onl
 - Behaviour on persistent clusters and on the production namespaces. They were not looked
   at.
 
+**Re-verified 2026-09-27 (read at `4a7543e`):** every code location in Fact and Options — the
+ones that moved are corrected in place; nothing changed in the cited mechanisms since
+`f5c6886` (`git diff f5c6886 4a7543e` touches only comments in `rbac.go` and `labeler.go` among
+the cited files); controller-runtime is still `v0.25.1` with `defaultSyncPeriod = 10 * time.Hour`
+at `pkg/cache/cache.go:45`; `managerOptions` sets no `SyncPeriod`
+([`cmd/main.go:102-110`](../../cmd/main.go)); the "Pod watch" premise sentences, by grep.
+**Newly found by reading:** ADR 0002 D11's last sentence and the comment at
+`valkey_controller.go:2290` ~~misstate~~ *(misstated, until the XS corrections of 2026-09-27)* the
+Sentinel arm's source (Fact A, mechanism 1).
+**Not verified 2026-09-27:** every **run** fact — the wds18 logs live in an untracked scratchpad
+file and were not re-read.
+
 ## Impact
 
 - **A: a status field is wrong, for up to the resync period.**
@@ -366,7 +386,9 @@ return without a recheck. Each calls `requestRecheck(ctx, d)`.
 already holds the answer that makes the label stale (`info.Role != master`,
 [`:261-267`](../../internal/controller/steady_state_master.go)). It records the pod name on
 the pass state (`passState`,
-[`foreign_object.go:89-130`](../../internal/controller/foreign_object.go) — the carrier the
+~~[`foreign_object.go:89-130`](../../internal/controller/foreign_object.go)~~ *(corrected
+2026-09-27: [`foreign_object.go:89-146`](../../internal/controller/foreign_object.go), with
+`requestRecheck` at `:126` and `applyRecheck` at `:138`)* — the carrier the
 recheck already rides), and `currentMasterPod`
 ([`valkey_controller.go:2323-2341`](../../internal/controller/valkey_controller.go)) skips
 rule 1 when its one labelled pod is that name, falling to the annotation, which after
@@ -385,6 +407,9 @@ that completes the roll, and A1's recheck confirms the relabel.
   routing lag becomes a condition's business (A3), not the field's.
 - Cost: XS on top of A1. One field, three lines, two tests; the `currentMasterPod` comment
   rewritten.
+- *(added 2026-09-27)* Touches [ADR 0002 D11](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md)
+  (`:321-332`), which states the rule A2 changes — the label first, as the `-rw` selector — so
+  A2 amends D11; the list above missed it.
 
 **A3 — a sole master label on a pod that is not master is reported.** Today it is one log
 line while `Ready` reads `True`, the phase `OK`, `status.masterPod` the replica, and every
@@ -404,7 +429,11 @@ observer.
   with one live label instead of none.
 - Touches: ADR 0012 D12
   ([`:407`](../adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md), which
-  describes the level), the README condition row, and the registry row
+  describes the level), the README condition row *(2026-09-27: since the documentation
+  restructure a condition has three places — the row at [`README.md:522`](../../README.md),
+  the section at [`docs/operations/status.md:71`](../operations/status.md#rwserviceempty) and
+  the row at [`docs/developer/package-map.md:49`](../developer/package-map.md) — plus the
+  `ConditionType` next to [`valkey_types.go:239-258`](../../api/v1/valkey_types.go))*, and the registry row
   ([`condition_registry.go:236-244`](../../internal/controller/condition_registry.go)) —
   the same row with a new reason, or a new level if "Empty" may not mean "misrouted"; ADR
   0027 decides that by the name, not by the mechanism.
@@ -440,7 +469,23 @@ memory. Every relabel then re-enters the pass inside the API round trip.
     That reasoning stands — A4 adds no evidence and changes no evidence rule — and it never
     weighed the timeliness of the operator's own records, so the amendment adds a
     requirement rather than overturning one. The other eight need one clause each. That
-    sweep is most of the effort.
+    sweep is most of the effort. *(corrected 2026-09-27 at `4a7543e`: ~~ADR 0002:214~~
+    [ADR 0002:230](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md), ~~`CLAUDE.md:834`~~
+    `CLAUDE.md:902`, ~~`rootless-migration.md:69`~~
+    [`docs/security/rootless-migration.md:55`](../security/rootless-migration.md); ADR 0011 D13
+    is `:222`, D21 `:306`. The list missed three Go comments that state the premise —
+    [`rolling_update.go:355-356`](../../internal/controller/rolling_update.go),
+    [`steady_state_master.go:668-669`](../../internal/controller/steady_state_master.go),
+    [`sidecar_pending_condition_test.go:109`](../../internal/controller/sidecar_pending_condition_test.go)
+    — so the sweep is twelve places outside `docs/tickets/`; the archived T31 is history and
+    needs none. *(Review 2026-09-27: ~~twelve~~ **thirteen** — two more test comments wrap
+    between "no Pod" and "watch" and are missed by the grep below:
+    [`steady_state_master_test.go:1301-1302`](../../internal/controller/steady_state_master_test.go)
+    and [`pod_security_migration_test.go:513-514`](../../internal/controller/pod_security_migration_test.go).
+    `grep -rnE "Pod watch|no Pod *$" internal docs CLAUDE.md DEVELOPER.md`, outside
+    `docs/tickets`, gives 14 hits at `4a7543e`: these thirteen and the heading of the rejected
+    alternative at ADR 0011 `:417`, which stays.)* The sentences that say the next *guaranteed* pass is the cache resync stay
+    true: the watch fires on a change, it guarantees no pass.)*
   - **Pass volume**: one pass per relabel. `Owns(StatefulSet)` carries no predicate, so every
     readiness flip already re-enters, and every role change that kills a pod comes with one;
     the wds18 chaos schedule adds about two relabels per kill. ADR 0019 D3 is untouched: no
@@ -448,7 +493,7 @@ memory. Every relabel then re-enters the pass inside the API round trip.
   - **Security, `hardening` class, not `boundary`**: the map function trusts a label, so
     whoever can patch pod labels in a namespace can enqueue passes for a CR of that
     namespace — and the sidecar's own `resourceNames`-bound `patch` grant
-    ([`rbac.go:72`](../../internal/builder/rbac.go)) already can, on the very label the
+    (~~[`rbac.go:72`](../../internal/builder/rbac.go)~~ *(corrected 2026-09-27: [`rbac.go:73-74`](../../internal/builder/rbac.go))*) already can, on the very label the
     predicate watches. The pass it triggers writes nothing it would not write anyway: every
     write is ownership-proven (ADR 0020), the work queue deduplicates per CR, the rate
     limiter backs off. ADR 0031:185 calls the watch "one this operator deliberately does not
@@ -565,7 +610,7 @@ own candidate. When the majority names the pod itself and `/data` holds no `dump
   reproduction shows C2's flag does not cover the window.
 
 **The same first-voice shape exists at two more sites**, for the record. The labeler's
-cross-check `GetMasterAddress` ([`labeler.go:350`](../../internal/sidecar/labeler.go)) takes
+cross-check `GetMasterAddress` (~~[`labeler.go:350`](../../internal/sidecar/labeler.go)~~ *(corrected 2026-09-27: [`labeler.go:351`](../../internal/sidecar/labeler.go))*) takes
 the first answering Sentinel — a lagging one keeps the promoted pod labelled `replica` for
 one more poll, direction `-rw` empty, safe. The roll's `getSentinelMasterPodName`
 ([`rolling_update.go:1740`](../../internal/controller/rolling_update.go)) does too, which
@@ -625,7 +670,7 @@ already names as the baseline; Sentinel pods carry no labeler. ADR 0011 D14 keep
 ([`drain.go:172-179`](../../internal/sidecar/drain.go)): `PatchLabel(peer, instanceRole,
 master)`, best-effort like the stamp. The grant exists — the stamp already patches the peer,
 and the sidecar Role carries `get, patch` on every pod of the StatefulSet
-([`rbac.go:72`](../../internal/builder/rbac.go), ADR 0012 D8 step 3). The peer's own labeler
+(~~[`rbac.go:72`](../../internal/builder/rbac.go)~~ *(corrected 2026-09-27: [`rbac.go:73-74`](../../internal/builder/rbac.go))*, ADR 0012 D8 step 3). The peer's own labeler
 writes the same value on its next poll; both derive it from `ROLE`, so they cannot disagree.
 Non-Sentinel only, the drain's scope (ADR 0012 D10). It closes the drain's empty window to
 the API round trip. Touches ADR 0012 D6 and D12 by one clause each ("each pod's sidecar
@@ -687,10 +732,48 @@ the weighing that carried the mark is in Options.
 | 6 | a misrouted `-rw` selection reported on the CR | **A3 as a new level `RWServiceMisrouted`** — same evaluator as `RWServiceEmpty` (`reportRWServiceEndpoints`), judged from the A2 verdict on the non-Sentinel arm and `clusterState.MasterPod` against the labelled pod on the Sentinel arm; own registry row, README row, ADR 0012 D12 sentence; presence-guarded like its sibling | 2026-09-27 |
 | 7 | the crash-restart adjacent finding | **its own ticket, [T36](036-non-persistent-master-restarts-empty.md)** — no board row: Hans rejected the board outright ("a board entry was never sufficient"); a finding is a new ticket or an appendix to the existing ticket of its family, and this one differs from T35 in mechanism and severity, so it is new. The Kind reproduction first, as proposed; severity high is an estimate until then | 2026-09-27 |
 
+## Work list *(added 2026-09-27)*
+
+No decision is open; every item below follows the table above.
+
+- **XS, needs no decision, can land today** — the two false statements about the Sentinel
+  arm's source (Fact A, mechanism 1), each corrected in place with a dated note:
+  - [ADR 0002 D11](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md) `:331-332`, "the
+    master as Sentinel reports it" → the pod answering `role:master` to `INFO replication`,
+    found by `findMaster`; no Sentinel is asked. The ADR's `Status` gets a dated line naming
+    the correction (CLAUDE.md, ADRs must be kept current).
+  - the comment at [`valkey_controller.go:2290`](../../internal/controller/valkey_controller.go),
+    "(clusterState.MasterPod, from Sentinel)" → the same.
+  - Urgency returns to `later` (rule 4) when both land. Decision 1 amends D11 again later
+    (A2); this correction does not wait for it.
+  - **Done 2026-09-27**, both, each with a dated note (History).
+- **Change 1 — decisions 1, 2, 5, 6, one change (M):** A1 + A2
+  ([`steady_state_master.go:250`, `:264`](../../internal/controller/steady_state_master.go),
+  [`valkey_controller.go:2323-2341`](../../internal/controller/valkey_controller.go)); B2 after
+  `persistStatus` ([`valkey_controller.go:2460`, `:2527`](../../internal/controller/valkey_controller.go),
+  [`checker.go:325-341`](../../internal/health/checker.go),
+  [`rolling_update.go:1070`](../../internal/controller/rolling_update.go)); A4 next to the Secret
+  watch ([`valkey_controller.go:2996`](../../internal/controller/valkey_controller.go)); A3 as
+  `RWServiceMisrouted` ([`rw_service_report.go:37`](../../internal/controller/rw_service_report.go),
+  [`condition_registry.go:236`](../../internal/controller/condition_registry.go)); the ~~twelve-place~~
+  *(review 2026-09-27: thirteen-place, Options A4)* "no Pod watch" sweep (Options A4) and the ADR amendments (0002 D11, 0008 D3, 0011 D12/D21,
+  0012 D12); the full e2e suite on both legs. A1 + A2 alone would be XS, but decision 5 binds
+  them to A4 — shipping them first is a re-decision of 5, not an implementation choice.
+- **Change 2 — decision 3 (M):** the Kind reproduction, in one session with the
+  [T36](036-non-persistent-master-restarts-empty.md) reproduction (both kill the master of a
+  Sentinel cluster); then C1 + C2 in the Sentinel data init
+  ([`statefulset.go:288-316`](../../internal/builder/statefulset.go)), a builder unit test,
+  `make test-image-tools`, the e2e rerun.
+
 ## Verification
 
 Per option, each with the revert check ADR 0017 asks for: the named test fails without the
 change.
+
+- [x] **XS corrections** *(added 2026-09-27)*. `git grep -n "as Sentinel reports it\|MasterPod, from Sentinel"`
+  returns only struck text; `make lint` stays green (a comment change); no ticket is cited in
+  either file (ADR 0034 D7). *(Run 2026-09-27 after the fix: the grep returns only the struck
+  text at ADR 0002 `:342`; no added line cites a ticket. `make lint` was not run.)*
 
 - [ ] **A1.** Unit: a pass whose sole labelled pod answers `role:slave` returns a requeue of
   the chosen delay, and so does a pass whose sole labelled pod is terminating. Revert:
@@ -699,7 +782,9 @@ change.
   `INFO replication` master within one recheck — the fixture already reads that master by
   INFO (`findMasterPod`,
   [`rolling_update_test.go:195-209`](../../test/e2e/rolling_update_test.go)); the status
-  comparison is the new assertion.
+  comparison is the new assertion. *(2026-09-27: `:195-209` are its calls; the helper is
+  defined at [`rolling_update_test.go:733`](../../test/e2e/rolling_update_test.go), the test at
+  [`:97`](../../test/e2e/rolling_update_test.go).)*
 - [ ] **A2.** Unit: the completing pass writes the annotation's pod into `status.masterPod`
   when the sole label was proven stale in the same pass, and the labelled pod when nothing
   was proven. Revert: without the pass-state field the first fails.
@@ -707,7 +792,8 @@ change.
   that is not the INFO master reports `RWServiceMisrouted=True/LabeledPodIsNotMaster`, and
   clears it on the next settled pass whose label matches; `RWServiceEmpty` is untouched by
   the same fixture. Its own registry row; the ADR 0027 guard stays green; the README row
-  exists; ADR 0012 D12 names both levels.
+  exists; ADR 0012 D12 names both levels. *(2026-09-27: and the `docs/operations/status.md`
+  section and the `docs/developer/package-map.md` row, Options A3.)*
 - [ ] **A4.** Unit: the predicate fires on a changed `instanceRole` value only — not on a
   status-only pod update, not on a pod without the cluster label — and the map function
   returns the CR named by the pod's namespace and cluster label. Integration (envtest): a
@@ -715,13 +801,18 @@ change.
   it produces. Sweep: `grep -rn "no Pod watch" docs CLAUDE.md DEVELOPER.md`
   returns only sentences that say when the watch was added. *(File list amended 2026-09-27:
   `SECURITY_ARCHITECTURE.md` is now `docs/security/`, which `docs` covers, and `DEVELOPER.md`
-  is new.)*
-- [ ] **B1.** The ADR 0008 D3 sentence.
+  is new.)* *(corrected 2026-09-27: that grep misses `internal/` and every sentence wrapped
+  between "no" and "Pod watch" — three of the twelve places; the sweep is
+  `grep -rn "Pod watch" internal docs CLAUDE.md DEVELOPER.md`, each hit read.)* *(Review
+  2026-09-27: that grep still misses a sentence wrapped between "Pod" and "watch" — two test
+  comments, Options A4; the sweep is `grep -rnE "Pod watch|no Pod *$" internal docs CLAUDE.md
+  DEVELOPER.md`, each hit read, and a line break elsewhere in the phrase can still hide one.)*
+- [ ] **B1.** The ADR 0008 D3 sentence. *(Not chosen — decision 2 took B2; kept as filed.)*
 - [ ] **B2.** Unit: with a majority of Sentinels and INFO naming P and the annotation naming
   Q, the pass writes P; with the Sentinels split, with INFO disagreeing, or with P outside
   the ordinals, it writes nothing; on a non-Sentinel cluster it never runs. Revert: without
   the refresh the first fails. Kind: a Sentinel cluster in the shape of
-  `TestE2E_HAClusterWithSentinel`, master deleted, `+switch-master` seen; then the
+  `TestE2E_HAClusterWithSentinel` ([`standalone_test.go:121`](../../test/e2e/standalone_test.go)), master deleted, `+switch-master` seen; then the
   annotation and the monitor line of `<name>-sentinel-config` name the new master within
   one pass after `Ready`.
 - [ ] **C, reproduction first** — the filing's item, sharpened. On Kind, a Sentinel cluster;
@@ -738,7 +829,7 @@ change.
   restricted posture; `awk` has its line in `RequiredImageTools` or gets one (ADR 0017).
   Kind: the reproduction above, re-run, with the replacement booting as a replica of the
   promoted pod on every run and the health checker logging no "Multiple masters".
-- [ ] **L1.** Measured first, on a TLS Sentinel cluster on Kind: sidecar and `valkey-server`
+- [ ] **L1.** *(Not chosen — decision 4 is "nothing"; L1 and L2 kept as filed.)* Measured first, on a TLS Sentinel cluster on Kind: sidecar and `valkey-server`
   CPU at 1 s against 250 ms over ten minutes. Then the constant, the builder test, and an
   e2e assertion that the `-rw` EndpointSlice follows a drain within the new bound
   (`readyEndpointPodNames`).
@@ -785,6 +876,44 @@ Not in scope, not filed.
 
 ## History
 
+- 2026-09-27: urgency `now` -> `later` (rule 4): the two corrections, the only rule-1 statements, landed; changes 1 and 2 are decided. Applied as the History entry below derived it.
+- 2026-09-27: the two XS corrections landed, file by file (read in `git diff` of the working
+  tree):
+  - [ADR 0002](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D11 (`:342-346` now): "the
+    master as Sentinel reports it" struck and corrected in place - the running data pod that
+    answers `role:master` to `INFO replication`, found by `findMaster` probing every data pod,
+    the most connected replicas when several answer, ties to the lowest ordinal (a stable sort,
+    re-read at `checker.go:218` ff.), and no Sentinel is asked; a dated "Corrected 2026-09-27
+    (no decision changes)" Status line, which also carries the T18 correction.
+  - [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go),
+    the `currentMasterPod` doc comment (`:2290-2291` now): "(clusterState.MasterPod: the pod
+    answering role:master to INFO replication, health.Checker.findMaster; no Sentinel is asked)".
+
+  The comment grew by one line, so every `valkey_controller.go` reference in this file from
+  `:2290` on is one lower than the working tree now (two lower from `:3049` on, after another
+  comment edit of the same change); the references before `:2290` are unchanged. Decisions 1-7
+  and changes 1 and 2 are untouched. **Urgency not recomputed in this pass** (the orchestrating
+  run left every urgency but one to the owner): by the frontmatter's own derivation it returns
+  from `now` to `later` (rule 4), because the two corrections were the only rule-1 statements.
+  **Not verified:** `make lint` was not run.
+- 2026-09-27: adversarial review of the enrichment — the new locations re-read at `4a7543e`
+  (foreign_object, rbac, labeler, the three Go comments, ADR 0002/0011 lines, the condition's
+  three doc places, `findMaster`, the e2e helpers, `managerOptions`), all held, and the false
+  D11 sentence confirmed: `CheckCluster` takes `MasterPod` from `findMaster`
+  ([`checker.go:108-115`](../../internal/health/checker.go)), and `updateHAStatus` copies it
+  (`valkey_controller.go:2476`, `:2489`). Corrected in place: the sweep is thirteen places, not
+  twelve (two wrapped test comments), with a grep that finds them; the XS correction of D11
+  also gets a dated `Status` line. Effort stays L.
+- 2026-09-27: enriched - locations re-read at `4a7543e` and corrected in place (the "no Pod
+  watch" sweep grows from nine to twelve places, three Go comments included; A2 amends ADR 0002
+  D11; a condition now has three doc places); a work list separating two XS corrections from
+  changes 1 and 2; B1, L1 and L2 marked not chosen in Verification. **Urgency later → now**,
+  rule 1: the last sentence of ADR 0002 D11 and the comment at `valkey_controller.go:2290` say
+  the Sentinel arm's `status.masterPod` is Sentinel's answer, and the code takes it from
+  `INFO replication` — false by reading the code the sentences describe, which is how a claim
+  about code is measured; urgency falls back to `later` (rule 4) once the XS correction lands.
+  **Effort M → L:** change 1 is M on its own (twelve-place sweep, four ADR amendments, the full
+  e2e on both legs), change 2 another M with its Kind reproduction.
 - 2026-09-27 — `SECURITY_ARCHITECTURE.md` was split into `docs/security/` by the documentation
   restructure: the "no Pod watch" premise at its line 1010 now also names its new place,
   `docs/security/rootless-migration.md:69`, and the A4 sweep command no longer names the

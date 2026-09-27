@@ -1,4 +1,4 @@
-# Ticket: replace the dangling `NA…` ticket references with ADR references
+# Ticket: ~~replace the dangling `NA…` ticket references with ADR references~~ rewrite every ticket citation outside `docs/tickets/` to the ADR that holds the rule
 
 Ticket 040, formerly C3 (`local_na_references_to_adr.md`); renamed on 2026-09-27 when the tickets
 were numbered.
@@ -8,7 +8,13 @@ were numbered.
 > [ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md), and every ticket citation
 > outside `docs/tickets/` is its work list — see
 > [the section of 2026-09-27](#2026-09-27-the-t-label-citations-join-this-ticket). The residue
-> below was verified 2026-08-26 on `HEAD` = `1c309d8`.** Index:
+> below was verified 2026-08-26 on `HEAD` = `1c309d8`.** *(Added 2026-09-27: re-measured on
+> `HEAD` = `4a7543e`. Two decisions are open, and two XS items need neither of them; see
+> [Current state](#current-state-2026-09-27-head--4a7543e), [Options](#options) and
+> [Work list](#work-list). Urgency: `later` (re-derived 2026-09-27, rule 4: the rewrite is decided
+> and mechanical). Effort: L.)* *(2026-09-27, later: work item 1, the 8 `NA` noun uses, landed;
+> item 2 still waits on Hans for the `CLAUDE.md` edit, and both decisions are still open; see
+> History.)* Index:
 > [`archive/039-findings-from-the-1-11-0-fleet-rollout.md`](archive/039-findings-from-the-1-11-0-fleet-rollout.md) (archived 2026-09-27, no longer maintained).
 > Keep this line current — update it in the same change that touches this ticket.
 >
@@ -49,16 +55,24 @@ were numbered.
 > Deployment); `NA62` → ADR 0020 (every managed kind) and ADR 0006; `NA63` → ADR 0020 (pods).
 >
 > **Premise falsified:** this ticket says `local_valkey_operator_admission_gap.md` is "about
-> to be deleted". It is **still there**, 7544 lines, untracked and gitignored, five days on.
+> to be deleted". ~~It is **still there**, 7544 lines, untracked and gitignored, five days on.~~
+> *(corrected 2026-09-27: it is no longer at the repository root; it became the tracked
+> [archive/037](archive/037-recovery-after-transient-admission-webhook-rejection.md), see
+> [below](#2026-09-27-the-t-label-citations-join-this-ticket))*
 > `NA61`–`NA63` are documented in it at `:7041` and `:7090` — so the references resolve for
 > Hans locally and dangle for every clone. That asymmetry is the whole defect.
 >
 > **Not verified:** whether the `NA61`/`NA62`/`NA63` tags inside ADR "Amended … (NAxx)"
 > headers are intentional provenance markers rather than oversights. No ADR or CLAUDE.md rule
 > speaks to it; treating them as citations to rewrite is a judgement call, not a fact read off
-> the tree. Decide it before starting, or the 41 ADR lines get churned twice.
+> the tree. Decide it before starting, or the 41 ADR lines get churned twice. *(2026-09-27:
+> [ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) now records the question
+> as undecided, under Alternatives, "Rewrite all existing citations in the same change". It is
+> Decision 1 under [Options](#options).)*
 >
-> **Effort for the residue: XS.**
+> **Effort for the residue: XS.** *(corrected 2026-09-27: XS covered the 49 `NA` lines only.
+> Since 2026-09-27 the work list is every ticket citation outside `docs/tickets/`, about 250
+> lines, so the effort is L.)*
 
 ## Context
 
@@ -237,6 +251,14 @@ renaming:
 
 ## Verification
 
+*(Corrected 2026-09-27: the two `grep` lines and the note under them below are superseded by
+the two commands of* Done when *at the end of
+[the 2026-09-27 section](#2026-09-27-the-t-label-citations-join-this-ticket). `docs` now includes `docs/tickets/`,
+`SECURITY_ARCHITECTURE.md` is gone, and this file and archive/037 are tracked, not gitignored.
+The `make` lines stay. Because lint skips build-tagged files (T43), the comment edits under
+`test/integration/` and `test/e2e/` are proven only by `make test-integration` and the e2e
+compile run below.)*
+
 ```bash
 # no dangling references left anywhere
 grep -rn 'NA[0-9]' --include='*.go' .        # expect: no matches
@@ -271,7 +293,8 @@ outside `docs/tickets/` references a ticket
 ([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md)) is adopted **as partly
 implemented**. No new ticket citation is written anywhere outside `docs/tickets/`; the citations
 that exist today stay until this ticket rewrites them. The decision is taken — option B of four
-put to the owner — so no `## Options` section is owed here.
+put to the owner — ~~so no `## Options` section is owed here.~~ *(corrected 2026-09-27: two
+narrower decisions inside it are still open, see [Options](#options).)*
 
 **What joins the work list.** Every `T<n>` label cited outside `docs/tickets/`, and every path
 into this directory from outside it. They are the same defect as the `NA…` residue: a tracked
@@ -456,8 +479,197 @@ the pointers to the rules page in `DEVELOPER.md`, `docs/developer/README.md` and
 The narrower command in the table above counts only paths that name a ticket file. Neither
 command finds a ticket cited by its bare number ("ticket 040") or by the unlabelled phrase above.
 
+## Current state (2026-09-27, `HEAD` = `4a7543e`)
+
+**Verified** with `git grep` at `HEAD`, using the commands of the table above:
+
+- **190 T-label lines outside `docs/tickets/`.** 110 are in `docs/adr` and 70 in Go files (26
+  files). 7 are in [`CLAUDE.md`](../../CLAUDE.md): `:284`, `:568`, `:620`, `:785`, `:794`,
+  `:1014`, `:1047`. 3 are in [`rootless-migration.md`](../security/rootless-migration.md): `:27`,
+  `:47`, `:85`. The total and every per-label count equal the 10:24 column. `T26` and `T30`
+  occur nowhere.
+- **49 `NA6[123]` lines.** 37 are in ADR 0020 and 4 in ADR 0006. 3 are in
+  [`isolation-and-tenancy.md`](../security/isolation-and-tenancy.md): `:160`, `:178`, `:213`.
+  5 are in Go:
+  [`foreign_object_test.go:318`](../../internal/controller/foreign_object_test.go#L318), `:913`,
+  `:1062`, [`rolling_update.go:273`](../../internal/controller/rolling_update.go#L273) and
+  [`test/integration/foreign_object_test.go:170`](../../test/integration/foreign_object_test.go#L170).
+  *(2026-09-27, after work item 1, measured on the working tree: ~~49~~ 41 lines, all in ADRs -
+  37 in ADR 0020 and 4 in ADR 0006. The 3 `isolation-and-tenancy.md` lines and the 5 Go lines
+  are rewritten; `git grep -nE 'NA6[123]' -- ':!docs/tickets'` finds only the two ADRs.)*
+- **T and `NA` labels together:** 151 lines in 18 ADRs, heaviest 0020 (37), 0026 (24), 0030 (19),
+  0010 (13) and 0017 (12); and ~~75 lines in 28 Go files~~ *(2026-09-27, after work item 1: 70
+  lines in 26 Go files; the ADR count is unchanged)*.
+- **The 8 path citations are unchanged**, all in ADRs: `0012:286`, `0017:612`, `0025:444`, `:496`,
+  `0028:30`, `0032:6`, `0033:6`, `:750`. The two commands of *Done when* return ~~239~~ *(231 after
+  work item 1, 2026-09-27; the T-label count is still 190)* and 54 lines.
+- **No label reaches a generated artifact.** The three in `api/v1/valkey_types.go` (`:173`,
+  `:249`, `:255`) are doc comments on `ConditionType` constants, and `config/crd/bases/` carries
+  none (grep).
+- **New: the code demands new citations.**
+  [`condition_registry_test.go:205`](../../internal/controller/condition_registry_test.go#L205)
+  asserts the regexp `T\d+` on every `declaredGap`. The failure messages at `:128`, `:158` and
+  `:206` tell the author to add a ticket reference, and the field doc at
+  [`condition_registry.go:84-86`](../../internal/controller/condition_registry.go#L84-L86) calls
+  it "the ticket reference". [ADR 0027](../adr/0027-conditions-are-levels-edges-or-history.md) D4
+  (`0027:198-205`) decides it. So every future gap has to break ADR 0034 D7. The one gap today,
+  the `Ready` row ([`condition_registry.go:102`](../../internal/controller/condition_registry.go#L102)),
+  suppresses no assertion that would fail. The only skips on `declaredGap` are
+  `condition_registry_test.go:122` (edges) and `:149` (levels). `Ready` is a level, so `:149`
+  does skip its one-evaluator assertion, but it declares `evaluators: 1`
+  (`condition_registry.go:98`) and would pass it. *(Precised by the review of 2026-09-27: the
+  enrichment said `:149` skips only levels with more than one evaluator; it skips every level
+  that declares a gap.)*
+
+**Not verified:**
+
+- That archive/039 gives an unambiguous ADR and decision for every label T1–T29; it was not read
+  through.
+- Which label lines are tags and which carry meaning (the split Decision 1 turns on). A rough
+  regex puts 56 of the 151 ADR lines in tag shape; they were not classified by hand, and neither
+  were the Go lines.
+- No `make` target was run.
+
+## Options
+
+Two decisions. **Decision 1 comes first**: it decides the shape of the ADR half, which is the
+bulk of the work. Decision 2 is independent and XS. The scope decision of 2026-09-27 (option B,
+[above](#2026-09-27-the-t-label-citations-join-this-ticket)) stands, and neither decision
+reopens it.
+
+### Decision 1 — is a ticket label used as a provenance tag rewritten, or kept as a listed exception?
+
+A **tag** is a label that records where a statement came from, and that can be removed without
+changing what the sentence says. Examples: `Amended 2026-08-22 (NA61):`, `Added 2026-09-26
+(T32).`, `*(corrected 2026-09-26, T34)*`, `(measured, T31)`, `(T24)`. Text already struck as
+superseded counts too. Tags occur in ADRs, in Go comments, in `CLAUDE.md` (`:284`, `:785`,
+`:794`, `:1014`, `:1047`) and in `rootless-migration.md` (`:27`, `:47`, `:85`). ADR 0034 names
+only the ADR `Amended` headers as undecided, but the other tags have the same shape. A label
+used as a noun ("the NA61 half of ADR 0020", "`Ready`/T18") is a citation the sentence depends
+on. It is rewritten under every option, and that is why the first two work items need no
+decision.
+
+- **A. Rewrite or drop tags like every other citation.** **(recommended)** A bare tag is
+  dropped, because the date already identifies the amendment: `Amended 2026-08-22 (NA61):`
+  becomes `Amended 2026-08-22:`. Struck text is treated the same way, and the strike stays. Cost
+  L, about 250 lines. *Done when* stays one grep that returns only the rules-page lines. That is
+  the only check that runs mechanically, and it matters because ADR 0034 records "Enforcement
+  of D7 is manual" (Residual risks). What is lost: the pointer from an amendment to its analysis
+  in `archive/`. The date and `git log` still find it.
+- **B. Keep tags as listed exceptions.** *Done when* lists each kept line with its reason. The
+  rewrite drops to about M, but a list of tens of lines has to stay current. Every kept tag also
+  points into `archive/`, which is the "points at history" failure ADR 0034 gives for rejecting
+  "Do not adopt the reference ban".
+- **C. Replace each tag with the commit that shipped the amendment**, for example `Amended
+  2026-08-22 (<hash>):`. This keeps provenance and cites no ticket. It costs a `git log` lookup
+  per tag on top of A, and a hash in prose tells a reader no more than a label does.
+
+### Decision 2 — what a `declaredGap` in the condition registry has to name
+
+- **A. The ADR decision that owns the exception.** **(recommended)** The test asserts
+  `ADR \d{4}` instead of `T\d+`. The messages at `condition_registry_test.go:128`, `:158` and
+  `:206` and the field doc at `condition_registry.go:84-86` say so. The `Ready` row drops its
+  `T18: ` prefix; it already names "ADR 0001 D4 … re-decision open". ADR 0027 D4 is amended in
+  place. Cost XS, unit tier only. D4's own purpose is that "an exception has to be traceable to
+  a decision", and decisions live in ADRs. An ADR number never changes, while the ticket that
+  `T18` names is archived when it closes and the reference then points at history. Coordinate
+  the `Ready` row with T18.
+- **B. Keep `T\d+` and list it as a D7 exception.** No code change, but ADR 0034 D7 gains a
+  carve-out, and every future gap adds a citation that rots once its ticket is archived.
+- **C. Drop the traceability test.** It removes the conflict together with the guard ADR 0027 D4
+  exists for: a `declaredGap` would become a way to silence the registry.
+
+## Decision
+
+The scope decision of 2026-09-27 stands (option B,
+[above](#2026-09-27-the-t-label-citations-join-this-ticket)). Decisions 1 and 2 under
+[Options](#options) are not yet decided.
+
+## Work list
+
+1. **[XS, no decision] The 8 `NA` noun uses outside ADRs and `CLAUDE.md`.** D7 is decided and
+   none of these is a tag: *(**Done 2026-09-27**, with two deviations from the mapping below,
+   see History: `:1062` and `rolling_update.go:273` cite ADR 0020 D8, not D1, and `:318` and the
+   integration test cite D1 and D8.)*
+   - `internal/controller/foreign_object_test.go:318`: `the NA61 half of ADR 0020` becomes
+     `ADR 0020 D1, amended 2026-08-22`.
+   - `internal/controller/foreign_object_test.go:913`: `the NA63 half of ADR 0020` becomes
+     `ADR 0020 D9`.
+   - `internal/controller/foreign_object_test.go:1062`: `The NA61 StatefulSet guard` becomes
+     `The ADR 0020 D1 StatefulSet guard`.
+   - `internal/controller/rolling_update.go:273`: `The NA61 guard above` becomes
+     `The ADR 0020 D1 guard above`.
+   - `test/integration/foreign_object_test.go:170`: `is the NA61 half of ADR 0020:` becomes
+     `is the StatefulSet half of ADR 0020 D1:`.
+   - `docs/security/isolation-and-tenancy.md:160`: `Since the NA62 amendment of` becomes
+     `Since the 2026-08-22 amendment of`.
+   - `docs/security/isolation-and-tenancy.md:178`: `since the NA63 amendment:` becomes
+     `since 2026-08-22:`. The sentence already cites ADR 0020 D9 at `:180`.
+   - `docs/security/isolation-and-tenancy.md:213`: `The NA62 guard is not retroactive.` becomes
+     `The ADR 0020 D1 guard on every managed kind (2026-08-22) is not retroactive.`
+2. **[XS, no open decision, but not executable without Hans: it edits `CLAUDE.md`, and no agent
+   run may change that file on its own authority]** The two
+   `CLAUDE.md` noun uses:
+   - `:568`: `` `Ready`/T18 `` becomes `` `Ready` (ADR 0001 D4) ``.
+   - `:620`: `a pre-existing gap T32 does not close` becomes `a pre-existing gap, an ADR 0026
+     residual risk`; the residual risk is at `0026:787`.
+3. *(waits on Decision 2)* The registry test, its messages, the `Ready` row and ADR 0027 D4.
+4. *(waits on Decision 1)* The 151 ADR lines and the 8 path links, the Go T-label lines,
+   `CLAUDE.md` `:284`, `:785`, `:794`, `:1014` and `:1047`, and `rootless-migration.md` `:27`,
+   `:47` and `:85`. Noun uses among them are rewritten either way. Do it as one comment sweep
+   together with T46, and rewrite ADR 0020 before T42 touches it. *(2026-09-27: T46 landed and
+   is archived, [archive/046](archive/046-code-comments-name-a-missing-test-and-a-false-import-reason.md),
+   so the sweep no longer has a sibling to coordinate with; it cited no ticket in its new text.)*
+5. Close ([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md)):
+   - Set D7 to implemented in ADR 0034 Status, and its State in `docs/adr/README.md`.
+   - Update the "Partly implemented" paragraphs in `CLAUDE.md` and `docs/tickets/README.md`.
+   - Run the two *Done when* greps and `git grep -nwE 'T40|040|C3'` outside `docs/tickets/`.
+   - Move this file to `archive/`.
+
 ## History
 
+- 2026-09-27: work list item 1 landed, file by file (read in `git diff` of the working tree):
+  - [`internal/controller/foreign_object_test.go`](../../internal/controller/foreign_object_test.go):
+    `:318` header "ADR 0020 D1 and D8, amended 2026-08-22"; `:913` "pods: ADR 0020 D9"; `:1062`
+    "The ADR 0020 D8 StatefulSet guard".
+  - [`internal/controller/rolling_update.go:273`](../../internal/controller/rolling_update.go#L273):
+    "The ADR 0020 D8 guard above".
+  - [`test/integration/foreign_object_test.go:170`](../../test/integration/foreign_object_test.go#L170):
+    "covers ADR 0020 D1 and D8 for StatefulSets:".
+  - [`docs/security/isolation-and-tenancy.md`](../security/isolation-and-tenancy.md): `:160`
+    "Since the 2026-08-22 amendment of"; `:178` "since 2026-08-22:"; `:213` "The ADR 0020 D1
+    guard on every managed kind (2026-08-22)", the H-9 paragraph rewrapped.
+
+  Deviation from the mapping of the work item, checked and accepted: the guard `:1062` and
+  `rolling_update.go:273` name is the `IsControlledBy` check in `dispatchDataRollingUpdate` that
+  treats a foreign StatefulSet as absent, and ADR 0020 D8 (`:403`) lists
+  `checkAndHandleRollingUpdate` among its guarded consumers (`:410`), so D8 is the decision it
+  stands for; D1 governs writes. The section header and the integration test cover both a
+  refused write (D1) and a consumer that treats the object as absent (D8). Measured afterwards:
+  `grep -rnE 'NA6[123]' --include='*.go' .` and `git grep -nE 'NA6[123]' docs/security` print
+  nothing; the `NA` residue is 41 lines in ADRs 0020 and 0006; the first *Done when* command
+  returns 231 (was 239); the T-label count is still 190; no added line outside `docs/tickets/`
+  cites a ticket (grep over the added lines of `git diff`). Work item 2 is untouched (it needs
+  Hans). **Not verified:** `make lint` and `make test-unit` were not run for the comment edits.
+  Urgency, effort and both decisions unchanged.
+- 2026-09-27: adversarial review of the enrichment below. Spot-checked at `4a7543e`: every
+  count of Current state, the 8 path citations, the 8 `NA` lines of work item 1 and the
+  7 `CLAUDE.md` and 3 `rootless-migration.md` lines hold. One sentence precised: the `:149` skip
+  covers every level with a gap, and `Ready` would pass the assertion it skips. Work item 2 is
+  relabelled: it needs Hans for the `CLAUDE.md` edit, so the XS run does not take it. Both
+  recommendations unchanged.
+- 2026-09-27: enriched - re-measured on `4a7543e`: 190 T-label lines, 49 `NA` lines and 8
+  path citations, every number unchanged since 10:24. New finding: the condition-registry test
+  demands a `T\d+` citation in code (`condition_registry_test.go:205`, ADR 0027 D4), against
+  ADR 0034 D7. Added Current state (Verified / Not verified), Options (two ordered decisions,
+  each with a recommendation), Decision, and a work list with two XS items that need no
+  decision. Stale text corrected in place: the title, the "still there" premise, the XS effort,
+  "no Options section owed", and the Verification block. **Effort re-derived: L, was XS**; the
+  XS covered only the 49 `NA` lines, and the scope has been about 250 lines since 2026-09-27.
+  **Urgency re-derived: `later`, unchanged from the board row** (rule 4: the rewrite is decided
+  and mechanical; nothing is measured false, and D7 accepts the existing citations as partly
+  implemented). The title was "replace the dangling `NA…` ticket references with ADR
+  references" and is kept struck through in the heading.
 - 2026-09-27, 10:24 — the six remaining "open follow-up (T31 …)" work items on the security
   pages (gaps H-1, H-13, H-14, H-15, H-19 and H-24) were removed by the review of those pages;
   their work is tickets 048, 049, 051, 055, 056 and 058. The `T31` list above strikes them and

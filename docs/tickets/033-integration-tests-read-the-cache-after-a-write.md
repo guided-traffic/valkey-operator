@@ -16,7 +16,14 @@ done:
 Filed as a board row on 2026-09-26 out of the CI-red analysis of `e2ce8bb`
 ([T31](archive/031-generated-pods-run-as-root.md), section "CI red on `e2ce8bb`"). This file was
 written on the same day. Every file:line below was re-read against the tree at `a8e8931`
-(`feat/rootless`, clean). Each claim is labelled by how it was verified
+(`feat/rootless`, clean). *(Re-read 2026-09-27 at `4a7543e`: `git diff --stat a8e8931 4a7543e`
+over `test/integration/` and the cited controller files is empty except for
+`internal/controller/volumeclaim_conflict.go`, where `4a7543e` rewrote the message string of
+`warnRecreateRequired` and added one line at `:144`; every other test and controller cite holds.
+Two cites moved (`volumeclaim_conflict.go:183`, ADR 0017 `:1111-1115`) and one length note was
+wrong from the start (`:1183`); all three are corrected in place. An earlier wording of this
+note, written the same day, called the controller diff empty; corrected by the adversarial
+review of 2026-09-27.)* Each claim is labelled by how it was verified
 ([ADR 0017](../adr/0017-test-and-ci-policy.md) D36): **run** means executed, **read** means
 read in the tree, the module cache or a public API, and **hypothesis** means neither.
 "Audit" refers to the integration-race audit of 2026-09-26: a find agent and an adversarial
@@ -128,7 +135,7 @@ changed. The sentence also said "all the remaining sites", but C5 lives in
 
 | # | Site | Shape | Flake scenario | Severity |
 |---|---|---|---|---|
-| A1 | [`foreign_object_test.go:75-78`](../../test/integration/foreign_object_test.go), `:223-226`; [`volumeclaim_conflict_test.go:230-233`](../../test/integration/volumeclaim_conflict_test.go) | One unpolled `Get` asserts `phase == Error` after a poll on `ReconcileBlocked` (and `StorageSpecNotApplied`, which the StatefulSet step writes even earlier, [`volumeclaim_conflict.go:182`](../../internal/controller/volumeclaim_conflict.go)) | A 250 ms tick (all three polls use 250 ms; `claimGuardInterval`, `volumeclaim_conflict_test.go:48`) lands between the condition write (`:276`) and `writePhase` (`:295`), or its 409-delayed retry pass. The CR still reads its previous phase (`Provisioning` in envtest, where no pod ever runs), and the assertion fails. | real, low rate (audit estimate from the pass structure, not measured) |
+| A1 | [`foreign_object_test.go:75-78`](../../test/integration/foreign_object_test.go), `:223-226`; [`volumeclaim_conflict_test.go:230-233`](../../test/integration/volumeclaim_conflict_test.go) | One unpolled `Get` asserts `phase == Error` after a poll on `ReconcileBlocked` (and `StorageSpecNotApplied`, which the StatefulSet step writes even earlier, [`volumeclaim_conflict.go`](../../internal/controller/volumeclaim_conflict.go) ~~`:182`~~ *(corrected 2026-09-27: `:183`; `4a7543e` added a line at `:144`)*) | A 250 ms tick (all three polls use 250 ms; `claimGuardInterval`, `volumeclaim_conflict_test.go:48`) lands between the condition write (`:276`) and `writePhase` (`:295`), or its 409-delayed retry pass. The CR still reads its previous phase (`Provisioning` in envtest, where no pod ever runs), and the assertion fails. | real, low rate (audit estimate from the pass structure, not measured) |
 | A2 | [`tls_material_test.go:293-295`](../../test/integration/tls_material_test.go) | A cached `Get` of a pod the test created at `:272`, with only three `Patch` round trips in between | In the full suite the Pod informer already runs, because every pass lists pods (`listDataPodNames`, `valkey_controller.go:1061`). If it has not yet delivered the ADD, the `Get` returns NotFound. The assertion itself is stable. | real, full suite only. The audit claimed a larger window when the test runs alone under `-run`, and the verifier **refuted** that: the first cached `Get` of a new type blocks until the informer has synced, and its initial LIST holds the pod (controller-runtime `pkg/cache/internal/informers.go:322-331`, read). |
 | A3 | [`observer_test.go:159-164`](../../test/integration/observer_test.go) | A single cached `Get` and a spec `Update`, with no retry, right after the observer Deployment appears | The same pass writes the CR status after creating the Deployment. Either `persistStatus` changes `ObserverReady` from nil to `&false` (`valkey_controller.go:2558-2563`) and calls `Status().Update` (`:2569`), or `updatePhase` writes "Waiting for StatefulSet creation" (`:2190`). A `Get` that runs before that write, or misses it in the cache, carries the older resourceVersion, the `Update` gets a 409 and `require.NoError` fails. The first half needs no cache lag at all: it is write order. | real, low rate |
 
@@ -142,7 +149,7 @@ not guards that can never fail.)*
 |---|---|---|---|
 | B1 | [`sidecar_services_test.go:413-419`](../../test/integration/sidecar_services_test.go), `:421-427` | Both polls check `IsNotFound`, and `Eventually` checks immediately, so a cache that has not yet seen the test's own `Create` (`:392`, `:409`) satisfies them. A no-op `deleteLegacyServices` would pass whenever that happens, and goes red after 10 s when the cache already holds the first legacy Service. | unit, positive: `TestReconcile_DeletesLegacyClientService` and `TestReconcile_DeletesLegacyReadService`, [`valkey_controller_test.go:534`](../../internal/controller/valkey_controller_test.go), `:567`; error paths and the foreign-owner skip: [`resource_reconcile_test.go:915`](../../internal/controller/resource_reconcile_test.go) ff. *(Corrected 2026-09-26: only the second group was named, and none of those three tests asserts that an owned legacy Service is deleted.)* |
 | B2 | [`foreign_object_test.go:236-237`](../../test/integration/foreign_object_test.go) | The assertion runs as soon as the poll sees `ReconcileBlocked`, which the first pass writes. The nudge cannot land until `nudgeGracePeriod` = 10 s after a pass first observed the StatefulSet short ([`nudge.go:26`](../../internal/controller/nudge.go), `:229`). With the ownership guard (`nudge.go:211`) removed, the test therefore stays green unless the condition poll alone takes more than 10 s of its 30 s budget. This is vacuous **by construction**, not by cache timing. | unit: `TestNudgeShortStatefulSets_DoesNotNudgeAForeignStatefulSet`, [`foreign_object_test.go:424`](../../internal/controller/foreign_object_test.go) (it simulates the elapsed grace with `pastGrace`) |
-| B3 | [`observer_test.go:123-128`](../../test/integration/observer_test.go), `:87-94`; [`foreign_object_test.go:82-85`](../../test/integration/foreign_object_test.go), `:88-93`, `:311-326`; [`tls_material_test.go:182-184`](../../test/integration/tls_material_test.go); [`volumeclaim_conflict_test.go:150-169`](../../test/integration/volumeclaim_conflict_test.go), `:356-362`; [`integration_test.go:99-105`](../../test/integration/integration_test.go) | Each assertion ("X is absent", "not `Error`", "foreign object untouched") runs before the step or write it rules out has necessarily happened, or through another type's informer. Examples: the StatefulSet appears before the monitoring and TLS-material steps (`resourceReconcileSteps`, `valkey_controller.go:551-574`), and before `ReconcileBlocked` and the phase are written. `integration_test.go:99-105` was **found in this re-check and was not in the audit**: it checks that the `-all`/`-r` Services are absent through the cache (`assert.Error` on a cached `Get`). | unit tier, for the two foreign-object sets: `TestReconcileSidecarRBAC_WritesNoGrantWhenTheServiceAccountIsForeign` and `TestReconcileMetricsService_ForeignServiceDoesNotFailThePass`, [`internal/controller/foreign_object_test.go:132`](../../internal/controller/foreign_object_test.go), `:627` (read). *(Corrected 2026-09-26: cited the span `:63`-`:990`, which the file outruns, up to `:1152`.)* For the other sets (observer disabled, `TLSMaterialStale` on a non-TLS cluster, the storage conditions, the standalone Service set) the unit guard was not traced. Which of the named unit tests carry a recorded mutation check was not traced either. |
+| B3 | [`observer_test.go:123-128`](../../test/integration/observer_test.go), `:87-94`; [`foreign_object_test.go:82-85`](../../test/integration/foreign_object_test.go), `:88-93`, `:311-326`; [`tls_material_test.go:182-184`](../../test/integration/tls_material_test.go); [`volumeclaim_conflict_test.go:150-169`](../../test/integration/volumeclaim_conflict_test.go), `:356-362`; [`integration_test.go:99-105`](../../test/integration/integration_test.go) | Each assertion ("X is absent", "not `Error`", "foreign object untouched") runs before the step or write it rules out has necessarily happened, or through another type's informer. Examples: the StatefulSet appears before the monitoring and TLS-material steps (`resourceReconcileSteps`, `valkey_controller.go:551-574`), and before `ReconcileBlocked` and the phase are written. `integration_test.go:99-105` was **found in this re-check and was not in the audit**: it checks that the `-all`/`-r` Services are absent through the cache (`assert.Error` on a cached `Get`). | unit tier, for the two foreign-object sets: `TestReconcileSidecarRBAC_WritesNoGrantWhenTheServiceAccountIsForeign` and `TestReconcileMetricsService_ForeignServiceDoesNotFailThePass`, [`internal/controller/foreign_object_test.go:132`](../../internal/controller/foreign_object_test.go), `:627` (read). *(Corrected 2026-09-26: cited the span `:63`-`:990`, which the file outruns, up to ~~`:1152`~~ *(corrected 2026-09-27: `:1183`, the length at `a8e8931` as at `4a7543e`)*.)* For the other sets (observer disabled, `TLSMaterialStale` on a non-TLS cluster, the storage conditions, the standalone Service set) the unit guard was not traced. Which of the named unit tests carry a recorded mutation check was not traced either. |
 
 **Class C: latent (holds today only on timing, or because no operator write happens in the gap).**
 
@@ -205,12 +212,35 @@ top-level tests passed, 0 failed, 0 skipped in each log. Same limit as above.
   is required rests on [ADR 0017](../adr/0017-test-and-ci-policy.md) D47.
 - Which of the unit-tier guards named in class B carry a recorded mutation check was not traced.
 
+**Verified 2026-09-27 at `4a7543e` (read, no test run):**
+- every cite re-opened; only the two marked above moved (plus the `:1183` length note, which was wrong at `a8e8931` already). `go.mod` still pins controller-runtime
+  v0.25.1 and testify v1.12.1 (`7017676` moved only `k8s.io/*` to v0.37.1), so the decoder and
+  `Eventually` sources cited above still apply;
+- `apiReader` is still used once (`pod_hardening_test.go:257`); 57 `require`/`assert.Eventually`
+  lines; no `MatchingFields`/`IndexField` anywhere in `test/integration`;
+- `make lint` does not see these files: every file in `test/integration` is
+  `//go:build integration`, and `Makefile:77-85` and `.golangci.yml` pass no build tags
+  ([T43](043-lint-and-vet-skip-every-build-tagged-test-file.md));
+- [`docs/developer/testing.md:69-71`](../developer/testing.md) says `k8sClient` reads the cache —
+  true today, and the one doc sentence Option B makes false;
+- the strings the XS item in the Work list polls for: `errForeignObject`
+  ([`foreign_object.go:71`](../../internal/controller/foreign_object.go), wrapped at `:76-77`),
+  `errRecreateRequired` ([`volumeclaim_conflict.go:46-47`](../../internal/controller/volumeclaim_conflict.go),
+  wrapped at `:53-54`); the phase message is `Failed to reconcile resources: ` plus
+  `compactErrorMessage` of the pass error (`valkey_controller.go:295-296`,
+  [`reconcile_blocked.go:88-93`](../../internal/controller/reconcile_blocked.go));
+- `git grep -nw T33` outside `docs/tickets/`: no hit, so closing needs no citation cleanup.
+
+**Not verified 2026-09-27:** no test was run; whether client-go v0.37.1 changed anything about
+informer delivery was not read; every rate stays the audit's estimate.
+
 ## Impact
 
 - **The required check can go red for nothing.** `Integration Tests (envtest)` is one of the
   twelve required contexts (ADR 0017 D47, read). ADR 0017's Consequences say it outright: a
   flaky required check blocks every merge, and the policy answer is to fix or quarantine it,
-  never to drop the context (`0017:1096-1100`). The same red also holds Renovate's automerge
+  never to drop the context (~~`0017:1096-1100`~~ *(corrected 2026-09-27: `:1111-1115`; ADR 0017
+  grew in `f5c6886` and `4a7543e`)*). The same red also holds Renovate's automerge
   (**hypothesis**: automerge waits on the required checks). The class has
   shown that it can do this: the race reproduced locally on `e2ce8bb` (T31, 2 of 4 runs), and
   CI's integration check was red on the same commit (read; which test failed there is T31's
@@ -239,20 +269,43 @@ mechanism was reproduced locally on one site (now fixed), and every remaining si
 required check on every push. No remaining site has been reproduced; "live" rests on that
 reachability, not on a reproduction.
 
+**Four open decisions, in the order they have to be taken** *(added 2026-09-27)*. D1 comes
+first because it decides how A2, B1, B3 and C1–C3 are written; D2 and D3 are independent of it
+and of each other; D4 is an ADR amendment and comes last. The write-order fixes of A1, A3 and C4
+need none of them (Work list below).
+
+1. **D1 — how the cache-lag half is removed:** A, B or C in the first table. **B (recommended)**:
+   one line at [`suite_test.go:129`](../../test/integration/suite_test.go) covers every present
+   and future Get-after-write, and the suite already runs such a client
+   (`pdb_uid_precondition_test.go:46`). A leaves the class open to the next test, C deletes the
+   only envtest coverage of the ADR 0020 and ADR 0023 recovery paths.
+2. **D2 — B2:** delete the assertion and name the unit guard, or wait past the nudge (last
+   paragraph of this section). **Delete (recommended)**: the unit test
+   `TestNudgeShortStatefulSets_DoesNotNudgeAForeignStatefulSet` pins the guard deterministically
+   (ADR 0017 D9), the wait would be at least 10 s of backoff-timed negative check.
+3. **D3 — `writePhase`:** W1 or W2 in the second table. **W1 (recommended)**: its neighbour
+   `writeStatusCondition` (`valkey_controller.go:2678-2690`) documents and retries exactly this
+   409; the cost is one unit test with a 409-injecting client and a mutation (D7).
+4. **D4 — extend ADR 0017 D25 (`wait.PollUntilContextTimeout`, never `Eventually`) to the
+   integration tier**, as the Decision section below recommends. Options: extend D25 to every
+   wait this ticket touches **(recommended)** — `awaitClaimGuard` and `requirePhaseError` already
+   follow it by choice; convert all 57 lines (effort grows to L, no flake it fixes is known); or
+   leave D25 e2e-only. Needs an ADR 0017 amendment, so it is Hans's call, not a ticket edit.
+
 | | What | Cost |
 |---|---|---|
 | **A** | Fix each site within the cached-client design. A1 → `requirePhaseError` (the suite is one package, so it is callable from every file as it is; moving it into a shared helper file is optional). A2 → take the pod from the last `Patch` answer, or read it through `apiReader`. A3, C4 → retry the `Get`+write inside a poll, as `pod_hardening_test.go:150-158` does. B1 → poll `apiReader` for NotFound. B3 → first wait for the positive state the completed pass writes (the phase or `Ready`), then read the negative through `apiReader`, and add a positive control where the set lacks one (D11). C1–C3 → turn each unpolled read into a poll. | 26 cited ranges in 7 test files, plus `writePhase` if W1 is taken. *(Corrected 2026-09-26: said "about 20 sites in 8 files".)* It protects only the sites on this list: the next `Get` after a `Create` repeats the class. |
-| **B** | Make the suite's reads uncached. `k8sClient` becomes a client built from the envtest config (`client.New`), so every test read comes from the API server, and `apiReader` merges into it. The suite already builds one such client for a single test (`pdb_uid_precondition_test.go:46`, read). The write-order half (A1, A3, B2, B3, C4) still gets its per-site fix from A. | One line removes the cache-lag half for every present and future test: A2, B1, C1–C3, and every "never created" check. Tests no longer read what the operator reads. The audit found no test that relies on that (**read**: no `MatchingFields`/index use in `test/integration`). Whether anything else depends on it is a **hypothesis** until the suite runs. |
+| **B (recommended, D1)** | Make the suite's reads uncached. `k8sClient` becomes a client built from the envtest config (`client.New`), so every test read comes from the API server, and `apiReader` merges into it. The suite already builds one such client for a single test (`pdb_uid_precondition_test.go:46`, read). The write-order half (A1, A3, B2, B3, C4) still gets its per-site fix from A. | One line removes the cache-lag half for every present and future test: A2, B1, C1–C3, and every "never created" check. Tests no longer read what the operator reads. The audit found no test that relies on that (**read**: no `MatchingFields`/index use in `test/integration`). Whether anything else depends on it is a **hypothesis** until the suite runs. |
 | **C** | Quarantine the class-A tests. ADR 0017 names this as the alternative to a fix. | It removes the only end-to-end coverage of the recovery without a restart (ADR 0020 for the two foreign-object tests, ADR 0023 for the claim guard), plus the TLS-carrier and observer-toggle tests of A2 and A3. Nothing is fixed, and the vacuous half stays. |
 
 For every option there is a separate sub-question about production code:
 
 | | `writePhase` (C5) | Cost |
 |---|---|---|
-| **W1** | `retry.RetryOnConflict` around the `Get`+`Update`, the same shape as `writeStatusCondition`. | Production change: a unit test with a conflict-injecting client and a mutation check (D7). It narrows A1's window but does not close it, because the condition and the phase stay two separate writes. |
+| **W1 (recommended, D3)** | `retry.RetryOnConflict` around the `Get`+`Update`, the same shape as `writeStatusCondition`. | Production change: a unit test with a conflict-injecting client and a mutation check (D7). It narrows A1's window but does not close it, because the condition and the phase stay two separate writes. |
 | **W2** | Leave it. It heals itself: the next rate-limited pass writes `Error`. | None. A1's window stays one pass wider than it has to be. |
 
-**B2 has no cheap positive fix.** Waiting past the nudge would take `nudgeGracePeriod` plus the
+**B2 has no cheap positive fix (D2).** Waiting past the nudge would take `nudgeGracePeriod` plus the
 next pass. That pass is error-driven here, so the rate limiter's backoff decides when it comes,
 not the 5 s `nudgeRequeueInterval` (`nudge.go:39`). The limiter is the operator's own
 (`newReconcileRateLimiter`, `ratelimiter.go:71-80`, read): 5 ms doubling per consecutive
@@ -268,7 +321,8 @@ the deterministic guard is the unit test).
 
 ## Decision
 
-**Open.** Hans has not decided yet.
+**Open.** Hans has not decided yet. *(Checked 2026-09-27: still not decided. The recommendation
+below is D1–D4 of Options, in that order.)*
 
 **Recommendation: B, plus A's per-site fixes for the write-order half, plus W1. B2 is resolved
 by deleting the assertion in favour of the unit guard.**
@@ -289,6 +343,44 @@ integration helpers already follow it by choice (`awaitClaimGuard`,
 `volumeclaim_conflict_test.go:543-548`, which cites D25; `requirePhaseError`). Extending it to
 the integration tier, which has 57 lines with `require.Eventually`/`assert.Eventually` (read,
 `grep`), is part of the recommendation.
+
+## Work list
+
+*(Added 2026-09-27.)* The first two items need no decision: they are the same edit under A and
+B, because write order is not a cache property, and C exists only for a site nobody fixes. Each
+is XS and closes nothing on its own.
+
+- [ ] **XS, no decision — A1: poll the phase instead of reading it once**, with
+  `requirePhaseError` ([`pod_hardening_test.go:204-220`](../../test/integration/pod_hardening_test.go),
+  same package):
+  - [`foreign_object_test.go:75-78`](../../test/integration/foreign_object_test.go) →
+    `requirePhaseError(t, types.NamespacedName{Name: crName, Namespace: "default"}, "sidecar ServiceAccount")`;
+  - `foreign_object_test.go:223-226` → `requirePhaseError(t, key, "does not control")`;
+  - [`volumeclaim_conflict_test.go`](../../test/integration/volumeclaim_conflict_test.go):
+    insert `requirePhaseError(t, key, "volumeClaimTemplates are immutable")` before `:230` and
+    delete the assertion at `:232-233`; keep the `Get` at `:230-231`, which `:235` reads.
+  - Proof: the A1 mechanism line under Verification.
+- [ ] **XS, no decision — A3 and C4: read and write inside one poll**, the pattern of
+  `pod_hardening_test.go:150-158`:
+  - [`observer_test.go:159-164`](../../test/integration/observer_test.go): `Get`, set
+    `Spec.Observer.Enabled = false`, `Update`, retried until the `Update` lands (needs the
+    `context` and `k8s.io/apimachinery/pkg/util/wait` imports);
+  - [`reconcile_concurrency_test.go:148-154`](../../test/integration/reconcile_concurrency_test.go):
+    fresh `Get` of the StatefulSet, the six status fields, `Status().Update`, retried; the
+    `slowProbes.arm()` at `:144` stays in front.
+  - Proof: the grep line under Verification; no deterministic mutation for these two is known.
+- [ ] **Waits on D1:** `suite_test.go:129-130` plus `pod_hardening_test.go:257` (B), or the
+  per-site reads (A); then A2, B1, C1–C3, and B3 with a positive wait before each negative read
+  and a positive control per set (D11).
+- [ ] **Waits on D2:** B2 (`foreign_object_test.go:236-237`).
+- [ ] **Waits on D3:** W1 (`valkey_controller.go:2614-2628`) with its unit test.
+- [ ] **Waits on D4:** the wait style of every touched wait.
+- [ ] **Close ([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md)):** the
+  decisions taken go into ADR 0017 as a new D (integration reads come from the API server, a
+  write-order read polls for the completed pass), with its Status date, and the ADR index row
+  ([`docs/adr/README.md:109`](../adr/README.md)) if its State text changes; under B rewrite
+  [`docs/developer/testing.md:69-71`](../developer/testing.md); `git grep -nw T33` outside
+  `docs/tickets/` (no hit on 2026-09-27); then `git mv` to [archive/](archive/).
 
 ## Verification
 
@@ -320,7 +412,11 @@ Done when every line holds, with the command and date recorded here:
 - [ ] **W1 (if taken).** A unit test injects one 409 and asserts that the phase lands. It fails
   with the retry removed.
 - [ ] `make test-integration` green locally in at least 10 consecutive runs, `make lint`,
-  `make cyclo`, and `Integration Tests (envtest)` green in CI on the fix commit. A streak does
+  `make cyclo`, and `Integration Tests (envtest)` green in CI on the fix commit. *(Precised
+  2026-09-27: `make lint` checks only the formatting of these files — `gofmt -l .` at
+  `Makefile:84` ignores build tags, `go vet` and golangci-lint skip every
+  `//go:build integration` file until [T43](043-lint-and-vet-skip-every-build-tagged-test-file.md)
+  lands; `make cyclo` ignores `_test.go`, so it matters for W1 only.)* A streak does
   not prove a zero rate (13 + 3 runs were already green before the fix); the mutation lines
   above are the proof.
 
@@ -342,6 +438,17 @@ Done when every line holds, with the command and date recorded here:
 
 ## History
 
+- 2026-09-27: adversarial review of the enrichment - spot-checked the new cites (the error
+  strings, `writePhase`, `writeStatusCondition`, `requirePhaseError`, `suite_test.go:129-130`,
+  `Makefile:84`, the three A1 sites, the A3/C4 sites and their imports, `go.mod`, the 57
+  `Eventually` lines): all hold. Corrected the intro note, which called the controller diff since
+  `a8e8931` empty although `4a7543e` changed `volumeclaim_conflict.go`. The two XS no-decision
+  items and the D1-D4 recommendations confirmed.
+- 2026-09-27: enriched - re-read at `4a7543e` (two moved cites corrected: `volumeclaim_conflict.go:183`,
+  ADR 0017 `:1111-1115`; the `:1152` length note), Options ordered into four decisions D1–D4 with
+  one recommendation each, a Work list splitting two XS no-decision items (A1; A3 and C4) from the
+  decision-bound work, and the `make lint` scope precised. State, severity, urgency (`next`, rule
+  3), effort `M` and `blocked-by` unchanged.
 - 2026-09-27 — renamed to `033-integration-tests-read-the-cache-after-a-write.md` (was `local_T33-integration-tests-read-the-cache-after-a-write.md`) when the tickets were numbered.
 - 2026-09-26 — **adversarial re-check** of this file and its board row, every file:line
   re-opened at `a8e8931`. State, severity, urgency and the open Decision unchanged; rule 3 still

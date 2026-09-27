@@ -5,7 +5,7 @@ state: analysed
 severity: medium
 security: none
 urgency: next
-effort: S
+effort: M
 blocked-by: decision
 filed-from: T31, section "Drain-test finding", and ADR 0017 D50 as amended 2026-09-26
 opened: 2026-09-26
@@ -16,7 +16,11 @@ done:
 Filed as a board row on 2026-09-26 out of the drain-test finding recorded on
 [T31](archive/031-generated-pods-run-as-root.md) (section "Drain-test finding") and at
 [ADR 0017](../adr/0017-test-and-ci-policy.md) D50. This file was written the same day. Every
-file:line below was re-read in the tree at `a8e8931` (`feat/rootless`, clean). Each claim is
+file:line below was re-read in the tree at `a8e8931` (`feat/rootless`, clean). *(Re-read
+2026-09-27 at `4a7543e`: in `test/e2e/` only `sidecar_test.go` changed since `a8e8931`, where
+`f5c6886` split the comment line `:281` in two, so every `sidecar_test.go` line after `:281` is
+one higher; those cites, and the moved ADR 0017 and `CLAUDE.md` lines, are corrected in place.)*
+Each claim is
 labelled by how it was verified ([ADR 0017](../adr/0017-test-and-ci-policy.md) D36):
 
 - **run** means taken from the log of an executed run. The log is named at the claim.
@@ -34,7 +38,7 @@ which is not tracked:
 | `e2e_full9.log`, `e2e_full8.log`, `final2.log` … `final6.log` | The seven local runs of 2026-09-26 on Kind (`kindest/node:v1.36.1`), every one on a cluster of **control-plane + 3 workers** (`make kind-create`; `final6.log:7-20` shows four nodes joining, `:160` loads onto `valkey-operator-test-worker3`). Together they hold 11 full-suite legs. `leg8.log` is an excerpt of `final4.log` (byte-for-byte substring) and is not counted twice. |
 | `ci-b13-failed.log`, `ci-a04-failed.log`, `ci-e6a-full.log` | CI on `b13377e`, `a04e2d0` and `e6a9d7c`. Each has two single-node full-suite legs, Valkey 9 and Valkey 8, on `kindest/node:v1.33.4`. |
 | `drainexp.log`, `drain-orig-*/`, `drain-fixed-*/` | The Kind experiment with `TestE2E_SidecarFailoverDrainMaster` run alone: `test.log` per run, and `roles.txt` from a watcher that sampled role and `DBSIZE` ~~about once a second~~ *(corrected 2026-09-26, adversarial check: about every 2 s per pod — `drainwatch.sh` sleeps 1 s between rounds of nine `kubectl` calls; `drain-orig-1/roles.txt` samples `sc-drain-0` at :36, :38, :40, :42, :43)*. |
-| `ci-repro-full9.log` | **Excluded from every count.** A local full suite on the CI Kind config (`kindest/node:v1.33.4`, 17:41) with the drain fix, 36 of 49 `TestE2E_*` red: the environment did not start pods (`ready=0/N` 4362 times). The drain-master and replica-drain tests failed at their setup wait (`sidecar_test.go:244`, `:460`) and never reached their delete, so it is no run of the fix. Site 2 did reach its delete and logged `:137` right after two 3/3 polls. |
+| `ci-repro-full9.log` | **Excluded from every count.** A local full suite on the CI Kind config (`kindest/node:v1.33.4`, 17:41) with the drain fix, 36 of 49 `TestE2E_*` red: the environment did not start pods (`ready=0/N` 4362 times). The drain-master and replica-drain tests failed at their setup wait (`sidecar_test.go:244`, ~~`:460`~~ *(corrected 2026-09-27: `:461`)*) and never reached their delete, so it is no run of the fix. Site 2 did reach its delete and logged `:137` right after two 3/3 polls. |
 
 Across those logs, 17 distinct legs ran each of the tests below: 11 local and 6 CI.
 
@@ -79,8 +83,9 @@ that is terminating:
 
 The test deletes the master of a 3+3 Sentinel cluster
 ([`sidecar_test.go:274`](../../test/e2e/sidecar_test.go)). It then waited for the StatefulSet at
-3/3 (`:285`), phase `OK` (`:286`), every pod Ready (`:289-291`), and exactly one pod answering
-master (`:295-306`). The terminating old master meets all four.
+3/3 (~~`:285`~~), phase `OK` (~~`:286`~~), every pod Ready (~~`:289-291`~~), and exactly one pod
+answering master (~~`:295-306`~~) *(corrected 2026-09-27: `:286`, `:287`, `:290-292`,
+`:296-307`)*. The terminating old master meets all four.
 
 - **The red run (run, `final6.log`, the Valkey 9 leg of the day's last local run,
   2026-09-26).**
@@ -93,7 +98,7 @@ master (`:295-306`). The terminating old master meets all four.
     `sc-drain-0`, the pod it had just deleted, as the new master.
   - Its first `DBSIZE` exec failed and was retried after the 4 s backoff (`Retrying valkeyExec on
     pod sc-drain-0 (attempt 2/5, backoff 4s)`). The retry read `0`, and the test failed on
-    "got 0" at the old line `sidecar_test.go:334`, now `:343`.
+    "got 0" at the old line `sidecar_test.go:334`, now ~~`:343`~~ *(corrected 2026-09-27: `:344`)*.
   - The next subtest found `-rw` selecting `sc-drain-1`.
   - These log lines fit the recorded diagnosis: the old process left between the `EXISTS` and
     the `DBSIZE`, and the retry reached the empty replacement. **Which process answered each
@@ -128,7 +133,8 @@ master (`:295-306`). The terminating old master meets all four.
     runs** of the experiment, 10 before the fix and 8 after, the replacement `sc-drain-0` (the
     last UID of that name in each `roles.txt`) first answered `role:slave` with `dbsize=0`.
 - **The fix (read).** The test records the UID at `:272` and calls
-  `waitForPodRecreated(t, ns, initialMaster, killedUID)` at `:282`, before any role or data
+  `waitForPodRecreated(t, ns, initialMaster, killedUID)` at ~~`:282`~~ *(corrected 2026-09-27:
+  `:283`)*, before any role or data
   check. It landed in `b13377e`.
 - **Runs of the fix (run).**
   - Alone: 8 of 8 green, delete subtest 8.29–10.32 s (`drainexp.log`).
@@ -153,8 +159,17 @@ master (`:295-306`). The terminating old master meets all four.
   `CLAUDE.md:227` cites "D50, D51" correctly: its paragraph states both rules.
 - **The same comment calls the red run single-node (read, `sidecar_test.go:281`).** It was not;
   see the next section.
+- *(2026-09-27: both comment defects were fixed in `f5c6886`, read at `4a7543e`: `:276` cites
+  D50 alone, and `:281-282` name the local Kind cluster of control-plane + 3 workers. D51 is at
+  ADR 0017 `:619` today, the `CLAUDE.md` cite of both rules at `:288`.)*
 
 ### Tracked records of the fixed instance that are false now
+
+*(Added 2026-09-27: superseded — all of them were corrected on 2026-09-26 in `f5c6886`, the doc half. The lines in this
+section are those at `a8e8931`, before that change; at `4a7543e` the corrected text sits at ADR
+0017 `:111-114`, `:118-120`, `:133-136`, `:582-584`, `:603-604` and `CLAUDE.md:282-284`,
+`:1045-1047`. The D5 record of `e6a9d7c` is at ADR 0017 `:285-288`, the filing statement at
+`:606-617`.)*
 
 - **Measured false (run: the CI logs above).** Three sentences say that no full suite has run
   on the drain fix. CI ran the full suite on it in six single-node legs on `b13377e`,
@@ -209,18 +224,19 @@ The five sites came from a grep for pod deletes not followed by a UID-aware wait
 
 | # | Site | Delete | Class |
 |---|---|---|---|
-| 1 | `TestE2E_SidecarDrainReplica` | [`sidecar_test.go:484`](../../test/e2e/sidecar_test.go) | **vacuous**, two hypothetical flake paths |
+| 1 | `TestE2E_SidecarDrainReplica` | [`sidecar_test.go`](../../test/e2e/sidecar_test.go) ~~`:484`~~ *(corrected 2026-09-27: `:485`)* | **vacuous**, two hypothetical flake paths |
 | 2 | `TestE2E_SentinelStaleMaster` | [`sentinel_stale_master_test.go:126-127`](../../test/e2e/sentinel_stale_master_test.go) (six deletes, loop `:125-128`) | **vacuous** waits; the assertions are protected only by timing |
 | 3 | `TestE2E_AdmissionRejection_StatefulSetNudgeRecovery` | [`admission_recovery_test.go:237`](../../test/e2e/admission_recovery_test.go) (loop `:236-238`) | fine, by construction |
 | 4 | `TestE2E_RollingUpdate_NoSecondDeleteWhileAPodTerminates` | [`pod_termination_test.go:128`](../../test/e2e/pod_termination_test.go) | fine; observes termination deliberately |
 | 5 | `TestE2E_RollingUpdate_TopologyRestoreAbandoned` | [`topology_abandon_test.go:241`](../../test/e2e/topology_abandon_test.go) | fine, by effect |
 
 **1 — `TestE2E_SidecarDrainReplica` (read; timings run).** The test deletes a replica of a 3+3
-Sentinel cluster.
+Sentinel cluster. *(Corrected 2026-09-27: every line of this site below is one higher at
+`4a7543e`; each is corrected where it stands.)*
 
-- `:487-488` wait for the StatefulSet at 3/3 and for phase `OK`. The terminating replica meets
-  both.
-- `:491-492` then compare `findMasterPod` with `initialMaster`. ~~At that moment a failover
+- ~~`:487-488`~~ *(corrected 2026-09-27: `:488-489`)* wait for the StatefulSet at 3/3 and for
+  phase `OK`. The terminating replica meets both.
+- ~~`:491-492`~~ *(corrected 2026-09-27: `:492-493`)* then compare `findMasterPod` with `initialMaster`. ~~At that moment a failover
   triggered by the replica delete could not have happened yet, because Sentinel needs seconds to
   declare a master down.~~ *(corrected 2026-09-26, adversarial check: the conclusion holds, the
   reason did not.)* A failover a replica drain could trigger is a forced `SENTINEL FAILOVER`
@@ -229,7 +245,8 @@ Sentinel cluster.
   failover putting a second master up about 0.3 s after the delete in half the runs. Timing
   does not make the check vacuous. The ordinal order does:
   - In **17 of 17 legs** `initialMaster` was `sc-repdr-0` and the deleted replica `sc-repdr-1`
-    (run, `sidecar_test.go:477`, formerly `:468`, in every log).
+    (run, `sidecar_test.go` ~~`:477`~~ *(corrected 2026-09-27: `:478`)*, formerly `:468`, in
+    every log).
   - `findMasterPod` asks ordinal 0 first and returns the first pod answering `role:master`
     (read). `sc-repdr-0` keeps answering master until Sentinel reconfigures it, which comes
     after any promotion (read in the Valkey `sentinel.c` copy in the scratchpad: the failover
@@ -241,28 +258,32 @@ Sentinel cluster.
   - The subtest ended 0.10–0.32 s after its start in **17 of 17 legs** (run).
   - So "delete replica does not trigger master failover" never looks after the drain, and could
     not see a promotion elsewhere even if it looked early enough.
-- `:498` reads the key from the master. That is fine, but it says nothing about the delete.
-- `:504` `waitForPodLabel(replicaPod, instanceRole, replica)` is met by the terminating pod's own
-  label.
+- ~~`:498`~~ *(corrected 2026-09-27: `:499`)* reads the key from the master. That is fine, but
+  it says nothing about the delete.
+- ~~`:504`~~ *(corrected 2026-09-27: `:505`)* `waitForPodLabel(replicaPod, instanceRole, replica)`
+  is met by the terminating pod's own label.
   - The subtest took 0.01–0.10 s in 17 of 17 legs (run).
   - A replacement cannot be created, started and labelled by the sidecar within about 0.7 s of
     the delete. This is an inference from the 8.3 s minimum of the fixed drain test.
   - So "recreated replica labeled correctly by sidecar" reads the old pod.
-- `:509` calls `getPod` with `require.NoError` for every ordinal. **Hypothesis:** this fails when
+- ~~`:509`~~ *(corrected 2026-09-27: `:510`)* calls `getPod` with `require.NoError` for every
+  ordinal. **Hypothesis:** this fails when
   it lands between the old pod's removal and the replacement's creation. It was not observed in
   17 legs.
-- `:519` `waitForConnectedReplicas(initialMaster, 2)` is met while the old replica is still
-  online. `:524-529` reads the key from `replicaPod` by name, and the old replica holds it.
+- ~~`:519`~~ *(corrected 2026-09-27: `:520`)* `waitForConnectedReplicas(initialMaster, 2)` is
+  met while the old replica is still online. ~~`:524-529`~~ *(corrected 2026-09-27: `:525-530`)*
+  reads the key from `replicaPod` by name, and the old replica holds it.
   - Vacuous in 2 of 17 legs: 0.19 s in `e2e_full9.log`, 0.28 s in `ci-a04-failed.log` Valkey 8.
   - In the other 15 legs it took 6.2–30.2 s (run), because the old replica had disconnected
     first (inference: the durations fit a wait for the replacement's sync).
-- `:533` `waitForEndpointPodCount(-r, 2)` is the one step that saw a replacement whenever it
+- ~~`:533`~~ *(corrected 2026-09-27: `:534`)* `waitForEndpointPodCount(-r, 2)` is the one step that saw a replacement whenever it
   started early (inference, resting on the endpoint readiness below). In both legs where the
   replication subtest was vacuous, it then waited 10.0 s and 16.1 s (run).
   - That a terminating pod's endpoint is published not-ready is stated in ADR 0026:160-161 ("the
     endpoints controller carries its own `DeletionTimestamp` check"). The upstream source was
     **not read** here.
-  - **Hypothesis:** the count read at `:533` and the list read at `:534` are separate, so an
+  - **Hypothesis:** the count read at ~~`:533`~~ and the list read at ~~`:534`~~ *(corrected
+    2026-09-27: `:534`, `:535`)* are separate, so an
     endpoint that flips between them fails `assert.Len`. Not observed.
 
 **2 — `TestE2E_SentinelStaleMaster` (read; timings run).** The test deletes all three data pods
@@ -389,7 +410,7 @@ citation.
 - ADR 0017 D50's statement that the red cluster's operator log shows no action.
 - The EndpointSlice readiness of a terminating pod in upstream source.
 - Whether a replacement data pod can still briefly answer `role:master`, as the comment at
-  `sidecar_test.go:314-316` says. The watcher saw `role:slave` on the first answer ~~in three
+  `sidecar_test.go` ~~`:314-316`~~ *(corrected 2026-09-27: `:315-317`)* says. The watcher saw `role:slave` on the first answer ~~in three
   runs, at about 1 s resolution~~ *(corrected 2026-09-26, adversarial check)* in all 18
   experiment runs, sampled about every 2 s per pod; a shorter window before its first sample
   is not excluded.
@@ -399,10 +420,40 @@ citation.
   timestamps.
 - The flake paths marked as hypotheses: none was observed in 17 legs.
 
+**Verified 2026-09-27 at `4a7543e` (read, no test run):**
+- sites 1 and 2 still carry no UID capture and no `waitForPodRecreated`: site 1 deletes at
+  `sidecar_test.go:485`, site 2 at `sentinel_stale_master_test.go:125-128` and logs at `:137`;
+  the only UID wait in `sidecar_test.go` is the drain-master one (`:272`, `:283`);
+- helpers unchanged: `waitForStatefulSetReady` `e2e_test.go:147-163`, `waitForPodReady` `:285`,
+  `waitForPodRecreated` `:307-340`, `getPod` `:604-611`, `deletePod` `sidecar_test.go:68-74`,
+  `findMasterPod` `rolling_update_test.go:733-750`; `testTimeout` is 5 min and `pollInterval`
+  2 s (`e2e_test.go:37`, `:46`), so each `waitForPodRecreated` has its own 5 min budget;
+- `deletePod` has 10 call sites in 8 files (grep);
+- the open item is still recorded as open: ADR 0017 D50 `:616-617` ("The fixture fix is open"),
+  the index row [`docs/adr/README.md:109`](../adr/README.md), `CLAUDE.md:282-284`;
+- `git grep -nw T34` outside `docs/tickets/`: ten citation lines, `CLAUDE.md:284`, `:1047` and
+  ADR 0017 `:114`, `:119`, `:136`, `:584`, `:593`, `:604`, `:611`, `:612` — all on
+  [040](040-tracked-files-cite-work-items-instead-of-adrs.md)'s work list, and part of this
+  ticket's close;
+- the doc half's `make lint` result says nothing about `sidecar_test.go`: e2e files carry the
+  `e2e` build tag, which neither `go vet` nor golangci-lint passes
+  ([T43](043-lint-and-vet-skip-every-build-tagged-test-file.md)); only `gofmt -l .` sees them;
+- for D2 of Options: Sentinel's `SENTINEL MASTER` reply carries `config-epoch` for a master, and
+  a failover raises it — `failover_epoch = ++sentinel.current_epoch` in `sentinelStartFailover`,
+  copied into `config_epoch` once the promoted replica reports master, and spread to the other
+  Sentinels by hello messages (read in the Valkey `sentinel.c` copy of the earlier session's
+  scratchpad, `:3419-3420`, `:4939-4944`, `:2619`, `:2853`; release not recorded). No e2e reads
+  `config-epoch` or `master_replid` today (grep); `sentinelPeerCount`
+  (`sentinel_peer_table_test.go:134-149`) parses the same reply.
+
+**Not verified 2026-09-27:** no test was run; that the Valkey 8.1.9 and 9.1.1 pins behave as that
+`sentinel.c` copy does; that `master_replid` changes on a promotion (PSYNC2), still a hypothesis.
+
 ## Impact
 
 - **A required check can go red for nothing.**
-  - `E2E Tests` (`e2e-gate`) is a required context (ADR 0017:527-534, D47, read).
+  - `E2E Tests` (`e2e-gate`) is a required context (ADR 0017 ~~:527-534~~ *(corrected
+    2026-09-27: `:533-540`)*, D47, read).
   - A red run of this class ~~blocks every merge~~ *(corrected 2026-09-26, adversarial check)*
     fails that required check and holds the PR it ran on until a rerun. It has happened once,
     in a local run and not in CI.
@@ -429,23 +480,53 @@ citation.
 The filing bar allows this section: the severity is medium and the trigger is live. The class
 was red once, and the vacuous path of site 1 is measured in every recorded leg.
 
+**Two open decisions, in order** *(added 2026-09-27; the doc half is done, so both are about the
+fixtures)*:
+
+1. **D1 — the fixture half:** A, B or C in the table below. **A (recommended)**: site 1's guard
+   is vacuous by ordinal order in 17 of 17 legs, and only an identity wait plus an effect read
+   can see a replica-drain regression; B adds no enforcement (a direct `Delete` bypasses any
+   helper, `pod_termination_test.go:128`); C leaves both guard gaps.
+2. **D2 — how site 1 reads "no failover" back** (only under A or B, after D1):
+
+   | | What | Cost and what it leaves open |
+   |---|---|---|
+   | **i** | `initialMaster` still answers `role:master` with the `master_replid` it had before the delete | Needs no Sentinel; rests on the PSYNC2 hypothesis above; a promotion elsewhere that has not yet demoted `initialMaster` leaves its replid unchanged, so it needs the master count of ii as well |
+   | **ii (recommended)** | Record `config-epoch` from `SENTINEL MASTER` before the delete; after `waitForPodRecreated`, assert it unchanged and exactly one of the three pods answering `role:master` (every ordinal asked, not `findMasterPod`'s first match) | Reads the arbiter's own failover counter, read in source (Verified 2026-09-27 above); reuses the `sentinelPeerCount` parse; a failover that started and failed does not raise it, which is not the regression guarded here |
+   | **iii** | Keep `findMasterPod`, moved behind the UID wait | Free, but still first-match by ordinal: it sees the regression only once Sentinel has demoted `sc-repdr-0`, which is timing — a probabilistic guard (ADR 0017 D9) |
+
+   Why ii: it is the only one whose signal does not depend on which pod is asked first or on a
+   hypothesis, and the counter is the one Sentinel itself uses to order configurations.
+
+   *(Adversarial review 2026-09-27, caveat on ii, not a change of the mark:)* the master-count
+   half has to be a bounded poll for "exactly one master", not a single read. The comment at
+   `sidecar_test.go:315-317` says a restarted pod "may briefly report role:master"; the watcher
+   never saw that in 18 runs at about 2 s per pod (Not verified, above), so a one-shot count
+   right after `waitForPodRecreated` rests on that sampling gap. The `config-epoch` half is
+   unaffected: a replica that briefly answers master raises no Sentinel epoch. **Hypothesis**, not
+   read in the source: since the new epoch reaches the other Sentinels by hello messages (above),
+   a Sentinel that has not yet received one still reports the old value, so the after-read
+   should ask all three Sentinels, after the replacement has synced, rather than one pod; a poll
+   "until unchanged" would be vacuous for this negative check.
+
 | | What | Cost |
 |---|---|---|
-| **A** | The doc half, then a per-site fix of sites 1 and 2 (details below the table). | About 30 lines in two test files, ~~six doc sentences~~ eight doc sentences and one code comment with two fixes (`sidecar_test.go:276`, `:281`). ~~Site 1 gets about 8–35 s slower per leg (the measured replacement time). Site 2's polls already wait 5–35 s in CI, so it gains less.~~ *(corrected 2026-09-26, adversarial check:)* Both tests already pay the replacement time after the delete — site 1 in its replication or `-r` subtest (6.2–30.2 s in 15 legs, 10.0 and 16.1 s in the other two), site 2 in its first subtest (5.1–35.2 s in 16 of 17 legs) — so the UID waits move that time to the front and add little in total (inference from the run timings). |
+| **A (recommended, D1)** | The doc half, then a per-site fix of sites 1 and 2 (details below the table). | About 30 lines in two test files, ~~six doc sentences~~ eight doc sentences and one code comment with two fixes (`sidecar_test.go:276`, `:281`). ~~Site 1 gets about 8–35 s slower per leg (the measured replacement time). Site 2's polls already wait 5–35 s in CI, so it gains less.~~ *(corrected 2026-09-26, adversarial check:)* Both tests already pay the replacement time after the delete — site 1 in its replication or `-r` subtest (6.2–30.2 s in 15 legs, 10.0 and 16.1 s in the other two), site 2 in its first subtest (5.1–35.2 s in 16 of 17 legs) — so the UID waits move that time to the front and add little in total (inference from the run timings). |
 | **B** | A, and `deletePod` also returns the UID, or a `replacePod` helper deletes and waits by identity. Either way, all 10 call sites of `deletePod` in 8 files move to it. | It makes the identity wait cheaper to write, but does not force it. Three of the five audited sites are correct without it. Speculative. |
 | **C** | The doc half only. The two fixtures stay as they are. | The replica-drain guard gap and the timing-dependent Sentinel guard stay. |
 
 What A does:
 
-- **The doc half.** Supersede the three measured-false sentences in place with the CI facts
+- **The doc half** *(done 2026-09-26 in `f5c6886`)*. Supersede the three measured-false sentences in place with the CI facts
   (ADR 0017 D37). Supersede the three "single-node" records (ADR 0017:112, :576,
   `sidecar_test.go:281`) with the four-node local cluster. Point the three stale sentences at
   this audit. Correct the citation at `sidecar_test.go:276`. In the untracked T31, correct :948
   and :975-976 the same way.
 - **Site 1.**
-  - Capture the UID before `:484` and call `waitForPodRecreated` before any check that means
-    "after the replacement".
-  - Check "no failover" on the master itself, not with `findMasterPod`'s first match:
+  - Capture the UID before ~~`:484`~~ *(corrected 2026-09-27: `:485`)* and call
+    `waitForPodRecreated` before any check that means "after the replacement".
+  - Check "no failover" on the master itself, not with `findMasterPod`'s first match
+    *(2026-09-27: this is D2 option i above; ii is recommended)*:
     `initialMaster` still answers `role:master`, with the `master_replid` it had before the
     delete, once the replacement is synced. **Hypothesis:** a promotion elsewhere, or a demotion
     and return, changes the replication ID (PSYNC2), so this reads the effect back.
@@ -454,7 +535,8 @@ What A does:
 
 ## Decision
 
-**Open.** Hans has not decided yet.
+**Open.** Hans has not decided yet. *(Checked 2026-09-27: still not decided. The doc half landed
+in `f5c6886` and `feat/rootless` is merged (`ad81a47`), so what is open is D1 and D2 of Options.)*
 
 **Recommendation: A, doc half first, before `feat/rootless` merges; B not taken.**
 
@@ -472,11 +554,32 @@ What A does:
   today's instances, which A does per site, and prevents no future one. A guard that forces it
   would be a lint or a test over the e2e sources, which nobody has proposed.
 
+## Work list
+
+*(Added 2026-09-27.)* **No XS item needs no decision**: every open item is the fixture half,
+which waits on D1, and site 1's effect read waits on D2.
+
+- [ ] **Waits on D1 and D2 — site 1:** capture the UID before `sidecar_test.go:485`, call
+  `waitForPodRecreated` before `:488`, and replace the check at `:492-494` with the effect read
+  D2 picks; the label check (`:505`) and the replication checks (`:520`-`:535`) then read the
+  replacement.
+- [ ] **Waits on D1 — site 2:** capture the six UIDs before `sentinel_stale_master_test.go:125`
+  and call `waitForPodRecreated` for each before `:137`.
+- [ ] **Waits on D1 — runs:** on Kind, `make test-e2e E2E_RUN='TestE2E_SidecarDrainReplica|TestE2E_SentinelStaleMaster'`,
+  then the revert checks and the `SENTINEL FAILOVER` mutation of Verification; then both
+  single-node CI legs.
+- [ ] **Close ([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md)):** ADR 0017
+  D50 (`:606-617`, "The fixture fix is open") and its Status with the date; the index row
+  [`docs/adr/README.md:109`](../adr/README.md) (drop "D50 (the fixture fix for two vacuous
+  sites)"); `CLAUDE.md:282-284` ("two are vacuous"); rewrite the ten T34 citation lines listed under
+  Verified 2026-09-27 to cite ADR 0017 D50 (shared with ticket 040's list); `git grep -nw T34`
+  outside `docs/tickets/` returns nothing; then `git mv` to [archive/](archive/).
+
 ## Verification
 
 Done when every line holds, with the command and date recorded here:
 
-- [x] **Doc half.** Done 2026-09-26 in `f5c6886`, pushed. `git grep -n "single-node Valkey 9" -- docs test CLAUDE.md SECURITY_ARCHITECTURE.md` returns nothing (the struck records read `~~single-node~~ Valkey 9`); `git grep -n "D50, D51" test/` returns nothing; every remaining hit of "no full suite has run" and "not yet audited" outside `docs/tickets` is struck; T31:948 and :975-976 corrected (untracked); `make lint` 0 issues.
+- [x] **Doc half.** Done 2026-09-26 in `f5c6886`, pushed. `git grep -n "single-node Valkey 9" -- docs test CLAUDE.md SECURITY_ARCHITECTURE.md` returns nothing (the struck records read `~~single-node~~ Valkey 9`); `git grep -n "D50, D51" test/` returns nothing; every remaining hit of "no full suite has run" and "not yet audited" outside `docs/tickets` is struck; T31:948 and :975-976 corrected (untracked); `make lint` 0 issues *(precised 2026-09-27: that run checked only the formatting of `sidecar_test.go` — `go vet` and golangci-lint skip every `e2e`-tagged file, [T43](043-lint-and-vet-skip-every-build-tagged-test-file.md))*.
   - ADR 0017:130, :595 and `CLAUDE.md:975` are superseded in place, each naming the CI legs.
   - ADR 0017:112, :576 and `sidecar_test.go:281` no longer call the red run single-node, and
     `git grep -n "single-node Valkey 9" -- docs test` returns only superseded (struck) text.
@@ -495,7 +598,9 @@ Done when every line holds, with the command and date recorded here:
     delete to that line is recorded in both legs.
   - Revert check as for site 1.
 - [ ] `make lint`, `make cyclo`, and `E2E Tests` green in CI on the fix commit. As with ADR
-  0017 D50, a green streak is not a failure rate. The revert checks are the proof.
+  0017 D50, a green streak is not a failure rate. The revert checks are the proof. *(Precised
+  2026-09-27: until T43 lands `make lint` checks only the formatting of e2e files, and
+  `make cyclo` ignores `_test.go`; neither proves anything about this fix.)*
 
 ## Adjacent findings
 
@@ -514,13 +619,26 @@ Not in scope and not filed.
   exists.)*
 - **ADR 0017:585 says the watcher recorded "once a second".** It sampled each pod about every
   2 s (log table above). Cosmetic; fold it into the doc half if that paragraph is touched
-  anyway (run: `drain-orig-1/roles.txt`).
+  anyway (run: `drain-orig-1/roles.txt`). *(Done 2026-09-26 in `f5c6886`: read at `4a7543e`,
+  ADR 0017 `:592-593` strike "once a second" and say "about every 2 s per pod".)*
 - **The sibling in the integration tier** is
   [T33](033-integration-tests-read-the-cache-after-a-write.md): a read that a stale
   observer can satisfy.
 
 ## History
 
+- 2026-09-27: adversarial review of the enrichment - spot-checked the corrected
+  `sidecar_test.go` lines, the helper locations, the ADR 0017 and `CLAUDE.md` lines and the ten
+  T34 citations: all hold. Added a caveat under D2 option ii (poll the master count and ask every
+  Sentinel for `config-epoch`); the mark stays on ii and D1 stays A. Effort `M` confirmed.
+- 2026-09-27: enriched - re-read at `4a7543e`: the `sidecar_test.go` lines after `:281` (one
+  higher since `f5c6886`) and the moved ADR 0017 and `CLAUDE.md` lines corrected in place; the
+  fixed defects and the watcher note marked done. Options ordered into D1 (fixture half, A
+  recommended) and D2 (site 1's effect read, Sentinel `config-epoch` plus a full master count
+  recommended); a Work list with no XS no-decision item. **Effort `S` → `M`**: the code stays
+  about 30 lines, but closing needs Kind runs with two revert checks and a mutation, a CI run, and
+  the ADR 0017 D50, index row and `CLAUDE.md` edits plus ten T34 citation lines to rewrite. Urgency
+  stays `next` (rule 3: medium, trigger live); `blocked-by: decision` unchanged.
 - 2026-09-27 — the body of gap H-16 in `docs/security/workload-pod-posture.md` was replaced by
   a gap statement; its run log stays in ADRs 0032, 0033, 0025 and 0017. The two sentences this
   ticket pointed at there (`:252`, `:253`) are gone, and both pointers say so. No finding
