@@ -144,7 +144,6 @@ func runMigrateBinary(t *testing.T) {
 		binaryPath = defaultManagerBinary
 	}
 
-	// Build the absolute path if relative.
 	cmd := exec.Command(binaryPath, "migrate")
 
 	var stdout, stderr bytes.Buffer

@@ -105,6 +105,12 @@ locally, 2026-09-26). The drain marker handshake no longer crosses a uid boundar
 preStop half passed under the restricted Docker posture on both pinned lines
 (`TestRestrictedRuntime_DrainPreStopReleases`, green 2026-09-26).
 
+Corrected 2026-09-27 (no decision changes): D10 said `internal/common/drain.go` carries its two
+constants for a placement reason it attributed to D2. D2 gives no placement reason; the
+constants sit in `internal/common` because the sidecar (`internal/sidecar/drain.go`) and the
+builder (`internal/builder/statefulset.go`) both use them. Struck and corrected in place.
+Verified by grep on 2026-09-27; nothing was run.
+
 ## Context
 
 Every Valkey data pod runs a sidecar container. On SIGTERM of a **master** pod — any node
@@ -346,13 +352,14 @@ promotion, no stamp, no Event, and one log line in a container that is about to 
 
 The fix is a `preStop` hook on the **Valkey** container that waits for
 `/var/run/vko/drain-complete`, written by the drain handler on every exit path
-(`internal/common/drain.go` carries both constants, for the reason D2 gives for the
-annotation). Three properties make it a bound rather than a stall: the hook gives up after
-60 s, which is inside the 75 s `terminationGracePeriodSeconds` and leaves Valkey room to
-shut down; the marker write is a `defer` at the top of `Handle`, so it also covers the
-panic path -- a crashing sidecar must not hold Valkey hostage; and the sidecar treats a
-**missing mount** as "not this cluster", so the two sides cannot drift apart into a hook
-waiting for a file nobody can write.
+(`internal/common/drain.go` carries both constants~~, for the reason D2 gives for the
+annotation~~ *(corrected 2026-09-27: D2 gives no placement reason; the constants sit in
+`internal/common` because the sidecar and the builder both use them)*). Three properties make
+it a bound rather than a stall: the hook gives up after 60 s, which is inside the 75 s
+`terminationGracePeriodSeconds` and leaves Valkey room to shut down; the marker write is a
+`defer` at the top of `Handle`, so it also covers the panic path -- a crashing sidecar must not
+hold Valkey hostage; and the sidecar treats a **missing mount** as "not this cluster", so the
+two sides cannot drift apart into a hook waiting for a file nobody can write.
 
 **Scope: multi-replica without Sentinel only.** That is where the drain performs the
 failover itself and where losing it costs a dataset. A Sentinel cluster hits the same first

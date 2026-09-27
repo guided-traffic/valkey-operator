@@ -14,6 +14,18 @@ decision behind the immutable storage is
 | `aof` | Append-only file with `appendfsync everysec` |
 | `both` | RDB + AOF combined for maximum durability |
 
+## Without persistence, a restarted master can empty its replicas
+
+With `spec.persistence.enabled: false` (the default) nothing is saved (`save ""`,
+`appendonly no`). A restart of the master's `valkey-server` container — an `OOMKilled` at the
+memory limit, a crash, a liveness-probe kill — can bring it back on the same address with no
+data, or with the snapshot of its last full sync as a replica. Its replicas can then
+resynchronize from it and drop what they held, so replication does not protect the dataset
+against this event. Enable persistence for any dataset that must survive a restart of the
+master's container. This is derived from reading the operator and from running the Valkey
+side in plain docker against the Valkey 9 and Valkey 8 images the tests pin; it has not been
+reproduced on Kubernetes.
+
 ## Changing storage on an existing cluster
 
 `mode` is a config-file setting and propagates like any other one — it changes the

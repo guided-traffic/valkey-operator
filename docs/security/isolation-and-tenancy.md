@@ -157,7 +157,7 @@ Read this before treating a namespace as a tenant boundary.
   still open.** There is no admission webhook constraining CR names
   ([ADR 0015](../adr/0015-one-crd-validated-by-schema-only.md)), so whoever may
   `create valkeys` in a namespace chooses the names of that CR's derived objects.
-  Since the NA62 amendment of
+  Since the 2026-08-22 amendment of
   [ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) **every managed
   object family is guarded on both sides**: fourteen reconcile paths refuse to
   write an object the CR does not control, and every delete except
@@ -175,7 +175,7 @@ Read this before treating a namespace as a tenant boundary.
   foreign replica ConfigMap as absent, so a stranger's `replicaof` directive can no longer
   feed the master authority.
 
-  Pods are covered too, since the NA63 amendment: a pod's controller is its
+  Pods are covered too, since 2026-08-22: a pod's controller is its
   StatefulSet rather than the CR, so the proof runs `pod -> StatefulSet -> CR`
   (ADR 0020 D9). That closed three unequal doors — the sidecar Role granting
   `patch` on a foreign pod, an annotation Patch onto one, and the rolling update
@@ -210,13 +210,13 @@ Read this before treating a namespace as a tenant boundary.
 
 ### H-9: Before upgrading, look for objects an earlier release already adopted
 
-The NA62 guard is not retroactive. A ServiceMonitor or cert-manager
-Certificate that collided with a derived name under an earlier release
-carries this CR's controller ownerReference today, and deleting the CR will
-garbage-collect it. No field distinguishes such an object from a genuine
-child, so this cannot be automated: compare the ServiceMonitors and
-Certificates under `<cr>` names against what you expect the operator to have
-created, in every namespace that runs a Valkey.
+The ADR 0020 D1 guard on every managed kind (2026-08-22) is not retroactive.
+A ServiceMonitor or cert-manager Certificate that collided with a derived
+name under an earlier release carries this CR's controller ownerReference
+today, and deleting the CR will garbage-collect it. No field distinguishes
+such an object from a genuine child, so this cannot be automated: compare the
+ServiceMonitors and Certificates under `<cr>` names against what you expect
+the operator to have created, in every namespace that runs a Valkey.
 
 <a id="h-10"></a>
 

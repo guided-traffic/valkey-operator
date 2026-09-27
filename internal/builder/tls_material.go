@@ -45,8 +45,8 @@ var tlsMaterialKeys = []string{TLSCACertKey, TLSCertKey, TLSPrivateKeyKey}
 // gains or loses one is a different fingerprint rather than a collision.
 //
 // A nil secret returns the empty string, which every consumer reads as "no
-// fingerprint known": no annotation is written, and a pod without the annotation
-// is never restarted for it.
+// fingerprint known": nothing is stamped from it, and a pod without a recorded
+// fingerprint is never restarted for it.
 func ComputeTLSMaterialHash(secret *corev1.Secret) string {
 	if secret == nil {
 		return ""

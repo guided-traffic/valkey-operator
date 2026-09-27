@@ -2287,7 +2287,8 @@ func (r *ValkeyReconciler) updateStandaloneStatus(ctx context.Context, v *vkov1.
 }
 
 // currentMasterPod reports the pod the non-Sentinel cluster currently serves writes
-// from. The HA path has its own answer (clusterState.MasterPod, from Sentinel).
+// from. The HA path has its own answer (clusterState.MasterPod: the pod answering
+// role:master to INFO replication, health.Checker.findMaster; no Sentinel is asked).
 //
 // It used to be pod-0 unconditionally, which is a claim the rest of the operator
 // contradicts by design: after an abandoned topology restoration the promoted replica
@@ -2570,8 +2571,8 @@ func (r *ValkeyReconciler) persistStatus(ctx context.Context, v *vkov1.Valkey, p
 }
 
 // statusUnchanged compares the key fields of two ValkeyStatus values.
-// It returns true if phase, message, readyReplicas, masterPod, operatorVersion, and conditions
-// are all equal, meaning no status update is necessary.
+// It returns true if phase, message, readyReplicas, masterPod, operatorVersion,
+// observerReady and conditions are all equal, meaning no status update is necessary.
 func statusUnchanged(prev, curr *vkov1.ValkeyStatus) bool {
 	if prev.Phase != curr.Phase {
 		return false
@@ -3046,7 +3047,8 @@ func (r *ValkeyReconciler) findValkeyForSecret(ctx context.Context, obj client.O
 // rotation was invisible to the operator: cert-manager rewrote the Secret, no CR
 // matched, nothing was enqueued, and the pods kept the material they had parsed
 // at startup. Matching the TLS names is what turns a rotation into a reconcile;
-// the fingerprint annotation is what turns that reconcile into a roll.
+// the fingerprint recorded in the pod spec (VKO_TLS_MATERIAL_HASH, ADR 0031) is
+// what turns that reconcile into a roll.
 func secretConcernsValkey(v *vkov1.Valkey, secretName string) bool {
 	if v.IsAuthEnabled() && v.Spec.Auth.SecretName == secretName {
 		return true

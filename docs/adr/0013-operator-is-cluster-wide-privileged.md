@@ -122,6 +122,13 @@ Deployment, ServiceMonitors, Certificates, PodDisruptionBudgets, the ServiceAcco
 and the RoleBinding. The sentence is struck and restated in place, and the entry stays partly
 open for H-9 and H-11. Verified by reading on 2026-09-27; no test was run for this correction.
 
+Corrected 2026-09-27 (no decision changes): the alternative "A namespaced Role per watched
+namespace" offered, as a second option, a cache filtered by label with the ClusterRole narrowed
+to match. An RBAC rule carries no label selector — `rbacv1.PolicyRule` in `k8s.io/api` v0.37.1,
+the version `go.mod` pins, has `Verbs`, `APIGroups`, `Resources`, `ResourceNames` and
+`NonResourceURLs` only — so that option does not exist; it is struck in place, here and in gap
+[H-1](../security/privilege-footprint.md#h-1). Verified by reading the type.
+
 ## Context
 
 The operator is installed once and expected to serve `Valkey` CRs in arbitrary namespaces.
@@ -414,10 +421,13 @@ reads.
 
 ### A namespaced Role per watched namespace
 
-Or a cache filtered by label with the ClusterRole narrowed to match. Both are ~~on the hardening
-checklist~~ the options of the open gap [H-1](../security/privilege-footprint.md#h-1) *(since
-2026-09-27, ADR 0036)* with the cost stated: **the operator stops being install-and-forget for
-new namespaces.**
+~~Or a cache filtered by label with the ClusterRole narrowed to match. Both are~~ *(corrected
+2026-09-27: there is no second option — `rbacv1.PolicyRule` has no label selector, so no
+ClusterRole can be narrowed to match a label-filtered cache; such a cache shrinks what the
+operator holds in memory, not what its token may read.)* It is ~~on the hardening checklist~~
+the option of the open gap [H-1](../security/privilege-footprint.md#h-1) *(since 2026-09-27,
+ADR 0036)* with the cost stated: **the operator stops being install-and-forget for new
+namespaces.**
 
 ### Drop `escalate` and `bind`, keeping the sidecar Role a strict subset of the operator's own grants
 

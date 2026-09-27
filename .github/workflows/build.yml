@@ -172,13 +172,13 @@ jobs:
       - name: Update Chart Version
         id: version
         run: |
-          # Extrahiere Version aus dem Release-Tag (ohne 'v' Prefix)
+          # Extract the version from the release tag (without the 'v' prefix)
           VERSION=${GITHUB_REF_NAME#v}
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          # Aktualisiere Chart und App Version
+          # Update the chart version and the app version
           sed -i "s/^version:.*$/version: ${VERSION}/" deploy/helm/valkey-operator/Chart.yaml
           sed -i "s/^appVersion:.*$/appVersion: \"${VERSION}\"/" deploy/helm/valkey-operator/Chart.yaml
-          # Aktualisiere Image Tag in values.yaml
+          # Update the image tag in values.yaml
           sed -i "s/^  tag:.*$/  tag: \"${VERSION}\"/" deploy/helm/valkey-operator/values.yaml
 
       - name: Create Helm Package
@@ -187,7 +187,7 @@ jobs:
           helm package valkey-operator/
           mkdir -p repo
           mv *.tgz repo/
-          # Erstelle temporären Index für das neue Chart
+          # Create a temporary index for the new chart
           helm repo index repo/ --url https://guided-traffic.github.io/valkey-operator/
           cd ../..
 
@@ -210,20 +210,20 @@ jobs:
 
       - name: Publish to GitHub Pages
         run: |
-          # Kopiere neue Charts ins Root-Verzeichnis
+          # Copy the new charts into the root directory
           cp /tmp/helm-charts/*.tgz .
 
-          # Merge mit existierendem index.yaml falls vorhanden
+          # Merge with the existing index.yaml, if there is one
           if [ -f index.yaml ]; then
-            # Erstelle temporären Ordner für Merge
+            # Create a temporary directory for the merge
             mkdir -p temp-repo
             cp *.tgz temp-repo/
-            # Merge mit existierendem Index
+            # Merge with the existing index
             helm repo index temp-repo/ --url https://guided-traffic.github.io/valkey-operator/ --merge index.yaml
             cp temp-repo/index.yaml .
             rm -rf temp-repo
           else
-            # Erstelle neuen Index falls keiner existiert
+            # Create a new index if none exists
             helm repo index . --url https://guided-traffic.github.io/valkey-operator/
           fi
 

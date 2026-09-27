@@ -167,9 +167,9 @@ func TestForeignObserverServiceAccount_Integration(t *testing.T) {
 		"leaving it unowned is what keeps it out of this CR's garbage collection")
 }
 
-// TestForeignDataStatefulSet_Integration is the NA61 half of ADR 0020: the data
-// StatefulSet carries the bare CR name, so it is the name a pre-existing foreign
-// StatefulSet is most likely to hold. The operator must refuse the write — the
+// TestForeignDataStatefulSet_Integration covers ADR 0020 D1 and D8 for StatefulSets:
+// the data StatefulSet carries the bare CR name, so it is the name a pre-existing
+// foreign StatefulSet is most likely to hold. The operator must refuse the write — the
 // destructive alternative is installing its pod template into someone else's
 // workload — say so on the CR, leave the object entirely alone (no nudge patch,
 // no ownerReference), and provision its own StatefulSet by itself once the

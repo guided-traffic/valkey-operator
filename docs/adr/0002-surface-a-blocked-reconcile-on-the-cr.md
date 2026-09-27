@@ -48,6 +48,16 @@ blocked pass `persistStatus` puts the previous phase and message back, so there 
 Residual risks gains an entry with the verified facts. D5 and the choice to leave the
 assignment where it is are unchanged.
 
+Corrected 2026-09-27 (no decision changes), two sentences found false by code reading. D11
+said that with Sentinel `status.masterPod` comes from Sentinel; it is the data pod `findMaster`
+finds answering `role:master` to `INFO replication`, and no Sentinel is asked. The residual
+risk on `Ready` during a rolling update missed the two kinds of pass that reach `updateStatus`
+mid-roll (the correction of [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) D4
+of the same day). Both are struck and corrected in place; D11 and D5a are unchanged as rules.
+Verified by reading `CheckCluster` and `findMaster` in
+[`checker.go`](../../internal/health/checker.go), `updateHAStatus`, `reconcileWorkload` and
+`pauseRollingUpdate`; nothing was run.
+
 ## Context
 
 During the 2026-08-19 infra-d incident (context in
@@ -329,7 +339,11 @@ anything. **Two labeled masters deliberately picks no winner** — that state be
 `checkSteadyStateSplitBrain`
 ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md)). With Sentinel
 the field has a different source and `currentMasterPod` is never called: `updateHAStatus`
-writes `clusterState.MasterPod` — the master as Sentinel reports it.
+writes `clusterState.MasterPod` — ~~the master as Sentinel reports it~~ *(corrected
+2026-09-27: the running data pod that answers `role:master` to `INFO replication`, found by
+`findMaster` ([`checker.go`](../../internal/health/checker.go)) probing every data pod; when
+several answer, the one with the most connected replicas, ties to the lowest ordinal. No
+Sentinel is asked)*.
 
 **D12 — The status reports a per-instance current task.** `OK` when the instance is
 healthy, otherwise a short description of what the operator is doing
@@ -518,7 +532,12 @@ after that.
   a consumer from reading it as "the operator is healthy". The condition registry
   ([ADR 0027](0027-conditions-are-levels-edges-or-history.md)) records that `Ready` is a
   level with one evaluator, which catches a second evaluator appearing but not a wrong one.
-* **`Ready` keeps its pre-roll value for the whole rolling update**, because a pass with a
+* **`Ready` keeps its pre-roll value ~~for the whole rolling update~~** *(corrected 2026-09-27:
+  on every pass that ends on a rolling-update exit; a pass whose wait has outlived its bound
+  ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5, D11;
+  [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D16, D17) and the pass in which the
+  data roll pauses on its sync timeout reach `updateStatus` and recompute it, unless a
+  post-update check ends that pass)*, because a pass with a
   roll in flight returns before `updateStatus`
   ([ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) D4). That is decided
   behaviour, and D5a states it, but it means "Ready" and "serving right now" come apart for

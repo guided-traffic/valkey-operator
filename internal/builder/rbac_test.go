@@ -55,12 +55,12 @@ func TestBuildSidecarRole(t *testing.T) {
 	assert.Equal(t, "default", role.Namespace)
 	assert.Equal(t, common.ManagedBy, role.Labels[common.LabelManagedBy])
 
-	// patch is the only verb the sidecar calls, and only on this cluster's own data
-	// pods. Exact match, not Contains: a reintroduced get/list would widen the grant
-	// silently, list is incompatible with resourceNames, and a dropped resourceNames
-	// list would hand every sidecar token patch access to every pod in the namespace —
-	// including another cluster's drain stamp, which the operator consumes as promotion
-	// evidence (ADR 0012 D8 step 3).
+	// get and patch are the only verbs the sidecar calls, and only on this cluster's
+	// own data pods. Exact match, not Contains: an added verb such as list would widen
+	// the grant silently, list is incompatible with resourceNames, and a dropped
+	// resourceNames list would hand every sidecar token patch access to every pod in
+	// the namespace — including another cluster's drain stamp, which the operator
+	// consumes as promotion evidence (ADR 0012 D8 step 3).
 	require.Len(t, role.Rules, 1)
 	rule := role.Rules[0]
 	assert.Equal(t, []string{""}, rule.APIGroups)

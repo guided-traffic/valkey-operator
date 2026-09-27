@@ -270,8 +270,8 @@ func (r *ValkeyReconciler) dispatchDataRollingUpdate(ctx context.Context, v *vko
 			}
 			return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
 		}
-		// The NA61 guard above proves the StatefulSet, which is the wrong object for
-		// this decision: a pod holding <cr>-N was not necessarily created by it, and a
+		// The ADR 0020 D8 guard above proves the StatefulSet, which is the wrong object
+		// for this decision: a pod holding <cr>-N was not necessarily created by it, and a
 		// foreign one differs from our persisted template by construction, so the very
 		// next step would classify it as outdated and schedule it for deletion. The
 		// refusal fails the step rather than treating the pod as absent, because a name
@@ -419,8 +419,9 @@ func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 //
 // desiredTLSHash adds the fourth input: the fingerprint of the TLS Secret the
 // pods mount. Its whole purpose is to replace processes that cannot re-read
-// rotated material, so it has no fallback -- a pod without the annotation is
-// unmeasured and is left alone.
+// rotated material, so it has no fallback -- a pod without a recorded
+// fingerprint (the env var, or the legacy annotation) is unmeasured and is left
+// alone.
 func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, desiredConfigHash,
 	desiredPodSpecHash, desiredTLSHash string, desiredContainers []corev1.Container) bool {
 	if len(pod.Spec.Containers) == 0 {
@@ -2637,9 +2638,11 @@ func (r *ValkeyReconciler) pauseRollingUpdate(ctx context.Context, v *vkov1.Valk
 		return &RollingUpdateResult{Error: err}
 	}
 
-	// Return completed=false and no requeue. That ends THIS pass without a wait — it
-	// does not end the roll: any later pass that finds an outdated pod dispatches
-	// again on a fresh budget (see the function comment).
+	// Return completed=false and no requeue. That ends the data roll's work for this
+	// pass, not the pass: reconcileWorkload goes on to the post-update checks, the
+	// Sentinel roll included (ADR 0026 D11), and to updateStatus unless one of them
+	// ends the pass. Nor does it end the roll: any later pass that finds an outdated
+	// pod dispatches again on a fresh budget (see the function comment).
 	return &RollingUpdateResult{}
 }
 
@@ -3602,9 +3605,9 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 }
 
 // resetSentinelState reconfigures all sentinel instances by removing and re-adding
-// the monitored master. Unlike SENTINEL RESET (which reverts to the initial config
-// from the config file and loses the current master address after failovers), this
-// approach preserves the correct master by using the provided masterAddr.
+// the monitored master at the provided masterAddr. SENTINEL RESET would keep the
+// master address each Sentinel currently holds, including after a failover
+// (measured, ADR 0022 Context); this approach sets the one the caller names instead.
 //
 // If masterAddr is empty, falls back to the default master address (pod-0).
 //

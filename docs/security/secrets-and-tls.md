@@ -197,10 +197,16 @@ exporter — a third-party image — holds the same authority as a client that m
 
 ### H-7: Pin `enable-debug-command` and `enable-module-command` to `no` in the generated config
 
-The config builder renders neither
-([`configmap.go`](../../internal/builder/configmap.go), verified by grep), so whatever the
-image defaults to applies. Believed `no` since Redis 7; **not re-checked for either
-pinned Valkey line**.
+The config builder renders neither, nor `enable-protected-configs`
+([`configmap.go`](../../internal/builder/configmap.go), verified by grep), so the default
+compiled into the image a cluster runs applies. ~~Believed `no` since Redis 7; **not
+re-checked for either pinned Valkey line**.~~ *(corrected 2026-09-27, read in upstream
+source:)* on both pinned lines ([`images.go`](../../test/testimages/images.go)) that default is
+`no` — `src/config.c` of `valkey-io/valkey` defines all three directives as `IMMUTABLE_CONFIG`
+with default `no`, lines 3375-3377 at tag `9.1.1` and lines 3267-3269 at tag `8.1.9`, so
+`CONFIG SET` cannot switch them on at runtime. **Not verified:** the images themselves — neither
+was run with `CONFIG GET` — and any other image a CR author puts in `spec.image`, whose own
+default applies. Nothing in this repository states or checks the value.
 
 <a id="h-8"></a>
 

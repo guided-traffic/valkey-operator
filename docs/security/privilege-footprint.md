@@ -143,8 +143,11 @@ It needs
 the auth Secret and the TLS Secret of the namespaces it serves, not the
 cluster's Secrets. Since 2026-08-26 the TLS Secret is read on **every pass** of
 every TLS cluster, for the material fingerprint, so a filtered cache has one
-more consumer to satisfy. Options: a namespaced Role per watched namespace, or a
-cache filtered by label with the ClusterRole narrowed to match. Cost: the
+more consumer to satisfy. Option: a namespaced Role per watched namespace~~, or a
+cache filtered by label with the ClusterRole narrowed to match~~ *(corrected 2026-09-27: that
+second option does not exist — an RBAC rule carries no label selector, `rbacv1.PolicyRule` has
+verbs, API groups, resources, resource names and non-resource URLs only, so a label-filtered
+cache shrinks the Secrets held in memory, not what the token may read)*. Cost: the
 operator stops being install-and-forget for new namespaces. The cluster-wide scope is the
 decision of [ADR 0013](../adr/0013-operator-is-cluster-wide-privileged.md) D1.
 
@@ -169,5 +172,7 @@ uses none of the CRD half *(verified 2026-09-27 against the chart and the code)*
 and nothing else, and no Go file under `cmd/` or `internal/` imports `apiextensions`. The
 comment on the rule in
 [`pre-upgrade-rbac.yaml`](../../deploy/helm/valkey-operator/templates/pre-upgrade-rbac.yaml),
-"Update the CRD to the latest schema before migrating existing CRs", describes a step the hook
-never takes, so `customresourcedefinitions: get,list,patch,update` is granted and unused.
+~~"Update the CRD to the latest schema before migrating existing CRs", describes a step the hook
+never takes, so~~ *(corrected 2026-09-27: said that until 2026-09-27, a step the hook never
+takes, and now says the rule is granted but unused:)*
+`customresourcedefinitions: get,list,patch,update` is granted and unused.

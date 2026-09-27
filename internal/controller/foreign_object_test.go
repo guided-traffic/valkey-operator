@@ -315,7 +315,7 @@ func TestRequestRecheck_IsANoOpWithoutPassState(t *testing.T) {
 	assert.NotPanics(t, func() { requestRecheck(context.Background(), time.Second) })
 }
 
-// --- StatefulSets and observer Deployment: the NA61 half of ADR 0020 ---
+// --- StatefulSets and observer Deployment: ADR 0020 D1 and D8, amended 2026-08-22 ---
 
 // foreignStatefulSet returns a StatefulSet under name that no Valkey controls,
 // with its own selector and workload — the shape of a pre-existing application
@@ -910,7 +910,7 @@ func TestDeleteIfOwned_ToleratesAReplacementUnderTheName(t *testing.T) {
 	assert.NoError(t, r.deleteIfOwned(context.Background(), v, owned, "metrics Service"))
 }
 
-// --- pods: the NA63 half of ADR 0020 ---
+// --- pods: ADR 0020 D9 ---
 //
 // A pod is the only managed object whose controller is not the CR, so the proof runs
 // pod -> StatefulSet -> CR (D9). The three doors these tests cover are deliberately
@@ -1059,9 +1059,9 @@ func TestCollectPodStates_RefusesAForeignPod(t *testing.T) {
 }
 
 func TestCheckAndHandleRollingUpdate_RefusesAForeignPod(t *testing.T) {
-	// The NA61 StatefulSet guard proves the wrong object for this decision: a foreign
-	// pod differs from the persisted template by construction, so the very next step
-	// would classify it as outdated and schedule it for deletion.
+	// The ADR 0020 D8 StatefulSet guard proves the wrong object for this decision: a
+	// foreign pod differs from the persisted template by construction, so the very next
+	// step would classify it as outdated and schedule it for deletion.
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
 	sts := stsForValkey(v)
 	r, c := newTestReconciler(v, sts, foreignPod(v, "test-0"), podFromStsTemplate(v, sts, 1))

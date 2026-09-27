@@ -18,6 +18,11 @@ Not implemented, deliberately: the operator never issues `SENTINEL RESET` to cle
 peer table. Drift that predates this ADR is cleared manually or at the next Sentinel
 roll — see D6.
 
+Corrected 2026-09-27 (no decision changes): the comment above `resetSentinelState` that the
+Context and Residual risks call wrong now states the measured behaviour of `SENTINEL RESET`
+(it keeps the current master address). Both sentences are struck and corrected in place.
+Verified by reading the comment; nothing was run.
+
 ## Context
 
 Sentinel discovers its peers through hello messages on the monitored master's
@@ -67,7 +72,8 @@ Two further measurements constrain the fix. `SENTINEL RESET <name>` **keeps** th
 current master address, including after a failover moved it away from the config-file
 value — the comment in
 [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go)
-above `resetSentinelState` claims the opposite and is wrong. And a `SENTINEL RESET`
+above `resetSentinelState` ~~claims the opposite and is wrong~~ *(corrected 2026-09-27: claimed
+the opposite until 2026-09-27 and now states this)*. And a `SENTINEL RESET`
 issued while the master is unreachable leaves the Sentinel at
 `num-other-sentinels=0` and `num-slaves=0` with no way back: peer and replica
 discovery both run through the master, so there is no other channel to rebuild from.
@@ -201,8 +207,9 @@ store for a one-off.
   joining the monitor group — which is not a failure mode this operator produces.
 - **Existing fleet drift is a manual step** (D6) and nothing enforces that it happens.
   The condition makes it visible; it does not make it mandatory.
-- The wrong comment above `resetSentinelState` was left in place by this change and is
-  corrected in the change that next touches that function.
+- ~~The wrong comment above `resetSentinelState` was left in place by this change and is
+  corrected in the change that next touches that function.~~ *(Closed 2026-09-27: the
+  comment was corrected.)*
 
 ## References
 

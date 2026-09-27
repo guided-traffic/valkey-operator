@@ -179,8 +179,6 @@ is in [DEVELOPER.md](../../DEVELOPER.md#continuous-integration-and-the-release).
 
 ## What is wrong today, or not verified
 
-- **`E2E_TESTS=true`** is set by the CI step that runs `make test-e2e`, and no test reads it
-  (searched 2026-09-27).
 - **`make test-e2e-helm` passes `MANAGER_BINARY=./bin/manager`**, but `go test` runs the
   package with `test/e2e/` as its working directory and the test does not set one for the
   command, so that relative path points at `test/e2e/bin/manager`. The test's own default,

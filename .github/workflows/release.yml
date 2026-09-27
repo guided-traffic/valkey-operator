@@ -426,7 +426,6 @@ jobs:
             done
           fi
         env:
-          E2E_TESTS: "true"
           E2E_RUN: ${{ matrix.run_filter }}
           # Turns "not enough nodes" from a skip into a failure on the multi-node leg.
           E2E_REQUIRE_MULTI_NODE: ${{ matrix.require_multi_node }}

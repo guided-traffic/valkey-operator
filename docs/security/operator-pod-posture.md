@@ -85,8 +85,13 @@ By default it binds
 [ADR 0021](../adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)
 the payload is an inventory of the fleet and its health ([what `:8080` discloses](#what-8080-discloses)), not
 only controller-runtime counters. `--metrics-bind-address` is applied since
-the ADR 0018 D8 fix, so the endpoint can be moved or switched off (`=0`) from
-the chart; wherever it binds it stays unauthenticated — controller-runtime's
+the ADR 0018 D8 fix, so the endpoint can be moved or switched off (`=0`) ~~from
+the chart~~ *(corrected 2026-09-27: by the flag on the binary, not from the chart —
+[`deployment.yaml`](../../deploy/helm/valkey-operator/templates/deployment.yaml) passes
+`--metrics-bind-address=:8080` unconditionally and
+[`values.yaml`](../../deploy/helm/valkey-operator/values.yaml) has no value for it, so on a
+chart install moving or disabling it means changing the Deployment's arguments outside the
+chart)*; wherever it binds it stays unauthenticated — controller-runtime's
 `WithAuthenticationAndAuthorization` filter is a separate trade, not taken, and needs a
 `TokenReview`/`SubjectAccessReview` grant ([ADR 0018](../adr/0018-metrics-and-the-exporter-sidecar.md)
 D9/D10). A NetworkPolicy for the operator namespace is the only control that

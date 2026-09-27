@@ -146,8 +146,8 @@ metrics:
 
 # preUpgradeHook configures the Helm pre-upgrade hook Job that migrates existing
 # Valkey CRs to the field defaults of the current operator version.
-# The hook runs before the operator Deployment is updated, ensuring the CRD schema
-# and CR defaults are in place before the new operator starts reconciling.
+# The hook runs before the operator Deployment is updated. It lists and patches
+# Valkey CRs only (cmd/migrate); it does not read or write the CRD.
 preUpgradeHook:
   # enabled controls whether the pre-upgrade Job and its RBAC resources are rendered.
   enabled: true

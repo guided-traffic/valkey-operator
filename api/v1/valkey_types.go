@@ -39,9 +39,11 @@ const (
 	// and the operator cannot write something. Read status.message and ReconcileBlocked to
 	// find out what.
 	//
-	// It is a level, not an edge, with one carve-out: a pass with a rolling update in
-	// flight returns before updateStatus and writes its own phase, so during a roll Ready
-	// keeps its pre-roll value (ADR 0001 D4).
+	// It is a level, not an edge, with one carve-out: a pass that ends on a rolling-update
+	// exit returns before updateStatus and writes its own phase, so during a roll Ready
+	// keeps the value of the last pass that reached updateStatus (ADR 0001 D4). A pass
+	// whose wait has outlived its bound (ADR 0026 D5, D11) and the pass in which a data
+	// roll pauses do reach it, unless a post-update check ends the pass.
 	ConditionTypeReady ConditionType = "Ready"
 
 	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
@@ -231,9 +233,9 @@ const (
 	// unrelated reason, and the pods then keep the material they pinned at start
 	// until it expires and their long-lived processes go silent.
 	//
-	// It is written only on TLS clusters, and only for pods that already carry the
-	// fingerprint annotation; a pod created before the operator wrote fingerprints
-	// is not stale, it is unmeasured.
+	// It is written only on TLS clusters, and only for pods that already carry a
+	// recorded fingerprint (VKO_TLS_MATERIAL_HASH, or the legacy annotation); a pod
+	// created before the operator wrote fingerprints is not stale, it is unmeasured.
 	ConditionTypeTLSMaterialStale ConditionType = "TLSMaterialStale"
 
 	// ConditionTypeRWServiceEmpty reports that no data pod carries the

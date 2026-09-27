@@ -4,7 +4,7 @@
 // actually contain what the operator executes inside them.
 //
 // The operator does not build this image. It consumes the upstream one and runs
-// shell in it: both init containers are scripts, the container command wraps
+// shell in it: every init container is a script, the container command wraps
 // valkey-server in `sh -c` under auth, the probes exec valkey-cli, and the drain
 // preStop hook is a shell loop. Every one of those is an assumption about a
 // filesystem somebody else maintains and can change between tags -- a distroless

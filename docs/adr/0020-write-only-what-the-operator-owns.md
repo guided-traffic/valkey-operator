@@ -4,6 +4,17 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended again 2026-09-27 (correction, no decision changes):** D9 and its Consequences bullet
+said the rolling update's pod refusal reaches the CR as `ReconcileBlocked/ForeignObject`. It
+reaches it as phase `Error` and `status.message` only, and never did otherwise:
+`setReconcileBlockedCondition` has one caller, fed by the error of `reconcileResources`, at
+`995f186` as at HEAD. D9's "one Event series per pass" also becomes "at most one", because a
+colliding Sentinel pod, or one without the data-pod selector labels, gets no Event. Both places are struck and corrected in place, and
+Residual risks gains the entry. Whether the pod refusal is reported through `ReconcileBlocked`,
+as D5 asks of a refusal, is open. Verified by reading `Reconcile`, `reconcileWorkload`,
+`runSentinelRollingUpdate`, `reconcileSidecarRole` and `listDataPodNames` in
+[`valkey_controller.go`](../../internal/controller/valkey_controller.go); nothing was run.
+
 **Amended 2026-09-27 (correction, no decision changes):** the Context bullet on the three pod
 doors and the matching Alternatives entry said the sidecar grant needed only the label set.
 Read against the code before the 2026-08-22 pod amendment (`995f186^`), it needed the label
@@ -475,8 +486,17 @@ annotation in place, so its bounded waits stay armed
 **One reporter, and it is not the rolling update.** `reconcileSidecarRole` runs on every pass
 and lists the data pods anyway, so it emits the `PodNotOwned` Warning for the whole family at
 no extra read; every filtering path stays quiet. The rolling update emits no Event of its own —
-its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
-message — so a collision produces one Event series per pass, the same rule D8 sets.
+~~its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
+message~~ *(corrected 2026-09-27: its refusal reaches the CR only as phase `Error` with the pod
+name in `status.message` — `Rolling update error: …`, or `Sentinel rolling update error: …` for a
+Sentinel pod — and on a pass the resource step also blocks, not even there, because that pass's
+one phase write names the resource error. `ReconcileBlocked` is evaluated from
+`reconcileResources` alone, which a pod collision does not fail, so the condition does not report
+it and the `ValkeyReconcileBlocked` alert, which reads the condition, does not fire. It was never
+true: the evaluator has taken only the resource-step error since this paragraph was written. And
+`reconcileSidecarRole` lists only pods carrying the data-pod selector labels, so a colliding
+Sentinel pod, or a pod under a data-pod name without those labels, gets no Event either)* — so a collision produces ~~one~~ *(corrected 2026-09-27: at most one)* Event series per
+pass, the same rule D8 sets.
 
 **D10 — A value the operator writes onto a pod and later trusts is not protected by D9.**
 *(2026-08-27.)* D9 answers "is this pod ours". It does not answer "did we write what this pod
@@ -567,8 +587,9 @@ watched the recreated one adopt the surviving pods under its new UID.
   — and it surfaced as a unit test that had been asserting the recovery with no pods staged
   at all.
 * **(2026-08-22, NA63) The rolling update stops on a colliding pod instead of deleting it.**
-  A cluster whose `<cr>-N` is held by a foreign pod now reports `ReconcileBlocked/ForeignObject`
-  and phase `Error` rather than quietly rolling. It could not have completed either way — the
+  A cluster whose `<cr>-N` is held by a foreign pod now reports ~~`ReconcileBlocked/ForeignObject`
+  and~~ phase `Error` *(corrected 2026-09-27: not the condition, see D9)* rather than quietly
+  rolling. It could not have completed either way — the
   statefulset-controller cannot create its own pod under a taken name — but the failure is now
   the reported one rather than a rollout that never finishes.
 * **(2026-08-22, NA63) Every pod fixture in the unit tests had to declare its parent.** The
@@ -776,6 +797,12 @@ that alters nothing a user asked for.
 * **A pod still carries the ServiceAccount *name* as its identity** for a service mesh, SPIFFE
   or an admission policy, and that name is CR-derived whether or not the operator owns the
   object. The guard does not change it.
+* **The rolling update's pod refusal carries no condition** *(added 2026-09-27)*. A foreign
+  pod under a generated pod name stops the roll and reaches the CR as phase `Error` and
+  `status.message` only (D9): `ReconcileBlocked` does not report it, so nothing that reads the
+  condition — the `ValkeyReconcileBlocked` alert included — sees the collision, and a
+  colliding Sentinel pod, or one without the data-pod selector labels, gets no Event either. Whether the pod door is reported through
+  `ReconcileBlocked`, as D5 asks of a refusal, is open.
 * **`errors.Is` over a joined pass error decides the ReconcileBlocked reason.** If a future
   step wraps a refusal in a way that breaks unwrapping, the reason silently degrades to
   `WriteFailed`. The condition still fires; only its reason would be wrong.
