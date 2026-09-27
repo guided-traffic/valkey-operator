@@ -441,7 +441,7 @@ during a genuine split brain would restart the silence.
   hatch), so both sides of a split accumulate writes that the repair then
   discards. This ADR changes what a Warning promises; it does not change what a
   divergence costs. Tracked separately as T12 in
-  [`docs/tickets/012-no-write-fencing-min-replicas-to-write-as-an-opt-in-field.md`](../tickets/012-no-write-fencing-min-replicas-to-write-as-an-opt-in-field.md).
+  [`docs/tickets/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md`](../tickets/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md).
 - **The e2e assertion is an absence.** "No Warning Event on the CR" fails on a
   genuinely degraded run as well as on a regression of this ADR, which is
   intended — but on a resource-starved CI node a legitimately slow topology

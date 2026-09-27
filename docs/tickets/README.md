@@ -34,11 +34,13 @@ The highest existing number, archived and embargoed tickets included — the `lo
 stripped before sorting — printed from the repository root:
 
 ```
-ls docs/tickets docs/tickets/archive | sed -nE 's/^(local_)?([0-9]{3})-.*/\2/p' | sort -n | tail -1
+{ ls docs/tickets docs/tickets/archive; git log --all --format= --name-only -- docs/tickets | xargs -n1 basename; } \
+  | sed -nE 's/^(local_)?([0-9]{3})-.*/\2/p' | sort -n | tail -1
 ```
 
-Run it in the owner's working tree: `local_` files are gitignored, so a fresh clone cannot see
-an embargoed ticket's number and would hand it out a second time.
+The `git log` half counts the numbers of merged tickets, whose files are deleted. Run it in the
+owner's working tree: `local_` files are gitignored, so a fresh clone cannot see an embargoed
+ticket's number and would hand it out a second time.
 
 Numbering started on 2026-09-27. The files written before it were given numbers as follows,
 and they keep them: 037, 038 and 039 are the multi-item analysis records that predate the
@@ -95,7 +97,7 @@ citations that already exist outside this directory — T-labels in ADRs, in Go 
 there verbatim from the former `SECURITY_ARCHITECTURE.md`), the `NA61`–`NA63` labels defined in
 [archive/037](archive/037-recovery-after-transient-admission-webhook-rejection.md), and the
 links from ADRs into this directory — stay until they are rewritten. They are the work list of
-[ticket 040](040-tracked-files-cite-work-items-instead-of-adrs.md), which counts them, and they
+[ticket 040](040-tracked-text-cites-tickets-and-states-what-the-code-contradicts.md), which counts them, and they
 are not a precedent.
 
 ## There is no index table and no board
@@ -111,11 +113,9 @@ below starts its lines with `state:` as well. The board was retired on 2026-09-2
 instruction; its final state is archived verbatim in
 [archive/039, "Board archive"](archive/039-findings-from-the-1-11-0-fleet-rollout.md#board-archive--final-state-of-local_boardmd-retired-2026-09-27).
 
-Six files carry no frontmatter. Tickets 040, 041 and 042 state their state in the
-`> **Status: …**` blockquote under the title
-(`grep -rH -m1 '^> \*\*Status' --include='[0-9]*.md' docs/tickets`); the archived
-multi-item records 037, 038 and 039 are closed by being in `archive/`. An embargoed ticket shows
-up in the grep only on a machine that holds its file.
+Every open ticket carries frontmatter. The archived multi-item records 037, 038 and 039 carry
+none and are closed by being in `archive/`. An embargoed ticket shows up in the grep only on a
+machine that holds its file.
 
 ## The filing rule
 
@@ -237,7 +237,7 @@ One line per related ticket.
   [archive/](archive/). An embargoed ticket keeps its `local_` prefix and moves to
   [archive/](archive/) with it; the repository ignore line keeps it untracked there
   ([above](#an-open-security-finding-is-embargoed)).
-- Every open item has had its own file since 2026-09-27: T12, T18, T23, T26 and T29 were
-  extracted from the collection ticket, now
-  [archive/039](archive/039-findings-from-the-1-11-0-fleet-rollout.md), and C3, C2 and S1 became
-  tickets 040, 041 and 042.
+- Merging tickets (the [filing rule](#the-filing-rule)) keeps the number and the `id:` of the
+  ticket that takes the others in; the merged files are deleted, not archived, and every reference
+  to their ids is pointed at the surviving ticket. A ticket cited outside `docs/tickets/` is the
+  one that survives, so the citation stays valid.

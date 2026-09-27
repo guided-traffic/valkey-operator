@@ -82,8 +82,11 @@ move into the frontmatter fields `shipped:` and `publication-accepted:`, with `d
 for a dropped ticket; that placement was chosen when the rule was implemented and was not put to
 the owner as a question of its own. **Implemented** in
 [docs/tickets/README.md](../tickets/README.md) and `CLAUDE.md` in the same uncommitted change, and
-every open ticket was rewritten to the D9 form. **Open:** whether the nineteen new tickets are
-merged into the tickets of their subject under the new D5.
+every open ticket was rewritten to the D9 form. Under the new D5 the open tickets were then
+consolidated by subject, on the owner's instruction the same day: 50 files became 21 (15 tracked,
+6 embargoed), each merged ticket keeping the number and id of the ticket that took the others in,
+chosen so that every ticket cited outside `docs/tickets/` survives. The numbers of the merged
+tickets are not reused; the numbering command of the rules page reads them from git history.
 
 ## Context
 
