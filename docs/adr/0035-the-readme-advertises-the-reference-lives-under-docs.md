@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted. Date: 2026-09-27.
+Accepted, amended 2026-09-27 (D6 re-decided: the README carries no decisions and does not link to
+ADRs). Date: 2026-09-27.
+
+**Re-decided 2026-09-27 by the owner: D6.** The README is the project's front page and the entry
+point for administrators who consider or run the operator; decisions have no place in it. Every
+ADR citation, every decision rationale ("no opt-out", "so upgrades change nothing") and the ADR
+row of the documentation table were removed from it in the same uncommitted change. Contributors
+reach the ADRs through `DEVELOPER.md` and `docs/developer/`.
 
 The owner adopted this layout for the repository on 2026-09-27. It comes from a sibling project,
 adapted in three places: the complete CRD reference and the complete Helm chart values table
@@ -150,8 +157,11 @@ toolchain versions and the conventions. It never repeats a page of `docs/develop
 
 **D6 — The README links; it does not explain.** When a README paragraph starts explaining a
 mechanism, the explanation belongs on the page the paragraph links to. The README links to
-documents, to the configuration a user opens (`values.yaml`) and to ADRs. It never links into
-the source tree.
+documents ~~, to the configuration a user opens (`values.yaml`) and to ADRs~~ and to the
+configuration a user opens (`values.yaml`) *(re-decided 2026-09-27, see Status)*. It never links
+into the source tree. **It carries no decisions:** no ADR citation, no rationale for why the
+operator behaves as it does, no record of what was rejected - it states what the operator does
+and how to configure it.
 
 **D7 — Every emoji heading in the README carries an explicit HTML anchor.** The anchor that
 GitHub generates for an emoji heading is neither stable nor guessable. An anchor that other

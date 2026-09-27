@@ -49,13 +49,12 @@ C3, C2 and S1; each of those three says so under its title.
 
 A ticket is **embargoed** while its frontmatter says `security: live` or `security: boundary`
 and a live or boundary finding in it is not fixed; `state: done` alone does not end it. **The
-embargo ends when the finding is fixed, not when the ticket closes.** *(corrected 2026-09-27:
-this page first ended the embargo, and renamed the file, at `state: done`, against
-[ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) D4 — a ticket can reach
-`done` with a live or boundary risk accepted rather than fixed.)* A `dropped` live or boundary
+embargo ends when the finding is fixed, not when the ticket closes**
+([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) D4): a ticket can reach
+`done` with a live or boundary risk accepted rather than fixed. A `dropped` live or boundary
 finding is unfixed by definition, so it stays embargoed unless the owner explicitly accepts
-publishing it; that acceptance, with its date, is the newest History entry of the ticket before
-its file is renamed. While a ticket is embargoed:
+publishing it; that acceptance is recorded as the frontmatter field `publication-accepted:` with
+its date before the file is renamed. While a ticket is embargoed:
 
 - **Its file carries the `local_` prefix**: `local_NNN-<kebab-slug>.md`. Two ignore rules
   match it: this repository's own [`.gitignore`](../../.gitignore) carries
@@ -73,13 +72,13 @@ its file is renamed. While a ticket is embargoed:
   "embargoed security finding, open - details in its own ticket file until it is fixed".
 - **It still takes its number**, so the tracked numbering has gaps where embargoed tickets sit.
 
-When the "what shipped" History entry of `done` names the fix of every live or boundary item of
-the ticket, the file is renamed without the prefix (`local_NNN-<slug>.md` becomes
+When the `shipped:` line of a `done` ticket names the fix of every live or boundary item of the
+ticket, the file is renamed without the prefix (`local_NNN-<slug>.md` becomes
 `NNN-<slug>.md`) and is tracked from then on like any other ticket; the embargo notes in
 tracked files may then be replaced by what they stood for. A ticket that reaches `done` with a
 live or boundary item whose risk was accepted rather than fixed (a multi-item ticket included)
 keeps the prefix, like a `dropped` one, until the owner explicitly accepts publishing it; that
-acceptance, with its date, is the newest History entry. When its `state:` reaches `dropped`,
+acceptance is the `publication-accepted:` date. When its `state:` reaches `dropped`,
 the file keeps the prefix and stays untracked; it is renamed the same way only after the
 owner's explicit acceptance above. A `hardening` finding is not embargoed.
 
@@ -120,17 +119,20 @@ up in the grep only on a machine that holds its file.
 
 ## The filing rule
 
-**Every finding is a file** — a new ticket, or an appendix to the existing ticket of its
-family (same mechanism, same decision). A row somewhere was never sufficient (Hans,
-2026-09-27; it replaced the earlier bar that gave a low finding a board row and no file).
-Severity and security class still derive the urgency below; they never decide whether a file
-exists.
+**A finding goes into an existing ticket first.** Before anything new is opened, the finding is
+assigned to the open ticket whose subject it shares - the same component, mechanism or kind of
+change - and becomes part of that ticket's current state and required changes. A ticket collects
+similar findings. Only when no open ticket fits is a new ticket opened (Hans, 2026-09-27;
+[ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) D5). A collecting ticket is
+still one subject: findings that share only the event or the analysis that found them are not
+collected in one file. A row somewhere, or a finding that lives only in a report, is never
+enough.
 
-**An `## Options` section is expected wherever a decision is open.** Decisions are presented
-one at a time, each with options researched against the code and sensible in the project's
-context, weighed against each other, the best one marked and the mark justified (Hans,
-2026-09-26, global rule). An adversarial pass is warranted for severity high+ or security
-live/boundary.
+**An `## Open questions` section is expected wherever a decision is open**: one subsection per
+question, understandable on its own, with the sensible options, the recommended one marked and
+the mark justified, and an `**Answer:**` line that Hans fills in. Decisions are put to Hans one at
+a time (Hans, 2026-09-26, global rule). An adversarial pass is warranted for severity high+ or
+security live/boundary.
 
 ## Frontmatter
 
@@ -153,6 +155,9 @@ filed-from: T25       # optional: the analysis or event that produced it
 opened: 2026-08-27
 decided:              # date, when state reaches decided
 done:                 # date, when state reaches done
+shipped:              # optional, set with done: one line naming what shipped (for an embargoed ticket: the fix of every live or boundary item)
+dropped-reason:       # optional, set with dropped: one line
+publication-accepted: # optional, embargoed tickets only: date of the owner's explicit acceptance to publish an unfixed finding
 ---
 ```
 
@@ -178,55 +183,57 @@ A blanket statement ("could be a security risk") does not fill the `threat:` fie
 | Needs a product call, a human re-decision, or a threat-model escalation nobody has accepted | `icebox` |
 
 Urgency is recomputed when facts change (a dormant trigger goes live, a severity gets
-re-measured) — and the change is a History entry, not a silent edit.
+re-measured); the comment of the `urgency:` line names the rule that matched.
 
 ## Body skeleton
 
+**A ticket shows the current state and nothing else**
+([ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) D9). There is no History
+section. When a fact, a question or an answer changes, the text is rewritten to the new state:
+nothing is struck through, nothing is annotated with a date, and no account of how the code or the
+ticket evolved is kept - git keeps that for a tracked ticket. Done work items are removed. The
+content must be graspable in a few minutes.
+
 ```markdown
-## Fact
+## Current state
 
-What is broken / missing, mechanism first, with file:line links and measurement dates.
-Mandatory split, every time:
+What the code, configuration or documentation does today and why that is a problem, with
+file:line links. Impact in a few lines: who hits it and what breaks; if security != none, the
+principal, the action and the target. Only the facts the change or a decision needs.
 
-**Verified:** ...
-**Not verified:** ...
+## Required changes
 
-## Impact
+The target state: what changes where (files, functions, docs, ADRs) and the tests that prove it
+("merged" is not verification). Split into "Independent of the open questions" and "Depends on
+the answers" when both exist.
 
-Who hits it, when, what breaks. If security != none: the threat line, expanded per case —
-which principal, which verb, which object, live today or dormant.
+## Open questions            <- wherever a decision is open
 
-## Options            <- wherever a decision is open
+### Q1: <the question in one sentence>
 
-Costed options, weighed against each other, the best one marked with its justification; one
-decision at a time when they are put to Hans.
+Context in one to three sentences. The sensible options, each with its cost or consequence; the
+recommended one marked and justified.
 
-## Decision
+**Answer:** _open_
 
-Exactly ONE current decision. On a re-decision the old text moves to History — a reader must
-never find a superseded decision stated as current (same rule as the ADRs).
+## Not verified              <- only if something unknown still matters
 
-## Verification
+What is not known, and what would settle it.
 
-What proves done-ness: the test, the measurement, the grep. "Merged" is not verification.
+## Related                   <- optional
 
-## History
-
-Append-only log, newest first: filed, re-scoped, superseded decisions (moved here verbatim),
-urgency changes with their reason. The narrative that used to live in index refreshes goes
-here.
+One line per related ticket.
 ```
 
 ## Index maintenance
 
 - State change → the frontmatter `state:` and its date field, in the same commit-of-work.
-- `done` → `state: done`, `done:` stamped, and a one-line "what shipped" as the newest
-  History entry; the file keeps the full story. Then the extraction above, then the move to
-  [archive/](archive/) — and, for an embargoed ticket, the rename without the `local_` prefix
-  only when the "what shipped" line names the fix of every live or boundary item; otherwise it
-  keeps the prefix until the owner's explicit, dated publishing acceptance
-  ([above](#an-open-security-finding-is-embargoed)).
-- `dropped` → `state: dropped` and the reason as the newest History entry, then the move to
+- `done` → `state: done`, `done:` stamped, and the one-line `shipped:` field. Then the
+  extraction above, then the move to [archive/](archive/) — and, for an embargoed ticket, the
+  rename without the `local_` prefix only when the `shipped:` line names the fix of every live or
+  boundary item; otherwise it keeps the prefix until the owner's explicit, dated publishing
+  acceptance (`publication-accepted:`, [above](#an-open-security-finding-is-embargoed)).
+- `dropped` → `state: dropped` and the one-line `dropped-reason:` field, then the move to
   [archive/](archive/). An embargoed ticket keeps its `local_` prefix and moves to
   [archive/](archive/) with it; the repository ignore line keeps it untracked there
   ([above](#an-open-security-finding-is-embargoed)).

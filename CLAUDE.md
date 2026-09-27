@@ -50,8 +50,12 @@ to `docs/tickets/archive/` when the work lands. **The extraction is the close**,
 the decision goes into an ADR, the user-facing consequence into `README.md`, `docs/operations/`
 or `docs/security/`, the subsystem and contributor knowledge into `docs/developer/` or
 `DEVELOPER.md` — an archived ticket is history, never the source of a current rule. There is no
-index and no board; each ticket's frontmatter `state:` is the index. Rules: [docs/tickets/README.md](docs/tickets/README.md),
-[ADR 0034](docs/adr/0034-tickets-are-work-lists-that-get-archived.md).
+index and no board; each ticket's frontmatter `state:` is the index. **A finding goes into an
+existing ticket first** — the open ticket of the same subject collects it; a new ticket only when
+none fits. **A ticket shows the current state and nothing else**: current state, required
+changes, open questions with an answer line, no History section, no strike-throughs, no dated
+annotations — a changed fact is rewritten, not annotated. Rules: [docs/tickets/README.md](docs/tickets/README.md),
+[ADR 0034](docs/adr/0034-tickets-are-work-lists-that-get-archived.md) D5, D9.
 
 **An open security finding is embargoed.** An open ticket with `security: live` or
 `security: boundary` keeps the `local_` prefix (`local_NNN-<slug>.md`, ignored by
@@ -61,7 +65,7 @@ describes it — a tracked file may give its id, severity, security class, effor
 ([the rule](docs/tickets/README.md#an-open-security-finding-is-embargoed)).
 The embargo lifts when the finding is fixed. A dropped finding is unfixed by definition and
 stays embargoed until the owner explicitly accepts publishing it — accepting the drop is not
-enough — and that acceptance, dated, is the newest History entry of the ticket. Once the
+enough — and that acceptance is the ticket's `publication-accepted:` date. Once the
 embargo lifts, the file loses the prefix and is tracked.
 
 **Nothing outside `docs/tickets/` cites a ticket** — not `README.md`, not a page under

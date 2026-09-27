@@ -40,12 +40,12 @@ flowchart LR
 - 🔑 **Authentication** — password from Kubernetes Secret
 - 👀 **Observability** — CRD status visible in `kubectl` and Lens, Kubernetes Events
 - 🔄 **Controlled rolling updates** — replica-first rollout with replication sync verification and automatic failover
-- 🛡️ **Rootless pods** — every generated pod runs as a non-root user with all capabilities dropped, a read-only root filesystem and a seccomp filter, so once the one-time upgrade migration is through it is admitted in a namespace enforcing Pod Security `restricted`; no option, no opt-out ([ADR 0032](docs/adr/0032-generated-pods-run-rootless.md))
-- 🧱 **Pod hardening knobs** — [`spec.podSecurity`](#specpodsecurity) picks the seccomp profile (`RuntimeDefault`, or a `Localhost` profile an administrator has put on the operator's allow-list — never `Unconfined`) and opts into user namespaces (`hostUsers: false`); images can be pinned by digest ([ADR 0033](docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md))
+- 🛡️ **Rootless pods** — every generated pod runs as a non-root user with all capabilities dropped, a read-only root filesystem and a seccomp filter, so it is admitted in a namespace enforcing Pod Security `restricted`
+- 🧱 **Pod hardening knobs** — [`spec.podSecurity`](#specpodsecurity) picks the seccomp profile (`RuntimeDefault`, or a `Localhost` profile an administrator has put on the operator's allow-list — never `Unconfined`) and opts into user namespaces (`hostUsers: false`); images can be pinned by digest
 - 🩺 **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
 - 📊 **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
 - 🚧 **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
-- 🧭 **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread); off by default so upgrades change nothing
+- 🧭 **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread)
 - 🌐 **Network policies** — optional firewall rules for Valkey and Sentinel traffic
 - ⎈ **Helm deployment** — install the operator with a single `helm install`
 
@@ -55,8 +55,7 @@ flowchart LR
 
 Every name the operator generates is derived from the name of the `Valkey` resource,
 written `<name>` below. Several `Valkey` resources can therefore share a namespace, and a
-name another object already holds is reported, never taken over
-([ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md)).
+name another object already holds is reported, never taken over.
 
 <a id="common-labels"></a>
 
@@ -159,13 +158,13 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 
 | Key | On | Meaning |
 |---|---|---|
-| `vko.gtrfc.com/known-master` | the `Valkey` resource | The operator's recorded master authority ([ADR 0008](docs/adr/0008-known-master-annotation-is-the-recorded-authority.md)) |
+| `vko.gtrfc.com/known-master` | the `Valkey` resource | The master the operator has recorded for the cluster |
 | `vko.gtrfc.com/rolling-update-state`, `failover-timestamp`, `promoted-pod`, `reconnect-reset-count`, `sync-wait-started`, `topology-restore-started`, `manual-failover-started`, `sentinel-awareness-started`, `finalization-started`, `recreation-wait-started` (all under `vko.gtrfc.com/`) | the `Valkey` resource | State of a rolling update in flight, kept across reconcile passes |
 | `vko.gtrfc.com/operator-version` | every resource the operator creates or updates | The operator version that last reconciled it |
 | `vko.gtrfc.com/config-hash`, `vko.gtrfc.com/pod-spec-hash` | the pod template of both StatefulSets | Hashes of the generated configuration and of the pod spec; a changed hash is how a rolling update detects a change |
 | `vko.gtrfc.com/nudge` | a StatefulSet that is short of pods | A timestamp bump that makes the StatefulSet controller sync at once; never rolls a pod |
-| `vko.gtrfc.com/drain-promoted-at` | the data pod the sidecar promoted, written by the sidecar | A promotion the sidecar made while its own master pod was terminating, on a cluster without Sentinel ([ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)) |
-| `vko.gtrfc.com/tls-material-hash` | data and Sentinel pods from before 2026-08-27 | Superseded by `VKO_TLS_MATERIAL_HASH`; read, never written ([ADR 0031](docs/adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) |
+| `vko.gtrfc.com/drain-promoted-at` | the data pod the sidecar promoted, written by the sidecar | A promotion the sidecar made while its own master pod was terminating, on a cluster without Sentinel |
+| `vko.gtrfc.com/tls-material-hash` | data and Sentinel pods created by older operator versions | Replaced by the `VKO_TLS_MATERIAL_HASH` environment variable; read, never written |
 
 </details>
 
@@ -179,7 +178,6 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 | **[CRD reference](#crd-reference)** and **[Helm chart values](#helm-chart-values)** (below) | Every `spec` and `status` field and every chart value, with its default |
 | **[docs/security/](docs/security/)** | The security architecture: trust boundaries, every RBAC rule the operator and the per-instance sidecar hold and what each one permits, where the password and the TLS material live, and what the isolation does **not** cover |
 | **[SECURITY.md](SECURITY.md)** | How to report a vulnerability |
-| **[docs/adr/](docs/adr/README.md)** | Architecture Decision Records — what was decided, why, what was rejected and what it costs, for the reconcile model, the rolling update, the master authority and split-brain resolution, the privilege model, and the test/CI policy |
 | **[DEVELOPER.md](DEVELOPER.md)** · **[docs/developer/](docs/developer/)** | Changing the code |
 | [Valkey documentation](https://valkey.io/topics/) | Upstream server, replication and Sentinel behaviour |
 | [cert-manager](https://cert-manager.io/docs/) | Issuers referenced by `spec.tls.certManager` |
@@ -501,7 +499,7 @@ How to read it — `Ready` against `phase`, and every condition in full: [status
 
 #### Condition Types
 
-A **level** is re-measured on every pass, an **edge** records something and is cleared where the operator can prove it is over, **history** is a verdict about a finished operation and is never cleared ([ADR 0027](docs/adr/0027-conditions-are-levels-edges-or-history.md)).
+A **level** is re-measured on every pass, an **edge** records something and is cleared where the operator can prove it is over, **history** is a verdict about a finished operation and is never cleared.
 
 | Type | Kind | What `True` means |
 |------|------|-------------------|

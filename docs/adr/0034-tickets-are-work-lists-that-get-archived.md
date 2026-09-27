@@ -3,7 +3,9 @@
 ## Status
 
 Accepted, amended 2026-09-27 (D2, D4: the ignore line reaches `archive/`, see the amendment
-below; D4: `state: done` is not proof of a fix, a clarification). Date: 2026-09-27.
+below; D4: `state: done` is not proof of a fix, a clarification; D5 re-decided and D9 added:
+a finding goes into an existing ticket first, and a ticket carries no history, see the last
+amendment). Date: 2026-09-27.
 
 Every decision below was taken by the owner on 2026-09-27, each presented on its own with its
 options, during the documentation restructure that also produced
@@ -63,8 +65,25 @@ clarification of the owner decision, not a new rule: D4 already ended the embarg
 but [docs/tickets/README.md](../tickets/README.md) had ended it, and renamed the file, at
 `state: done`. A ticket can reach `done` with a live or boundary risk accepted rather than
 fixed, and that rule would have published it. D4 now says so outright, and the rules page
-renames an embargoed ticket only when its "what shipped" History entry names the fix of every
+renames an embargoed ticket only when its ~~"what shipped" History entry~~ `shipped:`
+frontmatter line *(amended 2026-09-27 with D9: tickets carry no History)* names the fix of every
 live or boundary item.
+
+**Re-decided 2026-09-27 by the owner, later the same day: D5's filing rule, and D9 added.** A
+re-verification of every open ticket had filed nineteen new tickets from side findings under
+"every finding is a file" and annotated every correction in place, with a History entry per
+pass. The backlog reached 50 files and more than 33,000 lines, and the owner judged the tickets
+overloaded and unreadable: small leftovers had started to block feature work. His rule, taken as
+stated: a finding is first assigned to an existing ticket, a new ticket is opened only when none
+fits, and a ticket collects similar findings (D5); ticket files carry no History entries (D9).
+Embargoed tickets stay as D4 has them. The two embargo records that D4 and the rules page used to
+keep as History entries - the "what shipped" line and the owner's dated publishing acceptance -
+move into the frontmatter fields `shipped:` and `publication-accepted:`, with `dropped-reason:`
+for a dropped ticket; that placement was chosen when the rule was implemented and was not put to
+the owner as a question of its own. **Implemented** in
+[docs/tickets/README.md](../tickets/README.md) and `CLAUDE.md` in the same uncommitted change, and
+every open ticket was rewritten to the D9 form. **Open:** whether the nineteen new tickets are
+merged into the tickets of their subject under the new D5.
 
 ## Context
 
@@ -147,9 +166,28 @@ acceptance, as a dropped finding does.
 
 **D5 — There is no index table and no board.** The `state:` line in each ticket's frontmatter
 is the index, read by the `grep` that [docs/tickets/README.md](../tickets/README.md) documents.
-That page carries the rules and nothing else. **Every finding is a file**, either a new ticket
-or an appendix to the existing ticket of its family (same mechanism, same decision). A row
-somewhere is never enough.
+That page carries the rules and nothing else. ~~**Every finding is a file**, either a new ticket
+or an appendix to the existing ticket of its family (same mechanism, same decision).~~
+*(Superseded 2026-09-27, re-decided by the owner the same day; see Status.)* **A finding goes
+into an existing ticket first**: the open ticket whose subject it shares - the same component,
+mechanism or kind of change - takes it into its current state and its required changes. A ticket
+collects similar findings. A new ticket is opened only when no open ticket fits. A collecting
+ticket is still one subject; findings that share only the event or the analysis that found them
+are not collected in one file (the collection ticket of the Context). A row somewhere, or a
+finding that lives only in a report, is never enough.
+
+**D9 — A ticket shows the current state and nothing else.** *(Added 2026-09-27.)* A ticket file
+has no History section and no dated entries. It holds its frontmatter, the current state (what
+the code, configuration or documentation does today, with code locations, and the impact), the
+required changes (the target state and the tests that prove it), the open questions (each
+understandable on its own, with the sensible options, the recommended one marked and justified,
+and an answer line the owner fills in), what is not verified where it still matters, and related
+tickets. When a fact, a question or an answer changes, the text is rewritten to the new state:
+nothing is struck through or annotated with a date, done work items are removed, and no account
+of how the code or the ticket evolved is kept. Git keeps that for a tracked ticket. The records
+the embargo needs are frontmatter fields: `shipped:` (set with `done:`, it names the fix of every
+live or boundary item before the rename of D4), `dropped-reason:`, and `publication-accepted:`
+(the date of the owner's explicit acceptance to publish an unfixed finding).
 
 **D6 — Only the open items of the collection ticket were extracted.** Each got a ticket of its
 own. The rest — the closed items, the analyses and the final state of the retired board — was
@@ -233,6 +271,16 @@ work list.
 
 **Adopt the sibling project's rule that an ADR carries no code references.** Rejected; D8
 gives the reason.
+
+**Every finding is a file.** *(Added 2026-09-27, the rule D5 held until it was re-decided the
+same day.)* Rejected by the owner after it had run for a day. It turned every side finding of an
+analysis into a file of its own, grew the backlog instead of shrinking it, and spread similar
+findings over several tickets that each had to be read, decided and closed on their own.
+
+**A History section in every ticket.** *(Added 2026-09-27.)* Rejected by the owner. Correction
+trails, dated review notes and the story of each pass made the tickets unreadable and hid the
+question that had to be answered. For a tracked ticket git keeps the story. For an untracked
+embargoed ticket the story is lost when the text is rewritten; that is accepted.
 
 **Keep a closed embargoed ticket in `docs/tickets/` until its embargo ends.** *(Added
 2026-09-27.)* Rejected. It is an exception to D2 for one case, and it does not save the ignore
