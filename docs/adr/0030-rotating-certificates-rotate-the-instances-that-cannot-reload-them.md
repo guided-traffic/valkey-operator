@@ -54,8 +54,13 @@ never issues a certificate. `valkey-server` and `valkey-sentinel` are still **un
 covered by D6 rather than by verification.
 
 Amends [ADR 0016](0016-authentication-and-tls-posture.md) D12 and its cert-manager residual
-risk, [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D10, and
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) sections 2, 6 and 9.
+risk, [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D10, and the
+security documentation now in
+[`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md#tls-material) (section
+"TLS material" and gap [H-4](../security/secrets-and-tls.md#h-4)) and
+[`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md)
+(gaps [H-23](../security/rotation-and-change-propagation.md#h-23) and
+[H-24](../security/rotation-and-change-propagation.md#h-24)).
 
 ## Context
 
@@ -388,7 +393,8 @@ cluster.
   private key. It does not follow that it holds one only briefly: the manager cache backs an
   unfiltered Secret informer, so every watched Secret is resident for the process lifetime, with
   or without this change. What the change adds is one more consumer to satisfy before the
-  `secrets` scope on the hardening checklist can be narrowed.
+  `secrets` scope of gap [H-1](../security/privilege-footprint.md#h-1) in
+  `docs/security/privilege-footprint.md` can be narrowed.
 * **A 4-byte digest derived from a private key is readable by anyone with `get pods` or
   `get statefulsets`.** See D11 and the residual risks.
 * **`TLSMaterialStale` adds a `vko_valkey_status_condition` series per TLS cluster** and one
@@ -468,7 +474,8 @@ measurement, and in that order.
   sidecar, the one container step 4 cannot help. The corrections: **forging was never the
   cheap attack** — a merge patch setting the key to `null` makes the pod unmeasured under the
   presence rule, which no digest strength addresses — and it was **not the third** forgeable
-  field of that grant but one of nine. `SECURITY_ARCHITECTURE.md` section 3 now
+  field of that grant but one of nine. `docs/security/isolation-and-tenancy.md`, section
+  ["What does not hold"](../security/isolation-and-tenancy.md#what-does-not-hold), now
   enumerates them instead of counting.
 
   **The two rejected repairs are recorded where they can be found again** — a stronger or
@@ -574,4 +581,5 @@ measurement, and in that order.
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) — the presence guard of D8
 * [ADR 0019](0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md) — the only pacing the roll has
 * [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — why `TLSMaterialStale` is a resource step
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — sections 2, 6 and the hardening checklist
+* [`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md#tls-material) — TLS material, and gap [H-4](../security/secrets-and-tls.md#h-4)
+* [`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md) — what propagates, and gaps [H-23](../security/rotation-and-change-propagation.md#h-23) and [H-24](../security/rotation-and-change-propagation.md#h-24)

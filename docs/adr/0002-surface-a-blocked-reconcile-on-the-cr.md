@@ -38,6 +38,16 @@ condition is a one-shot record with no later pass to recompute it uses that func
 directly and decides for itself
 ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D15).
 
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
+
+Amended again 2026-09-27 (correction, no decision changes): the reason D5's amendment and its
+residual risk give for leaving `readyReplicas` where it is — every phase message is a
+function of the ready count — is imprecise. Five phase messages name no count, and on a
+blocked pass `persistStatus` puts the previous phase and message back, so there only the
+`Ready` condition moves with the count. Both places are struck and restated in place, and
+Residual risks gains an entry with the verified facts. D5 and the choice to leave the
+assignment where it is are unchanged.
+
 ## Context
 
 During the 2026-08-19 infra-d incident (context in
@@ -118,8 +128,13 @@ it became `Available` at `07:05:10Z`, and the field still read `false` fourteen 
 later. Three seconds of real lag became a permanently wrong value, because a field with no
 proxy in phase, message or conditions has no passenger seat: nothing else changes when only
 it changes. `readyReplicas` carries the identical defect and is masked rather than fixed —
-every branch's phase message is a function of the ready count, so it always rides along.
-That masking is a property of the current message strings, not an invariant.
+~~every branch's phase message is a function of the ready count, so it always rides along.~~
+*(corrected 2026-09-27, Residual risks)* every branch either names the ready count or fixes
+it, and a change of it moves the phase message or the `Ready` condition with it — on a
+blocked pass only the `Ready` condition, because `persistStatus` puts the previous phase and
+message back.
+That masking is a property of the current ~~message strings~~ phase and `Ready` condition
+strings, not an invariant.
 
 The fix keeps D5's wording and moves the assignment: `observerReady` is now computed in
 `persistStatus`, next to `v.Status.OperatorVersion`, which is the side of the capture this
@@ -139,8 +154,9 @@ blocked. `Ready` carries only the first. The contract now lives on
 `vkov1.ConditionTypeReady`, which moved out of `internal/controller` (where it was an
 unexported string constant, and therefore the one condition every CR carries with no
 declared type and no entry in any table built from `api/v1`) into
-[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go). It is stated in the README
-condition table and pinned by `TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked` and
+[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go). It is stated in
+[docs/operations/status.md](../operations/status.md#ready) (ADR 0035; this record wrote the
+README condition table here) and pinned by `TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked` and
 `TestUpdateHAStatus_KeepsReadyTrueWhileBlocked` — the second because no test at any tier
 reached the `HAClusterReady` shape the finding was actually reported on.
 
@@ -459,13 +475,44 @@ after that.
 * A user reading only `ReconcileBlocked` cannot see a blocked **pod** creation (D13);
   that path is visible as a short-of-pods StatefulSet plus the nudge.
 * **`readyReplicas` still cannot trigger a status write on its own** (D5, amended).
-  Deliberately not fixed with `observerReady`: the field is masked by the fact that every
+  Deliberately not fixed with `observerReady`: the field is masked by the fact that ~~every
   branch's phase message is a function of the ready count, so it rides along on every pass
-  that changes it, and no case could be constructed by reading in which it goes stale. The
-  accepted cost is that the masking is a property of the message strings — anyone who makes
-  a phase message stop naming the count reopens the defect, and nothing tests for that.
+  that changes it~~ *(corrected 2026-09-27, next entry)* a change of the ready count moves the
+  phase message or the `Ready` condition with it, and no case could be constructed by reading
+  in which it goes stale. The accepted cost is that the masking is a property of the message
+  strings — ~~anyone who makes a phase message stop naming the count reopens the defect~~
+  *(corrected 2026-09-27, next entry)* the phase and `Ready` condition strings, and nothing
+  tests for that.
   Moving the assignment next to `observerReady` closes it and is a two-line change if the
   coupling is ever judged too fragile to keep.
+* **The masking of `readyReplicas` is narrower than D5's amendment and the entry above first
+  said** (added 2026-09-27). Verified by reading `updateStandaloneStatus`, `updateHAStatus`,
+  `persistStatus` and `statusUnchanged` in
+  [`valkey_controller.go`](../../internal/controller/valkey_controller.go):
+  - Not every phase message names the count. Five name none: the standalone OK message
+    `All replicas are ready`, the standalone Error `Instance unreachable: …`, the HA Error
+    `Cluster health check failed: …`, and the two no-pod-ready messages. The HA Syncing
+    message names the synced counts of the health check, not the StatefulSet's ready count.
+    In those branches the count is only implied by the branch: it equals `spec.replicas` in
+    the all-ready branches and is 0 in the no-pod-ready ones. The `Ready` condition follows
+    the same shape: its message names the count in the partly-ready branches, and its reason
+    changes with the branch.
+  - On a blocked pass `persistStatus` restores `prevStatus.Phase` and `prevStatus.Message`
+    before `statusUnchanged` runs, so the phase message carries nothing there. Of the other
+    fields `statusUnchanged` compares — the conditions, `masterPod`, `observerReady`,
+    `operatorVersion` — the one that moves with the count is the `Ready` condition.
+
+  It follows from these two facts that the coupling is wider than the entry above said: a
+  change to the `Ready` condition's messages or reasons, not only to a phase message, can
+  reopen the defect on a blocked pass. **Not verified:** that the count can never go stale
+  today. That no such case was found rests on reading the code, not on a measurement. The two
+  blocked-pass status tests in
+  [`status_phase_test.go`](../../internal/controller/status_phase_test.go)
+  (`TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked`,
+  `TestUpdateHAStatus_KeepsReadyTrueWhileBlocked`) mark the StatefulSets ready after the first
+  pass and assert the `Ready` condition along with the count, so neither isolates the count.
+  The fix named above, moving the assignment into `persistStatus`, still closes it and is
+  still not taken.
 * **The `Ready` contract is documented, not enforced** (D5a). Nothing prevents a future
   writer from setting `Ready` off something that is not the data plane, and nothing prevents
   a consumer from reading it as "the operator is healthy". The condition registry

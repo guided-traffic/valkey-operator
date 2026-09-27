@@ -1,0 +1,236 @@
+# Tickets
+
+One file per ticket, kept next to the code it changes and tracked with it — except while it is
+embargoed, see [below](#an-open-security-finding-is-embargoed). **A ticket is a work list.** It
+holds what has to be done, what was verified and how, and what was deliberately left out — and
+when the work lands it is **moved to [archive/](archive/)**. Nothing outside this directory may
+reference a ticket; decisions live in [docs/adr/](../adr/) and may be referenced from anywhere.
+The rule and the reasoning behind it are
+[ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md).
+
+Before archiving a ticket, move anything durable out of it — the decision into an
+[ADR](../adr/), the operator-visible consequence into [README.md](../../README.md),
+[docs/operations/](../operations/) or [docs/security/](../security/), the contributor-facing
+one into [docs/developer/](../developer/) or [DEVELOPER.md](../../DEVELOPER.md) — then
+`git grep` its number and its T-label and clear whatever is left. **The extraction is the
+close** — archiving is only what happens to the file afterwards, and an archived file is
+history, never a source of a current rule.
+
+This page carries the rules only. There is no index table here and no board: the tickets'
+own frontmatter is the index ([below](#there-is-no-index-table-and-no-board)).
+
+## Naming and numbering
+
+`NNN-<kebab-slug>.md`, three digits, the slug naming the outcome or the defect. A ticket with a
+T-label takes the label's number: T33 is ticket 033, and its frontmatter keeps `id: T33`,
+because code and ADRs cite the label. A new ticket takes the next free number — the highest
+existing number plus one — and its `id:` is `T` and that number (ticket 043 is `T43`). **A
+number is never reused**, including the number of an embargoed ticket and of an item that
+never got a file of its own: T1–T29 without a file here are recorded in
+[archive/039](archive/039-findings-from-the-1-11-0-fleet-rollout.md).
+Moving a ticket into `archive/` changes its directory, not its name.
+
+The highest existing number, archived and embargoed tickets included — the `local_` prefix is
+stripped before sorting — printed from the repository root:
+
+```
+ls docs/tickets docs/tickets/archive | sed -nE 's/^(local_)?([0-9]{3})-.*/\2/p' | sort -n | tail -1
+```
+
+Run it in the owner's working tree: `local_` files are gitignored, so a fresh clone cannot see
+an embargoed ticket's number and would hand it out a second time.
+
+Numbering started on 2026-09-27. The files written before it were given numbers as follows,
+and they keep them: 037, 038 and 039 are the multi-item analysis records that predate the
+one-file-per-ticket rule, and 040, 041 and 042 are the open sibling tickets formerly labelled
+C3, C2 and S1; each of those three says so under its title.
+
+## An open security finding is embargoed
+
+A ticket is **embargoed** while its frontmatter says `security: live` or `security: boundary`
+and a live or boundary finding in it is not fixed; `state: done` alone does not end it. **The
+embargo ends when the finding is fixed, not when the ticket closes.** *(corrected 2026-09-27:
+this page first ended the embargo, and renamed the file, at `state: done`, against
+[ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) D4 — a ticket can reach
+`done` with a live or boundary risk accepted rather than fixed.)* A `dropped` live or boundary
+finding is unfixed by definition, so it stays embargoed unless the owner explicitly accepts
+publishing it; that acceptance, with its date, is the newest History entry of the ticket before
+its file is renamed. While a ticket is embargoed:
+
+- **Its file carries the `local_` prefix**: `local_NNN-<kebab-slug>.md`. Two ignore rules
+  match it: this repository's own [`.gitignore`](../../.gitignore) carries
+  `docs/tickets/**/local_*`, so the file stays untracked in every clone, in `docs/tickets/` and
+  in `archive/` alike, and the owner's global ignore rule `local_*` (`~/.gitignore`, set as
+  `core.excludesFile`) matches it as well. Verified 2026-09-27 with `git check-ignore -v`,
+  which names the repository rule for both embargoed files. Neither rule stops `git add -f`.
+  *(corrected 2026-09-27: the line was
+  `docs/tickets/local_*`, which did not reach `archive/`;
+  [ADR 0034](../adr/0034-tickets-are-work-lists-that-get-archived.md) Status.)*
+- **No tracked file carries its exploit details** — not its threat line, its mechanism, its
+  attack path, and not its file name, whose slug states the finding. For the same reason
+  neither does a commit message or a pull request. A tracked file may name the embargoed
+  ticket's id, severity, security class, effort and state, and puts in place of the details:
+  "embargoed security finding, open - details in its own ticket file until it is fixed".
+- **It still takes its number**, so the tracked numbering has gaps where embargoed tickets sit.
+
+When the "what shipped" History entry of `done` names the fix of every live or boundary item of
+the ticket, the file is renamed without the prefix (`local_NNN-<slug>.md` becomes
+`NNN-<slug>.md`) and is tracked from then on like any other ticket; the embargo notes in
+tracked files may then be replaced by what they stood for. A ticket that reaches `done` with a
+live or boundary item whose risk was accepted rather than fixed (a multi-item ticket included)
+keeps the prefix, like a `dropped` one, until the owner explicitly accepts publishing it; that
+acceptance, with its date, is the newest History entry. When its `state:` reaches `dropped`,
+the file keeps the prefix and stays untracked; it is renamed the same way only after the
+owner's explicit acceptance above. A `hardening` finding is not embargoed.
+
+## Nothing outside this directory references a ticket
+
+No file outside `docs/tickets/` — not `README.md`, not a page under `docs/`, not an ADR, not
+`CLAUDE.md`, not a code comment — and no commit message or pull request cites a ticket: not its
+number, its T-label, its file name or its path. Cite the ADR that holds the rule instead. A
+ticket may cite an ADR; an ADR does not cite a ticket.
+
+**Partly implemented.** The rule binds every citation written from 2026-09-27 on. The ticket
+citations that already exist outside this directory — T-labels in ADRs, in Go comments, in
+`CLAUDE.md` and in the security pages under [docs/security/](../security/README.md) (moved
+there verbatim from the former `SECURITY_ARCHITECTURE.md`), the `NA61`–`NA63` labels defined in
+[archive/037](archive/037-recovery-after-transient-admission-webhook-rejection.md), and the
+links from ADRs into this directory — stay until they are rewritten. They are the work list of
+[ticket 040](040-tracked-files-cite-work-items-instead-of-adrs.md), which counts them, and they
+are not a precedent.
+
+## There is no index table and no board
+
+The frontmatter `state:` line of each ticket is the index:
+
+```
+grep -rH '^state:' --include='[0-9]*.md' --include='local_[0-9]*.md' docs/tickets
+```
+
+The `--include` patterns keep this page out of the result, because the frontmatter example
+below starts its lines with `state:` as well. The board was retired on 2026-09-27 on Hans's
+instruction; its final state is archived verbatim in
+[archive/039, "Board archive"](archive/039-findings-from-the-1-11-0-fleet-rollout.md#board-archive--final-state-of-local_boardmd-retired-2026-09-27).
+
+Six files carry no frontmatter. Tickets 040, 041 and 042 state their state in the
+`> **Status: …**` blockquote under the title
+(`grep -rH -m1 '^> \*\*Status' --include='[0-9]*.md' docs/tickets`); the archived
+multi-item records 037, 038 and 039 are closed by being in `archive/`. An embargoed ticket shows
+up in the grep only on a machine that holds its file.
+
+## The filing rule
+
+**Every finding is a file** — a new ticket, or an appendix to the existing ticket of its
+family (same mechanism, same decision). A row somewhere was never sufficient (Hans,
+2026-09-27; it replaced the earlier bar that gave a low finding a board row and no file).
+Severity and security class still derive the urgency below; they never decide whether a file
+exists.
+
+**An `## Options` section is expected wherever a decision is open.** Decisions are presented
+one at a time, each with options researched against the code and sensible in the project's
+context, weighed against each other, the best one marked and the mark justified (Hans,
+2026-09-26, global rule). An adversarial pass is warranted for severity high+ or security
+live/boundary.
+
+## Frontmatter
+
+Copy the skeleton below into `NNN-<kebab-slug>.md` (`local_NNN-<kebab-slug>.md` while
+[embargoed](#an-open-security-finding-is-embargoed)). Every field is mandatory unless marked
+optional.
+
+```yaml
+---
+id: T27
+title: fresh TLS clusters carry no fingerprint
+state: filed          # filed -> analysed -> decided -> in-progress -> done | dropped
+severity: high        # critical | high | medium | low | cosmetic  (impact if never fixed)
+security: live        # live | boundary | hardening | none         (see scale below)
+threat: "no attacker; rotated material never reaches fresh clusters"  # required unless security: none
+urgency: now          # derived via the rules below, never gut feeling
+effort: M             # XS | S | M | L
+blocked-by: decision  # optional: decision | human | product | release | adr-NNNN | T<NN>
+filed-from: T25       # optional: the analysis or event that produced it
+opened: 2026-08-27
+decided:              # date, when state reaches decided
+done:                 # date, when state reaches done
+---
+```
+
+### Security scale (threat-model based, not high/low)
+
+| Class | Meaning | The `threat:` line must name |
+|---|---|---|
+| `live` | weakens a guarantee the repo already gives, no hostile principal needed | the guarantee and who relies on it |
+| `boundary` | real trust-boundary hole, needs a hostile principal | principal + verb + target (e.g. "a principal who may create `Valkey` CRs names one so that its generated StatefulSet name hits a foreign StatefulSet") |
+| `hardening` | defense-in-depth, no concrete attack path today | what it would additionally cover |
+| `none` | not security | — |
+
+A blanket statement ("could be a security risk") does not fill the `threat:` field.
+
+### Urgency derivation — apply top-down, first match wins
+
+| Rule | Urgency |
+|---|---|
+| Defect in an **unreleased feature on the current branch**, or a **measured-false statement in tracked files** | `now` |
+| Gates the release, or is gated on it (cluster ops) | `release` |
+| severity ≥ medium **and** trigger live | `next` |
+| Everything with a decided fix or a cheap known fix | `later` |
+| Needs a product call, a human re-decision, or a threat-model escalation nobody has accepted | `icebox` |
+
+Urgency is recomputed when facts change (a dormant trigger goes live, a severity gets
+re-measured) — and the change is a History entry, not a silent edit.
+
+## Body skeleton
+
+```markdown
+## Fact
+
+What is broken / missing, mechanism first, with file:line links and measurement dates.
+Mandatory split, every time:
+
+**Verified:** ...
+**Not verified:** ...
+
+## Impact
+
+Who hits it, when, what breaks. If security != none: the threat line, expanded per case —
+which principal, which verb, which object, live today or dormant.
+
+## Options            <- wherever a decision is open
+
+Costed options, weighed against each other, the best one marked with its justification; one
+decision at a time when they are put to Hans.
+
+## Decision
+
+Exactly ONE current decision. On a re-decision the old text moves to History — a reader must
+never find a superseded decision stated as current (same rule as the ADRs).
+
+## Verification
+
+What proves done-ness: the test, the measurement, the grep. "Merged" is not verification.
+
+## History
+
+Append-only log, newest first: filed, re-scoped, superseded decisions (moved here verbatim),
+urgency changes with their reason. The narrative that used to live in index refreshes goes
+here.
+```
+
+## Index maintenance
+
+- State change → the frontmatter `state:` and its date field, in the same commit-of-work.
+- `done` → `state: done`, `done:` stamped, and a one-line "what shipped" as the newest
+  History entry; the file keeps the full story. Then the extraction above, then the move to
+  [archive/](archive/) — and, for an embargoed ticket, the rename without the `local_` prefix
+  only when the "what shipped" line names the fix of every live or boundary item; otherwise it
+  keeps the prefix until the owner's explicit, dated publishing acceptance
+  ([above](#an-open-security-finding-is-embargoed)).
+- `dropped` → `state: dropped` and the reason as the newest History entry, then the move to
+  [archive/](archive/). An embargoed ticket keeps its `local_` prefix and moves to
+  [archive/](archive/) with it; the repository ignore line keeps it untracked there
+  ([above](#an-open-security-finding-is-embargoed)).
+- Every open item has had its own file since 2026-09-27: T12, T18, T23, T26 and T29 were
+  extracted from the collection ticket, now
+  [archive/039](archive/039-findings-from-the-1-11-0-fleet-rollout.md), and C3, C2 and S1 became
+  tickets 040, 041 and 042.

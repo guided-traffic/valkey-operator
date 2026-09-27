@@ -16,7 +16,7 @@ deleted in the same second, which consolidated the fleet toward an empty reborn 
 ([ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D5a). `IsTerminating` reads
 the candidate pod's `DeletionTimestamp` through the same named-pod grant the patches use;
 unknown reads as alive, so an API blip cannot fail a drain. The security cost is bounded and
-stated in `SECURITY_ARCHITECTURE.md` section 4.2: `get` on this cluster's own data pods,
+stated in [`docs/security/privilege-footprint.md`](../security/privilege-footprint.md#the-per-instance-sidecar-role): `get` on this cluster's own data pods,
 whose Secrets are mounted rather than inlined.
 
 The stamp and the `findSyncedReplica` fix are implemented on branch `feat/support-pdb` —
@@ -86,8 +86,8 @@ is indeed pod-level, but declaring a projected volume by hand and mounting it in
 container is a supported pattern and has been GA since Kubernetes 1.20. The data pod now
 sets the flag to `false` and hands the token to the sidecar alone; the Sentinel pod sets it
 too and hands it to nobody. The superseded residual is marked in place below rather than
-deleted, because the claim travelled into
-[`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and a reader has to be able to
+deleted, because the claim travelled into the security architecture — struck through there,
+now in [`docs/security/isolation-and-tenancy.md`](../security/isolation-and-tenancy.md#what-does-not-hold) — and a reader has to be able to
 find where it came from.
 
 Amended 2026-09-26: **D8 step 4 and D10 now run under
@@ -283,7 +283,7 @@ that waits for a data StatefulSet to become Ready exercises the read — the fle
 repaired pods the differing-uid branch — and the explicit proof is the sidecar labelling roles
 in a namespace enforcing `restricted` (`TestE2E_PodSecurity_RestrictedNamespace`,
 [`test/e2e/pod_security_test.go`](../../test/e2e/pod_security_test.go)). **All of these ran
-green on this posture, locally and not in CI** ([T31](../tickets/local_T31-generated-pods-run-as-root.md),
+green on this posture, locally and not in CI** ([T31](../tickets/archive/031-generated-pods-run-as-root.md),
 Verification): the full suite on both e2e legs on Kind (Kubernetes v1.36.1), 2026-09-26, and
 `TestE2E_FleetUpgrade` from released chart 1.12.8, whose persistent pods ran
 `fix-data-ownership` and whose clusters converged; the fleet-upgrade e2e is not a CI job. A
@@ -595,8 +595,9 @@ costs the injection seam the sidecar tests rely on.
   **(Closed 2026-08-27, and the reasoning above was wrong.)** Kubernetes offers exactly that
   split: `automountServiceAccountToken: false` plus a hand-declared projected volume mounted
   into one container, GA since 1.20. No second ServiceAccount is involved. D8 step 4 ships
-  it. The false half of the claim had also been copied into
-  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) and is corrected there too.
+  it. The false half of the claim had also been copied into the security architecture and is
+  corrected there too, now in
+  [`docs/security/isolation-and-tenancy.md`](../security/isolation-and-tenancy.md#what-does-not-hold).
 
 * **The sidecar container itself still holds the grant, and must.** Step 4 shrinks who
   carries the token; it cannot shrink what the token permits, because `PatchLabel` and

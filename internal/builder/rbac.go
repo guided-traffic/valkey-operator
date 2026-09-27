@@ -39,7 +39,8 @@ func BuildSidecarServiceAccount(v *vkov1.Valkey) *corev1.ServiceAccount {
 // internal/sidecar/labeler.go is the package's single clientset call site — so
 // nothing else is granted. Dropping the unused get/list was the precondition for
 // the resourceNames restriction below, which is incompatible with list
-// (SECURITY_ARCHITECTURE.md section 4.2, ADR 0012 D8).
+// (docs/security/privilege-footprint.md, "The per-instance sidecar Role";
+// ADR 0012 D8).
 //
 // livePodNames are the pods that currently carry this cluster's data-pod selector
 // labels; SidecarRolePodNames explains why the grant is not derived from

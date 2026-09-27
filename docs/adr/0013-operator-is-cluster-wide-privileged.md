@@ -5,9 +5,11 @@
 Accepted. Date: 2026-08-21.
 
 The privilege model is implemented and documented rule by rule in
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md). **Several narrowing items in
-this ADR are open** and live as the hardening checklist there; they are listed under
-Residual risks.
+~~`SECURITY_ARCHITECTURE.md`~~ [docs/security/privilege-footprint.md](../security/privilege-footprint.md)
+*(since 2026-09-27, [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md))*.
+**Several narrowing items in this ADR are open** and live ~~as the hardening checklist there~~
+as open gaps `H-<n>` in the closing section of the security page whose mechanism has the gap
+*(ADR 0036 D3, D4)*; they are listed under Residual risks.
 
 The privilege footprint was verified by reading only: the repository at one commit, taken
 from `config/rbac/role.yaml`, the Helm ClusterRole, `internal/builder/rbac.go` and the
@@ -79,8 +81,46 @@ none for the default, and failed the render for each refused entry (2026-09-26).
 allow-list and ADR 0033's CEL path rule existed: the fleet-upgrade e2e from 1.12.8 green including the second roll (two
 `RollingUpdateComplete` per persistent tier), the full suite 53/53 on Valkey 8 and 52/53 on
 Valkey 9 with ADR 0033's hardening e2e failing once on its own `/data` owner assertion, since
-fixed and passed on Valkey 8 and, rerun alone, on Valkey 9 (ADR 0032 Status). The allow-list's
-e2e subtest has not run, and no run of its integration test is recorded.
+fixed and passed on Valkey 8 and, rerun alone, on Valkey 9 (ADR 0032 Status). ~~The allow-list's
+e2e subtest has not run, and no run of its integration test is recorded.~~ *(Corrected
+2026-09-27: [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+Status records later runs of the same day — the allow-list's refusal subtest green on every run of
+the hardening e2e, and its integration test green on envtest 1.29 on the tree before D9's gate
+moved to the write. Read in ADR 0033, not re-run for this correction.)*
+
+Amended 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md), which replaced
+`SECURITY_ARCHITECTURE.md` with one page per perspective under
+[docs/security/](../security/README.md) and moved vulnerability reporting to
+[SECURITY.md](../../SECURITY.md). **D12** (one document), **D13** (one checklist ordered by blast
+radius, completed items kept) and the first half of **D14** ("There is no `SECURITY.md`") are
+superseded, and so is the alternative "Drop completed items from the checklist". Each is
+struck through in place below, with the rule that replaced it. The residual
+"`DEVELOPER.md` does not exist yet" is closed by
+[ADR 0035](0035-the-readme-advertises-the-reference-lives-under-docs.md). Every link to the deleted
+document now names the page that holds the material: the footprint and gaps H-1 to H-3 are on
+[privilege-footprint.md](../security/privilege-footprint.md), the generated-name, egress and
+CR-author gaps H-9 to H-11 on [isolation-and-tenancy.md](../security/isolation-and-tenancy.md).
+D1–D11 are unchanged as rules. In the same change, a stale sentence in D8 was corrected: the chart has refused an
+absolute or `..` path for the operator's own `Localhost` profile since ADR 0033's amendment of
+2026-09-26. Verified by reading `docs/security/`, `SECURITY.md`, `DEVELOPER.md` and the
+`valkey-operator.podHardening` helper in
+[`_helpers.tpl`](../../deploy/helm/valkey-operator/templates/_helpers.tpl), on 2026-09-27.
+
+Amended again 2026-09-27 (correction, no decision changes): the residual risk "A generated
+name can be held by an object the operator did not create" still said that every managed kind
+but the two ServiceAccounts, the sidecar Role and its RoleBinding is written by generated name
+with no ownership check. [ADR 0020](0020-write-only-what-the-operator-owns.md) has guarded
+every managed kind since its amendments of 2026-08-22, and the code agrees. In
+`internal/controller` — the reconcile paths of
+[`valkey_controller.go`](../../internal/controller/valkey_controller.go), `pdb.go`, the nudge
+in `nudge.go`, `clearDrainStamps` in `steady_state_master.go`, and `writeWorkload`, which only
+those paths call — every `Update` and `Patch` of a managed object follows an ownership proof of
+the object read (`metav1.IsControlledBy`, or `podIsOurs` for a pod), and every `Create` runs on
+NotFound or after an owned object was deleted with its UID precondition. That covers StatefulSets, Services, ConfigMaps, NetworkPolicies, the observer
+Deployment, ServiceMonitors, Certificates, PodDisruptionBudgets, the ServiceAccounts, the Role
+and the RoleBinding. The sentence is struck and restated in place, and the entry stays partly
+open for H-9 and H-11. Verified by reading on 2026-09-27; no test was run for this correction.
 
 ## Context
 
@@ -192,9 +232,12 @@ fields. The seccomp profile is `podSecurity.seccompProfile`: `RuntimeDefault` by
 `Localhost` fails the render, so `Unconfined` cannot be installed through the chart. *(Added
 2026-09-26, ADR 0033 D9:)* the operator's own profile is the installer's choice and is not
 checked against `valkeyPodSecurity.allowedSeccompLocalhostProfiles`, which bounds only what a
-Valkey resource may name; unlike that list and the CRD, the chart does not refuse an absolute
+Valkey resource may name; ~~unlike that list and the CRD, the chart does not refuse an absolute
 path or a `..` element here (rendered by hand 2026-09-26; what the API server then does with the
-Deployment was not run).
+Deployment was not run)~~ *(corrected 2026-09-27: like the CRD, the chart refuses an absolute path
+or a `..` element at render — `valkey-operator.podHardening` fails on both, added with
+[ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)'s amendment
+of 2026-09-26; read in the template, not rendered for this correction)*.
 `hostUsers: false` is behind `podSecurity.userNamespaces`, default off, because a node without
 user-namespace support would not start the operator pod; an API server with the
 `UserNamespacesSupport` gate off drops the field from both pods without an error, and for the
@@ -260,22 +303,39 @@ unused is auditable, and trimming it would put the generated role permanently ou
 what `make manifests` reproduces.
 
 **D12 — The privilege footprint is documented rule by rule, and updated in the same change
-as the code.** `SECURITY_ARCHITECTURE.md` covers roles and trust boundaries, data and secret
+as the code.** ~~`SECURITY_ARCHITECTURE.md` covers roles and trust boundaries, data and secret
 flow, isolation and what it does *not* defend against, the footprint rule by rule, the
-validation story, rotation, vulnerability reporting and the hardening checklist. Every rule is
-read out of the manifests, not out of intent, and unverified statements say so. Before it
-existed, the permission set lived only in the markers, the generated role and the chart
-ClusterRole, and the README documented no verbs at all.
+validation story, rotation, vulnerability reporting and the hardening checklist.~~
+*(Superseded 2026-09-27 by [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D1, D7, D8.)* The footprint rule by rule is
+[docs/security/privilege-footprint.md](../security/privilege-footprint.md); roles and trust
+boundaries, secret flow, isolation, the validation story and rotation are each a page of their
+own under [docs/security/](../security/README.md); vulnerability reporting is
+[SECURITY.md](../../SECURITY.md). Every rule is read out of the manifests, not out of intent,
+and unverified statements say so. Before the first security document existed, the permission set
+lived only in the markers, the generated role and the chart ClusterRole, and the README
+documented no verbs at all.
 
-**D13 — The hardening checklist is ordered by what a compromise buys an attacker, never by
-effort, and completed items stay in the list with what they did *not* close.**
-Effort-ordered lists get worked top-down and leave the expensive, highest-impact items
+**D13 — ~~The hardening checklist is ordered by what a compromise buys an attacker, never by
+effort, and completed items stay in the list with what they did *not* close.~~**
+~~Effort-ordered lists get worked top-down and leave the expensive, highest-impact items
 permanently last — here that would be exactly the two things that define the trust model.
 Keeping closed items visible with their residual prevents a checked box from being read as
-"this class of risk is gone".
+"this class of risk is gone".~~ *(**Superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D3–D5:** there is
+no single checklist. An open gap is `H-<n>` in the closing section `What this does not cover` of
+the page whose mechanism has the gap, its number never reused; a closed gap loses its entry,
+and keeps at most three sentences of past-tense prose inside its mechanism's section where it
+explains a current rule — which is where "what the fix did not cover" now stands, beside the rule
+it qualifies. The worry D13 answered, that effort ordering buries the trust-model items, has no
+list left to act on; the two gaps that define the trust model are H-1 and H-2, the first two on
+[privilege-footprint.md](../security/privilege-footprint.md).)*
 
-**D14 — Vulnerability intake states the gap rather than inventing a contact.** There is no
-`SECURITY.md` and no published address; reports are routed to GitHub private vulnerability
+**D14 — Vulnerability intake states the gap rather than inventing a contact.** ~~There is no
+`SECURITY.md` and no published address;~~ *(superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D7: the reporting
+policy is [SECURITY.md](../../SECURITY.md) at the root, which states that there is no published
+address;)* reports are routed to GitHub private vulnerability
 reporting, or to the maintainer organisation, and reporters are asked not to open a public
 issue for anything that reads a Secret, escalates RBAC or destroys data, and to include the
 operator version, the chart version and whether TLS and auth were enabled. An invented or
@@ -337,21 +397,27 @@ reads.
   never labels namespaces.
 * The documented blast radius includes creating `Valkey` CRs in any namespace on top of
   deleting them (D11).
-* The checklist has to carry unchecked high-severity items indefinitely without that reading
-  as neglect — scoping the `secrets` grant costs install-and-forget behaviour for new
-  namespaces, and may never be done.
+* ~~The checklist has~~ The security pages have *(since 2026-09-27, ADR 0036 D3)* to carry
+  open high-severity gaps indefinitely without that reading
+  as neglect — scoping the `secrets` grant ([H-1](../security/privilege-footprint.md#h-1))
+  costs install-and-forget behaviour for new namespaces, and may never be done.
 * Vulnerability intake depends on GitHub's private-reporting feature being enabled on the
-  repository. The missing `SECURITY.md` is an open documentation item, distinct from
+  repository. ~~The missing `SECURITY.md` is an open documentation item, distinct from
   `SECURITY_ARCHITECTURE.md`, which is the design document and deliberately **not** the
-  GitHub reporting convention file.
+  GitHub reporting convention file.~~ *(Superseded 2026-09-27 by
+  [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D7:
+  [SECURITY.md](../../SECURITY.md) exists and is the reporting policy only; the design is
+  [docs/security/](../security/README.md).)* Whether private reporting is switched on is still
+  not verified, and `SECURITY.md` says so.
 
 ## Alternatives Considered
 
 ### A namespaced Role per watched namespace
 
-Or a cache filtered by label with the ClusterRole narrowed to match. Both are on the hardening
-checklist with the cost stated: **the operator stops being install-and-forget for new
-namespaces.**
+Or a cache filtered by label with the ClusterRole narrowed to match. Both are ~~on the hardening
+checklist~~ the options of the open gap [H-1](../security/privilege-footprint.md#h-1) *(since
+2026-09-27, ADR 0036)* with the cost stated: **the operator stops being install-and-forget for
+new namespaces.**
 
 ### Drop `escalate` and `bind`, keeping the sidecar Role a strict subset of the operator's own grants
 
@@ -373,7 +439,8 @@ Rejected: more pods holding a namespace-wide pod-patch token for no functional g
 
 ### Add egress NetworkPolicies
 
-On the checklist, not implemented.
+~~On the checklist~~ An open gap, [H-10](../security/isolation-and-tenancy.md#h-10) *(since
+2026-09-27, ADR 0036)*, not implemented.
 
 ### Set a workload `securityContext`
 
@@ -396,11 +463,18 @@ and kept edited.
 
 ### Order the hardening checklist by effort or likelihood
 
-Rejected: it buries the items that define the trust model.
+Rejected: it buries the items that define the trust model. *(Moot since 2026-09-27: there is no
+single checklist left to order, [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D3.)*
 
 ### Drop completed items from the checklist
 
-Rejected: it loses the statement of what the fix did *not* cover.
+~~Rejected: it loses the statement of what the fix did *not* cover.~~ *(**Superseded
+2026-09-27 — taken by [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D4, D5.**)* A closed gap loses its entry and its `H-<n>`. The statement of what its fix did not
+cover survives as at most three sentences of past-tense prose in the section of the mechanism
+it qualifies, which is where a reader of that rule finds it. Everything else about it is history
+in git.
 
 ### Publish a maintainer email, or omit the reporting section
 
@@ -408,13 +482,18 @@ The first is not established; the second leaves a reporter with no channel at al
 
 ## Residual risks
 
-Every item below except the last is on the hardening checklist in
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md), ordered there by blast radius.
+~~Every item below except the last is on the hardening checklist in
+`SECURITY_ARCHITECTURE.md`, ordered there by blast radius.~~ *(Superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md):)* Every open item
+below is an open gap on the security page whose mechanism has it, named per item; the last item
+is closed.
 
-* **`secrets: get,list,watch` cluster-wide (open)** — the heaviest confidentiality exposure.
+* **`secrets: get,list,watch` cluster-wide (open,
+  [H-1](../security/privilege-footprint.md#h-1))** — the heaviest confidentiality exposure.
   `delete` exists for exactly one, provenance-gated caller; the guard bounds the reconcile
   path, not the grant.
-* **`roles: escalate` + `rolebindings` + `serviceaccounts: create` (open)** — namespaced
+* **`roles: escalate` + `rolebindings` + `serviceaccounts: create` (open,
+  [H-2](../security/privilege-footprint.md#h-2))** — namespaced
   admin everywhere. Reducing it requires verifying the subset claim and dropping both
   `escalate` and `bind`; the chart grants the pair, and holding all of a Role's permissions is
   what makes either one unnecessary.
@@ -470,25 +549,40 @@ Every item below except the last is on the hardening checklist in
   step 2 shipped: the observer runs under `<cr-name>-observer`, bound to no Role, mounting
   no token. A pre-existing ServiceAccount under that derived name is refused rather than
   overwritten ([ADR 0020](0020-write-only-what-the-operator-owns.md) D1, D2).
-* **A generated name can be held by an object the operator did not create (partly open).**
+* **A generated name can be held by an object the operator did not create (partly open,
+  [H-9](../security/isolation-and-tenancy.md#h-9) and
+  [H-11](../security/isolation-and-tenancy.md#h-11)).**
   There is no admission webhook constraining CR names
   ([ADR 0015](0015-one-crd-validated-by-schema-only.md)), so whoever may `create valkeys`
   picks the names of every derived object. Deletes are guarded
-  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)); writes are guarded for the
+  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)); ~~writes are guarded for the
   observer ServiceAccount and the sidecar ServiceAccount, Role and RoleBinding
   ([ADR 0020](0020-write-only-what-the-operator-owns.md)). Every other managed kind is
   still written by generated name with no ownership check — ADR 0020 D7 and its Residual
-  risks name what that leaves open.
-* **No egress NetworkPolicies (open).**
-* **The pre-upgrade hook's cluster-wide CRD write grant (open)** — taken on every upgrade
-  unless disabled.
-* **`DEVELOPER.md`, the third file of the documentation standard, does not exist yet
+  risks name what that leaves open.~~ *(corrected 2026-09-27: stale since ADR 0020's
+  amendments of 2026-08-22, Status)* writes are guarded for every managed kind
+  ([ADR 0020](0020-write-only-what-the-operator-owns.md)): a reconcile path updates or
+  patches an existing object only after `metav1.IsControlledBy` proves it is this Valkey's,
+  and refuses a foreign one; it creates only on NotFound; a pod is proven two-hop, through the
+  StatefulSet. What stays open is what the guards do not undo: an object an earlier release
+  already adopted (H-9), and the choices a CR author makes, the image among them (H-11).
+* **No egress NetworkPolicies (open, [H-10](../security/isolation-and-tenancy.md#h-10)).**
+* **The pre-upgrade hook's cluster-wide CRD write grant (open,
+  [H-3](../security/privilege-footprint.md#h-3))** — taken on every upgrade unless disabled.
+* ~~**`DEVELOPER.md`, the third file of the documentation standard, does not exist yet
   (open).** A documentation gap, not a hardening item: `SECURITY_ARCHITECTURE.md` records it
-  in its introduction, not on its checklist.
+  in its introduction, not on its checklist.~~ **(Closed 2026-09-27 by
+  [ADR 0035](0035-the-readme-advertises-the-reference-lives-under-docs.md).)**
+  [DEVELOPER.md](../../DEVELOPER.md) exists, together with
+  [docs/developer/](../developer/README.md); the same change replaced
+  `SECURITY_ARCHITECTURE.md` with [docs/security/](../security/README.md)
+  ([ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)).
 
 ## References
 
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the rule-by-rule footprint, trust boundaries and hardening checklist
+* [docs/security/privilege-footprint.md](../security/privilege-footprint.md) — the rule-by-rule footprint and its open gaps H-1 to H-3; trust boundaries are [trust-boundaries.md](../security/trust-boundaries.md), the other gaps sit on their own pages under [docs/security/](../security/README.md) *(until 2026-09-27 all of it was `SECURITY_ARCHITECTURE.md`)*
+* [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) — the security architecture as one page per perspective; supersedes D12, D13 and the first half of D14
+* [SECURITY.md](../../SECURITY.md) — vulnerability reporting (D14)
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarServiceAccount`, `BuildSidecarRole`, `BuildSidecarRoleBinding`
 * [`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go) — the three ingress-only policies
 * [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — `DefaultServiceAccountName` for Sentinel pods

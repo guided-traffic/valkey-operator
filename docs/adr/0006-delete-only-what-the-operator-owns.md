@@ -33,6 +33,18 @@ precondition and treats Conflict as "already gone" rather than as a failure.
 Delete without a UID precondition and accepts any ownerReference rather than the controller
 one — see Residual risks.
 
+Amended 2026-09-27 (correction, no decision changes): the residual risk "The write path is a
+separate rule" still listed StatefulSet, Service, ConfigMap, NetworkPolicy, Deployment,
+ServiceMonitor and Certificate as written with no ownership check, and the two `unstructured`
+reconcilers as stamping this CR's ownerReference onto an unverified object.
+[ADR 0020](0020-write-only-what-the-operator-owns.md) closed both in its amendments of
+2026-08-22, and the code agrees: in
+[`valkey_controller.go`](../../internal/controller/valkey_controller.go) each of those kinds
+is updated only after `metav1.IsControlledBy` accepts the object read, and
+`reconcileServiceMonitor` and `reconcileCertificate` call `SetOwnerReferences` only after that
+check. The list is struck and restated in place; the objects an earlier release already
+adopted stay open. Verified by reading on 2026-09-27; no test was run for this correction.
+
 This ADR is the **deletion** half. The write half — no write onto a generated name the
 operator cannot prove it owns, and no grant to a subject it does not own — is
 [ADR 0020](0020-write-only-what-the-operator-owns.md). D1 below is deliberately scoped
@@ -222,7 +234,8 @@ revision, and the *active* Secret is never deleted.
 * A user who leaves a foreign budget under the managed name gets **no operator-managed
   budget at all** for that StatefulSet, by design, with a Warning saying so. Documented
   at the `Enabled` field in `api/v1/valkey_types.go`, in the Helm `values.yaml` PDB
-  comment block, and in the README.
+  comment block, and in
+  [`docs/operations/disruption-budgets.md`](../operations/disruption-budgets.md#names-and-ownership).
 * Stale objects the operator cannot prove it owns are left behind and reported as
   Events — recoverable by hand — rather than deleted. The operator is loud about it: a
   Warning per refusing pass.
@@ -342,7 +355,7 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
   and no Delete is attempted.
 * Any new resource kind — especially `unstructured` ones that bypass `controllerutil` —
   must set the ownerReference explicitly, or D14's argument breaks silently.
-* **The write path is a separate rule and only partly guarded.** D1 binds deletions. On
+* **The write path is a separate rule ~~and only partly guarded~~.** D1 binds deletions. ~~On
   the reconcile *write* path, `reconcilePodDisruptionBudget` and the four paths
   [ADR 0020](0020-write-only-what-the-operator-owns.md) covers are the only ones that
   check provenance; StatefulSet, Service, ConfigMap, NetworkPolicy, Deployment,
@@ -350,7 +363,16 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
   check. Two of those go further than an overwrite — `reconcileServiceMonitor` and
   `reconcileCertificate` write `current.SetOwnerReferences(desired.GetOwnerReferences())`
   onto an object they never verified, so deleting the CR garbage-collects a foreign
-  object. That is a deletion D1 does not watch, because the operator never issues it.
+  object. That is a deletion D1 does not watch, because the operator never issues it.~~
+  *(corrected 2026-09-27: stale since ADR 0020's amendments of 2026-08-22, Status)* The write
+  path is guarded for every managed kind by
+  [ADR 0020](0020-write-only-what-the-operator-owns.md): each reconcile path updates an
+  existing object only after `metav1.IsControlledBy` proves it is this Valkey's, and
+  `reconcileServiceMonitor` and `reconcileCertificate` set their ownerReferences only on an
+  object that proof accepted. What D1 still does not watch is the garbage-collection delete of
+  a ServiceMonitor or Certificate that a release before that guard already stamped with this
+  CR's ownerReference ([H-9](../security/isolation-and-tenancy.md#h-9)), because the operator
+  never issues it.
 
 ## References
 

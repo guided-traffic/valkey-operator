@@ -3,7 +3,7 @@
 ## Status
 
 Accepted. Date: 2026-09-26. Decided by Hans during the T31/T32 work on `feat/rootless`
-([`local_T31-generated-pods-run-as-root.md`](../tickets/local_T31-generated-pods-run-as-root.md),
+([`031-generated-pods-run-as-root.md`](../tickets/archive/031-generated-pods-run-as-root.md),
 section "Extension 2026-09-26"), in three answers: the seccomp profile is configurable as
 `RuntimeDefault` or `Localhost` and never `Unconfined`; user namespaces are opt-in everywhere;
 Sentinel gets a resources field without a default, and no container gets a new default.
@@ -747,7 +747,7 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
   [`cmd/main_test.go`](../../cmd/main_test.go),
   [`integration/pod_hardening_test.go`](../../test/integration/pod_hardening_test.go),
   [`e2e/pod_hardening_test.go`](../../test/e2e/pod_hardening_test.go)
-- The decision round, including the reversal: [T31](../tickets/local_T31-generated-pods-run-as-root.md),
+- The decision round, including the reversal: [T31](../tickets/archive/031-generated-pods-run-as-root.md),
   section "Extension 2026-09-26"
 - [ADR 0032](0032-generated-pods-run-rootless.md) (the posture this extends),
   [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) (the token split),

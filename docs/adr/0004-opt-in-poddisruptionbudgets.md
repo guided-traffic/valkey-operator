@@ -25,12 +25,20 @@ envtest ([`test/integration/pdb_test.go`](../../test/integration/pdb_test.go)) a
 unit tests ([`internal/controller/pdb_test.go`](../../internal/controller/pdb_test.go)),
 not by e2e.
 
-One documentation follow-through is **open**: the "while
+~~One documentation follow-through is **open**: the "while
 `spec.podDisruptionBudget.enabled` is true" qualifier on the
-`PodDisruptionBudgetNotOwned` Event is present in `README.md` but still missing from
+`PodDisruptionBudgetNotOwned` Event is present in
+[`docs/operations/disruption-budgets.md`](../operations/disruption-budgets.md#names-and-ownership)
+(the README held it when this was written) but still missing from
 [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) (the source of truth) and
-`deploy/helm/valkey-operator/values.yaml`. The generated CRD copies follow
-automatically via `make generate-all` and must never be hand-edited.
+`deploy/helm/valkey-operator/values.yaml`.~~ *(Corrected 2026-09-27: the follow-through is
+**done**, and was when this paragraph still called it open. Commit `3c78c33` (2026-08-21) added
+the qualifier to both: the `PodDisruptionBudgetSpec` doc comment and the `Enabled` field comment
+in [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go), and the PDB comment block of
+`deploy/helm/valkey-operator/values.yaml`. The generated copies carry it too:
+`config/crd/bases/vko.gtrfc.com_valkeys.yaml` and
+`deploy/helm/valkey-operator/templates/crd.yaml`, both checked by grep on 2026-09-27.)* The
+generated CRD copies follow automatically via `make generate-all` and must never be hand-edited.
 
 ## Context
 

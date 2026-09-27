@@ -92,6 +92,14 @@ Valkey 9 and Valkey 8, and in two further Valkey 8 runs, its subtest for a `Loca
 the operator's allow-list does not hold (ADR 0033 D9) included. What it proves on a node is
 recorded in ADR 0033.)*
 
+**Amended 2026-09-27 (correction, no decision changes):** three sentences under Alternatives
+Considered called the admission-gap ticket untracked. It was then — a gitignored `local_` working
+note — and it stopped being that on 2026-09-27, when the tickets were numbered and it was renamed
+and archived with them without the `local_` prefix the ignore rule matches; it is tracked from
+then on, in the same change as this correction. The three claims are struck and corrected in
+place. Following [ADR 0034](0034-tickets-are-work-lists-that-get-archived.md) D7, this ADR still
+names no ticket path; the existing mentions of the admission-gap ticket stay.
+
 ## Context
 
 Two separate pressures produced the same rule.
@@ -343,19 +351,22 @@ the run shows that the tier rolled once, not why.
 ## Consequences
 
 * **The incident's enabling co-location is not prevented on the default path.** The
-  spread is opt-in. README, the CRD field docs and the Helm `values.yaml` therefore
+  spread is opt-in. [`docs/operations/anti-affinity.md`](../operations/anti-affinity.md),
+  the CRD field docs and the Helm `values.yaml` therefore
   recommend `mode: soft` for every multi-replica cluster, and enabling it later costs
   one failover-aware rolling update — lossless for multi-replica clusters.
 * The safest posture is never the one a user gets by accident: unauthenticated,
   unencrypted, unbudgeted, unspread clusters are the default — and no document asks for
-  them to be turned on in one place. Section 5 of
-  [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) names two of the four as
-  schema defaults (`tls.enabled: false`, `podDisruptionBudget.enabled: false`); its
-  hardening checklist in section 9 has **no** item for enabling auth, TLS, PDBs or
-  anti-affinity — its two adjacent items ("Require client certificates where the
-  deployment can", "Do not leave `spec.sentinel.disableAuth` or either
-  `allowUnencrypted` on") presuppose TLS and auth are already enabled. The
-  recommendation to opt in lives at the CRD fields, in README and in the Helm
+  them to be turned on in one place.
+  [`docs/security/validation.md`](../security/validation.md#schema-validation-and-no-webhook)
+  names two of the four as schema defaults (`tls.enabled: false`,
+  `podDisruptionBudget.enabled: false`); the open gaps H-1 to H-24 that close the pages of
+  [`docs/security/`](../security/README.md) have **no** item for enabling auth, TLS, PDBs or
+  anti-affinity — two of them ([H-5](../security/secrets-and-tls.md#h-5) "Require client
+  certificates where the deployment can", [H-8](../security/secrets-and-tls.md#h-8) "Do not
+  leave `spec.sentinel.disableAuth` or either `allowUnencrypted` on") presuppose TLS and
+  auth are already enabled. The recommendation to opt in lives at the CRD fields, in
+  [`docs/operations/anti-affinity.md`](../operations/anti-affinity.md) and in the Helm
   `values.yaml`; the auth and TLS posture and its cost are recorded in
   [ADR 0016](0016-authentication-and-tls-posture.md). Every new field must follow the
   same rule.
@@ -374,9 +385,12 @@ the run shows that the tier rolled once, not why.
   since the re-decision of the same day its retirement rolls the pods that carry it, through
   `podCarriesRetiredRepair` (D7).
 * Users see a controlled failover per multi-replica cluster on **every** operator
-  upgrade, permanently (D11). The only written mention is the README upgrade paragraph
-  "What it does to running clusters", which names the sidecar operator image as the
-  cause — and it sits inside the collapsed `<details>` block of the fast start. The rootless
+  upgrade, permanently (D11). The only written mention is the upgrade paragraph
+  "What it does to running clusters" in
+  [`docs/operations/upgrading.md`](../operations/upgrading.md#what-an-upgrade-does-to-running-clusters),
+  which names the sidecar operator image as the cause — and the README fast start reaches it
+  only through a link inside its collapsed `<details>` block (until 2026-09-27 the paragraph
+  itself sat inside that block). The rootless
   release adds a second one to every persistent multi-replica cluster (D11 amendment).
 * Users on kustomize or a floating tag get an unannounced rolling update on releases
   that change the pod spec.
@@ -397,15 +411,17 @@ the run shows that the tier rolled once, not why.
 
 Decided 2026-08-19 and revised the same day, before it reached a commit — no version of
 `api/v1/valkey_types.go` in this repository ever carried `+kubebuilder:default=hard`, so
-the only record of that decision is the untracked admission-gap ticket. The reasons for
+the only record of that decision is the ~~untracked~~ admission-gap ticket *(corrected
+2026-09-27: tracked since that day — see Status)*. The reasons for
 reversing it stand on their own: `hard` wedges any cluster with fewer schedulable spread
 domains than replicas, and it changed the e2e topology requirements.
 
 ### Default `soft`, with no off switch
 
 WP5 as built in `0c8b424`, reversed on 2026-08-20 by `146ffa5`. (The work-package
-numbering lives in the admission-gap ticket, which is untracked — only the commits are
-in this repository.) It renders a term into every multi-replica pod template on upgrade,
+numbering lives in the admission-gap ticket, ~~which is untracked — only the commits are
+in this repository~~ *(corrected 2026-09-27: which is tracked in this repository since that
+day, next to the commits — see Status)*.) It renders a term into every multi-replica pod template on upgrade,
 flipping the hash and rolling the fleet for a change the user never requested.
 
 ### Treat block presence as opt-in with an implicit `soft`
@@ -439,7 +455,9 @@ Rejected for upgrade neutrality. The cost is named explicitly above rather than 
 
 All rejected together with their premise. The claim — that the default anti-affinity
 term would trigger "an orchestrated mass-failover event" — comes from the review record
-in the untracked admission-gap ticket, not from anything in this repository. Verified by
+in the ~~untracked~~ admission-gap ticket, not from anything in this repository
+*(corrected 2026-09-27: that ticket is itself tracked in this repository since that day — see
+Status; nothing else in the repository backs the claim)*. Verified by
 reading the source, the data StatefulSet rolls on every release anyway (D11), so there
 was nothing new to announce.
 

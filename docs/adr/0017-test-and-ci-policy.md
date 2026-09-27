@@ -609,7 +609,7 @@ pod and none of them then waits for the replacement by UID; whether their waits 
 terminating pod is what the audit has to establish)*, in `sidecar_test.go` (the replica drain),
 `admission_recovery_test.go`, `sentinel_stale_master_test.go`, `pod_termination_test.go` and
 `topology_abandon_test.go`. They are filed unaudited as T34 on
-[the ticket board](../tickets/local_BOARD.md). *(Audited 2026-09-26, T34, read and from the run
+[the ticket board](../tickets/archive/039-findings-from-the-1-11-0-fleet-rollout.md#board-archive--final-state-of-local_boardmd-retired-2026-09-27). *(Audited 2026-09-26, T34, read and from the run
 logs:)* two are vacuous — the replica drain in `sidecar_test.go` asserts "no failover" and "the
 recreated replica is labelled" before a replacement can exist, and `sentinel_stale_master_test.go`
 logs "all pods restarted and ready" on the old pods, its assertions protected only by how fast

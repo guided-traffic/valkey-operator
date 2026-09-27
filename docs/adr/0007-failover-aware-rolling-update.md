@@ -130,6 +130,8 @@ investigating a CI failure whose promoted master served an empty dataset; that f
 **not** explained by this defect (the WAIT gate did report an acknowledging replica) and
 stays open.
 
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
+
 ## Context
 
 The data StatefulSet uses `updateStrategy: OnDelete` and
@@ -234,9 +236,12 @@ pod "is restarted and its in-memory data is lost", which would have had an admin
 downtime for nothing while never learning the real behaviour. That draft was corrected
 before it was committed, so the wrong sentence is development history and is not
 recoverable from this repository; only the correction is, in the message of commit
-`a0ac61f`. The committed README states the deferral ("A single-replica cluster without
-Sentinel is not restarted for this"). Do not read the same phrase in the committed metrics
-note as the defect: there the pod really is restarted, which is D7's counter-case.
+`a0ac61f`. [`docs/operations/upgrading.md`](../operations/upgrading.md#a-single-replica-cluster-without-sentinel)
+(ADR 0035; this record wrote the committed README here) states the deferral ("A
+single-replica cluster without Sentinel is not restarted for this"). Do not read the same
+phrase in the committed metrics note
+([`docs/operations/monitoring.md`](../operations/monitoring.md#enabling-metrics-on-a-running-cluster))
+as the defect: there the pod really is restarted, which is D7's counter-case.
 
 *Amended 2026-09-26* ([ADR 0032](0032-generated-pods-run-rootless.md) D3, ticket T31): a
 single pod that runs without `runAsNonRoot` — every pod an operator before the rootless

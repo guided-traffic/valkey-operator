@@ -4,6 +4,15 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended 2026-09-27 (correction, no decision changes):** the Context bullet on the three pod
+doors and the matching Alternatives entry said the sidecar grant needed only the label set.
+Read against the code before the 2026-08-22 pod amendment (`995f186^`), it needed the label
+set plus a name of the `<cr>-<ordinal>` form, because `SidecarRolePodNames`
+([`internal/builder/rbac.go`](../../internal/builder/rbac.go)) has filtered the listed names
+to that pattern since `fa50b89`. Both places are struck and corrected in place. The other two
+doors were stated correctly: the `clearDrainStamps` patch needed only the label set, and the
+rolling update read and deleted a pod by its generated name, with no label at all.
+
 **Amended 2026-08-26:** the D8/NA62 read-path sweep is corrected in place — it omitted
 Deployments, and `isObserverDeploymentReady` was the unguarded consumer, which inverted the
 `status.observerReady` signal this ADR's own observer refusal direction rests on. The reader
@@ -42,7 +51,8 @@ and `sentinelRolloutComplete` all treat an unproven pod as absent.
 namespace restore recreates every child with a stale controller-reference UID, the guards
 refuse it by design, and adoption gated on Velero's restore labels was considered and
 rejected. No decision changes; the supported restore path is documented in
-[`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) section 7.
+[`docs/security/backup-and-restore.md`](../security/backup-and-restore.md#the-supported-restore-path-restore-state-not-derived-objects),
+section "The supported restore path: restore state, not derived objects".
 
 Implemented on branch `feat/support-pdb`, in the same change as this ADR. Fourteen reconcile
 paths carry the guard — `reconcileObserverServiceAccount`, `reconcileSidecarServiceAccount`,
@@ -148,14 +158,21 @@ branch; none is a report of an object observed being damaged on a cluster.
   ([`internal/health/checker.go`](../../internal/health/checker.go); it was `podAddress` until
   [ADR 0029](0029-a-name-is-not-a-component.md) replaced it), so reaching a foreign
   pod needs this cluster's label set, a per-pod record under the headless Service **and** the
-  CR's password. The two doors nobody had filed need only the label set:
+  CR's password. ~~The two doors nobody had filed need only the label set:~~ *(Corrected
+  2026-09-27, read against the code before this amendment, `995f186^`:)* The two doors nobody
+  had filed need no network, no password and no DNS record — the drain-stamp patch needs only
+  the label set, the sidecar grant the label set plus a name of the `<cr>-<ordinal>` form:
 
   * `clearDrainStamps`
     ([`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go))
     listed by selector labels and **patched** every match — no network, no password, no DNS.
   * `listDataPodNames` fed `SidecarRolePodNames`, whose result is the `resourceNames` of the
-    sidecar Role ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)). A pod
-    carrying the labels therefore entered the grant, and this cluster's sidecar token got
+    sidecar Role ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)). ~~A pod
+    carrying the labels therefore entered the grant,~~ *(Corrected 2026-09-27:)* A pod
+    carrying the labels **and** a name of the form `<cr>-<ordinal>` therefore entered the
+    grant — `SidecarRolePodNames` has dropped every other listed name since `fa50b89`, and
+    below `spec.replicas` its desired half grants the name without any label, which D9 leaves
+    alone (Residual risks) — and this cluster's sidecar token got
     `patch` on somebody else's pod. That is D3 mirrored: there the grant followed the name of
     the *subject*, here it followed the name of the *object*.
 
@@ -529,8 +546,8 @@ watched the recreated one adopt the surviving pods under its new UID.
   branch that stamped the reference also wrote `current.SetLabels(desired.GetLabels())`,
   replacing the label map wholesale, and `ApplyOperatorVersion` stamped the annotation — so
   labels, controller reference and version annotation are all identical to a real one. This
-  is documented and left, not detected; see Residual risks and the hardening checklist in
-  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md).
+  is documented and left, not detected; see Residual risks and gap
+  [H-9](../security/isolation-and-tenancy.md#h-9) in `docs/security/isolation-and-tenancy.md`.
 * **(2026-08-22, NA62) Turning a feature off can no longer delete somebody else's object.**
   `spec.metrics.enabled`, `spec.metrics.serviceMonitor.enabled` and `spec.observer.enabled`
   each drove a name-only `Delete`. The cheapest of them needed one boolean in a CR the author
@@ -659,8 +676,10 @@ recreated" forever, while what happened is that a foreign object holds the name 
 of waiting fixes it.
 
 **(NA63) Close only the two doors the finding named.** Rejected once the other two were read:
-the network commands need labels, a DNS record and the password, while the `clearDrainStamps`
-patch and the sidecar grant need only the label set — and the grant is the one that hands a
+the network commands need labels, a DNS record and the password, while ~~the `clearDrainStamps`
+patch and the sidecar grant need only the label set~~ *(corrected 2026-09-27)* the
+`clearDrainStamps` patch needs only the label set and the sidecar grant the label set plus a
+`<cr>-<ordinal>` name — and the grant is the one that hands a
 capability to a stranger rather than merely touching them.
 
 **Amend ADR 0006 instead of writing this one.** Its D2 and D11 are already the rules a refusal
@@ -689,8 +708,8 @@ that alters nothing a user asked for.
   guard is not retroactive, and no field separates a foreign object that was stamped from a
   genuine child — see the Consequences bullet for why. A cluster that ran an earlier release
   with a colliding ServiceMonitor or Certificate carries that stamp today, and deleting the
-  CR will garbage-collect the object. The only remedy is to look before upgrading; it is on
-  the hardening checklist in [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md).
+  CR will garbage-collect the object. The only remedy is to look before upgrading; it is
+  gap [H-9](../security/isolation-and-tenancy.md#h-9) in `docs/security/isolation-and-tenancy.md`.
 * **The garbage-collector behaviour was never reproduced.** That a `Controller: true` /
   `BlockOwnerDeletion: true` reference makes the CR deletion cascade to the referenced object
   is upstream behaviour asserted from the API contract. envtest starts no
@@ -707,7 +726,8 @@ that alters nothing a user asked for.
   rests on the same unreproduced garbage-collector contract as the bullet above. The supported
   path — restore only the CR, the auth Secret and the PVCs, and let the operator derive the
   rest — is documented in
-  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md) section 7. **Adoption gated on
+  [`docs/security/backup-and-restore.md`](../security/backup-and-restore.md#the-supported-restore-path-restore-state-not-derived-objects),
+  section "The supported restore path: restore state, not derived objects". **Adoption gated on
   Velero's `velero.io/backup-name` / `velero.io/restore-name` labels was considered and
   rejected**: a label is writable by anyone who can create the object, so honoring it would
   reopen the exact door D1 closed, with a Velero prefix instead of an instance label. The

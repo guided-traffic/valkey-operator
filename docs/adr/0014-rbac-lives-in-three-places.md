@@ -16,6 +16,16 @@ on a runner**: Actions run 32451432385, job `Generated Manifests Up To Date`, 20
 PR #184 at `9294ad9` — that record is held by GitHub Actions, not by this repository. Only its
 passing path has executed; see Residual risks.
 
+Amended 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md): **the home D11 names
+for the privilege footprint is now
+[docs/security/privilege-footprint.md](../security/privilege-footprint.md)**, because
+`SECURITY_ARCHITECTURE.md` was replaced by one page per perspective under
+[docs/security/](../security/README.md). The obligation itself is unchanged. D11, the
+Consequence and the residual risk that named the old file are marked in place. Verified by
+reading the page: it states the operator ClusterRole, the per-instance sidecar Role that
+`BuildSidecarRole` builds, and the pre-upgrade hook, 2026-09-27.
+
 ## Context
 
 The operator's permission set exists three times:
@@ -144,7 +154,9 @@ a documentation or schema correction is made once in the Go types and propagated
 `make generate-all`. **The chart ClusterRole is the named exception** — hand-maintained, not
 generated — and naming it keeps the exception from being generalised.
 
-**D11 — The privilege footprint is documented in `SECURITY_ARCHITECTURE.md` and updated in
+**D11 — The privilege footprint is documented in ~~`SECURITY_ARCHITECTURE.md`~~
+[docs/security/privilege-footprint.md](../security/privilege-footprint.md) *(since 2026-09-27,
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D8)* and updated in
 the same change** as any marker, chart ClusterRole or `BuildSidecarRole` edit. RBAC is the
 operator's blast radius, and a permission added without a written justification is a
 permission nobody can later argue for removing — the moment of the code change is the only
@@ -158,7 +170,9 @@ reclassify it and produce an unowned `go.mod` diff.
 ## Consequences
 
 * Every RBAC change now carries **three** obligations: the marker, the chart rule, and the
-  `SECURITY_ARCHITECTURE.md` entry. The last has no automated drift check and rests on review.
+  ~~`SECURITY_ARCHITECTURE.md` entry~~ entry on
+  [privilege-footprint.md](../security/privilege-footprint.md) *(since 2026-09-27, ADR 0036)*.
+  The last has no automated drift check and rests on review.
 * Every marker, API type or CRD change requires running `make generate-all` and committing the
   result in the same change.
 * Legitimate future use of Go templating or wildcards inside the chart's `rules:` block will
@@ -249,7 +263,9 @@ Rejected for the `go.mod`-ownership reason in D12.
   which is an observation of a run rather than a committed artifact. A deliberately stale
   manifest has never been pushed, so the job's *failing* path — the half that gives it its
   value — is not reproduced.
-* **The `SECURITY_ARCHITECTURE.md` obligation has no automated check.**
+* **The ~~`SECURITY_ARCHITECTURE.md`~~ footprint-page obligation
+  ([privilege-footprint.md](../security/privilege-footprint.md), since 2026-09-27) has no
+  automated check.**
 * **cert-manager-backed installs that migrated to `unifiedCertificate` before the
   `secrets: delete` fix keep a wedged CR and an orphaned `<name>-sentinel-tls` Secret** until
   a `helm upgrade` grants the verb. The wedge itself is announced — `reconcileTLSCertificates`
@@ -265,7 +281,8 @@ Rejected for the `go.mod`-ownership reason in D12.
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — the kubebuilder RBAC markers
 * [`deploy/helm/valkey-operator/templates/clusterrole.yaml`](../../deploy/helm/valkey-operator/templates/clusterrole.yaml) — the ClusterRole that ships
 * `.github/workflows/release.yml` — the `generated-manifests` job
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the footprint that must move with the rules
+* [docs/security/privilege-footprint.md](../security/privilege-footprint.md) — the footprint that must move with the rules *(until 2026-09-27 `SECURITY_ARCHITECTURE.md`)*
+* [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) — why the footprint is one page of `docs/security/`
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — what those rules actually permit
 * [ADR 0006](0006-delete-only-what-the-operator-owns.md) — why a destructive verb ships with a call-site guard
 * [ADR 0017](0017-test-and-ci-policy.md) — the surrounding CI and verification policy

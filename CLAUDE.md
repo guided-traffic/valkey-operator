@@ -10,8 +10,10 @@ All code, comments, commit messages, documentation, and CRD fields in this repos
 
 Every durable architecture decision lives in [`docs/adr/`](docs/adr/README.md), one file per
 decision family, named `NNNN-kebab-case-title.md`. The index in
-[`docs/adr/README.md`](docs/adr/README.md) lists all of them grouped by theme. Read the
-relevant ADR before changing the behaviour it describes.
+[`docs/adr/README.md`](docs/adr/README.md) lists all of them grouped by theme. Each theme
+table carries a *State* column, the coarse build state of the record, and a record's row, its
+State included, is updated in the same change as the record's `Status`. Read the relevant ADR
+before changing the behaviour it describes.
 
 Structure of an ADR:
 
@@ -36,6 +38,63 @@ Structure of an ADR:
 - A new durable decision — a rule, an invariant, a default, a refusal to act — gets its own
   ADR and a line in the index.
 - Every claim is verified against the code; anything unverified says so explicitly.
+
+## Decisions live in ADRs; tickets are work lists that get archived
+
+**Every design decision is an ADR** in the format above, written in the session the decision
+is taken, not when the work is finished. An ADR here **may** link into the code — its
+`References` section does — so moving the code it names means updating it.
+
+**A ticket is a work list and nothing else**: `docs/tickets/NNN-<slug>.md`, closed by moving it
+to `docs/tickets/archive/` when the work lands. **The extraction is the close**, not the move:
+the decision goes into an ADR, the user-facing consequence into `README.md`, `docs/operations/`
+or `docs/security/`, the subsystem and contributor knowledge into `docs/developer/` or
+`DEVELOPER.md` — an archived ticket is history, never the source of a current rule. There is no
+index and no board; each ticket's frontmatter `state:` is the index. Rules: [docs/tickets/README.md](docs/tickets/README.md),
+[ADR 0034](docs/adr/0034-tickets-are-work-lists-that-get-archived.md).
+
+**An open security finding is embargoed.** An open ticket with `security: live` or
+`security: boundary` keeps the `local_` prefix (`local_NNN-<slug>.md`, ignored by
+`.gitignore`), and no tracked file, commit message or pull request carries its file name or
+describes it — a tracked file may give its id, severity, security class, effort and state, and
+"embargoed security finding, open" in place of the details
+([the rule](docs/tickets/README.md#an-open-security-finding-is-embargoed)).
+The embargo lifts when the finding is fixed. A dropped finding is unfixed by definition and
+stays embargoed until the owner explicitly accepts publishing it — accepting the drop is not
+enough — and that acceptance, dated, is the newest History entry of the ticket. Once the
+embargo lifts, the file loses the prefix and is tracked.
+
+**Nothing outside `docs/tickets/` cites a ticket** — not `README.md`, not a page under
+`docs/`, not an ADR, not this file, not a code comment, not a commit message or pull request;
+cite the ADR instead. **Partly implemented:** the rule binds every citation written from
+2026-09-27 on; the T-label citations that already exist, in this file too, stay until they are
+rewritten and are not a precedent
+([ADR 0034](docs/adr/0034-tickets-are-work-lists-that-get-archived.md)).
+
+## Documentation has five homes, and a statement goes to exactly one
+
+The rule is [ADR 0035](docs/adr/0035-the-readme-advertises-the-reference-lives-under-docs.md).
+
+| Kind | Home |
+|---|---|
+| A decision — what the operator does and why, what was rejected | an [ADR](docs/adr/README.md) |
+| How the code works — a subsystem, an invariant, the contributor workflow | [docs/developer/](docs/developer/README.md) and [DEVELOPER.md](DEVELOPER.md) |
+| What somebody running the operator needs — installation, upgrading, TLS, persistence, rolling updates, pod security, monitoring, the status | [docs/operations/](docs/operations/README.md) |
+| The threat model, and the gap each mechanism leaves | [docs/security/](docs/security/) — one page per perspective, each closing with `## What this does not cover`; the form is [docs/security/README.md](docs/security/README.md) ([ADR 0036](docs/adr/0036-the-security-architecture-is-one-page-per-perspective.md)). Reporting a vulnerability is [SECURITY.md](SECURITY.md) |
+| Work still outstanding | a [ticket](docs/tickets/README.md), archived when the work lands |
+
+**`README.md` is the front page and carries the [CRD reference](README.md#crd-reference) and
+the [Helm chart values reference](README.md#helm-chart-values)**, and it explains nothing: an
+explanation belongs in the page the README links to. The reference tables live in the README
+and nowhere else — a page under `docs/operations/` explains a field without restating them.
+
+## Developer documentation lives in `docs/developer/`
+
+Overviews for people changing the code — the package map, the architecture, the reconcile loop,
+the test tiers. Start at [docs/developer/README.md](docs/developer/README.md);
+[DEVELOPER.md](DEVELOPER.md) is the contributor entry point and does not repeat those pages.
+**Read the page for a subsystem before you change it, and update it in the same change**: it
+points at files and functions on purpose, so it goes stale when the tree moves.
 
 ## CRD
 
@@ -242,7 +301,7 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 | Valkey image tool check       | `make test-image-tools`        |
 | Release tooling check         | `make test-release-tooling`    |
 | Full E2E local (Kind)         | `make e2e-local`               |
-| All tests with coverage       | `make test`                    |
+| ~~All tests with coverage~~ `fmt`, `vet` and the unit tier, profile to `cover.out` *(corrected 2026-09-27: it runs `go test ./...` without build tags, so no integration, e2e or image-tools test)* | `make test` |
 | Linting                       | `make lint`                    |
 | Lint with auto-fix            | `make lint-fix`                |
 | Security scan (GoSec)         | `make gosec`                   |
@@ -257,7 +316,11 @@ Always use Makefile targets to run tests, linting, and analysis. Never invoke Go
 
 Every pinned tool installs into `bin/` and is invoked by its path, never by bare name — probing
 `PATH` while installing into `GOPATH/bin` made `make cyclo`, `make gosec` and `make vuln` fail
-with `command not found` on any machine without that directory on `PATH`. A tool path or
+with `command not found` on any machine without that directory on `PATH`. *(corrected
+2026-09-27: not every tool the Makefile uses — `make coverage-merge` still probes `PATH` for
+`gocovmerge`, installs it unpinned (`@latest`) into `GOBIN` and calls it by bare name, the shape
+this paragraph describes as broken; no CI job calls that target, the coverage job merges the
+profiles in `release.yml` itself.)* A tool path or
 version variable must stay **above** the first target naming it: prerequisites expand when the
 rule is read, so a late definition silently drops the dependency. *(2026-09-26)* **The path
 carries the version** (`bin/controller-gen-v0.22.0`): `go-install-tool` installs only a missing
@@ -384,15 +447,16 @@ The kubebuilder markers in `internal/controller/valkey_controller.go` generate
 `config/rbac/role.yaml` (`make manifests`), but the ClusterRole that actually reaches users is
 the hand-maintained `deploy/helm/valkey-operator/templates/clusterrole.yaml`.
 **A new marker needs the chart rule in the same change**, plus an entry in
-`SECURITY_ARCHITECTURE.md`. `TestHelmClusterRoleCoversGeneratedRole`
+[the operator ClusterRole table](docs/security/privilege-footprint.md#the-operator-clusterrole).
+`TestHelmClusterRoleCoversGeneratedRole`
 (`internal/controller/rbac_drift_test.go`) asserts generated ⊆ chart and names the missing
 triple; the `generated-manifests` CI job covers the half it cannot see by running
 `make generate-all` and failing on a dirty tree.
 
 Why it is a test and not a convention, what "legal drift" means, and the one supported
 upgrade path: [ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md). The privilege footprint
-itself — every rule, what it permits, the hardening checklist — is
-[`SECURITY_ARCHITECTURE.md`](SECURITY_ARCHITECTURE.md) and
+itself — every rule, what it permits, and the hardening items it leaves open — is
+[`docs/security/privilege-footprint.md`](docs/security/privilege-footprint.md) and
 [ADR 0013](docs/adr/0013-operator-is-cluster-wide-privileged.md).
 
 ## Rolling Update Strategy
@@ -790,7 +854,11 @@ D4, [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) D10 and
 → [ADR 0030](docs/adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md),
 amending [ADR 0016](docs/adr/0016-authentication-and-tls-posture.md) D12 and its cert-manager
 residual risk, [ADR 0012](docs/adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
-D11, and `SECURITY_ARCHITECTURE.md` sections 2, 6 and 9.
+D11, and the security pages [secrets and TLS](docs/security/secrets-and-tls.md#tls-material)
+(gap [H-4](docs/security/secrets-and-tls.md#h-4)) and
+[rotation and change propagation](docs/security/rotation-and-change-propagation.md) (gaps
+[H-23](docs/security/rotation-and-change-propagation.md#h-23) and
+[H-24](docs/security/rotation-and-change-propagation.md#h-24)).
 
 ## Every generated pod runs rootless, with no option
 

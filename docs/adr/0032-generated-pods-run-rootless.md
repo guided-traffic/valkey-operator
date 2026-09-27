@@ -3,7 +3,7 @@
 ## Status
 
 Accepted. Date: 2026-09-26. Decided by Hans on the T31 analysis
-([`local_T31-generated-pods-run-as-root.md`](../tickets/local_T31-generated-pods-run-as-root.md));
+([`031-generated-pods-run-as-root.md`](../tickets/archive/031-generated-pods-run-as-root.md));
 released only together with [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 (T32),
 because this is the first change that rolls every cluster of a fleet automatically.
 

@@ -141,8 +141,9 @@ func (r *ValkeyReconciler) warnRecreateRequired(ctx context.Context, v *vkov1.Va
 			"nothing to this StatefulSet — replica, image and label changes are held together with "+
 			"the storage change. Applying the change needs the StatefulSet recreated by hand, in a "+
 			"maintenance window, and the operator does not carry the dataset across that: back it up "+
-			"first. The procedure and what it costs are in the spec.persistence section of the "+
-			"README. Reverting spec.persistence clears this immediately and costs no downtime.",
+			"first. The procedure and what it costs are in docs/operations/persistence.md of the "+
+			"operator repository, section 'Changing storage on an existing cluster'. Reverting "+
+			"spec.persistence clears this immediately and costs no downtime.",
 		kind, name, detail)
 }
 

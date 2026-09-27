@@ -209,7 +209,8 @@ so it is opt-in or a floor bump. Filed, not taken here.
 * **A compromised sidecar still has other levers.** `metadata.ownerReferences`,
   `metadata.finalizers`, any selector label and `spec.containers[*].image` are all reachable
   through `pods: patch`, and none of them is a record this ADR could move.
-  `SECURITY_ARCHITECTURE.md` section 3 enumerates them.
+  `docs/security/isolation-and-tenancy.md` enumerates them under
+  ["What does not hold"](../security/isolation-and-tenancy.md#what-does-not-hold).
 
 * **Not verified: nothing in this repository proves an *older operator* tolerates a pod
   template carrying the env.** The downgrade direction was reasoned about, not measured: an

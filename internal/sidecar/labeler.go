@@ -237,7 +237,8 @@ func (p *kubernetesPodPatcher) PatchAnnotation(ctx context.Context, namespace, n
 
 // IsTerminating reads the pod and reports whether it carries a DeletionTimestamp.
 // The read rides the same named-pod grant the patches use (get, added with this
-// method -- see SECURITY_ARCHITECTURE.md section 4.2).
+// method -- see docs/security/privilege-footprint.md, "The per-instance sidecar
+// Role").
 func (p *kubernetesPodPatcher) IsTerminating(ctx context.Context, namespace, name string) (bool, error) {
 	pod, err := p.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {

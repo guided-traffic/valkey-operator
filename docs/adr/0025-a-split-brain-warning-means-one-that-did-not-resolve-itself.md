@@ -441,7 +441,7 @@ during a genuine split brain would restart the silence.
   hatch), so both sides of a split accumulate writes that the repair then
   discards. This ADR changes what a Warning promises; it does not change what a
   divergence costs. Tracked separately as T12 in
-  [`docs/tickets/local_neue_baustellen.md`](../tickets/local_neue_baustellen.md).
+  [`docs/tickets/012-no-write-fencing-min-replicas-to-write-as-an-opt-in-field.md`](../tickets/012-no-write-fencing-min-replicas-to-write-as-an-opt-in-field.md).
 - **The e2e assertion is an absence.** "No Warning Event on the CR" fails on a
   genuinely degraded run as well as on a regression of this ADR, which is
   intended — but on a resource-starved CI node a legitimately slow topology
@@ -493,6 +493,6 @@ during a genuine split brain would restart the silence.
   outlives the pod.
 - [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) — how the condition
   becomes a metric.
-- [`docs/tickets/local_neue_baustellen.md`](../tickets/local_neue_baustellen.md) — T4, the
+- [`docs/tickets/archive/039-findings-from-the-1-11-0-fleet-rollout.md`](../tickets/archive/039-findings-from-the-1-11-0-fleet-rollout.md) — T4, the
   finding and the option analysis behind this ADR; T5, the matching
   `DeletionTimestamp` guard in the replace-candidate selection.

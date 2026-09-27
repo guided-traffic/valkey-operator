@@ -18,6 +18,8 @@ what the operator knows inside a rolling update) in place.
 Open, and named as such: `vko.gtrfc.com/promoted-pod` is not rewritten by the adoption of D2
 (*Residual risks*).
 
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
+
 ## Context
 
 `detectAndResolveSplitBrain` resolves a multi-master state during a rolling update by naming a
@@ -25,7 +27,7 @@ real master and sending `REPLICAOF` to every other one. `REPLICAOF` discards the
 dataset. Until this change the function had exactly one rule: **if the authority the caller
 named answers `role:master`, it is the real master, unconditionally.**
 
-**Measured 2026-08-23, kind, Kubernetes 1.36** (item T11 of `docs/tickets/local_neue_baustellen.md`,
+**Measured 2026-08-23, kind, Kubernetes 1.36** (item T11 of `docs/tickets/archive/039-findings-from-the-1-11-0-fleet-rollout.md`,
 found while verifying [ADR 0023](0023-volume-claim-templates-are-immutable.md) end to end). A
 three-replica cluster, pod-0 the recorded master. Pod-0 was deleted; its sidecar drained and
 promoted the last surviving replica, which held the data — the
@@ -160,7 +162,9 @@ promotion candidate and as a "master already present" answer; everything short o
 (an unreadable Pod object, an API error) reads as alive, because a drain has one bounded
 chance to run and must not fail on an API blip. The read is the one `get` the sidecar Role
 grants ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8,
-`SECURITY_ARCHITECTURE.md` section 4.2).
+[`docs/security/privilege-footprint.md`](../security/privilege-footprint.md#the-per-instance-sidecar-role),
+section "The per-instance sidecar Role" — ADR 0036; this record wrote `SECURITY_ARCHITECTURE.md`
+section 4.2 here).
 
 **D6 — A refusal emits no Event, and the resolver still reports nothing.** The level is already
 carried: `resolveSplitBrain` writes `MultipleMasters` and emits `SplitBrainDetected` once the
