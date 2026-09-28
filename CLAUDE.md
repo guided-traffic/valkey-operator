@@ -468,9 +468,13 @@ itself — every rule, what it permits, and the hardening items it leaves open �
 1. Replace replica pods one by one
 2. Verify new pod joins cluster and is seen by other instances
 3. Wait for replication sync to complete
-4. After 2 replicas are migrated: initiate controlled leader failover
+4. After 2 replicas are migrated: initiate controlled leader failover — `SENTINEL FAILOVER <name>
+   COORDINATED`, the forced command only as fallback on a Sentinel that refuses the option
+   (before Valkey 9.0) and on the retrigger (ADR 0037 D1)
 5. Verify failover succeeded
-6. Replace last pod (former master)
+6. Replace last pod (former master) — once it no longer answers master, every current replica is
+   synced from and attached to the new master, and the delete discards no dataset; otherwise held
+   and, past `syncTimeout`, reported as `MasterHandoverStalled` (ADR 0037 D3, D5, D6)
 
 The data StatefulSet uses `updateStrategy: OnDelete` and `podManagementPolicy: Parallel`, so
 pod replacement is the operator's job, not the StatefulSet controller's — which is also why a
@@ -481,7 +485,10 @@ cannot turn an image change into a pod-delete loop.
 **"Synced" in step 3 and 4 is the full replication answer** — role, `master_link_status:up`
 and no sync in progress (`replicationNotEstablishedReason`), never the sync flag alone: a
 replica whose link is still connecting reports `master_sync_in_progress:0` while holding
-nothing, and step 4 is followed by the delete of the outgoing master. Zero WAIT
+nothing, and step 4 is followed by the delete of the outgoing master. The same predicate,
+asked of the replica itself (`ReplicationInfo.NotEstablishedReason`), is what `Syncing`, the
+observer's `replica_sync` and the gate in front of that delete read — never the master's
+`connected_slaves` or its sync flag, which a master does not carry (ADR 0037 D2, D3). Zero WAIT
 acknowledgements is not a partial acknowledgement, and a promotion candidate holding no keys
 while the master holds some is refused (`verifyPromotionCandidateHoldsData`). Every one of
 these waits is bounded by `spec.rollingUpdate.syncTimeout` and pauses the update rather than
@@ -540,7 +547,11 @@ fire early), ADR 0010 D14; one test per site. ~~The final e2e runs of 2026-09-26
 were the runs with the guard, before its clock and the one-update arm, not the final one)* The
 e2e runs of 2026-09-26 with the guard logged, on that cluster `hard`, 4 failover triggers (one
 per run of the test), 0 demotions and 0 timeouts — 11, 11 and 9 in the run before D9, both legs
-together.
+together. **Since ADR 0037 D1 the roll's own failover is coordinated on Valkey 9 Sentinels**: the
+old master hands over and turns replica at once, so the window closes with no acknowledged write
+lost (measured on Kind: 0 of 22 772); on the forced fallback (Valkey 8 Sentinels, the 8 to 9
+upgrade roll, the retrigger) it lasts until Sentinel converts the old master, and the writes it
+acknowledges meanwhile are lost.
 → [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
 
 ## Every condition is a level, an edge or history
@@ -620,8 +631,8 @@ terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel 
 delete, `replaceNextReplica`, `replaceRemainingPods` — ask of the pod they delete only whether it
 is terminating (`terminationWait`); its readiness is not asked. The tier gate above and the
 preconditions each site already had stay (`verifyReplacedReplicasSynced`,
-`verifyNewMasterReady` — which reads the new master's `DBSIZE` but does not refuse on it, a
-pre-existing gap T32 does not close). The old wait was justified as "recently replaced", which
+the handover gate `gateOutgoingPodDelete`, which since ADR 0037 D5 also refuses the delete while
+the new master holds no keys and the outgoing pod some). The old wait was justified as "recently replaced", which
 no outdated pod ever is, and after a spec fix the replacement that never came up *is* the next
 candidate, so the roll waited for it forever. The Sentinel roll
 deletes an unavailable outdated pod ahead of `firstOutdatedPod`, and its quorum guard
@@ -1086,7 +1097,10 @@ never removes the pod from the `-rw`/`-r` Services. The `<name>-metrics` Service
 marker label `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it; the
 ServiceMonitor is `unstructured` (`monitoring.coreos.com/v1`) and skipped when the CRD is
 absent. Enabling metrics changes the pod-spec hash and therefore rides the failover-aware
-rolling update — lossless except for a single standalone pod without persistence.
+rolling update — the pre-roll dataset survives except on a single standalone pod without
+persistence; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before
+Valkey 9.0) and on any roll whose coordinated failover fell back to forced, the writes the
+outgoing master acknowledges during the roll's failover are lost (ADR 0037 D8).
 → [ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
 
 **The operator's own endpoint is a separate surface.** `:8080/metrics` serves one set of

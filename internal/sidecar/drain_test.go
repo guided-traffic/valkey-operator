@@ -172,6 +172,9 @@ func TestDrainHandler_DetectionErrorExitsImmediately(t *testing.T) {
 	assert.Empty(t, patcher.patches)
 }
 
+// The drain's Sentinel path sends the plain, forced SENTINEL FAILOVER, and
+// ValkeyCommander deliberately has no coordinated variant (ADR 0037 D1): the drain
+// runs inside a 75 s grace period that a 60 s coordinated stall would consume.
 func TestDrainHandler_MasterSentinelFailover(t *testing.T) {
 	detector := &changingRoleDetector{role: common.RoleMaster}
 	patcher := &mockPodPatcher{}
@@ -301,11 +304,12 @@ func TestDrainHandler_NoSyncedReplicaFound(t *testing.T) {
 	detector := &mockRoleDetector{role: common.RoleMaster}
 	patcher := &mockPodPatcher{}
 
-	// Replicas are syncing (not fully synced).
+	// Replicas are in a full sync: the link stays down while the dataset is
+	// transferred and master_sync_in_progress is 1 -- the shape Valkey reports.
 	replicaClient := &mockValkeyCommander{
 		infoResult: &valkeyclient.ReplicationInfo{
 			Role:                 "slave",
-			MasterLinkStatus:     "up",
+			MasterLinkStatus:     "down",
 			MasterSyncInProgress: true,
 		},
 	}
@@ -689,7 +693,19 @@ func TestIsSyncedReplica(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "link down",
+			// A master's reply carries no link status; this case is the only one
+			// that shows the role is asked at all, and not just the link.
+			name: "master with link up",
+			info: &valkeyclient.ReplicationInfo{
+				Role:             "master",
+				MasterLinkStatus: "up",
+			},
+			expected: false,
+		},
+		{
+			// Right after REPLICAOF, before the transfer starts: nothing has
+			// moved and master_sync_in_progress is still 0.
+			name: "link down, no sync yet",
 			info: &valkeyclient.ReplicationInfo{
 				Role:             "slave",
 				MasterLinkStatus: "down",
@@ -697,10 +713,12 @@ func TestIsSyncedReplica(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "sync in progress",
+			// During the transfer the link is down and the sync flag is 1; Valkey
+			// never reports the flag on a link that is up.
+			name: "full sync in progress",
 			info: &valkeyclient.ReplicationInfo{
 				Role:                 "slave",
-				MasterLinkStatus:     "up",
+				MasterLinkStatus:     "down",
 				MasterSyncInProgress: true,
 			},
 			expected: false,
@@ -795,20 +813,10 @@ func TestIsConnectionRefused_WrappedError(t *testing.T) {
 	assert.True(t, isConnectionRefused(wrapped))
 }
 
-func TestIsSyncedReplica_EmptyRole(t *testing.T) {
-	info := &valkeyclient.ReplicationInfo{
-		Role:             "",
-		MasterLinkStatus: "up",
-	}
-	assert.False(t, isSyncedReplica(info))
-}
-
-func TestIsSyncedReplica_LoadingRole(t *testing.T) {
-	info := &valkeyclient.ReplicationInfo{
-		Role:             "loading",
-		MasterLinkStatus: "up",
-	}
-	assert.False(t, isSyncedReplica(info))
+// A reply nothing was parsed from -- no role, no link -- is not a synced replica.
+// No sync in progress is not evidence of a finished one.
+func TestIsSyncedReplica_EmptyReply(t *testing.T) {
+	assert.False(t, isSyncedReplica(&valkeyclient.ReplicationInfo{}))
 }
 
 func TestIsSyncedReplica_EmptyLinkStatus(t *testing.T) {

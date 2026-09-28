@@ -2789,7 +2789,7 @@ func TestTriggerSentinelFailover_TLS_UsesTLSPort(t *testing.T) {
 	tlsSecret := newTestSentinelTLSSecret(secretName, "default")
 	r, _ := newTestReconciler(v, tlsSecret)
 
-	err := r.triggerSentinelFailover(context.Background(), v)
+	err := r.triggerSentinelFailover(context.Background(), v, true)
 
 	// The function must fail (no real sentinel running), but the error must
 	// reference the TLS port 36379, proving the correct port was selected.
@@ -2935,7 +2935,7 @@ func TestTriggerSentinelFailover_NoTLS_UsesPlainPort(t *testing.T) {
 
 	r, _ := newTestReconciler(v)
 
-	err := r.triggerSentinelFailover(context.Background(), v)
+	err := r.triggerSentinelFailover(context.Background(), v, true)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), fmt.Sprintf(":%d", builder.SentinelPort),
@@ -2966,7 +2966,7 @@ func TestTriggerSentinelFailover_DisableAuth_NoAuthSent(t *testing.T) {
 	}
 	r, _ := newTestReconciler(v, authSecret)
 
-	err := r.triggerSentinelFailover(context.Background(), v)
+	err := r.triggerSentinelFailover(context.Background(), v, true)
 
 	// The function will fail (no real sentinel), but the error must NOT contain
 	// "AUTH failed" — it should be a connection error instead, proving no AUTH was sent.
@@ -3791,10 +3791,11 @@ func TestVerifyReplacedReplicasSynced_SyncInProgress(t *testing.T) {
 	r, _ := newTestReconciler(v)
 	r.InstanceChecker = &mockInstanceChecker{
 		replicationInfoFn: func(_ string) (*valkeyclient.ReplicationInfo, error) {
+			// A replica in full sync: its link reads down while the transfer runs.
 			return &valkeyclient.ReplicationInfo{
 				Role:                 "slave",
 				MasterSyncInProgress: true,
-				MasterLinkStatus:     "up",
+				MasterLinkStatus:     "down",
 			}, nil
 		},
 	}
@@ -4015,7 +4016,7 @@ func TestReplaceNextReplica_WaitsForSyncBeforeDeleting(t *testing.T) {
 				return &valkeyclient.ReplicationInfo{
 					Role:                 "slave",
 					MasterSyncInProgress: true,
-					MasterLinkStatus:     "up",
+					MasterLinkStatus:     "down",
 				}, nil
 			}
 			return nil, fmt.Errorf("mock: no info for %s", podName)

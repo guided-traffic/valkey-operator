@@ -17,6 +17,12 @@ Everything in this ADR was **verified by reading** the builders, `cmd/main.go`, 
 `deployment.yaml` and the controller-runtime version pinned in `go.mod`. Nothing here was
 reproduced against a cluster, and no scrape, dashboard or endpoint response was measured.
 
+Amended 2026-09-28 (correction): **D7 and one rejected alternative said the migration loses
+nothing.** It keeps the pre-roll dataset, not every acknowledged write;
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8 states what
+a multi-replica roll loses. The rule of D7 — migrate through the rolling update, no persistence
+required — is unchanged; both claims are struck and corrected in place.
+
 ## Context
 
 Two metrics surfaces are in scope here, and they are easy to confuse:
@@ -97,9 +103,14 @@ orphaning them ([ADR 0004](0004-opt-in-poddisruptionbudgets.md) D6 has the same 
 surface tracks the feature set rather than being permanently widened for a feature most
 clusters do not enable.
 
-**D7 — Enabling metrics migrates through the failover-aware rolling update, losslessly.** The
+**D7 — Enabling metrics migrates through the failover-aware rolling update~~, losslessly~~.** The
 sidecar changes the pod-spec hash, so the existing machinery migrates the pods and **no
-persistence is required**. Routing every pod-spec change through the same rolling update means
+persistence is required**. *(Corrected 2026-09-28,
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8: on a
+multi-replica cluster the pre-roll dataset survives; on a Sentinel cluster whose Sentinels cannot
+run a coordinated failover — before Valkey 9.0, the 8 to 9 upgrade roll included — and on any
+roll whose coordinated failover fell back to forced, the writes the outgoing master acknowledges
+during the roll's failover are lost.)* Routing every pod-spec change through the same rolling update means
 new features do not each need their own migration story
 ([ADR 0007](0007-failover-aware-rolling-update.md)).
 
@@ -176,7 +187,9 @@ Rejected as unnecessary exposure.
 
 ### Require persistence before enabling metrics
 
-Rejected: unnecessary for multi-replica clusters, which migrate losslessly.
+Rejected: unnecessary for multi-replica clusters, which migrate ~~losslessly~~ *(corrected
+2026-09-28: with the pre-roll dataset intact without persistence; the writes an outgoing master
+acknowledges during a forced failover are lost with persistence as without it — D7)*.
 
 ### Leave `--metrics-bind-address` unwired
 

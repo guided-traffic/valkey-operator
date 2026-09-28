@@ -43,7 +43,7 @@ flowchart LR
 - 🛡️ **Rootless pods** — every generated pod runs as a non-root user with all capabilities dropped, a read-only root filesystem and a seccomp filter, so it is admitted in a namespace enforcing Pod Security `restricted`
 - 🧱 **Pod hardening knobs** — [`spec.podSecurity`](#specpodsecurity) picks the seccomp profile (`RuntimeDefault`, or a `Localhost` profile an administrator has put on the operator's allow-list — never `Unconfined`) and opts into user namespaces (`hostUsers: false`); images can be pinned by digest
 - 🩺 **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
-- 📊 **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
+- 📊 **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update, which keeps the pre-roll dataset; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before Valkey 9.0, the 8 to 9 upgrade roll included) and on any roll whose coordinated failover fell back to forced, the writes the outgoing master acknowledges during the roll's failover are lost ([the master handover](docs/operations/rolling-updates.md#the-master-handover-on-a-sentinel-cluster))
 - 🚧 **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
 - 🧭 **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread)
 - 🌐 **Network policies** — optional firewall rules for Valkey and Sentinel traffic
@@ -159,7 +159,7 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 | Key | On | Meaning |
 |---|---|---|
 | `vko.gtrfc.com/known-master` | the `Valkey` resource | The master the operator has recorded for the cluster |
-| `vko.gtrfc.com/rolling-update-state`, `failover-timestamp`, `promoted-pod`, `reconnect-reset-count`, `sync-wait-started`, `topology-restore-started`, `manual-failover-started`, `sentinel-awareness-started`, `finalization-started`, `recreation-wait-started` (all under `vko.gtrfc.com/`) | the `Valkey` resource | State of a rolling update in flight, kept across reconcile passes |
+| `vko.gtrfc.com/rolling-update-state`, `failover-timestamp`, `promoted-pod`, `reconnect-reset-count`, `sync-wait-started`, `topology-restore-started`, `manual-failover-started`, `sentinel-awareness-started`, `finalization-started`, `recreation-wait-started`, `handover-hold-started` (all under `vko.gtrfc.com/`) | the `Valkey` resource | State of a rolling update in flight, kept across reconcile passes |
 | `vko.gtrfc.com/operator-version` | every resource the operator creates or updates | The operator version that last reconciled it |
 | `vko.gtrfc.com/config-hash`, `vko.gtrfc.com/pod-spec-hash` | the pod template of both StatefulSets | Hashes of the generated configuration and of the pod spec; a changed hash is how a rolling update detects a change |
 | `vko.gtrfc.com/nudge` | a StatefulSet that is short of pods | A timestamp bump that makes the StatefulSet controller sync at once; never rolls a pod |
@@ -469,7 +469,7 @@ Explained in: [anti-affinity.md](docs/operations/anti-affinity.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting, and how long a rolling update waits on a pod that never becomes available before it reports that pod |
+| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting, how long a rolling update waits on a pod that never becomes available before it reports that pod, and how long a held delete of the outgoing master lasts before it is reported as `MasterHandoverStalled` (the hold itself does not end) |
 
 Explained in: [rolling-updates.md](docs/operations/rolling-updates.md).
 
@@ -518,6 +518,7 @@ A **level** is re-measured on every pass, an **edge** records something and is c
 | `PodRecreationStalled` | edge | [status.md](docs/operations/status.md#podrecreationstalled) |
 | `PodAvailabilityStalled` | level | [status.md](docs/operations/status.md#podavailabilitystalled) |
 | `RWServiceEmpty` | level | [status.md](docs/operations/status.md#rwserviceempty) |
+| `MasterHandoverStalled` | edge | [status.md](docs/operations/status.md#masterhandoverstalled) |
 
 #### Phase Values
 

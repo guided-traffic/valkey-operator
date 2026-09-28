@@ -520,7 +520,7 @@ the better option (S, fully measured).
 
 ## Related
 
-- [T12](012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) - owns the outgoing master's write loss in the roll's own failover; L4 only shortens routing.
+- [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done) - the roll's own failover is coordinated on Valkey 9 Sentinels and loses no acknowledged write there (ADR 0037 D1); L4 only shortens routing.
 - [T18](018-cr-status-reporting-and-the-status-write.md) - overlaps B2 textually in `updateHAStatus`; either may land first.
 - [T34](034-test-fixtures-pass-on-evidence-that-does-not-prove-the-assertion.md) - A4's integration test must not read the cache right after its patch.
 - [T34](034-test-fixtures-pass-on-evidence-that-does-not-prove-the-assertion.md) - the Q2 and Q9 e2e name the replacement by UID.

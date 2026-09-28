@@ -100,6 +100,11 @@ then on, in the same change as this correction. The three claims are struck and 
 place. Following [ADR 0034](0034-tickets-are-work-lists-that-get-archived.md) D7, this ADR still
 names no ticket path; the existing mentions of the admission-gap ticket stay.
 
+**Amended 2026-09-28 (correction, no decision changes):** one sentence under Consequences said
+the rolling update that enabling anti-affinity costs loses nothing on a multi-replica cluster.
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8 says what a
+multi-replica roll keeps and what it loses; the claim is struck and corrected in place.
+
 ## Context
 
 Two separate pressures produced the same rule.
@@ -354,7 +359,12 @@ the run shows that the tier rolled once, not why.
   spread is opt-in. [`docs/operations/anti-affinity.md`](../operations/anti-affinity.md),
   the CRD field docs and the Helm `values.yaml` therefore
   recommend `mode: soft` for every multi-replica cluster, and enabling it later costs
-  one failover-aware rolling update — lossless for multi-replica clusters.
+  one failover-aware rolling update — ~~lossless for multi-replica clusters~~ *(corrected
+  2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+  D8: on a multi-replica cluster the pre-roll dataset survives; on a Sentinel cluster whose
+  Sentinels cannot run a coordinated failover — before Valkey 9.0, the 8 to 9 upgrade roll
+  included — and on any roll whose coordinated failover fell back to forced, the writes the
+  outgoing master acknowledges during the roll's failover are lost)*.
 * The safest posture is never the one a user gets by accident: unauthenticated,
   unencrypted, unbudgeted, unspread clusters are the default — and no document asks for
   them to be turned on in one place.

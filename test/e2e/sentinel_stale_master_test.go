@@ -201,9 +201,12 @@ func TestE2E_SentinelStaleMaster(t *testing.T) {
 			podName := fmt.Sprintf("%s-%d", name, i)
 			podFQDN := fmt.Sprintf("%s.%s-headless.%s.svc.cluster.local", podName, name, ns)
 			if strings.Contains(sentinelMasterAddr, podName) || sentinelMasterAddr == podFQDN {
+				// The reply is classified, not the exit code: valkey-cli exits 0 on an
+				// error reply too (ADR 0038 D4). Name what came back rather than assume
+				// it was READONLY.
 				resp := tc.valkeyExecAllowError(t, ns, podName, 6379, "SET", "readonly-check", "ok")
 				assert.Equal(t, "OK", resp,
-					"Writing to Sentinel-reported master %s should not return READONLY", podName)
+					"a write to the Sentinel-reported master %s must be acknowledged; it answered %q", podName, resp)
 				break
 			}
 		}

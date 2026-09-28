@@ -112,6 +112,10 @@ recorded exception) and D11 (this release rolls the Sentinel tier);
 under `fsGroup`); [ADR 0017](0017-test-and-ci-policy.md) (the new guards). Supersedes
 [ADR 0013](0013-operator-is-cluster-wide-privileged.md) D9.
 
+Amended 2026-09-28 (correction, no decision changes): the first Consequence said every roll
+loses nothing. [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8
+says what a multi-replica roll keeps and what it loses; the claim is struck and corrected in place.
+
 ## Context
 
 The builder set no `securityContext` on any pod or container — ADR 0013 D9, a stated decision.
@@ -363,7 +367,12 @@ reported").
 
 - **Every multi-replica data tier rolls once — a persistent one twice (D2) — and every Sentinel
   tier rolls once**, which a plain operator upgrade otherwise never does (ADR 0005 D11).
-  Failover-aware and lossless like every roll; on a persistent tier every pod is replaced twice
+  Failover-aware ~~and lossless~~ like every roll *(corrected 2026-09-28,
+  [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8: the
+  pre-roll dataset survives; on a Sentinel cluster whose Sentinels cannot run a coordinated
+  failover — before Valkey 9.0, the 8 to 9 upgrade roll included — and on any roll whose
+  coordinated failover fell back to forced, the writes the outgoing master acknowledges during the
+  roll's failover are lost, once per failover)*; on a persistent tier every pod is replaced twice
   and the master is failed over twice, ~~though the two replacements need not complete as two
   rolls (*Residual risks*, the handover)~~ *(corrected 2026-09-26: since the ordering fix of D4
   the two replacements complete as two rolls, each with its own `RollingUpdateComplete` — read

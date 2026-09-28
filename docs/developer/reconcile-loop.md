@@ -115,7 +115,17 @@ order is swapped.
    ([`rolling_update.go`](../../internal/controller/rolling_update.go)). An error writes phase
    `Error` and returns it; `NeedsRequeue` ends the pass with that delay; a
    `DeferredRequeueAfter` — a wait past its bound — is kept for the end of the pass and marks
-   the data tier as holding.
+   the data tier as holding. One such wait is the handover gate of a Sentinel roll
+   ([`master_handover.go`](../../internal/controller/master_handover.go)), which holds the
+   delete of the outgoing master until every other current pod answers as a synced replica,
+   the new master has at least that many replicas attached and never none, the delete
+   discards no dataset and the outgoing pod no longer answers master. Inside
+   `spec.rollingUpdate.syncTimeout` the hold is a 10 s `NeedsRequeue`; past it the hold
+   reports `MasterHandoverStalled`, with one Warning Event, and returns a 10 s
+   `DeferredRequeueAfter`, so the rolling-update state is kept, the Sentinel roll waits and the
+   status write runs
+   ([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+   D3, D5, D6).
 3. **The post-update checks**, `handlePostRollingUpdateChecks`:
    - the Sentinel-tier roll, `runSentinelRollingUpdate`. Without Sentinel it only clears a
      standing `SentinelUpdatePending` and the Sentinel report of `PodAvailabilityStalled`; it
@@ -138,6 +148,13 @@ order is swapped.
    | a StatefulSet is short of pods | `nudgeRequeueInterval`, 5 s |
    | a post-update check asked for a recheck | its interval |
    | otherwise | the deferred rolling-update recheck, zero when there is none |
+
+   A held handover past its bound has no phase of its own
+   ([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+   D7): its status write reads `Syncing` while a replica is still syncing or the outgoing pod
+   still answers master, and the first row requeues it at the same 10 s its deferred recheck
+   asks for. A hold on an unreadable key count alone leaves no replica out of sync and can
+   read `OK`; the last row then applies. Read from the code, not measured.
 
 ## The status write
 
@@ -164,6 +181,16 @@ already set `readyReplicas`, and end in `persistStatus`, which:
   residual risk accept this masking as fragile
   ([ADR 0002](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D5).
 
+Only `updateHAStatus` asks about replication. Once both StatefulSets report every pod Ready it
+calls `CheckCluster` ([`internal/health/checker.go`](../../internal/health/checker.go)); with a
+master found, the phase is `Syncing`, with `Ready=False/ReplicationSyncing`, while fewer data
+pods than `spec.replicas - 1` answer their own `INFO replication` as a synced replica — role
+replica, link up, no sync in progress. That lasts as long as any replica full sync does, after an
+eviction, a restart or a Sentinel reconfiguration too. The master's `connected_slaves` is not
+asked, because it counts a replica from its sync request on
+([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+D2). A cluster without Sentinel never reads `Syncing`.
+
 Conditions reach the CR in two ways:
 
 | Path | Behaviour | Used by |
@@ -176,13 +203,15 @@ pass; only `writePhase` bypasses that.
 
 ## What this page does not cover
 
-- **The inside of the rolling updates** — the state annotations, the failover, topology
-  restoration and every bounded wait — is
-  [`rolling_update.go`](../../internal/controller/rolling_update.go) and its ADRs:
+- **The inside of the rolling updates** — the state annotations, the failover, the master
+  handover, topology restoration and every bounded wait — is
+  [`rolling_update.go`](../../internal/controller/rolling_update.go),
+  [`master_handover.go`](../../internal/controller/master_handover.go) and their ADRs:
   [ADR 0007](../adr/0007-failover-aware-rolling-update.md),
   [ADR 0010](../adr/0010-every-rolling-update-wait-is-bounded.md),
   [ADR 0024](../adr/0024-the-sentinel-tier-reports-its-own-completion.md),
-  [ADR 0026](../adr/0026-a-pod-being-deleted-is-not-available.md).
+  [ADR 0026](../adr/0026-a-pod-being-deleted-is-not-available.md),
+  [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md).
 - **Which condition is a level, an edge or history**, and who may clear it, is the registry
   in [`condition_registry.go`](../../internal/controller/condition_registry.go) and
   [ADR 0027](../adr/0027-conditions-are-levels-edges-or-history.md).

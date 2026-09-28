@@ -5,9 +5,11 @@
 Accepted. Date: 2026-09-28.
 
 Implemented: the refusal holds — `generateValkeyConf` writes no `min-replicas` directive and
-the CRD has no field. Outstanding are two corrections this record names (*Residual risks*): a
-unit fixture that mocks a reply `WAIT` never gives, and an e2e helper that reads a refused write
-as a success.
+the CRD has no field. The two corrections of D4 were made on 2026-09-28:
+`TestHandleMasterFailover_DoesNotFailOverWhenWriteSyncFails` mocks the reply `WAIT` gives on a
+replica, and the Sentinel stale-master e2e names the reply a refused write returned instead of
+calling it `READONLY`. The writer harness of ADR 0037 classifies every reply the same way: a write
+counts as acknowledged only when it answered `OK`.
 
 Companion of [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md),
 which closes the losses the fence was considered for.
@@ -116,8 +118,10 @@ feature opt-in; built and kept it has to be regardless.
 - **Whether the diverging side in ADR 0028's windows is the replica-less one** is not verified;
   the fence protects only that side.
 - **Survivor lag under a large full sync was measured once**, on 9.1.1.
-- **D4 is outstanding**: until the fixture and the helper are corrected, one unit test pins a
-  reply that cannot occur and one e2e path reports a refused write as written.
+- ~~**D4 is outstanding**: until the fixture and the helper are corrected, one unit test pins a
+  reply that cannot occur and one e2e path reports a refused write as written.~~ *(Closed
+  2026-09-28: both corrected, see Status. The e2e path compared the reply with `OK` already; what
+  it got wrong was the diagnosis, which named `READONLY` whatever came back.)*
 
 ## References
 

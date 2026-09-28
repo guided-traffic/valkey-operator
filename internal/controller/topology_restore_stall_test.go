@@ -144,7 +144,7 @@ func TestHandleTopologyRestoration_AbandonsAfterSyncTimeout(t *testing.T) {
 				if podName == "topo-sync-0" {
 					return &valkeyclient.ReplicationInfo{
 						Role:                 "slave",
-						MasterLinkStatus:     "up",
+						MasterLinkStatus:     "down",
 						MasterSyncInProgress: true,
 					}, nil
 				}

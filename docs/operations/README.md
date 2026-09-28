@@ -15,7 +15,7 @@ the README and nowhere else
 | [authentication.md](authentication.md) | You turn on password authentication, or change the password of a running cluster |
 | [tls.md](tls.md) | You turn TLS on, need the port map, keep plaintext ports open, rotate certificates, or a Sentinel-aware client fails certificate verification |
 | [persistence.md](persistence.md) | You choose a persistence mode, want to change the storage of an existing cluster, or a data pod fails its `check-data-writable` pre-flight |
-| [rolling-updates.md](rolling-updates.md) | A rolling update paused, gave up handing the master back to pod-0, or waits on a pod that does not come up |
+| [rolling-updates.md](rolling-updates.md) | A rolling update paused, gave up handing the master back to pod-0, waits on a pod that does not come up, or holds the delete of the outgoing master |
 | [disruption-budgets.md](disruption-budgets.md) | You want a node drain to leave enough data pods and the Sentinel quorum running |
 | [anti-affinity.md](anti-affinity.md) | You want the pods of a cluster spread across nodes or zones |
 | [compute-resources.md](compute-resources.md) | A cpu/memory `ResourceQuota` refuses the generated pods |

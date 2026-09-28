@@ -4,7 +4,7 @@
 
 Accepted. Date: 2026-08-24.
 
-Amended 2026-09-28: **the roll's own failover of D9 is coordinated where Sentinel supports it** ([ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1: `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback and on Sentinels before Valkey 9.0). The window D9 reports stays; what changes inside it is that a coordinated failover pauses the outgoing master before the handover, so no write is acknowledged and then discarded. The residual risk below that recorded the loss is marked in place, and the forced `REPLICAOF` of `handleMasterWithNoReplicas` is subject to the dataset veto of ADR 0037 D4. Decided, not built.
+Amended 2026-09-28: **the roll's own failover of D9 is coordinated where Sentinel supports it** ([ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1: `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback and on Sentinels before Valkey 9.0). The window D9 reports stays; what changes inside it is that a coordinated failover pauses the outgoing master before the handover, so no write is acknowledged and then discarded. The residual risk below that recorded the loss is marked in place, and the forced `REPLICAOF` of `handleMasterWithNoReplicas` is subject to the dataset veto of ADR 0037 D4. ~~Decided, not built.~~ *(Implemented 2026-09-28: `handleMasterFailover` calls `triggerSentinelFailover` coordinated, which asks the Sentinels in ordinal order; one that refuses the option itself — `NOGOODPRIMARY`, or an `ERR` whose text names wrong arguments, the Valkey 8 answer, or an unknown failover option (`coordinatedFallbackReason`) — is asked the forced command at once, and so is every Sentinel after it in that pass; `INPROG`, `NOGOODSLAVE`, any other error reply and a transport error are a failed attempt at that Sentinel, and the next one is asked in the same mode. The retrigger `handleFailoverRetrigger` and the sidecar's drain failover stay forced. The success log line carries `failoverMode` and `fallbackReason`. Unit-tested in [`coordinated_failover_test.go`](../../internal/controller/coordinated_failover_test.go); no run of the built code on Kubernetes is recorded here.)*
 
 Implemented: the `MultipleMasters` condition and the `splitBrainWarnAfter` bound
 ([`internal/controller/split_brain_report.go`](../../internal/controller/split_brain_report.go)),
@@ -216,11 +216,20 @@ new master. With a connected replica, `replaceRemainingPods` sets `replacing-mas
 resolver runs again — right before it deletes the old master, once `verifyNewMasterReady` passes
 and no pod of the tier is terminating *(and, since 2026-09-28, once every current replica holds
 the dataset and the deletion discards none — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3, D5; a handover that cannot pass
-holds as `MasterHandoverStalled`, D6)*. With no connected replica, `replicaReconnectTimeout` (90 s
+holds as `MasterHandoverStalled`, D6)* *(implemented 2026-09-28 as the handover gate
+`gateOutgoingPodDelete`: every other pod on the current template that exists and is not
+terminating answers as a synced replica and the new master counts at least that many attached
+replicas, at least one; the new master's key count is readable; the ADR 0028 veto lets the
+deletion through; and the pod about to be deleted does not answer master. A refusal requeues
+inside `spec.rollingUpdate.syncTimeout` and past it continues the pass with
+`MasterHandoverStalled` set and the rolling-update state kept)*. With no connected replica, `replicaReconnectTimeout` (90 s
 from the failover timestamp) sends a best-effort `REPLICAOF` of the new master to every other
 reachable pod, the old master included (`handleMasterWithNoReplicas`, `forceReplicaConnections`)
 *(vetoed for the whole call while the new master holds no keys and any other pod holds some,
-since 2026-09-28 — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4)*.
+since 2026-09-28 — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4)* *(implemented 2026-09-28, `replicaOfRefusal`: nothing
+is sent while the new master's count cannot be read, or while it holds no keys and any other
+existing pod — non-Ready included — holds some or cannot be counted; the Sentinel reset that
+follows still runs)*.
 With no new-image master, `failoverRetryTimeout` (30 s) hands the failover to
 `stateFailoverReset`, which resets Sentinel onto the pod answering master, and the next pass
 resolves as before. One wait of the connected-replica branch has no bound — Residual risks.)*
@@ -302,7 +311,10 @@ D1 still holds — the level is True from the first pass, and the Warning waits 
   *(Amended 2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1: measured in docker as 9133-11249 of 13271 acknowledged
   writes at 500-600 writes/s in the 16 s until `+convert-to-slave`; with a coordinated failover the
   old master pauses writes before the handover and none is acknowledged after it, so the loss stays
-  on the forced fallback and on Sentinels before Valkey 9.0.)*
+  on the forced fallback and on Sentinels before Valkey 9.0.)* *(Implemented 2026-09-28, and one
+  more forced case read from the code: the retrigger after a failover that did not complete,
+  `handleFailoverRetrigger`, is forced on every Sentinel line. The coordinated first trigger is
+  not yet measured on Kubernetes here.)*
 
 ## Alternatives Considered
 
@@ -378,6 +390,16 @@ during a genuine split brain would restart the silence.
   of them holds and the old master still answers master, nothing in the operator resolves the
   double master; Sentinel reconfiguring the old master is what ends it. Read in code; no run has reached it, and
   whether it is reachable with a Sentinel that has already reconfigured a replica was not traced.
+  *(Amended 2026-09-28, read in code: the wait is no longer unchanged. The function became the
+  handover gate of [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+  D3, D5 and D6 (`gateOutgoingPodDelete`, `verifyNewMasterReady` in
+  [`master_handover.go`](../../internal/controller/master_handover.go)); the master's sync flag is
+  asked nowhere, and every refusal — a current replica not synced or not attached, an unreadable
+  key count (a TLS configuration that cannot be built is one), the dataset veto, the outgoing pod
+  still answering master — arms the hold's own bound (`vko.gtrfc.com/handover-hold-started`)
+  and, past `spec.rollingUpdate.syncTimeout`,
+  reports `MasterHandoverStalled` and lets the pass continue. The plain requeue while no pod on
+  the current template answers master is the one left without a bound.)*
 - **(D9) A rewrite of the failover timestamp re-opens the window.** *(Added 2026-09-26, read.)*
   The no-replica timeout does so by design, ~~at most `maxReconnectResets` times~~ *(corrected
   2026-09-26, read: `maxReconnectResets` times in a row, and the pass that reaches the cap clears
@@ -451,7 +473,10 @@ during a genuine split brain would restart the silence.
   [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) — so both sides of a split accumulate writes that the repair then
   discards. This ADR changes what a Warning promises; it does not change what a
   divergence costs. *(Rewritten 2026-09-28; [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 and D5 keep the operator's own
-  `REPLICAOF` and delete from discarding the only dataset in such a split.)*
+  `REPLICAOF` and delete from discarding the only dataset in such a split.)* *(Implemented
+  2026-09-28, on the Sentinel roll only: `forceReplicaConnections` is called from
+  `handleMasterWithNoReplicas` and `checkFinalizationTopology`, and `replaceRemainingPods` from
+  the Sentinel roll alone; the non-Sentinel roll's deletes carry no such veto.)*
 - **The e2e assertion is an absence.** "No Warning Event on the CR" fails on a
   genuinely degraded run as well as on a regression of this ADR, which is
   intended — but on a resource-starved CI node a legitimately slow topology
@@ -472,7 +497,11 @@ during a genuine split brain would restart the silence.
   `detectAndResolveSplitBrain` (reports nothing), `labelClaimsMaster`,
   `collectPodStates`, `demoteRogueMaster`, `verifyTopologyRestored`,
   `forgetWaitBounds`; D9: `resolveSplitBrainUnlessFailingOver`, called from
-  `handleRollingUpdate`, its clock `ownFailoverInFlight`, and `setFailoverTriggered`.
+  `handleRollingUpdate`, its clock `ownFailoverInFlight`, and `setFailoverTriggered`; the
+  2026-09-28 amendment: `triggerSentinelFailover`, `coordinatedFallbackReason`,
+  `handleFailoverRetrigger`, `forceReplicaConnections`.
+- [`internal/controller/master_handover.go`](../../internal/controller/master_handover.go) —
+  `gateOutgoingPodDelete`, `verifyNewMasterReady`, `replicaOfRefusal` (the 2026-09-28 amendment).
 - [`internal/controller/split_brain_failover_test.go`](../../internal/controller/split_brain_failover_test.go) —
   D9's unit test, `TestHandleRollingUpdate_DoesNotDemoteTheReplicaSentinelIsPromoting`, and
   `TestHandleRollingUpdate_ArmsTheFailoverStateWithItsTimestamp`.

@@ -426,7 +426,7 @@ exists, because form 2 is a write of the previous pass.
   the same registry line, ADR 0027 D4 and `CLAUDE.md:568`.
 - T23 - its pause change makes the pause pass a holding pass; only ADR 0001 `:118`'s reason
   ("because `pauseRollingUpdate` returns an empty result") becomes false, and T23 rewrites it.
-- T12 - changes `AllSynced` in `updateHAStatus`; composes with Q1 B's roll-in-flight branch.
+- [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done) - `AllSynced` in `updateHAStatus` counts replicas by their own answer (ADR 0037 D2), so `True/HAClusterReady` no longer holds while a replica full-syncs; composes with Q1 B's roll-in-flight branch.
 - [T35](035-who-the-master-is-after-a-restart-or-failover.md) - its decided B2 writes the `known-master`
   annotation from `v` after `persistStatus`; it inherits the stale base today and gets a current
   one under R1.

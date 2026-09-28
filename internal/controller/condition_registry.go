@@ -246,6 +246,17 @@ var conditionRegistry = []conditionOwnership{
 		presenceGuarded: false,
 	},
 	{
+		// ADR 0037 D6: the handover hold in the terminationWait shape. An edge, not a
+		// level: the gate that sets it is reached only while the outgoing pod is still
+		// to be deleted, and the delete that goes through is the site that proves the
+		// precondition gone.
+		conditionType:   vkov1.ConditionTypeMasterHandoverStalled,
+		kind:            conditionEdge,
+		evaluators:      1,
+		clearSite:       "clearMasterHandoverStalled, from the delete that goes through in replaceRemainingPods and from clearRollingUpdateState",
+		presenceGuarded: true,
+	},
+	{
 		conditionType: vkov1.ConditionTypeTopologyRestored,
 		kind:          conditionHistory,
 		evaluators:    1,
