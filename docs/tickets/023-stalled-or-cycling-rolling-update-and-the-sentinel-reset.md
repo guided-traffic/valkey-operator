@@ -165,6 +165,12 @@ measured). No pod template changes.
   waits 20 s and up to 90 s for Sentinel to know its replicas, then `setFailoverTriggered` and
   `triggerSentinelFailover` (`:3700-3740`; a refusal by all is only logged). About 50 s per cycle,
   up to 2.5 min, and the retrigger skips the first trigger's sync gates (`:2710-2719`).
+  Those skipped gates are the route to an empty promotion that
+  [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 and
+  D5 only hold (its Residual risks, 2026-09-28): the coordinated first trigger cannot promote a
+  replica behind the master, the forced retrigger can. Closing the route — the retrigger asking
+  `waitForReplicasReady` and `WAIT` first, or a coordinated attempt before the forced one — is
+  this ticket's, with the cycle questions below.
 - **Loop B, a new master with no connected replica.** `handleMasterWithNoReplicas`
   ([`:3145-3187`](../../internal/controller/rolling_update.go#L3145-L3187)) after 90 s sends
   `REPLICAOF` to every other reachable pod (`:3159`) and resets every Sentinel (`:3161`) before it

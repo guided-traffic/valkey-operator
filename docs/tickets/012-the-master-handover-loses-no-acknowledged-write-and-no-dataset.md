@@ -196,6 +196,36 @@ D3 lengthens that window on every refused demotion and names the missing fence a
 
 ## Required changes
 
+**Order of the work** (also in ADR 0037's Status; the implementation happens in a session that
+has only these files). Nothing of D1-D7 lands before step 0 ran on both legs.
+
+0. The e2e writer harness (below), run on `single-node-valkey9` and `single-node-valkey8` against
+   today's code; its counts go into the ADR 0037 Context as the Kubernetes measurement.
+1. ADR 0037 D1 (Q1), with the fifteen rewordings (D8) and `upgrading.md`.
+2. D2 and D3 (Q2) together with D6 and D7 (Q5): one gate, one hold, one registry row; the
+   `Syncing`/`Ready` change and the fixtures.
+3. D4 (Q3) and D5 (Q4), with the refusal-shape unit test and the comments.
+4. ADR 0038 D4: the `WAIT` fixture and the e2e reply check.
+
+Every step: `make test-unit`, `make lint`, `make cyclo`, `make test-integration`, full e2e on both
+legs, the revert checks of ADR 0017, and the same change updates ADR 0037's Status ("Implemented:"
+per rule) and its index row, the pages under *Documentation* below, and this ticket's
+`state:`/`done:`. Cyclomatic complexity stays under 15; `verifyNewMasterReady` and
+`replaceRemainingPods` are near it and split before they grow.
+
+**Documentation that moves with the code:** [package-map.md:80](../developer/package-map.md#L80)
+(the checker's contract), [reconcile-loop.md](../developer/reconcile-loop.md) ("The workload
+pass" for the handover, "The status write" and the requeue table for phase `Syncing`;
+DEVELOPER.md names none of the handover functions), [rolling-updates.md](../operations/rolling-updates.md)
+("The former master is never force-promoted" gains the coordinated handover, the hold and the
+repair), [status.md](../operations/status.md) (a `MasterHandoverStalled`
+section, the `Ready`/`Syncing` meaning), [upgrading.md](../operations/upgrading.md) (the 8 -> 9
+roll is forced, the 60 s block), [monitoring.md](../operations/monitoring.md) (`ValkeyPhaseNotOK`
+covers a long sync; the condition series), the README condition row. CLAUDE.md needs Hans: the
+"Rolling Update Strategy" step 4 ("controlled leader failover") and the "A Warning named
+split-brain" paragraph ("Writes that reach the old master after the promotion are lost") gain the
+ADR 0037 pointer and the forced-fallback scope, the ADR 0025 D9 line the coordinated note.
+
 ### Shared, or in one change across parts
 
 - **E2E writer harness** (independent; needs T34's reply classification): during a Sentinel roll,
@@ -264,7 +294,20 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   Sentinel tier shares `spec.image` and rolls after the data tier, so the first lossless roll
   is the next one. [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
   D1 (written 2026-09-28, amending ADR 0025 D9 and ADR 0007 D1); the fifteen places reworded
-  again; `upgrading.md` names the 8 -> 9 roll and the 60 s block. Unit (RESP fake)
+  again; `upgrading.md` names the 8 -> 9 roll and the 60 s block. Implementation notes: the
+  fallback sits inside `triggerSentinelFailover`'s per-Sentinel loop, so the Sentinel that
+  refused the option is the one asked forced; `valkeyclient.Client` gains
+  `SentinelFailoverCoordinated(name)` beside `SentinelFailover`, and the sidecar's
+  `ValkeyCommander` interface ([drain.go:27-32](../../internal/sidecar/drain.go#L27-L32)) is not
+  widened. The client wraps every error (`sentinel failover %s on %s: %w`), so the classification
+  reads the reply text: `ERR wrong number of arguments for 'sentinel|failover' command` (8.1.9,
+  measured), `NOGOODPRIMARY Primary does not support FAILOVER command`, `INPROG Failover already
+  in progress`, `NOGOODSLAVE No suitable replica to promote`, `Unknown failover option specified`
+  (a 9.x Sentinel given a wrong option; treated as the 8.x reply) — all from
+  [sentinel.c 9.1.1:3923-3960](https://github.com/valkey-io/valkey/blob/9.1.1/src/sentinel.c#L3923-L3960);
+  match on the leading token, the client may or may not keep the `-`. The trigger logs
+  `failoverMode` (`coordinated`/`forced`) and `fallbackReason` with those stable keys, which the
+  e2e on Valkey 8 asserts on; a second `COORDINATED` attempt is never made in the same pass. Unit (RESP fake)
   per reply, plus forced retrigger and drain handler, with revert checks
   ([ADR 0017](../adr/0017-test-and-ci-policy.md)); e2e: 0 lost on Valkey 9, non-zero with the
   argument reverted, Valkey 8 logs its count and the fallback, zero Warning Events on a clean
@@ -280,7 +323,15 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   ([tls_test.go:1301-1311](../../test/e2e/tls_test.go#L1301-L1311), cannot fail) with a
   replica-side TLS wait via `valkeyTLSExecAllowError`; run on both lines.
 - **Q2 = A (decided 2026-09-28):** move the predicate of `replicationNotEstablishedReason`
-  onto `ReplicationInfo`, build it and `isSyncedReplica` on that, drop the message at `:4580`.
+  onto `ReplicationInfo` — one method, `NotEstablishedReason() string`, `""` when the pod is a
+  replica with `master_link_status` `up` and no sync in progress, the reason otherwise;
+  `replicationNotEstablishedReason(podName, info)` keeps its signature and prefixes the pod name,
+  `isSyncedReplica` is `info.NotEstablishedReason() == ""` — and drop the message at `:4580`.
+  `findMaster` hands `CheckCluster` every reply indexed by ordinal (the `Checker` API keeps its
+  shape; `ClusterState` may carry the per-pod reasons for the status message);
+  `ReadyReplicas` is the count of non-master pods with an empty reason, `AllSynced` is
+  `ReadyReplicas == TotalReplicas`, the `Syncing` message stays "Replication syncing: %d/%d
+  replicas ready".
   `CheckCluster` evaluates it on the replies `findMaster` already collects
   ([checker.go:174-199](../../internal/health/checker.go#L174-L199) keeps master candidates
   only; keep every reply, indexed by ordinal), no extra dial, and `ReadyReplicas` counts the
@@ -331,7 +382,11 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   `verifyPromotionCandidateHoldsData` refused before the promotion and the veto catches only a
   master that lost its data since, T35). First `demotionRefusalReason(dbSizeReader(ctx, v), X,
   pod)` unchanged: X with keys or both empty, deleted; X empty and the pod with keys or
-  unreadable, X unreadable, held. Second the role: the pod is deleted only when it does not
+  unreadable, X unreadable, held. X is the pod `verifyNewMasterReady` returned on the Sentinel
+  path and the pod flagged `isMaster` on the current template otherwise; no such pod is
+  "X unreadable", held (fail closed, ADR 0028 D3). The role is read with
+  `checker.GetReplicationInfo(pod)`: `role:master` holds (`FormerMasterStillMaster`); an error
+  is "no answer" and passes the role check, and the veto's `DBSIZE` then decides. Second the role: the pod is deleted only when it does not
   answer `master` (a replica, or no answer); on Valkey 9 with Q1 = A that costs nothing, on the
   forced path it holds the delete until Sentinel has converted O (~16 s plus one requeue) and
   the drain handler's second failover has no master to act on, and the comment at `:3126`
@@ -353,8 +408,16 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   synced replica); a second phase override beside `ReconcileBlocked` would be an ADR 0002
   amendment for a shape `MultipleMasters`, `SplitBrainDetected` and this condition carry.
   Cleared presence-guarded where the delete goes through and in `clearRollingUpdateState`;
-  `conditionRegistry` row, README condition row, [status.md](../operations/status.md) with
-  the repair, [rolling-updates.md](../operations/rolling-updates.md). The condition exports as
+  `conditionRegistry` row (`kind: conditionEdge, evaluators: 1, clearSite: "clearMasterHandoverStalled,
+  from the delete that goes through in replaceRemainingPods and from clearRollingUpdateState",
+  presenceGuarded: true`), constants `ConditionTypeMasterHandoverStalled` and the three reasons
+  in `api/v1`, the Event reason `MasterHandoverStalled`, the requeue
+  `DeferredRequeueAfter: rollingUpdateRequeueDelay`; the bound is the existing pair
+  `ensureSyncWaitTimestamp`/`isSyncWaitTimedOut`, and the gate clears it
+  (`clearSyncWaitTimestamp`) in the pass the delete goes through — `verifyReplacedReplicasSynced`
+  clears it at its own end, so the gate must arm its own (see *Not verified*). README condition
+  row, [status.md](../operations/status.md) with the repair,
+  [rolling-updates.md](../operations/rolling-updates.md). The condition exports as
   `vko_valkey_status_condition{condition="MasterHandoverStalled"}` (ADR 0021); a chart alert
   row follows T23 Q2. Test past `syncTimeout`: state kept, condition True with the reason of
   the cause, no `RollingUpdatePaused`, no delete, `DeferredRequeueAfter` without
