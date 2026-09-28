@@ -14,6 +14,14 @@ never registered here. The count is corrected in place and the rule it states is
 that input always did come from the persisted template, which is why a blocked StatefulSet
 write cannot turn a certificate rotation into a pod-delete loop.
 
+Amended 2026-09-28: **D2's image input is every container and init container of the
+template, not the valkey and sidecar images alone.** `podImagesDrifted` maps the template's
+`Containers` and `InitContainers` by name and reports the first pod container whose image
+differs; `podOutdated` ORs it in and `sentinelPodNeedsUpdate` uses it. Before this the data
+tier compared the valkey and sidecar images only, so an image written onto the `exporter`
+or an init container was never rolled away. The rule is stated in D2 below and its
+single-pod residual next to D6.
+
 Amended 2026-09-26: **D9's second half counted the delete of an outdated pod among the
 sites that ask `available()`, and it no longer is one.**
 [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 (ticket T32): an outdated pod
@@ -199,6 +207,34 @@ line:
 Nothing else can be a correct comparison target, because nothing else is what a
 recreated pod gets.
 
+Amended 2026-09-28: **the image input is every container and init container of the
+template, not the valkey and sidecar images alone.** `podImageChanged` still answers the
+narrow valkey/sidecar question the single-pod deferral asks
+(`singlePodDeferral`, `isSidecarOnlyChange`, D6), but whether a pod is outdated is decided
+by `podImagesDrifted(pod, &sts.Spec.Template.Spec)`: it maps the template's `Containers`
+and `InitContainers` by name and reports the first pod container whose image differs,
+skipping a name the template does not carry. `podOutdated` ORs it in, and
+`sentinelPodNeedsUpdate` uses it for the Sentinel tier. Before this, the data tier compared
+the valkey and sidecar images only, so an image written onto the `exporter` container or an
+init container — which a holder of `pods: patch`, or of the `<cr>-sidecar` token that may
+patch this cluster's data pods, can do — differed from the template and was never rolled
+away. A pod the statefulset-controller built carries the template's images exactly, so an
+honest fleet rolls nothing here and an operator upgrade onto this rule replaces no pod of an
+unswapped cluster.
+
+*Residual, accepted:* comparing the pod's actual image against the template extends the
+same incompatibility D2 already has for the valkey and sidecar images (`podImageChanged`) to
+every other container and init container. A mutating admission webhook that rewrites a
+container image at pod **create** but not in the StatefulSet template — an air-gapped
+registry mirror, say — makes that container drift from the template on every recreated pod,
+which reads here as permanently outdated and rolls the pod forever. Before this change the
+exporter and init images entered the decision only through the pod-spec-hash annotation,
+which such a webhook does not touch, so the exporter specifically was immune; it no longer is.
+This is the same failure the valkey and sidecar comparison already had, made uniform rather
+than newly introduced, and it is accepted, not fixed: a pod-image-mutating webhook that leaves
+the template untouched is unsupported. Closing it would mean reading the pod image back with
+mirror-aware tolerance, which the operator has no registry map to do.
+
 **D3 — An empty desired value means "cannot tell" and degrades toward not replacing
 pods.** `valkeyImageFromSts` and `configHashFromSts` return the empty string when the
 container or annotation is absent, and every comparison treats that as "skip the check".
@@ -269,6 +305,18 @@ persistence toggle the operator refused to write
 ([ADR 0023](0023-volume-claim-templates-are-immutable.md)) would otherwise read as persistent
 and delete the only pod together with its `emptyDir`. A rootless single pod goes through
 `isSidecarOnlyChange` exactly as described above.
+
+*Residual (2026-09-28), the single-pod cost of the widened image comparison above:* on a
+non-persistent single-replica non-Sentinel cluster the deferral still reads the valkey and
+sidecar images only. An image written onto that pod's `exporter` or an init container while
+the sidecar image also differs reads to `isSidecarOnlyChange` as sidecar-only and is
+deferred with it — reported as `SidecarUpdatePending`, not replaced. The deferral cannot be
+tightened to notice it: a release that bumps `DefaultMetricsExporterImage` moves the sidecar
+and the exporter image together, and replacing a single non-persistent pod for that would
+discard its dataset, which D7 forbids. The pod-spec-hash record that would tell a swap from
+an upgrade is writable by the same principal (`vko.gtrfc.com/pod-spec-hash`). On every other
+topology — multi-replica or persistent — the swap is replaced by the ordinary
+failover-aware roll.
 
 **D7 — The sidecar image must remain the only pod-spec delta an operator upgrade
 introduces for single-replica pods.** The D6 deferral compares **images only** *(for a

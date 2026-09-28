@@ -1,13 +1,13 @@
 ---
 id: T60
 title: ownership guard gaps - a refused pod-name collision is not reported through ReconcileBlocked, and the legacy Service cleanup deletes without the guard
-state: analysed       # every fact verified, options complete for both parts
+state: in-progress    # Q1 shipped (B, 2026-09-28: reportPodNameCollision); Q2 open
 severity: low         # both refusals and deletes are narrow; the reports and one delete path are weaker than documented
 security: hardening
-threat: "no attack path: a pod whose generated name is held by a foreign pod is refused as ADR 0020 D9 intends but not reported through ReconcileBlocked (the critical ValkeyReconcileBlocked alert stays blind, on installs that render the chart PrometheusRule); the legacy Service delete needs this CR's server-assigned UID in an ownerReference, which only a principal who may write that Service can place and who can already have the garbage collector delete it"
-urgency: now          # ADR 0020 states a false Event rule and ADR 0006 D1 a false site count; both corrections are decision-free, after them later
-effort: M             # the ADR and comment corrections are XS; the recommended options of Q1 and Q2 are S each
-blocked-by: decision  # Q1, Q2; the ADR corrections need none
+threat: "no attack path: the legacy Service delete needs this CR's server-assigned UID in an ownerReference, which only a principal who may write that Service can place and who can already have the garbage collector delete it (the pod-name-collision report is now on ReconcileBlocked, Q1 shipped)"
+urgency: now          # ADR 0006 D1 states a false site count; the correction is decision-free, after it later
+effort: S             # Q1 shipped; the recommended option of Q2 is S, the ADR 0006 correction XS
+blocked-by: decision  # Q2 only
 filed-from: orchestrator verification during the ticket enrichment
 opened: 2026-09-27
 decided:
@@ -31,87 +31,13 @@ can be corrected without a decision.
 
 ## Current state
 
-### Pod-name collision report
+### Pod-name collision report — resolved (2026-09-28)
 
-ADR 0020 D9 refuses a pod whose generated name (`<cr>-N`, `<cr>-sentinel-N`, N below the
-StatefulSet's replicas) is held by a pod its StatefulSet did not create, and fails the step instead
-of deleting it. D5 (`0020:332`) says every refusal is reported with its own `ReconcileBlocked`
-reason; the pod door does not, and ADR 0020 records that as an open Residual risk (`0020:800-805`).
-The refusal itself works: no foreign pod is deleted, commanded or counted.
-
-Why the condition is never written:
-
-- `ReconcileBlocked` has one evaluator, `setReconcileBlockedCondition`
-  ([`reconcile_blocked.go:118`](../../internal/controller/reconcile_blocked.go#L118)), called once
-  per pass at [`valkey_controller.go:276`](../../internal/controller/valkey_controller.go#L276)
-  with `resourceErr`, the joined error of `reconcileResources` (`:275`); the registry row declares
-  that one evaluator and clear site
-  ([`condition_registry.go:104-110`](../../internal/controller/condition_registry.go#L104-L110)).
-- The rolling update runs later, in `reconcileWorkload` (`:284`). Its refusals return
-  `foreignObjectError("Pod", …)`
-  ([`foreign_object.go:76-78`](../../internal/controller/foreign_object.go#L76-L78)) at
-  [`rolling_update.go:282`](../../internal/controller/rolling_update.go#L282),
-  [`:1935`](../../internal/controller/rolling_update.go#L1935) (`collectPodStates`),
-  [`:3782`](../../internal/controller/rolling_update.go#L3782),
-  [`:4289`](../../internal/controller/rolling_update.go#L4289) (data tier) and
-  [`:4992`](../../internal/controller/rolling_update.go#L4992) (Sentinel, `scanSentinelPods`).
-  `verifyTopologyRestored` (`:4728-4752`) swallows a `collectPodStates` error, but only after
-  `:3881` has refused in the same pass, so it is not a live route.
-- The data-tier error writes phase `Error`, `Rolling update error: …`
-  ([`valkey_controller.go:336-339`](../../internal/controller/valkey_controller.go#L336-L339)),
-  the Sentinel-tier error `Sentinel rolling update error: …`
-  ([`:473-481`](../../internal/controller/valkey_controller.go#L473-L481)). Neither touches
-  `ReconcileBlocked`, and both return before `updateStatus` (`:369`), so its fields stay frozen
-  (T18).
-- No resource step fails on a pod collision: `reconcileSidecarRole`
-  ([`valkey_controller.go:1096`](../../internal/controller/valkey_controller.go#L1096)) emits
-  `PodNotOwned` (`:1106-1110`) and carries on, so `ReconcileBlocked` is absent or
-  `False/ReconcileSucceeded`
-  ([`reconcile_blocked.go:121-132`](../../internal/controller/reconcile_blocked.go#L121-L132)).
-- On a pass another resource step blocks, `updatePhase` is suppressed
-  ([`valkey_controller.go:2606-2611`](../../internal/controller/valkey_controller.go#L2606-L2611))
-  and the one phase write names only the resource error: the collision is not on the CR at all.
-- The data tier is scanned every pass (`valkey_controller.go:335`); the Sentinel tier not on a
-  pass where the data roll errors, requeues or holds (`:336-342`, `:465-468`), nor with Sentinel
-  disabled (`:455-464`). The refusal is retried by the rate limiter
-  ([`ratelimiter.go:71-79`](../../internal/controller/ratelimiter.go#L71-L79)): 5 ms doubling,
-  capped at 30 s after about 41 s.
-- The rolling update is the only door on the fail-the-step side of D9's table (`0020:472-476`)
-  whose refusal is not in `resourceErr`.
-
-**The `PodNotOwned` Event is decided by labels, not by name.** `listDataPodNames` lists by the
-data-pod selector labels `app.kubernetes.io/instance`, `app.kubernetes.io/managed-by`,
-`app.kubernetes.io/component=valkey`
-([`valkey_controller.go:1065-1068`](../../internal/controller/valkey_controller.go#L1065-L1068),
-[`labels.go:115-121`](../../internal/common/labels.go#L115-L121)) and refuses every listed pod the
-data StatefulSet does not control (`filterOwnedPods`,
-[`foreign_object.go:264-275`](../../internal/controller/foreign_object.go#L264-L275)). The Event
-fires for every foreign pod carrying those labels, a Sentinel-named one included, and never for one
-without them; it does not fire on a pass where the sidecar ServiceAccount step fails or the
-ServiceAccount is foreign (`valkey_controller.go:983-992`), or the pod List fails (`:1096-1100`).
-ADR 0020 says "a colliding Sentinel pod, or one without the data-pod selector labels, gets no
-Event" (Status `0020:11-12`, D9 `:497-498`, Residual risks `:803-804`), false for a Sentinel-named
-pod carrying the labels; D5's list of Event reasons (`0020:337-341`) omits `PodNotOwned`.
-
-**Comment drift.** [`rolling_update.go:279-280`](../../internal/controller/rolling_update.go#L279-L280)
-says the refusal leaves the roll state in place "so its bounded waits keep being driven". Every
-refused pass returns at `:282` before any wait is evaluated, so the waits stay armed and none is
-driven; ADR 0020 D9 (`0020:482-483`) says "stay armed", which is accurate.
-
-**Tests.** `TestCollectPodStates_RefusesAForeignPod`,
-`TestCheckAndHandleRollingUpdate_RefusesAForeignPod` and
-`TestCheckAndHandleSentinelRollingUpdate_RefusesAForeignPod`
-([`foreign_object_test.go:1050-1103`](../../internal/controller/foreign_object_test.go#L1050-L1103))
-assert the returned error, the last two also that the pod survives. No test runs `Reconcile` with a
-foreign pod at an in-range ordinal; `test/integration/foreign_object_test.go` has no Pod case.
-
-**Impact.** A pod-name collision never fires the critical `ValkeyReconcileBlocked` alert
-([`prometheusrule.yaml:51-59`](../../deploy/helm/valkey-operator/templates/prometheusrule.yaml#L51-L59),
-`for: 15m`); it shows as phase `Error` and, after 30 minutes, the `ValkeyPhaseNotOK` warning
-(`:73-79`). Both alerts exist only with `metrics.prometheusRule.enabled`
-([`values.yaml:143`](../../deploy/helm/valkey-operator/values.yaml#L143), default false). A
-colliding pod without the data-pod labels gets no Event, and on a pass another step blocks it
-leaves no trace on the CR. Contributors read in D5 a rule the pod door does not satisfy.
+Shipped under Q1 = B. A pod at a generated ordinal name the StatefulSet did not create is now
+reported through `ReconcileBlocked=True/ForeignObject` by the `reportPodNameCollision` resource
+step, so the critical `ValkeyReconcileBlocked` alert sees it; the roll holds on the pod rather
+than failing the pass (ADR 0020 D9, ADR 0002 D13). The `PodNotOwned` Event still fires only for
+a data-pod-labelled pod — the condition, not the Event, is the complete report.
 
 ### Legacy Service cleanup
 
@@ -180,30 +106,17 @@ does for the RoleBinding).
 
 ## Required changes
 
-### Shared, independent of the open questions (one docs change)
+### Pod-name collision report — shipped (Q1 = B, 2026-09-28)
 
-1. ADR 0020, Status (`0020:11-12`), D9 (`:497-498`) and Residual risks (`:803-804`): replace the
-   Event sentence with "a colliding pod without the data-pod selector labels (`instance`,
-   `managed-by`, `component=valkey`) gets no Event, whatever its name, and none gets one on a pass
-   where the sidecar ServiceAccount step fails or the ServiceAccount is foreign". Add
-   `PodNotOwned` to D5's list of Event reasons (`:337-341`). Check:
-   `git grep -n "Sentinel pod, or" -- docs/adr` finds no current statement, and `PodNotOwned` has
-   a hit in D5.
-2. ADR 0006 D1 (`docs/adr/0006-delete-only-what-the-operator-owns.md:103-106`): state that one
-   pre-existing site, `deleteLegacyServices`, does not yet satisfy D1.
-3. Reword the comment at `rolling_update.go:279-280` to say the waits stay armed.
-4. Once 1-3 land, set this ticket's urgency to `later`.
-
-### Pod-name collision report
-
-- Q1 = A: the D5 exception sentence in ADR 0020 (`0020:332-345`), the Residual-risks entry
-  (`:800-805`) turned into the recorded answer, and a half-sentence in
-  [`status.md:37`](../operations/status.md#reconcileblocked) that `ForeignObject` does not cover a
-  pod under a generated pod name.
-- Q1 = B: the step, tests and docs listed under Q1.
+Done: `reportPodNameCollision` resource step; ADR 0020 D9 (hold + report), its "One reporter"
+paragraph and Status amendment; ADR 0002 D13; `docs/developer/reconcile-loop.md` step table;
+`docs/operations/status.md` `ForeignObject`; `docs/security/isolation-and-tenancy.md`; the
+entry-scan comment reworded to the hold. Tests as listed under Q1.
 
 ### Legacy Service cleanup
 
+- ADR 0006 D1 (`docs/adr/0006-delete-only-what-the-operator-owns.md:103-106`): state that one
+  pre-existing site, `deleteLegacyServices`, does not yet satisfy D1. Decision-free, do it with Q2.
 - Q2 = A: `deleteLegacyServices` calls `r.deleteIfOwned(ctx, v, svc, "legacy Service")` per
   existing name, replacing the loop at `:951-960`; the comments stop calling `<cr>-read` an old
   read Service. The three unit fixtures gain `Controller: true`. New unit tests: the delete carries
@@ -276,7 +189,19 @@ B is recommended because it is the only option that brings the one failing refus
 `resourceErr` to `ReconcileBlocked` and the critical alert, through the existing single evaluator,
 at S; A saves one size step at the price of a permanent D5 exception and a blind alert.
 
-**Answer:** _open_
+**Answer:** B (Hans, 2026-09-28), **shipped**. `reportPodNameCollision` is the last resource
+step: per applicable tier it reads the ordinal range, treats a foreign or absent StatefulSet as
+absent, and returns `foreignObjectError("Pod", name)` for the first pod `podIsOurs` refuses, so
+the one evaluator writes `ReconcileBlocked=True/ForeignObject` and the critical alert sees it; a
+read error other than NotFound is returned so a standing report is not cleared on silence
+(ADR 0027). ADR 0020 D9 and its "One reporter" paragraph, ADR 0002 D13 and the
+`docs/developer/reconcile-loop.md` step table are amended. Tests:
+`TestReconcile_ReportsADataPodNameCollisionThroughReconcileBlocked`,
+`TestReconcile_ReportsASentinelPodNameCollisionThroughReconcileBlocked`,
+`TestReportPodNameCollision_SkipsTheSentinelTierWhenDisabled`,
+`TestReportPodNameCollision_TreatsAForeignStatefulSetAsAbsent` (removing the step leaves them
+red on the condition). The embargoed security finding that depended on this step as its report
+landed in the same change.
 
 ### Q2: Is the legacy Service cleanup routed through `deleteIfOwned` or removed? (legacy Service cleanup)
 

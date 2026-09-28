@@ -94,6 +94,7 @@ earlier steps by name only
 | 9 | NetworkPolicies | `spec.networkPolicy.enabled` | Valkey, Sentinel and observer policies |
 | 10 | monitoring | always | the observer ServiceAccount and Deployment or their cleanup; the metrics Service and ServiceMonitor or their cleanup |
 | 11 | TLS material | always, deliberately ungated | nothing — it reports `TLSMaterialStale` by measuring the pods against the fingerprints steps 6 and 7 just stamped ([`tls_material.go`](../../internal/controller/tls_material.go)) |
+| 12 | pod name collision | always, deliberately ungated | nothing — it reports `ReconcileBlocked=True/ForeignObject` when a pod at a generated ordinal name is not controlled by its StatefulSet, so the roll's own hold on that pod ([ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) D9) reaches the critical alert ([`reportPodNameCollision`](../../internal/controller/foreign_object.go), [ADR 0002](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D13) |
 
 **Step 5 runs before step 6 on purpose.** The sidecar Role grants `patch` on named pods, so on
 a scale-up it has to name the new pod before the StatefulSet write creates it;

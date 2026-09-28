@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -197,6 +198,21 @@ type RollingUpdateResult struct {
 	// one writer per tier (checkAndHandleRollingUpdate,
 	// checkAndHandleSentinelRollingUpdate).
 	availabilityStall *unavailablePod
+
+	// heldByPodCollision reports that a pod under a generated ordinal name is not
+	// controlled by the tier's StatefulSet, so the roll holds: nothing on that pod
+	// is deleted, promoted or commanded, and the pass continues to the recovery
+	// checks and the status write rather than ending on an error. The collision is
+	// reported to ReconcileBlocked by the "pod name collision" resource step
+	// (reportPodNameCollision), not here -- this is the workload half staying quiet
+	// so the tier's evaluator does not retract PodAvailabilityStalled or
+	// PodSecurityUpdatePending on a pass that measured neither
+	// (docs/adr/0020-write-only-what-the-operator-owns.md, D9;
+	// docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11).
+	//
+	// It is set with DeferredRequeueAfter, so the pass continues and the Sentinel
+	// roll is held exactly as a stalled data wait holds it.
+	heldByPodCollision bool
 }
 
 // rollingUpdateRequeueDelay is the default delay between rolling update steps.
@@ -217,11 +233,22 @@ const rollingUpdateRequeueDelay = 10 * time.Second
 func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
 	result := r.dispatchDataRollingUpdate(ctx, v)
 	if result.Error == nil {
+		// PodAvailabilityStalled is retracted on evidence, not on the absence of a
+		// report in this pass: reportAvailabilityStall re-derives the truth from
+		// expiredUnavailablePod, which rescans the tier's ordinal range and skips a
+		// pod that is not ours. So it is safe -- and required (ADR 0027) -- even on a
+		// collision hold, where the entry scan set no stall: a genuinely stalled
+		// owned pod keeps the True, an all-healthy tier clears it, and the foreign
+		// pod is skipped either way.
 		r.reportAvailabilityStall(ctx, v, common.ComponentValkey, result.availabilityStall)
-		// The same frame for the same reason: the level has to be re-measured on
-		// every pass, and the deferral is decided one dispatch target down, which
-		// most passes never reach (ADR 0032 D3).
-		r.reportPodSecurityUpdatePending(ctx, v, result.rootDeferredPod)
+		// PodSecurityUpdatePending, by contrast, retracts on silence: an empty pod
+		// clears a standing True with no evidence check. A collision hold returned
+		// at the unproven ordinal before the single-pod deferral was decided, so
+		// calling it here would flap the level -- it is the one skipped on the hold
+		// (ADR 0026 D11, ADR 0032 D3).
+		if !result.heldByPodCollision {
+			r.reportPodSecurityUpdatePending(ctx, v, result.rootDeferredPod)
+		}
 	}
 	return result
 }
@@ -273,19 +300,24 @@ func (r *ValkeyReconciler) dispatchDataRollingUpdate(ctx context.Context, v *vko
 		// The ADR 0020 D8 guard above proves the StatefulSet, which is the wrong object
 		// for this decision: a pod holding <cr>-N was not necessarily created by it, and a
 		// foreign one differs from our persisted template by construction, so the very
-		// next step would classify it as outdated and schedule it for deletion. The
-		// refusal fails the step rather than treating the pod as absent, because a name
-		// nothing of ours can ever occupy clears only when a human acts, and the failure
-		// leaves the rolling-update state annotation in place so its bounded waits keep
-		// being driven (ADR 0020 D9, ADR 0010).
+		// next step would classify it as outdated and schedule it for deletion. The roll
+		// holds rather than treating the pod as absent, because a name nothing of ours can
+		// ever occupy clears only when a human acts: nothing on the pod is deleted,
+		// promoted or commanded, and the hold leaves the rolling-update state annotation
+		// in place so its bounded waits stay armed. The collision reaches the CR through
+		// the "pod name collision" resource step, not here (ADR 0020 D9, ADR 0026 D11).
 		if !podIsOurs(pod, currentSts) {
-			return RollingUpdateResult{Error: foreignObjectError("Pod", podName)}
+			return r.holdForPodCollision(ctx, pod, podName)
 		}
 		readyPods += readyOne(pod)
 
+		// No break on the first outdated pod: the loop proves the ownership of every
+		// ordinal before any roll, so a pod at a higher ordinal that this StatefulSet
+		// does not control holds the roll rather than being rolled past. An owned
+		// outdated pod at a lower ordinal would otherwise dispatch the roll and start
+		// replacing pods while a collision stands at a higher one (ADR 0020 D9).
 		if podOutdated(pod, currentSts) {
 			needsRollingUpdate = true
-			break
 		}
 	}
 
@@ -397,6 +429,42 @@ func (r *ValkeyReconciler) finishDataRoll(ctx context.Context, v *vkov1.Valkey, 
 	return nil
 }
 
+// holdForPodCollision builds the roll hold for an ordinal held by a pod the tier's
+// StatefulSet did not create (ADR 0020 D9, ADR 0026 D11). It logs which of the two
+// shapes it is -- no controller reference at all, or controlled by another object --
+// because the CR-facing message from reportPodNameCollision is uniform and the log
+// is where an operator tells a name collision from a stray. It writes nothing.
+func (r *ValkeyReconciler) holdForPodCollision(ctx context.Context, pod *corev1.Pod, podName string) RollingUpdateResult {
+	shape := "controlled by another object"
+	if metav1.GetControllerOf(pod) == nil {
+		shape = "no controller reference"
+	}
+	log.FromContext(ctx).Info("Holding the rolling update: a pod at a generated ordinal name is not controlled by this StatefulSet",
+		"pod", podName, "shape", shape)
+	return RollingUpdateResult{DeferredRequeueAfter: foreignObjectRecheckInterval, heldByPodCollision: true}
+}
+
+// holdForSentinelPodCollision is holdForPodCollision for the Sentinel tier. The scan
+// reports only that a collision exists, so this re-reads the ordinal range once (all
+// cache-served) to name the colliding pod and log its shape; a pod that has since
+// been fixed just yields a generic hold, which is harmless because the collision is
+// re-measured every pass.
+func (r *ValkeyReconciler) holdForSentinelPodCollision(ctx context.Context, v *vkov1.Valkey, sentinelSts *appsv1.StatefulSet) RollingUpdateResult {
+	if sentinelSts.Spec.Replicas != nil {
+		for i := int32(0); i < *sentinelSts.Spec.Replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", sentinelSts.Name, i)
+			pod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+				continue
+			}
+			if !podIsOurs(pod, sentinelSts) {
+				return r.holdForPodCollision(ctx, pod, podName)
+			}
+		}
+	}
+	return RollingUpdateResult{DeferredRequeueAfter: foreignObjectRecheckInterval, heldByPodCollision: true}
+}
+
 // detectImageChange returns true if the StatefulSet's current image differs from the desired image.
 func detectImageChange(desired string, current *appsv1.StatefulSet) bool {
 	if len(current.Spec.Template.Spec.Containers) == 0 {
@@ -440,11 +508,13 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 }
 
 // podOutdated is podNeedsUpdate against every input of the persisted data
-// StatefulSet, plus the retired ownership repair. It is what every site of the data
-// tier asks, so the inputs cannot drift apart between them.
+// StatefulSet, plus the image of every other container and init container and the
+// retired ownership repair. It is what every site of the data tier asks, so the
+// inputs cannot drift apart between them.
 func podOutdated(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return podNeedsUpdate(pod, valkeyImageFromSts(sts), sidecarImageFromSts(sts), configHashFromSts(sts),
 		podSpecHashFromSts(sts), tlsMaterialHashFromSts(sts), sts.Spec.Template.Spec.Containers) ||
+		podImagesDrifted(pod, &sts.Spec.Template.Spec) ||
 		podCarriesRetiredRepair(pod, sts)
 }
 
@@ -480,8 +550,11 @@ func podTLSMaterialHashChanged(pod *corev1.Pod, desiredHash string) bool {
 	return podHash != "" && podHash != desiredHash
 }
 
-// podImageChanged returns true if any container image on the pod differs from
-// the desired images.
+// podImageChanged returns true if the valkey or the sidecar container runs an image
+// other than the desired one; an empty desired image is not compared. It is the
+// narrow question the single-pod deferral asks (singlePodDeferral,
+// isSidecarOnlyChange); whether a pod is outdated is decided against every
+// container and init container of the template (podImagesDrifted).
 func podImageChanged(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage string) bool {
 	for _, c := range pod.Spec.Containers {
 		switch c.Name {
@@ -491,6 +564,40 @@ func podImageChanged(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage st
 			}
 		case builder.SidecarContainerName:
 			if desiredSidecarImage != "" && c.Image != desiredSidecarImage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// podImagesDrifted returns true if a container or an init container of the pod runs
+// an image other than the one the template gives the container of the same name. It
+// is the image input of both tiers (podOutdated, sentinelPodNeedsUpdate), and it
+// reads the persisted template for the reason valkeyImageFromSts gives.
+//
+// The StatefulSet controller builds every pod from that template, so a pod it built
+// carries the template's images exactly and an honest fleet rolls nothing here. A
+// difference was written onto the pod afterwards: a pod update may change the image
+// of any container and init container. The kubelet restarts a regular container on
+// its new image at once and runs a changed init container on the next sandbox, so a
+// container this comparison skipped kept that image until the pod was replaced for
+// another reason (docs/adr/0007-failover-aware-rolling-update.md, D2).
+//
+// A container name the template does not carry is skipped. The retired ownership
+// repair has its own question (podCarriesRetiredRepair), and a container the
+// template dropped changed the pod-spec hash, which reports it already.
+func podImagesDrifted(pod *corev1.Pod, tmpl *corev1.PodSpec) bool {
+	desired := make(map[string]string, len(tmpl.Containers)+len(tmpl.InitContainers))
+	for _, c := range tmpl.InitContainers {
+		desired[c.Name] = c.Image
+	}
+	for _, c := range tmpl.Containers {
+		desired[c.Name] = c.Image
+	}
+	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for _, c := range list {
+			if want, ok := desired[c.Name]; ok && c.Image != want {
 				return true
 			}
 		}
@@ -4834,17 +4941,14 @@ func (r *ValkeyReconciler) finalizeMultiReplicaRollingUpdate(ctx context.Context
 	return RollingUpdateResult{Completed: true}
 }
 
-// differ from what the sentinel StatefulSet template specifies.
+// sentinelPodNeedsUpdate returns true if the Sentinel pod's images, pod-spec hash,
+// config hash or TLS material fingerprint differ from what the sentinel StatefulSet
+// template specifies.
 func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
-	// Check container images.
-	desired := make(map[string]string, len(desiredTemplate.Spec.Containers))
-	for _, c := range desiredTemplate.Spec.Containers {
-		desired[c.Name] = c.Image
-	}
-	for _, c := range pod.Spec.Containers {
-		if want, ok := desired[c.Name]; ok && c.Image != want {
-			return true
-		}
+	// Check the images of every container and init container, by name -- the
+	// same rule as the data tier's (podImagesDrifted).
+	if podImagesDrifted(pod, &desiredTemplate.Spec) {
+		return true
 	}
 	// Check pod spec hash annotation: trigger update when the pod carries a hash
 	// that no longer matches the desired template (e.g. resources changed).
@@ -5003,6 +5107,10 @@ func (r *ValkeyReconciler) scanSentinelPods(ctx context.Context, v *vkov1.Valkey
 // leaves the condition as it is.
 func (r *ValkeyReconciler) checkAndHandleSentinelRollingUpdate(ctx context.Context, v *vkov1.Valkey) RollingUpdateResult {
 	result := r.dispatchSentinelRollingUpdate(ctx, v)
+	// PodAvailabilityStalled retracts on evidence (expiredUnavailablePod rescans the
+	// Sentinel tier), so it is reported even on a collision hold, exactly as on the
+	// data tier: a genuinely stalled owned Sentinel keeps the True, an all-healthy
+	// tier clears it, and the foreign pod is skipped (ADR 0027, ADR 0026 D11).
 	if result.Error == nil {
 		r.reportAvailabilityStall(ctx, v, common.ComponentSentinel, result.availabilityStall)
 	}
@@ -5060,6 +5168,14 @@ func (r *ValkeyReconciler) dispatchSentinelRollingUpdate(ctx context.Context, v 
 
 	scan, err := r.scanSentinelPods(ctx, v, sentinelSts)
 	if err != nil {
+		// A pod at a Sentinel ordinal that this StatefulSet did not create holds the
+		// Sentinel roll the same way it holds the data roll: nothing on it is deleted
+		// or commanded, the collision reaches the CR through the resource step, and
+		// the pass continues (ADR 0020 D9, ADR 0026 D11). Any other read error is a
+		// genuine failure and ends the pass.
+		if errors.Is(err, errForeignObject) {
+			return r.holdForSentinelPodCollision(ctx, v, sentinelSts)
+		}
 		return RollingUpdateResult{Error: err}
 	}
 

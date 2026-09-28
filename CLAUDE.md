@@ -729,8 +729,25 @@ them, so the proof is two-hop: `podIsOurs(pod, sts)` against a StatefulSet alrea
 never a label and never a name. It binds touching a pod, deleting one, and putting its name
 into the sidecar Role — that grant follows the name of the *object*, so an unfiltered pod hands
 this cluster's sidecar `patch` on a stranger's pod.
+
+**A pod at a generated ordinal name the StatefulSet did not create holds the roll and is
+reported, it is not failed on.** The two roll entry scans
+(`checkAndHandleRollingUpdate`, `checkAndHandleSentinelRollingUpdate`) prove every ordinal
+before acting on an outdated one and, on an unproven pod, return `heldByPodCollision` with
+`DeferredRequeueAfter`: nothing on the pod is touched, the roll of every pod of that tier is
+held, and the pass continues to the status write, the split-brain check and the no-master
+recovery. The report is a separate report-only resource step, `reportPodNameCollision`, which
+carries the collision to `ReconcileBlocked=True/ForeignObject` through the one evaluator — the
+roll itself reports nothing. The three inner refusals (`collectPodStates`,
+`handleStandaloneRollingUpdate`, `handlePostManualFailover`) stay as race guards and still fail
+the step. This replaced the earlier "refuse and fail the step" that froze the CR status; the
+image-comparison side of the same lever — the data and Sentinel tiers now compare every
+container and init-container image against the persisted template (`podImagesDrifted`), so a
+swapped `exporter` or init image is rolled away — rides `podOutdated`.
 → [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes, grants and pods),
-[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
+[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes),
+[ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D13 (the collision report),
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D2 (the image inputs)
 
 ## Sentinel identity is pinned to the pod
 

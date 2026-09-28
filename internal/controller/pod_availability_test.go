@@ -356,23 +356,54 @@ func TestCheckAndHandleRollingUpdate_NoConditionWithoutAStall(t *testing.T) {
 	assert.Nil(t, availabilityCondition(t, c, v), "a cluster that never stalled never gains the condition")
 }
 
-// An error result did not measure the tier, so a standing report stays standing.
-func TestCheckAndHandleRollingUpdate_ErrorLeavesTheReportAsItIs(t *testing.T) {
+// PodAvailabilityStalled is retracted on evidence, not on the silence of a collision
+// hold: reportAvailabilityStall re-derives from expiredUnavailablePod, which rescans
+// the tier and skips the foreign pod. So on a hold with a genuinely stalled owned pod
+// the True survives, and on a hold with an all-healthy owned tier it clears -- both
+// correct per ADR 0027, and neither retracts on silence.
+func TestCheckAndHandleRollingUpdate_CollisionHoldKeepsAStandingAvailabilityStallOnEvidence(t *testing.T) {
 	v := newTestValkey("dse", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 },
 		availabilityStalledTrue(vkov1.ReasonValkeyPodNotAvailable))
 	sts := stsForValkey(v)
-	pod0 := podFromStsTemplate(v, sts, 0)
+	// pod-0 is ours and genuinely stalled (not Ready, past syncTimeout), so the
+	// evidence keeps the True; pod-1 is foreign and holds the roll.
+	stalled := podFromStsTemplate(v, sts, 0)
+	stalled.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	stalled.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionFalse,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-pastSyncBudget)),
+	}}
 	foreign := podFromStsTemplate(v, sts, 1)
-	foreign.OwnerReferences = nil // not ours: the dispatch fails the step
-	r, c := newTestReconciler(v, sts, pod0, foreign)
+	foreign.OwnerReferences = nil // not ours: the dispatch holds the roll
+	r, c := newTestReconciler(v, sts, stalled, foreign)
 
 	result := r.checkAndHandleRollingUpdate(context.Background(), crGet(t, c, "dse"))
-	require.Error(t, result.Error)
+	require.NoError(t, result.Error)
+	assert.True(t, result.heldByPodCollision)
 
 	cond := availabilityCondition(t, c, v)
 	require.NotNil(t, cond)
-	assert.Equal(t, metav1.ConditionTrue, cond.Status)
-	assert.Equal(t, "seeded", cond.Message)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status, "an owned pod is genuinely stalled, so the True stays on evidence")
+}
+
+// The same hold, but every owned pod is healthy: the evidence-based retraction clears
+// the standing True. This is what distinguishes the availability level (evidence) from
+// PodSecurityUpdatePending (silence), which the collision hold does skip.
+func TestCheckAndHandleRollingUpdate_CollisionHoldClearsAvailabilityWhenNoOwnedPodIsStalled(t *testing.T) {
+	v := newTestValkey("dsc", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 },
+		availabilityStalledTrue(vkov1.ReasonValkeyPodNotAvailable))
+	sts := stsForValkey(v)
+	foreign := podFromStsTemplate(v, sts, 1)
+	foreign.OwnerReferences = nil
+	r, c := newTestReconciler(v, sts, podFromStsTemplate(v, sts, 0), foreign, podFromStsTemplate(v, sts, 2))
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), crGet(t, c, "dsc"))
+	require.NoError(t, result.Error)
+	assert.True(t, result.heldByPodCollision)
+
+	cond := availabilityCondition(t, c, v)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status, "no owned pod is stalled, so the level clears on evidence")
 }
 
 // The data evaluator retracts only its own report. A Sentinel report is the Sentinel
