@@ -90,10 +90,10 @@ Read this before treating a namespace as a tenant boundary.
   | `vko.gtrfc.com/config-hash` | suppresses the rolling update for a config change |
   | `vko.gtrfc.com/pod-spec-hash` | suppresses the rolling update for a pod-spec change |
   | ~~`vko.gtrfc.com/tls-material-hash`~~ | it did suppress the certificate-rotation roll **and** the `TLSMaterialStale` report; the record moved into pod spec on 2026-08-27 and the annotation is now inert ([ADR 0031](../adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) |
-  | any selector label | deleting one detaches the pod from its StatefulSet controllerRef; `podIsOurs` then reads false |
-  | `metadata.ownerReferences` | not in apimachinery's immutable ObjectMeta set — that set is exactly `name`, `namespace`, `uid`, `creationTimestamp`, `deletionTimestamp`, `deletionGracePeriodSeconds` |
+  | any selector label | deleting one detaches the pod from its StatefulSet controllerRef; `podIsOurs` then reads false. The operator holds that CR's roll and reports `ReconcileBlocked=True/ForeignObject` naming the pod ([ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) D9) until a human deletes or re-attaches it; it never touches the pod |
+  | `metadata.ownerReferences` | not in apimachinery's immutable ObjectMeta set — that set is exactly `name`, `namespace`, `uid`, `creationTimestamp`, `deletionTimestamp`, `deletionGracePeriodSeconds`. Same hold-and-report as above |
   | `metadata.finalizers` | same; a foreign finalizer keeps the pod from ever being deleted |
-  | `spec.containers[*].image` | one of the five entries the API server allows a pod update to change |
+  | `spec.containers[*].image` | one of the five entries the API server allows a pod update to change. Since 2026-09-28 the data and Sentinel tiers compare **every** container and init-container image against the persisted template, so a swapped image runs at once but is replaced by the next data-tier roll — except on a single-replica non-persistent cluster, where a swap that also moves the sidecar image is deferred with it ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2, D6) |
 
   Nine rows, of which the struck-through one is no longer reachable: eight are live.
   For every hash still in that table the **deletion** is cheaper than the forgery,

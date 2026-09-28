@@ -570,6 +570,14 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		// here silences the condition's only writer the moment TLS is turned off
 		// and freezes a True forever (T24(d), the T15 shape again).
 		{name: "TLS material", run: r.reportTLSMaterialStale},
+		// Also last and also a report rather than a write: it brings a pod under a
+		// generated name that its StatefulSet did not create to the ReconcileBlocked
+		// condition, which the rolling update's own refusal of that pod never reaches
+		// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D13; ADR 0020 D9).
+		// Same reasons as "TLS material" for living here: a level re-measured every
+		// pass, and no when: gate, because the evaluator that clears it runs
+		// unconditionally and a gate would freeze a True.
+		{name: "pod name collision", run: r.reportPodNameCollision},
 	}
 }
 
