@@ -4,6 +4,8 @@
 
 Accepted. Date: 2026-08-24.
 
+Amended 2026-09-28: **the roll's own failover of D9 is coordinated where Sentinel supports it** ([ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1: `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback and on Sentinels before Valkey 9.0). The window D9 reports stays; what changes inside it is that a coordinated failover pauses the outgoing master before the handover, so no write is acknowledged and then discarded. The residual risk below that recorded the loss is marked in place, and the forced `REPLICAOF` of `handleMasterWithNoReplicas` is subject to the dataset veto of ADR 0037 D4. Decided, not built.
+
 Implemented: the `MultipleMasters` condition and the `splitBrainWarnAfter` bound
 ([`internal/controller/split_brain_report.go`](../../internal/controller/split_brain_report.go)),
 the `DeletionTimestamp` guard on the role-label fallback (`labelClaimsMaster`,
@@ -212,9 +214,13 @@ only the branch in which no new-image master is found. In the double master of t
 promoted replica answers master, and once it is available `handlePostFailover` takes it as the
 new master. With a connected replica, `replaceRemainingPods` sets `replacing-master` — where the
 resolver runs again — right before it deletes the old master, once `verifyNewMasterReady` passes
-and no pod of the tier is terminating. With no connected replica, `replicaReconnectTimeout` (90 s
+and no pod of the tier is terminating *(and, since 2026-09-28, once every current replica holds
+the dataset and the deletion discards none — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3, D5; a handover that cannot pass
+holds as `MasterHandoverStalled`, D6)*. With no connected replica, `replicaReconnectTimeout` (90 s
 from the failover timestamp) sends a best-effort `REPLICAOF` of the new master to every other
-reachable pod, the old master included (`handleMasterWithNoReplicas`, `forceReplicaConnections`).
+reachable pod, the old master included (`handleMasterWithNoReplicas`, `forceReplicaConnections`)
+*(vetoed for the whole call while the new master holds no keys and any other pod holds some,
+since 2026-09-28 — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4)*.
 With no new-image master, `failoverRetryTimeout` (30 s) hands the failover to
 `stateFailoverReset`, which resets Sentinel onto the pod answering master, and the next pass
 resolves as before. One wait of the connected-replica branch has no bound — Residual risks.)*
@@ -293,6 +299,10 @@ D1 still holds — the level is True from the first pass, and the Warning waits 
   one every Sentinel failover has; before D9 the operator shortened it by demoting the promoted
   replica, which is what broke the failover. Writes that reach the old master after the promotion
   are lost when Sentinel reconfigures it — as they were before, for whichever pod was demoted.
+  *(Amended 2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1: measured in docker as 9133-11249 of 13271 acknowledged
+  writes at 500-600 writes/s in the 16 s until `+convert-to-slave`; with a coordinated failover the
+  old master pauses writes before the handover and none is acknowledged after it, so the loss stays
+  on the forced fallback and on Sentinels before Valkey 9.0.)*
 
 ## Alternatives Considered
 
@@ -437,11 +447,11 @@ during a genuine split brain would restart the silence.
   storm of objects. Not verified against a real API server; derived from the
   recorder's key, which is verified in code.
 - **Two masters still cost data.** No master this operator builds refuses writes
-  without a replica (`min-replicas-to-write` is set nowhere and has no CRD escape
-  hatch), so both sides of a split accumulate writes that the repair then
+  without a replica — the fence is refused, with its measurements, in
+  [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) — so both sides of a split accumulate writes that the repair then
   discards. This ADR changes what a Warning promises; it does not change what a
-  divergence costs. Tracked separately as T12 in
-  [`docs/tickets/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md`](../tickets/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md).
+  divergence costs. *(Rewritten 2026-09-28; [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 and D5 keep the operator's own
+  `REPLICAOF` and delete from discarding the only dataset in such a split.)*
 - **The e2e assertion is an absence.** "No Warning Event on the CR" fails on a
   genuinely degraded run as well as on a regression of this ADR, which is
   intended — but on a resource-starved CI node a legitimately slow topology

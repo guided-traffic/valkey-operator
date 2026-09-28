@@ -4,6 +4,8 @@
 
 Accepted. Date: 2026-08-21.
 
+Amended 2026-09-28: **D1's controlled failover is coordinated where Sentinel supports it, and D10's predicate binds the delete of the outgoing master.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1 sends `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback; its D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the delete in `replaceRemainingPods`, held past `syncTimeout` rather than paused (D6). The residual risk below that named the missing key check is closed by decision and open until built. Marked in place.
+
 The strategy itself predates this ADR set; the template-source and freshness-guard
 decisions below landed on branch `feat/support-pdb`.
 
@@ -182,7 +184,7 @@ and no maximum). Failing over only once every replica already runs the new spec
 guarantees the promotion target is up to date and synced, so the failover cannot promote
 a pod that would then have to full-resync. Replacing the master last means the pod
 holding the authoritative dataset is disturbed exactly once, at the end, when a synced
-successor already exists.
+successor already exists. *(Amended 2026-09-28: the controlled failover is `SENTINEL FAILOVER <name> COORDINATED` where the Sentinel supports it and the forced command otherwise — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1.)*
 
 **D2 — Every "desired" input comes from the live StatefulSet, never from the CR.** Five
 are named values: `valkeyImageFromSts(sts)`, `sidecarImageFromSts(sts)`,
@@ -439,6 +441,9 @@ because the old master is only deleted afterwards;~~ *(wrong since it was writte
 2026-09-26: `verifyNewMasterReady` reads the new master's `DBSIZE`, logs it and refuses only
 when it is unreadable — it never reads the outgoing master's count and compares nothing. Its
 comment calls that a critical safety check; the check does not exist. See Residual risks.)*
+*(Amended 2026-09-28: [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5 put the same replica-side predicate, a count on the
+new master, the key-count veto and the role in front of that delete, held past `syncTimeout` as
+`MasterHandoverStalled` rather than paused — decided, not built.)*
 On the manual path the delete follows the promotion within seconds, so the check has to come
 before it. An empty master returns early
 -- a cluster that holds no data yet must still be able to roll -- and an unreadable count
@@ -564,14 +569,18 @@ readiness a second, partial source of truth about replication.
   `singlePodDeferral` (D6 amendment), which is the one change that was caught.
 * **The Sentinel path deletes the former master with no key-count gate.** Before the
   `replaceRemainingPods` delete, `verifyNewMasterReady` requires a current, available master
-  with at least one connected replica and no sync in progress, and reads its `DBSIZE` — but
-  compares it with nothing and never reads the outgoing master's count, so a Sentinel
-  failover that promoted an empty replica passes it. `verifyPromotionCandidateHoldsData`
+  with at least one connected replica (its "no sync in progress" term reads
+  `master_sync_in_progress`, a field a master never reports, and never fires), and reads its
+  `DBSIZE` — but compares it with nothing and never reads the outgoing master's count, so a
+  Sentinel failover that promoted an empty replica passes it. `verifyPromotionCandidateHoldsData`
   exists on the manual path only. Pre-existing since commit `5214d56` (2026-02-18), found by
-  reading during the T32 review, not fixed by T32, not reproduced against a cluster. Three
-  code comments still describe the check as present: the header of `replaceRemainingPods`
-  ("has actual data (DBSIZE > 0)"), the inline comment in `verifyNewMasterReady`, and the
-  comment above the pre-promotion check in `handleManualFailover`.
+  reading during the T32 review, not fixed by T32, not reproduced against a cluster. ~~Three
+  code comments still describe the check as present~~ *(corrected 2026-09-28: the header of
+  `replaceRemainingPods` and the inline comment in `verifyNewMasterReady` say since 2026-09-26
+  that the count is logged and not enforced; the comment above the pre-promotion check on the
+  manual path still says the Sentinel path "reads the same counts", where it reads one)*.
+  *(Closed by decision 2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5: the replica-side predicate, a count
+  on the new master, the key-count veto and the role in front of that delete; open until built.)*
 * ~~**A Sentinel tier of one or two Sentinels never replaces a Ready outdated Sentinel — open,
   awaiting a decision.**~~ **Closed 2026-09-26: such a tier rolls serially**
   ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10, `sentinelDeleteKeepsVotes`;

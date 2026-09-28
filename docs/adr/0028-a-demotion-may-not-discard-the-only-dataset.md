@@ -20,6 +20,8 @@ Open, and named as such: `vko.gtrfc.com/promoted-pod` is not rewritten by the ad
 
 Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
 
+Amended 2026-09-28: **D1's veto binds a second `REPLICAOF` site and the delete of the outgoing master, and on the Sentinel path D8's refusal is held, not ended.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 (`forceReplicaConnections`, vetoed for the whole call), D5 (the delete in `replaceRemainingPods`) and D6 (the hold, `MasterHandoverStalled`). D3's "the divergence is bounded" no longer holds on that path, and the write fence D3 named as the price is refused in [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md). The residual risk that expected the veto to stay inert on the Sentinel path is corrected in place. Decided, not built.
+
 ## Context
 
 `detectAndResolveSplitBrain` resolves a multi-master state during a rolling update by naming a
@@ -99,7 +101,9 @@ the operator recorded.
 holding zero keys while the rogue holds some ends the demotion of that rogue. Both empty is
 **not** a refusal: an empty cluster is a legitimate state, and refusing there would stall the
 resolution of every cluster that holds no data yet. An authority that holds keys of its own is
-not the shape at all and costs a single `DBSIZE`.
+not the shape at all and costs a single `DBSIZE`. *(Amended 2026-09-28: "each `REPLICAOF`"
+includes the ones `forceReplicaConnections` sends, vetoed for the whole call — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 —
+and the same comparison guards the delete of the outgoing master — ADR 0037 D5.)*
 
 **D2 — The drain stamp outranks the recorded authority, and the adoption is recorded first.**
 Exactly one reported master carrying `vko.gtrfc.com/drain-promoted-at` becomes the real master,
@@ -120,11 +124,15 @@ evidence, and the destructive direction needs positive justification. **The asym
 promotion path is deliberate rather than overlooked.** There an unreadable count costs a wait
 while the master keeps serving; here it costs a growing divergence between two masters that both
 accept writes, for the length of the bound — and the operator ships no write fencing, so both
-sides keep accepting them (item T12). The trade is still one-sided: the divergence is bounded,
-visible and repairable by a human, and a wrong `REPLICAOF` is none of the three.
+sides keep accepting them (refused in [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md)). The trade is still one-sided: ~~the
+divergence is bounded~~ *(on the Sentinel path, since 2026-09-28, the divergence is held rather
+than bounded — until a human, the repair `MasterHandoverStalled` names, or the first write on the
+empty master; [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D6)*, visible and repairable by a human, and a wrong `REPLICAOF` is
+none of the three.
 
 **D4 — The veto guards the demotion, whatever chose the authority.** It applies to the stamp
-rule, to the named authority and to the connected-slaves tiebreak alike. The tiebreak needs it
+rule, to the named authority and to the connected-slaves tiebreak alike *(and, since 2026-09-28,
+to `forceReplicaConnections` and to the delete of the outgoing master — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4, D5)*. The tiebreak needs it
 most: with a shrunken cluster every master reports zero connected slaves and the tie falls to
 the lowest ordinal ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) D3),
 which in this shape is the empty pod-0. **"Treat an empty authority as no authority and fall
@@ -195,7 +203,7 @@ unbounded stall:
 | `stateManualFailover` / `stateReplacingMaster` | `boundManualFailover` | `handlePostManualFailover` abandons |
 | `stateRestoringTopology` | `boundTopologyRestore` | `abandonTopologyRestoration`, `TopologyRestored=False` |
 | `stateVerifyingTopology` | `finalizationStallTimeout` | completes despite rogue masters, clears state; `checkSteadyStateSplitBrain` then refuses on its own rules |
-| Sentinel path | Sentinel reconfigures the returning pod itself | resolved without the operator |
+| Sentinel path | Sentinel reconfigures the returning pod itself | resolved without the operator *(or, since 2026-09-28, held past `syncTimeout` as `MasterHandoverStalled` when the new master is empty and the returning pod holds the dataset — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D5, D6)* |
 
 *(Added 2026-09-26.)* One Sentinel-path state does not reach the resolver at all: in
 `failover-triggered` the Sentinel rolling update reports the double master and does not call
@@ -207,7 +215,9 @@ hands a failover that does not complete to `failover-reset`, where the resolver 
 a new-image master. With one, the state leaves for `replacing-master` — where the resolver runs
 again — once `verifyNewMasterReady` passes, or, with no connected replica, `replicaReconnectTimeout`
 forces every other reachable pod onto the new master; one wait of the first branch has no bound.
-ADR 0025 D9 carries the branches and that residual risk.)*
+ADR 0025 D9 carries the branches and that residual risk.)* *(Amended 2026-09-28: the gate passes
+only under [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3, the delete only under D5, the forced `REPLICAOF` is vetoed under D4,
+and a handover that cannot pass holds as `MasterHandoverStalled`, D6.)*
 
 **D9 — The amendments this makes to the two ADRs it touches.**
 
@@ -227,8 +237,8 @@ ADR 0025 D9 carries the branches and that residual risk.)*
 * A cluster the operator cannot reach no longer has its split brain resolved. That is the point
   of D3, and it is a real behaviour change: previously the demotion went ahead blind.
 * A refused demotion leaves two masters accepting writes until the bound of the state expires.
-  Without write fencing (item T12) both sides accumulate writes, and whichever loses the
-  eventual repair loses them.
+  Without write fencing (refused in [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md)) both sides accumulate writes, and whichever
+  loses the eventual repair loses them.
 * Eleven existing unit tests asserted a demotion against an unreachable Valkey, which under D3
   now reads as a refusal. They were moved onto a fake server with an explicit key count, and the
   three that used "which pod was contacted" as a proxy for "which pod was demoted" now assert on
@@ -293,6 +303,10 @@ ADR 0025 D9 carries the branches and that residual risk.)*
   operator log: ten cycles on Valkey 8 over about nine and a half minutes, until the e2e's
   ten-minute wait gave up — ADR 0025 D9)*. The fix is not a D1 rule but no resolution
   in that state; that D1 could not have caught it is reasoned from D1's condition, not measured.)*
+  *(Corrected 2026-09-28: not inert at `handleMasterWithNoReplicas` either — its
+  `forceReplicaConnections` sent `REPLICAOF` to every reachable pod without the veto, the old
+  master included, and `replaceRemainingPods` deleted the holder behind an empty new master;
+  [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 and D5 close both, decided, not built.)*
 
 ## References
 

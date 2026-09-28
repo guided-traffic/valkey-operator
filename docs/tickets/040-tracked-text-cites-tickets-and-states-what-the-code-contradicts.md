@@ -119,6 +119,12 @@ writes by waitForWriteSync"),
 [ADR 0012 D9](../adr/0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) `:340-341` ("It
 loses no data"), the `waitForWriteSync` doc comment `:2901-2903` ("prevents data loss") and the
 Sentinel-path call site `:2715-2716` ("prevents data loss from async replication").
+The loss has a lossless counterpart on both pins: `FAILOVER TO <host> <port>` on the master
+pauses writes, waits for the target's ack offset and hands over, which is the primitive
+[ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1
+takes through Sentinel (`SENTINEL FAILOVER … COORDINATED`, Valkey 9). Whether `promoteAndRedirect`
+takes it directly instead of `REPLICAOF NO ONE` plus the redirect is a design question this
+ticket does not decide (found 2026-09-28 while deciding ADR 0037).
 
 **(c) The `sentinelPodNeedsUpdate` doc comment starts mid-sentence**
 ([rolling_update.go:4837](../../internal/controller/rolling_update.go#L4837)). The function

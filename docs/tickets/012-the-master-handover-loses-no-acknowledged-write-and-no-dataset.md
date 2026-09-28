@@ -1,15 +1,15 @@
 ---
 id: T12
 title: no acknowledged write and no dataset is lost across the rolling update's master handover
-state: analysed       # every part read and measured, options costed, no option chosen
+state: decided        # Q1-Q6 decided 2026-09-28; ADR 0037 (Q1-Q5) and ADR 0038 (Q6) written the same day
 severity: high        # acknowledged writes lost on every Sentinel roll; the only dataset deleted in the refusal shape with phase OK
 security: none        # durability and data integrity; no principal gains a verb or an object
 urgency: now          # rule 1: tracked texts call every multi-replica roll lossless and describe sync and dataset gates the code does not have
 effort: L             # three code changes on one handover path, one e2e writer harness, ADR amendments; fencing as a refusal ADR
-blocked-by: decision  # Q1-Q5; Q6 is a product call and waits for Q1
+blocked-by:
 filed-from: T4 analysis, 2026-08-24
 opened: 2026-08-24
-decided:
+decided: 2026-09-28
 done:
 ---
 
@@ -34,30 +34,30 @@ O is the outgoing master, X the pod the roll takes as new master. Line numbers w
 in [rolling_update.go](../../internal/controller/rolling_update.go). Measurements ran in docker on
 `valkey/valkey:9.1.1` and `8.1.9` with the operator's settings unless noted.
 
-- **Trigger.** `handleMasterFailover` (`:2695-2758`) waits for the replicas, sends `WAIT`, stamps
-  `setFailoverTriggered` (`:2743`), triggers (`:2751`), requeues after 15 s. The retrigger
-  `handleFailoverRetrigger` (`:849-887`, trigger `:882`) skips the replica and write-sync gates
-  (`:2710-2719`). Both use `triggerSentinelFailover` (`:3700-3740`): each Sentinel in ordinal order,
+- **Trigger.** `handleMasterFailover` (`:2802-2865`) waits for the replicas, sends `WAIT`, stamps
+  `setFailoverTriggered` (`:2850`), triggers (`:2858`), requeues after 15 s. The retrigger
+  `handleFailoverRetrigger` (`:956-994`, trigger `:989`) skips the replica and write-sync gates
+  (`:2817-2826`). Both use `triggerSentinelFailover` (`:3807-3847`): each Sentinel in ordinal order,
   plain `SENTINEL FAILOVER <name>` ([client.go:231-238](../../internal/valkeyclient/client.go#L231-L238)).
-- **No-replica branch.** `handleMasterWithNoReplicas` (`:3145`) tolerates a zero-replica X for
-  about 270 s (90 s `replicaReconnectTimeout`, re-armed twice); past 90 s (`:3150`) it calls
-  `forceReplicaConnections` (`:3159`) and `resetSentinelState` (`:3161`).
-- **Delete.** `handleNewMasterFound` (`:3129`) hands over to `replaceRemainingPods`
-  (`:2984-3051`): `verifyNewMasterReady` (Sentinel only, `:3012-3017`), the ADR 0026 D5 gate,
-  `replacing-master` (`:3029`), delete of O (`:3034`), at the 15 s requeue or earlier on a watch
-  event. `finalizeRollingUpdate` (`:891`, `:946-989`) reads no key count.
-- **The gate.** `verifyNewMasterReady` (`:3331-3397`) takes the first current `available()` pod
-  answering `role:master` as X and refuses only on `connected_slaves == 0` (`:3350`), an
-  unreadable TLS config or `DBSIZE` of X (`:3368-3379`), or no non-terminating candidate. Its
-  `master_sync_in_progress` term (`:3355`) never fires. On any readable count, zero included, it
-  logs "New master verified with data" (`:3381`); it never reads O's count; its other waits are
+- **No-replica branch.** `handleMasterWithNoReplicas` (`:3252`) tolerates a zero-replica X for
+  about 270 s (90 s `replicaReconnectTimeout`, re-armed twice); past 90 s (`:3257`) it calls
+  `forceReplicaConnections` (`:3266`) and `resetSentinelState` (`:3268`).
+- **Delete.** `handleNewMasterFound` (`:3236`) hands over to `replaceRemainingPods`
+  (`:3091-3158`): `verifyNewMasterReady` (Sentinel only, `:3119-3124`), the ADR 0026 D5 gate,
+  `replacing-master` (`:3136`), delete of O (`:3141`), at the 15 s requeue or earlier on a watch
+  event. `finalizeRollingUpdate` (`:998`, `:1053-1096`) reads no key count.
+- **The gate.** `verifyNewMasterReady` (`:3438-3504`) takes the first current `available()` pod
+  answering `role:master` as X and refuses only on `connected_slaves == 0` (`:3457`), an
+  unreadable TLS config or `DBSIZE` of X (`:3475-3486`), or no non-terminating candidate. Its
+  `master_sync_in_progress` term (`:3462`) never fires. On any readable count, zero included, it
+  logs "New master verified with data" (`:3488`); it never reads O's count; its other waits are
   unbounded plain requeues.
-- **The ADR 0028 refusal shape.** The resolver runs before every dispatch (`:714-715`) with
-  Sentinel's master pointer as authority, except while `ownFailoverInFlight` (`:797-822`), the
-  negation of the predicate gating `:3159`. `demotionRefusalReason` (`:1713-1736`, counts via
-  `dbSizeReader` `:1681-1693`) refuses when the authority holds zero keys and the rogue some, or a
+- **The ADR 0028 refusal shape.** The resolver runs before every dispatch (`:821-822`) with
+  Sentinel's master pointer as authority, except while `ownFailoverInFlight` (`:904-929`), the
+  negation of the predicate gating `:3266`. `demotionRefusalReason` (`:1820-1843`, counts via
+  `dbSizeReader` `:1788-1800`) refuses when the authority holds zero keys and the rogue some, or a
   count is unreadable; the refusal lives only on the pod slice `handlePostFailover` discards
-  (`:3071`). X is returned as `masterIdx` (`:1478`), O keeps `isMaster` (`:1659-1663`). ADR 0028 D8
+  (`:3178`). X is returned as `masterIdx` (`:1585`), O keeps `isMaster` (`:1766-1770`). ADR 0028 D8
   (`:198`, `:206-210`) records the delete as the end of the refusal on the Sentinel path.
 - **Routes to an empty X:** the retrigger (Sentinel selects without reading a key count), and a
   promoted non-persistent pod restarting empty
@@ -74,8 +74,7 @@ they are discarded on resync, and `WAIT` covers only earlier ones. O keeps its m
 ([labeler.go:135-145](../../internal/sidecar/labeler.go#L135-L145)) sees `+switch-master`; pooled
 connections stay until the conversion.
 
-**Second failover.** Nothing asks O its role before the delete (the comment at `:3034` says "now a
-replica", true only after `+convert-to-slave`). The delete SIGTERMs O's sidecar, whose drain handler
+**Second failover.** Nothing asks O its role before the delete (the comment at `:3126` says "now a replica", true only after `+convert-to-slave`). The delete SIGTERMs O's sidecar, whose drain handler
 ([drain.go:98-148](../../internal/sidecar/drain.go#L98-L148)) sends the same forced command if O
 still answers master, failing over the pod just promoted. By timing (promotion at about +1 s,
 conversion about 16.4 s later, delete pass at 15 s or earlier) this is the expected order.
@@ -112,13 +111,13 @@ A loading replica answers `LOADING` to `PING` with exit 0 and stays Ready (T35).
 |---|---|---|
 | `CheckCluster` `AllSynced` [checker.go:130](../../internal/health/checker.go#L130), used at [valkey_controller.go:2475-2488](../../internal/controller/valkey_controller.go#L2475-L2488), Sentinel only | "all replicas have completed sync"; phase `Syncing` | `connected_slaves == replicas - 1` |
 | observer `checkReplicaSync` [checks.go:103](../../internal/observer/checks.go#L103) | CRD `replicaSyncFailure` "bulk sync is in progress" ([valkey_types.go:918](../../api/v1/valkey_types.go#L918)) | `connected_slaves >= replicas - 1` |
-| `verifyNewMasterReady` `:3355` | "all replicas synced", "no sync in progress" | `connected_slaves > 0` |
+| `verifyNewMasterReady` `:3462` | "all replicas synced", "no sync in progress" | `connected_slaves > 0` |
 
-The replica-side answer exists: `replicationNotEstablishedReason` (`:4467-4476`: role, link `up`, no
-transfer), applied by `verifyReplacedReplicasSynced` (`:2536-2603`, bounded by
+The replica-side answer exists: `replicationNotEstablishedReason` (`:4574-4583`: role, link `up`, no
+transfer), applied by `verifyReplacedReplicasSynced` (`:2643-2710`, bounded by
 `spec.rollingUpdate.syncTimeout`, pause on expiry) and asked by the sidecar's `isSyncedReplica`
 ([drain.go:351-353](../../internal/sidecar/drain.go#L351-L353)). ADR 0007 D10 requires it before a
-promotion; nothing asks it before the delete. Its "still syncing" message (`:4472-4474`) is
+promotion; nothing asks it before the delete. Its "still syncing" message (`:4579-4581`) is
 unreachable. Eight unit fixtures and one e2e subtest pin impossible replies.
 
 **Impact.** On a Sentinel roll with `replicas >= 3` O is deleted while the other replica is in
@@ -128,15 +127,29 @@ is empty; a sync restarting forever never fires `ValkeyPhaseNotOK`; `replica_syn
 
 ### Re-pointing pods at the new master
 
-`forceReplicaConnections` (`:3192`; callers `:983` and `:3159`) sends `REPLICAOF X` to every existing
+`forceReplicaConnections` (`:3299`; callers `:1090` and `:3266`) sends `REPLICAOF X` to every existing
 Ready pod except X, terminating ones included; it asks no role, reads no key count, and skips a
-failed send. At `:3159` it performs exactly the demotion of O the resolver refused, and re-points
+failed send. At `:3266` it performs exactly the demotion of O the resolver refused, and re-points
 every replica holding O's copy; likewise when a count was unreadable, when O was not counted master,
-or when the 90 s boundary falls between `:797` and `:3150`. Only "authority is O" does not reach
+or when the 90 s boundary falls between `:904` and `:3257`. Only "authority is O" does not reach
 it. Measured: a 500-key master and its replica re-pointed at an empty X are empty by +7 s; O with
 the operator's `rdb` or `aof` lines ([configmap.go:187-246](../../internal/builder/configmap.go#L187-L246))
 re-pointed and restarted boots master with `DBSIZE` 0 in four of four runs (the sync replaces the
 files). Comments, test texts and ADR 0028 Residual risks `:284` call the path safe.
+
+Three routes flush O in the refusal shape, and only one is the operator's. Sentinel lists O as a
+replica of X after `+switch-master` and sends it `REPLICAOF X` once O has reported `master` for
+8 s while X looks sane (`+convert-to-slave`,
+[sentinel.c 9.1.1:2630-2641](https://github.com/valkey-io/valkey/blob/9.1.1/src/sentinel.c#L2630-L2641);
+measured 16 s), which no veto reaches. The operator's `REPLICAOF` at `:3266` is live once
+Sentinel no longer knows O: after the reset at `:3268` (`REMOVE`+`MONITOR X`, Sentinel learns
+replicas from X's `INFO` alone), or with O unreachable to Sentinel. The delete of O is the
+third. Meanwhile the labeler trusts Sentinel over the local role
+([labeler.go:133-141](../../internal/sidecar/labeler.go#L133-L141)): O labels itself `replica`,
+`-rw` selects the empty X alone and `-r` selects O, so every client write lands on X. The shape
+itself is narrow: a forced failover promotes the replica with the highest offset
+(`compareReplicasForPromotion`), so an empty one only when it is the only eligible replica or
+all are empty; the other route is T35's promoted non-persistent pod restarting empty.
 
 ### The delete of the former master
 
@@ -163,7 +176,7 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   side that keeps a replica, nor against a replica full-syncing an empty master (T35).
 - **Placement:** the shared tail of `replicationConfig` (`configmap.go:174-181`, gated at
   `:108-111`); both bodies feed `ComputeConfigHash`, so enabling rolls once.
-- **Cost when opted in:** non-Sentinel `promoteAndRedirect` (`:4188-4248`) refuses writes
+- **Cost when opted in:** non-Sentinel `promoteAndRedirect` (`:4295-4355`) refuses writes
   0.23-0.25 s idle, 5.1-5.7 s plus the transfer under load; a forced Sentinel failover 5.7-6.9 s
   (nine runs); `replicas: 2` until the replacement joins. `sentinel.enabled` with `replicas: 1` is
   accepted ([valkey_types.go:1159-1161](../../api/v1/valkey_types.go)) and would be fenced for good
@@ -188,27 +201,23 @@ D3 lengthens that window on every refused demotion and names the missing fence a
 - **E2E writer harness** (independent; needs T34's reply classification): during a Sentinel roll,
   write through `-rw`, count acknowledged-but-missing and refused writes separately, log X's `INFO`
   at the delete, detect a second failover (sidecar log "sentinel failover triggered" on the deleted
-  pod, two `+switch-master`). Run on both legs before any fix; Q1 and Q6 build their e2e on it.
-- **`verifyNewMasterReady`, one change:** the log line `:3381` drops "with data" and logs the count
+  pod, two `+switch-master`). Run on both legs before any fix; Q1 builds its e2e on it.
+- **`verifyNewMasterReady`, one change:** the log line `:3488` drops "with data" and logs the count
   as a field (independent); returns the pod it verified; takes the replica-side check (Q2) and the
   dataset veto (Q4).
 - **Pass-level refusal-shape test** (independent; run before any fix to prove it reproduces): two
   masters, Sentinel names the empty one, stamp older than 90 s; the holder gets no `REPLICAOF` (Q3)
   and, once X has a replica, is not deleted (Q4). One fake per pod with a key count (fleet helper
   `split_brain_dataset_test.go:51`).
-- **ADR 0028, one amendment (Q3, Q4):** D1/D4 name the second `REPLICAOF` site and the delete; D8
-  and ADR 0025 `:215-217` say "subject to the dataset veto"; D3's "the divergence is bounded" no
-  longer holds on the Sentinel path. Independent: mark Residual risks `:284` in place as not holding
-  at `handleMasterWithNoReplicas`.
-- **ADR 0007, ADR 0026 (independent):** ADR 0007 `:517-519`, ADR 0026 `:475-476`, `:790-791` state
-  the gate as role, available and one attached replica; ADR 0007 Residual risks `:523-526` names the
-  texts of this ticket instead of three comments; fix ADR 0007 `:392-393`, ADR 0026 `:787-789`.
-  Depending on Q2/Q4: ADR 0007 D10 covers the delete, ADR 0026 D11's *Replacement* argument
-  (`:473-477`, `:791-792`) is amended, both residual risks close. No ADR edit cites a ticket.
-- **Comments (independent):** `:2980-2983`, `:3011` (the gate as it is); `:2983`, `:3003`, `:3365`
-  cite ADR 0007 Residual risks instead of T32; `:4026-4027` (the Sentinel path reads one count, the
-  manual path two); `:3189-3191`, `:3137`, `:3157`, `:975` (every Ready pod except X);
-  `:3143-3144`, `:3166-3167` and `sentinel_failover_test.go:1279-1281`, `:1300-1301` (the gate
+- **ADRs (done 2026-09-28):** ADR 0037 and ADR 0038 written; ADR 0025 D9, ADR 0007 D1 and D10,
+  ADR 0028 D1, D3, D4 and D8, ADR 0026 D11 amended in place, their residual risks on the gate
+  closed by decision and marked open until built, the gate descriptions no longer carry the dead
+  sync term, index rows added. The pre-existing T32 labels in the ADR 0007 and ADR 0026 residual
+  risks are T40's sweep. Every code change updates the Status of ADR 0037 and its index row.
+- **Comments (independent):** `:3087-3090`, `:3118` (the gate as it is); `:3090`, `:3110`, `:3472`
+  cite ADR 0007 Residual risks instead of T32; `:4133-4134` (the Sentinel path reads one count, the
+  manual path two); `:3296-3298`, `:3244`, `:3264`, `:1082` (every Ready pod except X);
+  `:3250-3251`, `:3273-3274` and `sentinel_failover_test.go:1279-1281`, `:1300-1301` (the gate
   checks replication, not the dataset; T23 edits the same lines, one change); `checker.go:32`,
   `:38`, `checks.go:91`.
 - Every code change: `make test-unit`, `make lint`, `make cyclo`, `make test-integration`; full e2e
@@ -231,16 +240,35 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   ADR 0023, ADR 0012 D9 (T40 item (b)), ADR 0016 `:261`, `rotation-and-change-propagation.md:47`.
   Check: `git grep -n -i 'lossless\|without data loss\|no data is lost\|loses no data\|zero data
   loss'` over `README.md`, `CLAUDE.md`, `docs/adr/`, `docs/operations/`, `test/` finds no such claim.
-- **(Q1 = A):** a coordinated call in `valkeyclient` beside `SentinelFailover`, which the drain
-  handler keeps ([drain.go:27-32](../../internal/sidecar/drain.go#L27-L32)). The first trigger
-  (`:2751`) sends `COORDINATED`; on the Valkey 8 `ERR wrong number of arguments` or `-NOGOODPRIMARY`
-  it asks the same Sentinel with the forced command; `-INPROG`/`-NOGOODSLAVE` stay a failed attempt.
-  The retrigger (`:882`) stays forced, so a failover without a majority falls back through the 30 s
-  `failoverRetryTimeout`. New ADR amending ADR 0025 D9 and ADR 0007, index row, the fifteen places
-  reworded again. Unit (RESP fake) per reply, plus forced retrigger and drain handler, with revert
-  checks ([ADR 0017](../adr/0017-test-and-ci-policy.md)); e2e: 0 lost on Valkey 9, non-zero with the
-  argument reverted, Valkey 8 logs its count and the fallback, zero Warning Events on a clean roll.
-- **(Q1 = C):** amend ADR 0025 D9 with the sizes and the Kind measurement as revisit trigger.
+- **Q1 = A (decided 2026-09-28):** a coordinated call in `valkeyclient` beside
+  `SentinelFailover`, which the retrigger (`:989`) and the drain handler
+  ([drain.go:27-32](../../internal/sidecar/drain.go#L27-L32)) keep forced. The first trigger
+  (`:2858`) sends `SENTINEL FAILOVER <name> COORDINATED`; on `ERR wrong number of arguments`
+  (a Valkey 8 Sentinel: 8.1.9 rejects the fourth argument, 9.0.0 knows it) or `-NOGOODPRIMARY`
+  it asks the same Sentinel with the forced command; `-INPROG`/`-NOGOODSLAVE` stay a failed
+  attempt. The second fallback is the existing one: an `OK` whose election is lost
+  (`-failover-abort-not-elected` after 10 s, no majority of the Sentinel table
+  ([sentinel.c 9.1.1:5090-5110](https://github.com/valkey-io/valkey/blob/9.1.1/src/sentinel.c#L5090-L5110)))
+  promotes nothing, `failoverRetryTimeout` (30 s) resets, and the retrigger fires forced,
+  about 40 s later than today. On the master the coordinated path
+  ([sentinel.c 9.1.1:4762-4800](https://github.com/valkey-io/valkey/blob/9.1.1/src/sentinel.c#L4762-L4800),
+  [replication.c 9.1.1:5596-5760](https://github.com/valkey-io/valkey/blob/9.1.1/src/replication.c#L5596-L5760))
+  sends `CLIENT PAUSE <rest of failover-timeout> WRITE` and `FAILOVER TO <X> <port> TIMEOUT
+  <same>` in one transaction: O blocks writes, waits for X's ack offset, becomes X's replica,
+  and the paused clients are disconnected unacknowledged. The stall shape (X not `online`,
+  or never catching up) blocks writes for up to `failover-timeout` (60 s), then both sides
+  abort; nothing is lost. The address chain holds by code: `replica-announce-ip` is the pod
+  FQDN ([statefulset.go:355](../../internal/builder/statefulset.go#L355)), Sentinel announces
+  hostnames ([sentinel.go:163](../../internal/builder/sentinel.go#L163)), `findReplica`
+  compares that string and the listening port. The upgrade roll 8 -> 9 itself is forced: the
+  Sentinel tier shares `spec.image` and rolls after the data tier, so the first lossless roll
+  is the next one. [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+  D1 (written 2026-09-28, amending ADR 0025 D9 and ADR 0007 D1); the fifteen places reworded
+  again; `upgrading.md` names the 8 -> 9 roll and the 60 s block. Unit (RESP fake)
+  per reply, plus forced retrigger and drain handler, with revert checks
+  ([ADR 0017](../adr/0017-test-and-ci-policy.md)); e2e: 0 lost on Valkey 9, non-zero with the
+  argument reverted, Valkey 8 logs its count and the fallback, zero Warning Events on a clean
+  roll.
 
 ### The sync checks
 
@@ -251,103 +279,153 @@ D3 lengthens that window on every refused demotion and names the missing fence a
   with sync `1`. Replace "Wait for TLS replication sync"
   ([tls_test.go:1301-1311](../../test/e2e/tls_test.go#L1301-L1311), cannot fail) with a
   replica-side TLS wait via `valkeyTLSExecAllowError`; run on both lines.
-- **(Q2 = A):** move the predicate of `replicationNotEstablishedReason` onto `ReplicationInfo`,
-  build it and `isSyncedReplica` on that, drop the message at `:4473`. `CheckCluster` counts full
-  answers from the replies `findMaster` already collects; `verifyNewMasterReady` calls
-  `verifyReplacedReplicasSynced` with the same pods; the observer asks each data pod. Rewrite the
-  three master fixtures (`sentinel_failover_test.go:1001-1011`,
+- **Q2 = A (decided 2026-09-28):** move the predicate of `replicationNotEstablishedReason`
+  onto `ReplicationInfo`, build it and `isSyncedReplica` on that, drop the message at `:4580`.
+  `CheckCluster` evaluates it on the replies `findMaster` already collects
+  ([checker.go:174-199](../../internal/health/checker.go#L174-L199) keeps master candidates
+  only; keep every reply, indexed by ordinal), no extra dial, and `ReadyReplicas` counts the
+  pods that pass. The observer asks each data pod, one `INFO` per replica per cycle. At the
+  gate, `verifyNewMasterReady` asks the predicate of every other pod on the current template
+  that exists and is not terminating **and** requires X's `connected_slaves` at least equal to
+  their number: the count on X proves the attachment, the predicate the dataset, neither alone
+  (a replica chained through O passes the predicate, `parallel-syncs 1`; `master_host` is not
+  compared, the init script writes two FQDN forms,
+  [statefulset.go:285](../../internal/builder/statefulset.go#L285),
+  [:445](../../internal/builder/statefulset.go#L445)). The gate arms the sync-wait bound; on
+  expiry it hands over as Q5 decides, never to `pauseRollingUpdate` (`:2726-2760`), which clears
+  the state under `failover-triggered` against ADR 0010 and releases the Sentinel roll.
+  `replicas: 2` is unchanged: O is X's only replica after the conversion, no other pod is asked,
+  the `connected_slaves == 0` refusal stays. Rewrite the three master fixtures
+  (`sentinel_failover_test.go:1001-1011`,
   [checker_live_test.go:293-298](../../internal/health/checker_live_test.go#L293-L298),
-  [checks_endpoint_test.go:73-79](../../internal/observer/checks_endpoint_test.go#L73-L79), fake node
-  `fake_endpoint_test.go:301-307`) replica-side. Tests: X at `connected_slaves:1` with the other
-  replica link `down` refuses the delete, arms the sync-wait bound, pauses past `syncTimeout`;
-  `CheckCluster` and `checkReplicaSync` fail on that shape; reverting each site turns it red.
-  Update [package-map.md:80](../developer/package-map.md) and the README `Syncing` row if needed.
-- **(Q2 = D):** A's gate and observer items; C at `CheckCluster`. **(Q2 = C):** delete the three
-  terms and master rows; the CRD description (`api/v1`, `make manifests`, `README.md:433`) says an
-  attached count.
-- In every case the only non-test user of `MasterSyncInProgress` is the parser (and the predicate
-  under A).
+  [checks_endpoint_test.go:73-79](../../internal/observer/checks_endpoint_test.go#L73-L79), fake
+  node `fake_endpoint_test.go:301-307`) replica-side. Tests: X at `connected_slaves:1` with the
+  other replica link `down` refuses the delete and arms the sync-wait bound; X at
+  `connected_slaves:0` with the other replica link `up` (chained) refuses; `CheckCluster` and
+  `checkReplicaSync` fail on a Ready replica in full sync; reverting each site turns it red.
+  Update [package-map.md:80](../developer/package-map.md); the README `Syncing` row and the
+  `Ready` text in [status.md](../operations/status.md) already read right;
+  [monitoring.md](../operations/monitoring.md) gains that `ValkeyPhaseNotOK` (`for: 30m`) now
+  covers a sync longer than that.
+- The only non-test user of `MasterSyncInProgress` is the parser and the predicate.
 
 ### Re-pointing and the delete
 
-- **(Q3 = B):** the veto inside `forceReplicaConnections`, reusing `dbSizeReader` and
-  `demotionRefusalReason`, covering both callers. Unit: X with keys or both empty re-point all; X
-  empty with a holder, a non-Ready holder, or an unreadable count re-point none (fail with the veto
-  removed; per-target and targets-only mutations fail the mixed and non-Ready cases). Give
+- **Q3 = B (decided 2026-09-28):** the veto inside `forceReplicaConnections`, reusing
+  `dbSizeReader` and `demotionRefusalReason` unchanged, covering both callers. X empty or
+  unreadable: count every other existing pod, non-Ready included; any holder or unreadable
+  count sends nothing and logs once who holds what; no Event (ADR 0028 D6). The reset at
+  `:3268` still runs after a vetoed call (T23 decides the reset). Unit: X with keys or both
+  empty re-point all; X empty with a holder, a non-Ready holder, or an unreadable count
+  re-point none (fail with the veto removed; per-target and targets-only mutations fail the
+  mixed and non-Ready cases). Give
   `TestHandleMasterWithNoReplicas_ForcesReconnectAndResetsSentinelOnTimeout` key counts.
 - **Independent:** rename `TestVerifyNewMasterReady_AcceptsAMasterWithReplicasAndData`
   ([sentinel_failover_test.go:1063](../../internal/controller/sentinel_failover_test.go#L1063)) and
   its message to what it pins, X's count being read; add a `DBSIZE 0` test pinning today's
   acceptance, the refusal test under Q4 = A.
-- **(Q4 = A):** in `replaceRemainingPods`, after the gate and before the D5 gate,
-  `demotionRefusalReason(dbSizeReader(ctx, v), X, O)` unchanged. X with keys or both empty: deleted;
-  X empty and O with keys or unreadable, X unreadable: kept.
-- **(Q5 = C):** the condition in `api/v1`, its `conditionRegistry` row, README condition row,
-  [status.md](../operations/status.md), [rolling-updates.md](../operations/rolling-updates.md). Test
-  past `syncTimeout`: state kept, condition True, no `RollingUpdatePaused`, no delete,
-  `DeferredRequeueAfter` without `NeedsRequeue`, Sentinel roll held, one Warning Event; O dropping
-  to 0 keys gives the delete and the presence-guarded clear.
+- **Q4 = A (decided 2026-09-28):** in `replaceRemainingPods`, after the gate and before the D5
+  gate, two preconditions on the pod about to be deleted, whichever outdated pod the loop
+  reached, on both paths (the gate is Sentinel-only, the delete is not; on the non-Sentinel path
+  the current master is the pod flagged `isMaster` on the current template, where
+  `verifyPromotionCandidateHoldsData` refused before the promotion and the veto catches only a
+  master that lost its data since, T35). First `demotionRefusalReason(dbSizeReader(ctx, v), X,
+  pod)` unchanged: X with keys or both empty, deleted; X empty and the pod with keys or
+  unreadable, X unreadable, held. Second the role: the pod is deleted only when it does not
+  answer `master` (a replica, or no answer); on Valkey 9 with Q1 = A that costs nothing, on the
+  forced path it holds the delete until Sentinel has converted O (~16 s plus one requeue) and
+  the drain handler's second failover has no master to act on, and the comment at `:3126`
+  becomes true. Both as AND: the veto carries the dataset reason and holds on an unreadable O,
+  the role holds a full X for the first seconds. What the hold reports and hands over to is Q5.
+  ADR 0028 D8 is amended: on the Sentinel path the delete no longer ends the refusal, it holds
+  it, bounded by Q5. Cost of the hold: O behind `-r` with the dataset, X empty behind `-rw`,
+  until a human or the first write on X (Q3); a non-Ready O is held while X is empty.
+- **Q5 = C (decided 2026-09-28):** `MasterHandoverStalled` in `api/v1`, an edge with one
+  evaluator (the gate) and reasons `ReplicaNotSynced`, `DatasetWouldBeDiscarded`,
+  `FormerMasterStillMaster`; the message names X, the held pod and the counts or the sync
+  reason, and the repair: point Sentinel at O (`SENTINEL REMOVE`/`MONITOR O`), after which the
+  resolver may demote the empty X (ADR 0028 D1), X syncs from O, the roll finds O outdated and
+  hands over coordinated. Set once the gate's wait outlived `syncTimeout`, with one Warning
+  Event; from then `DeferredRequeueAfter` as `terminationWait` (`:2163-2183`): state kept,
+  Sentinel roll held (`dataTierHolding`), the pass continues to the split-brain check and the
+  status write. Phase without override: health-derived, `Syncing` and
+  `Ready=False/ReplicationSyncing` in every hold shape under Q2 = A (the second master is not a
+  synced replica); a second phase override beside `ReconcileBlocked` would be an ADR 0002
+  amendment for a shape `MultipleMasters`, `SplitBrainDetected` and this condition carry.
+  Cleared presence-guarded where the delete goes through and in `clearRollingUpdateState`;
+  `conditionRegistry` row, README condition row, [status.md](../operations/status.md) with
+  the repair, [rolling-updates.md](../operations/rolling-updates.md). The condition exports as
+  `vko_valkey_status_condition{condition="MasterHandoverStalled"}` (ADR 0021); a chart alert
+  row follows T23 Q2. Test past `syncTimeout`: state kept, condition True with the reason of
+  the cause, no `RollingUpdatePaused`, no delete, `DeferredRequeueAfter` without
+  `NeedsRequeue`, Sentinel roll held, one Warning Event; O dropping to 0 keys, O answering
+  replica, or the replica syncing gives the delete and the presence-guarded clear.
 
 ### Write fencing
 
 - **Independent:** the `WAIT` fixture above gets the real `ERR WAIT cannot be used with replica
   instances. ...` reply and a comment that any error reply blocks the promotion; assertion unchanged.
-- **(Q6 = refuse):** new ADR "the operator does not offer `min-replicas-to-write` as a CRD field",
-  index row, measurements and option 1's prerequisites as Alternatives, stating it does not protect
-  against T35's flush; re-open trigger: a user asks, runs `replicas >= 3` and Valkey 9 with Q1 = A.
-  If Q1 = B, one ADR with that fence. Rewrite this ticket's citations (ADR 0025 `:443-444`, ADR 0028
-  `:123`, `:230`, [pod_termination_test.go:257](../../internal/controller/pod_termination_test.go);
-  ADR 0026 `:206-208` may cite the ADR) until `git grep -n 'T12\|012-the-master-handover' -- ':!docs/tickets'`
+- **Q6 = refuse (decided 2026-09-28):**
+  [ADR 0038](../adr/0038-the-operator-does-not-offer-min-replicas-to-write.md) (written the
+  same day) carries the measurements, what the fence protects and what it does not, option 1's
+  design with the admission-or-runtime question as the alternative, and the three re-open
+  triggers. The ADR citations of this ticket are rewritten; the one left is the comment at
+  [pod_termination_test.go:257](../../internal/controller/pod_termination_test.go#L257), which
+  cites ADR 0038 instead, until `git grep -n 'T12\|012-the-master-handover' -- ':!docs/tickets'`
   is empty.
-- **(Q6 = build):** `spec.writeFencing` (name open), default off:
-  `enabled: false # default`, `minReplicas: 1 # example`, `maxLagSeconds: 10 # example, >= 1`.
-  Render both directives in the shared tail only when enabled (ADR 0005 D1); refuse
-  `minReplicas > replicas - 2` and `maxLagSeconds < 1` without rendering (Q7), covering Sentinel
-  with `replicas: 1`; parse and surface `slaveN` `state`/`lag` and `min_slaves_good_slaves`;
-  document the refused-write cost at the field (ADR 0005 D8 shape); a divergence-free promotion for
-  paths Q1 = A does not cover (`FAILOVER TO <host> <port>` exists on both pins) or that refusal in
-  writing; gate e2e writes on `waitForConnectedReplicas` (after T34). Unit: absent and disabled
-  byte-identical, enabled renders both bodies, invalid shapes render nothing, parser reads the new
-  fields. E2E both legs: a fenced 3-replica cluster rolls under the writer harness with no
-  acknowledged write lost.
 
 ## Open questions
 
 ### Q1: How should the roll's own Sentinel failover stop the outgoing master from acknowledging writes that are later discarded? (forced failover)
 
-Today O acknowledges writes for about 16 s after the promotion, all lost. No option changes crash
-failovers, the non-Sentinel path, the drain handler, pod templates or the CRD. Decide before Q6.
+Today O acknowledges writes for about 16 s after the promotion, all lost. No option changes
+crash failovers, the non-Sentinel path, the drain handler, pod templates or the CRD.
 
-- **A - `COORDINATED` on Valkey 9, forced as fallback (recommended).** M. 0 lost in eight runs, and
-  the second failover vanishes on Valkey 9 because O is a replica at once. A stalled `FAILOVER TO`
-  can block writes on O for up to the remaining 60 s `failover-timeout` (refused, not lost; not
-  measured); Valkey 8 keeps today's loss.
+- **A - `COORDINATED` on Valkey 9, forced as fallback (chosen).** M. 0 lost in eight runs, and
+  the second failover vanishes on Valkey 9 because O is a replica at once. The stall shape
+  blocks writes on O for up to `failover-timeout` (60 s; `CLIENT PAUSE WRITE` blocks, it does
+  not refuse), then aborts; a lost election costs the roll about 40 s through the existing
+  retry; Valkey 8 Sentinels, the 8 -> 9 upgrade roll included, keep today's loss.
 - **B - runtime `CONFIG SET min-replicas-to-write 1` on O before each trigger.** M. Both lines,
   still about 500 lost, the second failover untouched, a write to clear wherever O stays master;
   Sentinel's `CONFIG REWRITE` persists it, so a later crash failover can promote a pod refusing
-  every write. Shares one ADR with Q6's refusal.
+  every write.
 - **C - keep the loss and record its size.** S. Nothing changes at runtime.
+- **D - `FAILOVER TO <X>` from the operator straight to O, on both lines.** Rejected: O then
+  reports `role:slave`, Sentinel treats a master reporting replica as unreachable, marks it down
+  after 5 s and runs its own failover with its own selection, and converts an X reporting master
+  back as soon as O looks sane again. The non-Sentinel promotion fought against Sentinel, timing
+  unverified.
 
-A: 0 lost by one argument on a command already sent, no state to clear, and its fallbacks are
-exactly today's command; B can follow for the Valkey 8 residual.
-
-**Answer:** _open_
+**Answer:** A, 2026-09-28. 0 lost by one argument on a command already sent, no state to clear,
+and every fallback is exactly today's command: the error replies fall back at once, an `OK`
+whose election is lost falls back through `failoverRetryTimeout`. The price is 60 s of blocked
+writes in the stall shape instead of lost ones, and a roll that depends on ADR 0022's clean
+Sentinel table for the first time. Design and verification under Required changes.
 
 ### Q2: Which signal answers "every replica holds the dataset" at `CheckCluster`, the observer and `verifyNewMasterReady`? (sync checks)
 
 All three count attached replicas on the master, empty ones included. Not touched: the ADR 0007 D10
 promotion gates, the `replicas: 2` shape, the dataset veto (Q4).
 
-- **A - the replicas' full replication answer at all three sites (recommended).** M. The roll waits
-  for the resync before deleting O; `Syncing` and `Ready=False` during every replica full sync.
-- **D - A at the roll gate and the observer, C at `CheckCluster`.** Protects the delete; `Ready`
-  does not flap on an eviction but keeps reading ready about an empty replica.
-- **C - delete the terms, correct the records.** S, no behaviour change.
+- **A - the replicas' full replication answer at all three sites (chosen).** M. The roll waits
+  for the resync before deleting O; `Syncing` and `Ready=False/ReplicationSyncing` during every
+  replica full sync, after an eviction or a restart too, minutes on a large dataset;
+  `ValkeyPhaseNotOK` (`for: 30m`) fires only on a sync longer than that, which today never
+  fires.
+- **D - A at the roll gate and the observer, C at `CheckCluster`.** Protects the delete and keeps
+  `Ready` quiet by reading `True` about an empty replica.
+- **C - delete the terms, correct the records.** S, no behaviour change, the delete stays
+  unguarded.
 
-A: guards the one irreversible step with existing, tested code, and `Ready` reports the data plane
-as ADR 0002 D5a defines it, at no extra dial.
-
-**Answer:** _open_
+**Answer:** A, 2026-09-28. One predicate, `replicationNotEstablishedReason`, at every site that
+says "synced", and it is the one ADR 0007 D10 already prescribes; the gate in front of the one
+irreversible step gets the bounded wait the promotion gates have, at no extra dial; `Ready`
+becomes what [status.md](../operations/status.md) already states ("replicating": a replica in
+full sync is not, and `-r` routes reads to it because the probe asks `PING` only), and the CRD
+description of `replicaSyncFailure` becomes true. No opt-in (ADR 0005 D1): a status defect, not a
+feature. Q2 decides the predicate; what the gate's wait hands over to on expiry is Q5, and the
+gate lands with it. Design under Required changes.
 
 ### Q3: What does `forceReplicaConnections` do when X holds no keys and a pod it would re-point holds some? (re-pointing)
 
@@ -355,85 +433,110 @@ Decides whether ADR 0028's dataset rule binds this second `REPLICAOF` site. An X
 re-points everyone; a refused shape holds as two visible masters (`MultipleMasters`,
 `SplitBrainDetected` after 90 s), as ADR 0028 D3 and D8 accept.
 
-- **A - veto per target.** XS-S. An empty target still attaches, the gate passes, and the spared
-  holder is deleted one pass later.
-- **B - veto the whole call (recommended).** S. X empty or unreadable: count every other existing
+- **A - veto per target.** XS-S. An empty target still attaches, X gains a replica, the gate
+  passes on `connected_slaves >= 1` and under Q2 = A on "synced" to an empty master; only Q4
+  stands before the holder's delete, and an X with a replica satisfies any write fence (Q6).
+- **B - veto the whole call (chosen).** S. X empty or unreadable: count every other existing
   pod, non-Ready included; any holder or unreadable count sends nothing and logs once who holds
-  what. The no-replica branch then cycles every 90 s, and `replaceRemainingPods` waits for a replica
-  no longer sent.
+  what. X stays replica-less: the gate refuses on `connected_slaves == 0` as today, without Q4;
+  the no-replica branch cycles every 90 s (T23's cap), `MultipleMasters` at every boundary
+  pass, `SplitBrainDetected` after 90 s.
 
-B: A's progress is the failure, since the empty pod it re-points unlocks the delete of the holder it
-spared. Attaching by another route is Q4.
-
-**Answer:** _open_
+**Answer:** B, 2026-09-28. The same rule as ADR 0028 D1 at the second `REPLICAOF` site,
+fail-closed as D3; D1/D4 name the site, D3's "the divergence is bounded" no longer holds on the
+Sentinel path. Its honest size: B stops the flush by the operator, which is the only one left
+once Sentinel has forgotten O; the common route runs through Sentinel's own conversion 16 s after
+an empty promotion, and the fix for that lies before Q3: Q1 = A's coordinated first trigger
+cannot promote an empty X, the forced retrigger can, and its missing gates are T23's (its
+"T12's route"). The veto holds until the first `-rw` write reaches X, one cycle on a cluster with
+traffic, until a human on an idle one; its complement is a write fence on a replica-less master
+(Q6), which B composes with and A would defeat.
 
 ### Q4: What, beyond an attached replica, must hold before O is deleted on the Sentinel path? (delete)
 
-`:3034` is the last point where a data-holding O can be kept; the veto needs O's count only when X
+`:3141` is the last point where a data-holding O can be kept; the veto needs O's count only when X
 is empty.
 
-- **A - veto at this delete (recommended).** S. Refuse when X is empty and O holds keys or a count
-  is unreadable. The two masters of ADR 0028 D3 then last unbounded on this path, both behind `-rw`,
-  until Sentinel or a human resolves them or X gains keys; a non-Ready O is held while X is empty.
+- **A - veto at this delete (chosen).** S. Refuse when X is empty and the pod about to be deleted
+  holds keys or a count is unreadable, and while that pod still answers `master`. The two
+  masters of ADR 0028 D3 then last unbounded on this path, X alone behind `-rw` and O behind
+  `-r` (the labeler trusts Sentinel), until Sentinel or a human resolves them or the first write
+  on X lifts the veto; a non-Ready O is held while X is empty.
 - **B - veto at every roll delete** (`replaceNextReplica`, `deleteNextPendingPod` too). M. A master
-  `DBSIZE` before every replica delete, for pods whose keys the next sync discards anyway.
+  `DBSIZE` before every replica delete, and no shape in which deleting a replica discards the
+  only dataset: a replica holding data behind an empty master is flushed by it at the next link,
+  and only a promotion saves it, not a skipped delete.
 
-A: protects exactly the pod at risk, at the site ADR 0028 D8 names, independent of Q5.
-
-**Answer:** _open_
+**Answer:** A, 2026-09-28. The veto guards the pod at risk at the site ADR 0028 D8 names, for
+whichever outdated pod the loop reached (B's concern without B's cost), on both paths for free;
+the role precondition at the same delete removes the forced path's second failover and makes the
+comment at `:3126` true. Q4 decides the predicates; the hold's report and hand-over are Q5.
 
 ### Q5: What does a refused delete report and hand over to? (delete)
 
-ADR 0010 bounds every roll wait and forbids handing expiry to a cleared state. Before the bound a
-plain requeue, past it `DeferredRequeueAfter` (as `terminationWait`, `:2056-2076`), clocked by the
-sync-wait bound (`ensureSyncWaitTimestamp`), which Q2 = A arms in the same gate. The held state is
-`failover-triggered`, whose other arm calls `forceReplicaConnections`: a hold is only as safe as
-Q3 = B.
+ADR 0010 bounds every roll wait and forbids handing expiry to a cleared state. Since Q2 and Q4
+the gate holds for three reasons (a replica not synced, the dataset veto, the outgoing pod still
+`master`), all in `failover-triggered`, clocked by the sync-wait bound
+(`ensureSyncWaitTimestamp`, `syncTimeout`, default 5 min). Before the bound a plain requeue.
+The code has two shapes past a bound: the pause (`pauseRollingUpdate`, `:2726-2760`: state
+cleared, Sentinel roll released, repeats every `syncTimeout`) and the hold (`terminationWait`,
+`recreationWait`, `availabilityWait`: state kept, `DeferredRequeueAfter`, a condition, the pass
+continues). A hold is only as safe as Q3 = B, since the state's other arm calls
+`forceReplicaConnections`.
 
 - **A - pause like the manual path** (`waitOrPauseForReplicaSync`). XS. Clears the state against
-  ADR 0010, releases the Sentinel roll, repeats a Warning and phase `Error` every `syncTimeout` (T23).
+  ADR 0010, releases the Sentinel roll onto the spec the data tier is stuck on, and repeats: with O
+  still `master` the resolver refuses, O keeps `isMaster`, `replaceNextReplica` skips it,
+  `waitForReplicasReady` blocks, a Warning and phase `Error` every `syncTimeout` (T23).
 - **B - `RollingUpdatePaused` with a new reason.** S. The condition then means both "cleared and
-  retrying" and "held, never retrying".
-- **C - its own edge condition (recommended)**, for example `DatasetDeleteRefused` naming both pods
-  and counts, set past `syncTimeout` with one Warning Event, cleared presence-guarded where the
-  veto lets the delete through and in `clearRollingUpdateState`. S.
+  retrying" and "held, never retrying", while T23 Q1/Q2 re-decide what a pause leaves behind and
+  whether the chart alerts on it.
+- **C - its own edge condition (chosen).** S. One condition for the handover hold, a reason per
+  cause.
 
-C: one meaning per condition, like the three `...Stalled` conditions, for one registry row more
-than B.
-
-**Answer:** _open_
+**Answer:** C, 2026-09-28. `MasterHandoverStalled`, in the `...Stalled` family, the
+`terminationWait` shape: edge, one evaluator, three reasons, `DeferredRequeueAfter` past
+`syncTimeout`, state and Sentinel roll held, one Warning at the set (this hold replaces a pause
+at this gate and every pause emits one; the three `...Stalled` are silent because their subject
+shows in `kubectl get pods`, a dataset veto shows nowhere else), phase health-derived without an
+override, cleared at the delete that goes through and in `clearRollingUpdateState`, the repair
+in the message and in `status.md`. A precedent for T23 Q1: a hold that keeps its state. Design
+under Required changes.
 
 ### Q6: Does the operator offer `min-replicas-to-write` as an opt-in CRD field, or refuse it in an ADR? (write fencing)
 
 A fence stops the replica-less side of a split from taking writes, but refuses writes at every
 failover with full-resyncing replicas and turns degraded states into unexplained write outages.
-Decided after Q1. A generic `spec.extraConfig` is no option (it would expose `replicaof`, `save`,
-TLS).
+A generic `spec.extraConfig` is no option (it would expose `replicaof`, `save`, TLS). What the
+fence still protects after Q1-Q5: the Valkey 8 forced-failover residual on a tier of three or
+more (16 s to about 1-2 s, since Sentinel re-points the third replica within seconds and O then
+refuses; a 2-pod tier cannot be fenced under `minReplicas <= replicas - 2`); the Q3/Q4 hold,
+where a replica-less X refuses writes, stays empty and keeps the veto standing until a human
+instead of one cycle; the steady-state splits of ADR 0028 D3. What it costs when opted in: at
+least 5 s of refused writes per controlled failover on Valkey 8 Sentinel clusters and on the
+non-Sentinel path under load, an unmeasured few seconds of `NOREPLICAS` after a coordinated
+failover (X has no good replica until O and R attach with lag under `max-lag`), degraded states
+as write outages the status cannot explain without parsing `slaveN` lag and
+`min_slaves_good_slaves`, a stalled link leaking `max-lag` plus one cron tick, `max-lag 0`
+switching off silently. No protection against T35's flush (a full sync is not a write) nor for
+the side that keeps a replica.
 
-- **Option 1 - build `spec.writeFencing`.** L. Protects refused-demotion windows and steady-state
-  splits when opted in; at least 5 s of refused writes per controlled failover on Valkey 8 Sentinel
-  clusters and on the non-Sentinel path under load.
-- **Option 2 - refuse it in an ADR (recommended).** S. Nothing changes at runtime.
+- **Option 1 - build `spec.writeFencing`.** L. CRD field, admission or runtime refusal, render,
+  parser, condition, observer, docs, e2e under the writer harness on both legs, plus the
+  recurring cost above for every cluster that opts in.
+- **Option 2 - refuse it in an ADR (chosen).** S. Nothing changes at runtime.
 
-Option 2: nobody has asked, option 1 is L with a recurring cost, and beyond Q1 = A it adds only the
-refused-demotion windows, bounded by ADR 0010 and reported as `MultipleMasters`. If Q1 = C, option 1
-is the only protection of the ADR 0025 D9 window and this has to be redone.
-
-**Answer:** _open_
-
-### Q7: Only if Q6 = build: is `minReplicas <= replicas - 2` / `maxLagSeconds >= 1` enforced at admission or at runtime? (write fencing)
-
-CEL is available ([valkey_types.go:541-542](../../api/v1/valkey_types.go)) and the CRD ships with
-the chart.
-
-- **Admission (CEL):** invalid specs never arrive, but a later scale-down below `minReplicas + 2` is
-  refused too, against the `podDisruptionBudget.maxUnavailable` precedent
-  ([valkey_types.go:775-779](../../api/v1/valkey_types.go)).
-- **Runtime:** nothing rendered; a `WriteFencingNotApplied` condition and a Warning Event report it.
-
-No option is recommended.
-
-**Answer:** _open_
+**Answer:** Option 2, 2026-09-28. Q1 = A removes the loss on Valkey 9; what remains for a fence
+is a residual on a line the upgrade path leaves and that no cluster keeps past its first roll
+under a Valkey 9 Sentinel, a narrow shape Q5 now reports with its repair and in which Q3 = B
+keeps the operator itself from the flush, and ADR 0028's accepted windows. Against that,
+seconds of `NOREPLICAS` on every failover for every opted-in cluster and an L nobody asked for;
+ADR 0005 D1 makes a feature opt-in, built and kept it has to be regardless. ADR 0038 records the
+measurements, the limits, option 1's design (the admission-or-runtime question of the former Q7
+included) and three re-open triggers: a user on Valkey 8 with `replicas >= 3` who cannot move
+to 9; `MasterHandoverStalled/DatasetWouldBeDiscarded` seen in the field; a non-Sentinel split
+diverging beyond ADR 0028's bound. Q7 (admission or runtime) is closed with it and lives in
+that ADR's alternative.
 
 ## Not verified
 
@@ -442,27 +545,37 @@ No option is recommended.
 - The second failover on Kubernetes and 8.1.9, and whether the sidecar's role read beats the Valkey
   container's SIGTERM (no `preStop` on Sentinel clusters,
   [statefulset.go:746-749](../../internal/builder/statefulset.go#L746-L749)).
-- For Q1 = A: TLS replication, two Sentinels, no majority, a stalled `FAILOVER TO`.
+- Q1 = A on Kubernetes: the address chain, TLS replication, three Sentinels with an election,
+  two Sentinels, no majority, a stalled `FAILOVER TO`; the docker runs are the only measurement.
 - What a replica in `wait_bgsave` serves, and what Sentinel promotes if X fails then.
-- Under Q2 = A, whether the sync-wait annotation is clear on entering `replaceRemainingPods`.
+- With Q2 = A, whether the sync-wait annotation is clear on entering `replaceRemainingPods`;
+  how long real full syncs take on a fleet, so how long `Ready` reads `ReplicationSyncing`;
+  whether the third replica resyncs partially after a coordinated failover (read from PSYNC2:
+  O paused before the handover and X caught up; the gate needs the check for a mid-roll
+  eviction or restart regardless).
 - The re-pointing and delete paths end to end (read only); how often X is empty while O holds data;
   persistence on a PVC (docker only).
-- The `status.phase` of a held pass (`updateHAStatus`,
-  [valkey_controller.go:2427](../../internal/controller/valkey_controller.go#L2427)); whether the
-  non-Sentinel `replaceRemainingPods` can delete a holder behind an empty master.
+- The `status.phase` of a held pass is health-derived by design (Q5): `Syncing` in every hold
+  shape under Q2 = A, read off `updateHAStatus`
+  ([valkey_controller.go:2427](../../internal/controller/valkey_controller.go#L2427)), not
+  measured. The repair path of `MasterHandoverStalled` (Sentinel pointed at O, X demoted, roll
+  resumed) is read along the resolver, the roll and Q1 = A, not driven. Whether the non-Sentinel
+  `replaceRemainingPods` could delete a holder behind an empty master is not measured; with
+  Q4 = A the veto runs on that path too.
 - Fencing: survivor lag measured once on 9.1.1; whether the diverging side in ADR 0028's windows is
-  the replica-less one.
+  the replica-less one; how long `NOREPLICAS` lasts after a coordinated failover.
 
 ## Related
 
 - T34: the e2e reply check the writer harness and Q6 option 1 need.
 - T40: item (b), the non-Sentinel counterpart of the lossless-text rewording.
 - T35: shortens how long `-rw` routes to O; its flag-aware `-rw` fence was left here, no option takes it up.
-- T23: `resetSentinelState` at `:3161` resets toward X without asking for keys; Q1 = A's fallback runs through it.
+- T23: `resetSentinelState` at `:3268` resets toward X without asking for keys; Q1 = A's fallback runs through it.
 - T23: the uncapped reset-and-retrigger cycle, a route to an empty X; edits the same comment lines.
 - T35: a non-persistent promoted pod restarting empty; fencing does not protect against its flush.
 - T35: the probe passing on `LOADING`.
-- T23: rests on `AllSynced` counting a mid-sync replica; Q5 option A inherits its missing pause record.
-- T18: its option B assumes `True/HAClusterReady` between replacements, false under Q2 = A.
+- T23: rests on `AllSynced` counting a mid-sync replica; its Q1 (what a pause leaves behind) has
+  this ticket's Q5 hold as a precedent, its Q2 decides the alert row for `MasterHandoverStalled`.
+- T18: its option B assumes `True/HAClusterReady` between replacements, false with Q2 = A.
 - T40: counts this ticket's citations outside `docs/tickets/` and the three T32 citations.
 - Origin: [archive/039](archive/039-findings-from-the-1-11-0-fleet-rollout.md) (T4/T11 analysis).

@@ -87,6 +87,8 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0026](0026-a-pod-being-deleted-is-not-available.md) | A pod being deleted is not available — readiness answers reachability, never spendability | Implemented |
 | [0028](0028-a-demotion-may-not-discard-the-only-dataset.md) | A demotion may not discard the only dataset — the roll resolver gets the drain stamp and a key-count veto | Implemented |
 | [0029](0029-a-name-is-not-a-component.md) | A name is not a component — the tier is passed, never parsed | Implemented |
+| [0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) | The master handover loses no acknowledged write and no dataset — a coordinated failover, the replica-side predicate and the key-count veto before the delete, the veto at every `REPLICAOF`, a held handover | Not built |
+| [0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) | The operator does not offer `min-replicas-to-write` as a CRD field | Implemented, except the `WAIT` fixture and the e2e reply check its D4 names |
 
 ### Security and API surface
 

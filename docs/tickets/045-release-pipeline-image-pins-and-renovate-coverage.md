@@ -391,4 +391,4 @@ correction is dropped (change 11 stays) and this alone would be `later`, while t
 - T50 - its no-own-ACL-user argument holds only against a compromised operator image, which this
   hardens; under its options every exporter bump re-checks the ACL command set (change 12 catches it).
 - T55 - if a `Localhost` seccomp profile ships (its option B), every exporter bump re-validates it.
-- T30 - embargoed security finding.
+- T30 - embargoed security finding, dropped.
