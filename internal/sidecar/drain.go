@@ -348,9 +348,11 @@ func (d *DrainHandler) signalDrainComplete(log drainLog) {
 	log.Info("drain complete, released the Valkey container", "path", path)
 }
 
-// isSyncedReplica returns true if the replication info indicates a fully synced replica.
+// isSyncedReplica returns true if the replication info indicates a fully synced
+// replica: the operator's predicate, asked of the replica itself
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2).
 func isSyncedReplica(info *valkeyclient.ReplicationInfo) bool {
-	return info.Role == valkeyRoleSlave && info.MasterLinkStatus == "up" && !info.MasterSyncInProgress
+	return info.NotEstablishedReason() == ""
 }
 
 // reconfigureReplicas sends REPLICAOF to all remaining replicas so they follow

@@ -59,7 +59,7 @@ func TestFindMaster_ProbesPodsConcurrently(t *testing.T) {
 	checker := router.install(newFakeChecker(runningTestPods(5)...))
 
 	start := time.Now()
-	podName, addr, err := checker.findMaster(ctx, v, "", nil)
+	podName, addr, _, err := checker.findMaster(ctx, v, "", nil)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
@@ -82,7 +82,7 @@ func TestFindMaster_SlowPodDoesNotHideAFastMaster(t *testing.T) {
 	router.serve(t, "test-1", answers(replicaInfo()))
 	router.serve(t, "test-2", answersAfter(probeDelay, masterInfo(2)))
 
-	podName, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
+	podName, _, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, "test-2", podName,
@@ -109,7 +109,7 @@ func TestFindMaster_TiedMastersResolveToTheLowestOrdinal(t *testing.T) {
 		router.serve(t, "test-1", answersAfter(20*time.Millisecond, masterInfo(1)))
 		router.serve(t, "test-2", answers(masterInfo(1)))
 
-		podName, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
+		podName, _, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
 
 		require.NoError(t, err)
 		require.Equal(t, "test-1", podName,
@@ -129,7 +129,7 @@ func TestFindMaster_MoreSlavesStillWins(t *testing.T) {
 	router.serve(t, "test-1", answers(replicaInfo()))
 	router.serve(t, "test-2", answers(masterInfo(2)))
 
-	podName, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
+	podName, _, _, err := router.install(newFakeChecker(runningTestPods(3)...)).findMaster(ctx, v, "", nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, "test-2", podName,
@@ -154,7 +154,7 @@ func TestFindMaster_ConcurrentProbesAreRaceFree(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			podName, _, err := checker.findMaster(ctx, v, "", nil)
+			podName, _, _, err := checker.findMaster(ctx, v, "", nil)
 			assert.NoError(t, err)
 			assert.Equal(t, "test-4", podName, "the master with the most replicas wins in every pass")
 		}()

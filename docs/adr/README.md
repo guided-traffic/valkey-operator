@@ -41,7 +41,8 @@ built, or supersedes a rule, updates the row's *State* with it.
 ## Index
 
 Every record here is **Accepted**. Rules superseded by a later decision: D9 of ADR 0013 by
-ADR 0032, and its D12, D13 and the first half of its D14 by ADR 0036; D7 of ADR 0020 by that
+ADR 0032, its D12, D13 and the first half of its D14 by ADR 0036, and parts of its D7 and D6 of
+ADR 0018 by ADR 0039; D7 of ADR 0020 by that
 record's own amendment of 2026-08-22. A part of a rule that a later amendment replaced is struck
 through in place in its record and not listed here. The *State* column is the coarse build state
 as of 2026-09-27, on the uncommitted working tree of the `feat/rootless` branch:
@@ -87,12 +88,14 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0026](0026-a-pod-being-deleted-is-not-available.md) | A pod being deleted is not available — readiness answers reachability, never spendability | Implemented |
 | [0028](0028-a-demotion-may-not-discard-the-only-dataset.md) | A demotion may not discard the only dataset — the roll resolver gets the drain stamp and a key-count veto | Implemented |
 | [0029](0029-a-name-is-not-a-component.md) | A name is not a component — the tier is passed, never parsed | Implemented |
+| [0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) | The master handover loses no acknowledged write and no dataset — a coordinated failover, the replica-side predicate and the key-count veto before the delete, the veto at every `REPLICAOF`, a held handover | Implemented |
+| [0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) | The operator does not offer `min-replicas-to-write` as a CRD field | Implemented |
 
 ### Security and API surface
 
 | ADR | Decision | State |
 |---|---|---|
-| [0013](0013-operator-is-cluster-wide-privileged.md) | The operator is a cluster-wide privileged component | Implemented; D9 superseded by ADR 0032, D12, D13 and the first half of D14 by ADR 0036 |
+| [0013](0013-operator-is-cluster-wide-privileged.md) | The operator is a cluster-wide privileged component | Implemented; D9 superseded by ADR 0032, D12, D13 and the first half of D14 by ADR 0036; D7 re-decided by ADR 0039 |
 | [0014](0014-rbac-lives-in-three-places.md) | RBAC lives in three places, and drift is guarded by a test and a CI job | Implemented |
 | [0015](0015-one-crd-validated-by-schema-only.md) | One CRD, validated by schema only — no admission webhook | Implemented |
 | [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture | Implemented |
@@ -101,6 +104,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) | A per-pod record the operator trusts lives in pod spec, not pod metadata — a pod can patch its own metadata | Implemented, except `config-hash` and `pod-spec-hash`, which D6 leaves in pod metadata as a follow-up, not a non-goal |
 | [0032](0032-generated-pods-run-rootless.md) | Generated pods run rootless, and existing clusters move with the operator upgrade | Implemented |
 | [0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) | Generated pods take a seccomp profile and an opt-in user namespace, and the operator's own pods carry the same posture | Implemented |
+| [0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) | A NetworkPolicy this repository ships admits only the components this repository deploys — no client, no scraper, no namespace-wide or any-source rule; outside access is the administrator's | Implemented for the generated policies; D4 (a chart policy for the operator pod) open |
 
 ### Process
 
@@ -110,7 +114,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0018](0018-metrics-and-the-exporter-sidecar.md) | Metrics — an opt-in exporter sidecar, and the operator's own endpoint | Implemented |
 | [0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) | Export per-resource state as metrics, because the only alertable signal could not name a resource | Implemented |
 | [0034](0034-tickets-are-work-lists-that-get-archived.md) | Tickets are work lists that get archived, and an open security finding is embargoed | Implemented, except D7: the ticket citations that predate it stay until they are rewritten, by decision |
-| [0035](0035-the-readme-advertises-the-reference-lives-under-docs.md) | The README advertises the operator and carries the reference; the explanations live under `docs/` | Implemented, except D3's operations page for `spec.networkPolicy` and a reference for the operator's command-line flags |
+| [0035](0035-the-readme-advertises-the-reference-lives-under-docs.md) | The README advertises the operator and carries the reference; the explanations live under `docs/` | Implemented, except a reference for the operator's command-line flags |
 | [0036](0036-the-security-architecture-is-one-page-per-perspective.md) | The security architecture is one page per perspective | Implemented |
 
 ## Related documents

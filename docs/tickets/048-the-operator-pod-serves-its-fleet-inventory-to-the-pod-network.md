@@ -4,7 +4,7 @@ title: the operator pod serves its fleet inventory on :8080 to the whole pod net
 state: analysed       # facts verified, every decision carries a coherent option set
 severity: low         # disclosure of names and health, no Secret material, no write path
 security: hardening
-threat: "would additionally cover any client that can route to the operator pod, outside a configured peer list, and reads :8080/metrics: today it gets, without credentials, the vko_valkey_* series that name every Valkey resource by namespace and name, with its health; :8081 (answers only 'ok') and the operator's egress are deliberately not covered"
+threat: "would additionally cover any client that can route to the operator pod, outside the policy the administrator adds for their scraper (ADR 0039), and reads :8080/metrics: today it gets, without credentials, the vko_valkey_* series that name every Valkey resource by namespace and name, with its health; :8081 (answers only 'ok') and the operator's egress are deliberately not covered"
 urgency: later        # rule 4: the off switch, the default-off policy template and the wording fixes are cheap known fixes
 effort: S             # with the recommended options; M if the enforcement check needs a local-only gate, M to L if Q4 takes B
 blocked-by: decision  # Q1 to Q4; the wording fixes are not blocked
@@ -125,17 +125,15 @@ no policy changes anything.
 
 1. One render-refusal helper in `_helpers.tpl` for the three metrics values
    `metrics.service.enabled`, `metrics.serviceMonitor.enabled` and
-   `metrics.prometheusRule.enabled`: it fails the render when the endpoint is off (Q1 = 1D) or
-   when the policy is on with an empty peer list (Q2 = A).
-2. The policy's `metrics` rule is omitted when the endpoint is off (Q1 = 1D and Q2 = A).
-3. One documentation pass naming both new values (Q1, Q2): README
+   `metrics.prometheusRule.enabled`: it fails the render when the endpoint is off (Q1 = 1D).
+2. One documentation pass naming both new values (Q1, Q2): README
    [Helm chart values](../../README.md#helm-chart-values) rows, H-13 and H-14, the `values.yaml`
    comment lines 106–111, [monitoring.md](../operations/monitoring.md) lines 82–84, ADR 0021 lines
    155–157, ADR 0018 D9 and its Consequences bullet "no chart value changes that" (lines 148–150,
    false under either value), and
    [ADR 0033](../adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
    lines 714–716 (lists the policy as open).
-4. Render tests, hand-run `helm template` until T43 gates the chart, then added to its matrix:
+3. Render tests, hand-run `helm template` until T43 gates the chart, then added to its matrix:
    default values render byte-identical to today with no policy; each value on renders what its
    part below names; every refusal case fails the render, one case each. Revert check: removing
    one refusal lets its case render.
@@ -165,29 +163,33 @@ no policy changes anything.
 
 **Operator-namespace NetworkPolicy (Q2 = A)**
 
+[ADR 0039](../adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)
+decides what such a policy may admit: only traffic between components this repository deploys,
+and none of them connects to the operator pod — so it admits nothing but the node, and a scraper
+of `:8080` is admitted by a policy the administrator writes.
+
 - `templates/networkpolicy.yaml`, default off, one NetworkPolicy in the release namespace:
-  `podSelector` = the chart selector labels (no `component` exclusion: a `podLabels` entry could
-  take the operator pod out of its own policy), `policyTypes: [Ingress]`.
-- Rule on named port `metrics` with `from` = a user-supplied `NetworkPolicyPeer` list (`toYaml`,
-  so pod selectors, namespace selectors and `ipBlock` fit). An empty list omits the rule, never
-  `from: []`.
-- Rule on named port `health` with no `from`, so the liveness of the single reconciler does not
-  depend on how a CNI implements the node allowance.
-- Values named so they read as the operator pod's policy, for example
-  `operatorNetworkPolicy.enabled` (default `false`) and `operatorNetworkPolicy.metricsFrom`
-  (default `[]`).
-- The template leaves the Deployment pod template untouched, so enabling it restarts nothing;
-  the render test asserts the Deployment byte-identical either way and exactly one policy with
-  the value on.
+  `podSelector` on a label only the operator pod carries (ADR 0039 D2 has the chart add one, the
+  hook pod shares the selector labels), `policyTypes: [Ingress]`, **no rule** — no `metrics` peer
+  list, no rule on `health`: kubelet's probes come from the node, which the API admits
+  (ADR 0039 D2, and its Residual risks for CNIs that do not).
+- Value named so it reads as the operator pod's policy, for example
+  `operatorNetworkPolicy.enabled` (default `false`); no peer-list value (ADR 0039 D3).
+- The template leaves the Deployment pod template untouched apart from ADR 0039's label, so
+  enabling it restarts nothing; the render test asserts the Deployment byte-identical either way
+  and exactly one policy with the value on.
+- Docs: with the policy on, the chart's Service and ServiceMonitor reach `:8080` only through the
+  administrator's own policy; the `values.yaml` comment and [monitoring.md](../operations/monitoring.md)
+  say so and show the example ADR 0039 D3 asks for.
 - H-14 ([`operator-pod-posture.md`](../security/operator-pod-posture.md) lines 100–105) states
   that egress is deliberately not filtered (the RBAC reason); H-13's mitigation sentence (lines
   97–98) names the value.
-- ADR: amend ADR 0013 D7 or write a new ADR (plus index line) recording the default-off policy,
-  the refusal of egress filtering (RBAC reason), the refusal of a default-on policy (ADR 0018 D9
-  calls the open endpoint posture), and the robustness reason for open health ports.
-- (Q3) The enforcement check: on an enforcing CNI, a non-hostNetwork pod outside the peer list
-  is refused on `:8080`, a listed pod is answered, with an empty list no pod reaches `:8080`, an
-  e2e Valkey resource reaches `OK`, and `helm upgrade` completes its pre-upgrade hook.
+- ADR: extend ADR 0039 D4 with the chart's answer, and record there the refusal of egress
+  filtering for the operator pod (the RBAC reason) and of a default-on policy.
+- (Q3) The enforcement check: on an enforcing CNI, a non-hostNetwork pod is refused on `:8080`
+  and `:8081` with the policy on, a pod the administrator's additional policy admits is answered
+  on `:8080`, an e2e Valkey resource reaches `OK`, and `helm upgrade` completes its pre-upgrade
+  hook.
 
 ## Open questions
 
@@ -219,18 +221,20 @@ ServiceMonitor renders cleanly, scrapes nothing and fires `ValkeyMetricsAbsent` 
 
 ### Q2: Should the chart offer the operator pod's NetworkPolicy as a template, or only document an example? (operator-namespace NetworkPolicy)
 
-The operator pod needs no ingress besides kubelet, so a policy restricting `:8080` to listed
-scrapers costs reconciling nothing. The question is who writes and maintains the selector.
+The operator pod needs no ingress besides kubelet, which comes from the node, so under
+[ADR 0039](../adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) a
+policy for it admits nothing and every scraper of `:8080` needs the administrator's own policy.
+The question is who writes and maintains the selector of the operator pod.
 
-- **A - ingress-only chart template, default off (recommended).** As in Required changes. Cost
-  S; the selector is the chart's own and the render refuses combinations that would break
-  scraping.
+- **A - ingress-only chart template, default off, admitting nothing (recommended).** As in
+  Required changes. Cost S; the selector is the chart's own and cannot drift from the Deployment.
 - **C - documented example under `docs/operations/`, no template.** Cost XS. The copied selector
-  depends on `nameOverride` and the release name and fails open silently when it stops matching;
-  nothing refuses a scraper without a peer, and no render checks the snippet.
+  depends on `nameOverride` and the release name and fails open silently when it stops matching,
+  and no render checks the snippet.
 
 A is recommended because it closes H-14's `:8080` exposure from the chart with a selector that
-cannot drift from the Deployment, for one template, two values and three checks more than C.
+cannot drift from the Deployment, for one template and one value more than C; what it no longer
+offers — a peer list for the scraper — ADR 0039 D3 leaves to the administrator.
 
 **Answer:** _open_
 

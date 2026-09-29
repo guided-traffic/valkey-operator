@@ -1299,15 +1299,24 @@ func TestE2E_TLS_HAClusterWithSentinel(t *testing.T) {
 	})
 
 	t.Run("Wait for TLS replication sync", func(t *testing.T) {
+		// Asked of each replica, not of the master: a master never reports
+		// master_sync_in_progress, and connected_slaves counts a replica from its
+		// sync request on, so the master's reply could not tell a full sync from a
+		// finished one (ADR 0037 D2).
 		require.Eventually(t, func() bool {
-			info := tc.valkeyTLSExec(t, ns, masterPod, tlsValkeyPort, "INFO", "replication")
-			// All replicas should be synced (offset lag should be small).
-			if !strings.Contains(info, "connected_slaves:2") {
-				return false
+			for i := 0; i < 3; i++ {
+				pod := fmt.Sprintf("%s-%d", name, i)
+				if pod == masterPod {
+					continue
+				}
+				info := tc.valkeyTLSExecAllowError(t, ns, pod, tlsValkeyPort, "INFO", "replication")
+				if !strings.Contains(info, "role:slave") || !strings.Contains(info, "master_link_status:up") ||
+					strings.Contains(info, "master_sync_in_progress:1") {
+					return false
+				}
 			}
-			// Verify no sync is in progress.
-			return !strings.Contains(info, "master_sync_in_progress:1")
-		}, 60*time.Second, 2*time.Second, "Replication sync over TLS should complete")
+			return true
+		}, 60*time.Second, 2*time.Second, "every replica should report its sync over TLS as complete")
 	})
 
 	t.Run("Verify replicated data on replica 1 over TLS", func(t *testing.T) {

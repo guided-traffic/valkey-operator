@@ -359,6 +359,20 @@ covered by the nudge ([ADR 0003](0003-nudge-a-short-of-pods-statefulset.md)) ins
 Naming the boundary prevents the recurring expectation that the condition explains
 every stall.
 
+*Amended 2026-09-28:* one operator refusal that is not a write of its own is now covered —
+a pod under a generated ordinal name (`<cr>-N`, `<cr>-sentinel-N`) that the StatefulSet did
+not create. The rolling update refuses to touch it and holds
+([ADR 0020](0020-write-only-what-the-operator-owns.md) D9,
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11), and a report-only resource
+step, `reportPodNameCollision`, carries the collision to `ReconcileBlocked=True/ForeignObject`
+through the single evaluator (`setReconcileBlockedCondition` over the joined
+`reconcileResources` error), so the critical `ValkeyReconcileBlocked` alert sees it. The step
+reads the ordinal range of each applicable tier, treats a foreign or absent StatefulSet as
+absent, and returns a read error other than NotFound so the evaluator cannot clear a standing
+report on a pass that measured nothing (ADR 0027). This is a report the operator produces from
+its own reconcile, not a claim that the pod's *creation* is the operator's write; the boundary
+D13 draws around StatefulSet-owned pod creation is unchanged.
+
 **D14 — Condition messages are truncated at 1024 runes, keeping the front.**
 `truncateConditionMessage` appends a literal `...` to the cut, so a truncated message is
 stored at 1027 runes; `conditionMessageLimit` bounds the copied error, not the field. The
@@ -487,7 +501,10 @@ after that.
   `ReconcileBlocked` condition; the operator cannot write through an admission block,
   so no guard would change the outcome.
 * A user reading only `ReconcileBlocked` cannot see a blocked **pod** creation (D13);
-  that path is visible as a short-of-pods StatefulSet plus the nudge.
+  that path is visible as a short-of-pods StatefulSet plus the nudge. Since 2026-09-28 one
+  pod-related refusal *is* on the condition — a pod under a generated ordinal name the
+  StatefulSet did not create, reported by `reportPodNameCollision` (D13 amendment) — but that
+  is the operator refusing to touch a colliding pod, not a rejected pod creation.
 * **`readyReplicas` still cannot trigger a status write on its own** (D5, amended).
   Deliberately not fixed with `observerReady`: the field is masked by the fact that ~~every
   branch's phase message is a function of the ready count, so it rides along on every pass

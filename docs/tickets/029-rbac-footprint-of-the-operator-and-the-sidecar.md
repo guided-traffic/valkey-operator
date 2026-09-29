@@ -73,7 +73,12 @@ itself, [`drain.go:415-422`](../../internal/sidecar/drain.go#L415-L422)).
   pod only on its next data-tier pass via `podImageChanged`
   ([`rolling_update.go:485-500`](../../internal/controller/rolling_update.go#L485-L500)), except
   where [ADR 0007](../adr/0007-failover-aware-rolling-update.md) D6 defers a sidecar-only change. A
-  swapped init-container image is latent until the pod sandbox is recreated.
+  swapped init-container image is latent until the pod sandbox is recreated. Since 2026-09-28
+  both tiers compare every container and init-container image against the persisted template
+  (`podImagesDrifted`, [ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2), so a swapped
+  `exporter` or init-container image is rolled away by the next data-tier pass — except on a
+  single-replica non-persistent cluster, where a swap that also moves the sidecar image is
+  deferred with it (D6).
 - A finalizer blocks deletion, reported only as `PodTerminationStalled` after 2 min
   ([`rolling_update.go:120`](../../internal/controller/rolling_update.go#L120)).
 - Deleting `pod-spec-hash` reduces `podSpecHashChanged` to a resources comparison, deleting

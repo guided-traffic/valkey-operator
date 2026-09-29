@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -59,6 +60,9 @@ type operatorFlags struct {
 	// allowedSeccompLocalhostProfiles is the comma-separated allow-list of Localhost
 	// seccomp profiles a Valkey resource may name (ADR 0033 D9).
 	allowedSeccompLocalhostProfiles string
+	// operatorPodSelector is the key=value list that selects the operator pod alone
+	// in its namespace, its peer in the generated NetworkPolicies (ADR 0039 D2).
+	operatorPodSelector string
 }
 
 // bindOperatorFlags declares the operator flags on fs and returns the struct
@@ -82,6 +86,10 @@ func bindOperatorFlags(fs *flag.FlagSet) *operatorFlags {
 			"directory, that a Valkey resource may name in spec.podSecurity.seccompProfile. Empty "+
 			"refuses every Localhost profile: the operator does not write a workload naming one, "+
 			"because a profile that allows every syscall is as good as no filter.")
+	fs.StringVar(&f.operatorPodSelector, "operator-pod-selector", "",
+		"Comma-separated key=value labels that select the operator pod alone in its namespace "+
+			"(POD_NAMESPACE). The generated NetworkPolicies admit the operator as that pod; empty, "+
+			"or without POD_NAMESPACE, they admit no operator.")
 
 	return f
 }
@@ -110,7 +118,8 @@ func managerOptions(f *operatorFlags) ctrl.Options {
 }
 
 // newReconciler builds the Valkey reconciler from the manager and the parsed flags.
-func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string) *controller.ValkeyReconciler {
+func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string,
+	operatorPodLabels map[string]string) *controller.ValkeyReconciler {
 	return &controller.ValkeyReconciler{
 		Client:                  mgr.GetClient(),
 		APIReader:               mgr.GetAPIReader(),
@@ -118,6 +127,7 @@ func newReconciler(mgr ctrl.Manager, f *operatorFlags, operatorNamespace string)
 		Recorder:                mgr.GetEventRecorder("valkey-operator"),
 		OperatorImage:           f.operatorImage,
 		OperatorNamespace:       operatorNamespace,
+		OperatorPodLabels:       operatorPodLabels,
 		OperatorVersion:         version,
 		MaxConcurrentReconciles: f.maxConcurrentReconciles,
 
@@ -171,8 +181,17 @@ func main() {
 	}
 
 	operatorNamespace := os.Getenv("POD_NAMESPACE")
+	operatorPodLabels, err := labels.ConvertSelectorToLabelsMap(flags.operatorPodSelector)
+	if err != nil {
+		setupLog.Error(err, "invalid --operator-pod-selector")
+		os.Exit(1)
+	}
+	if operatorNamespace == "" || len(operatorPodLabels) == 0 {
+		setupLog.Info("POD_NAMESPACE or --operator-pod-selector is unset: the generated NetworkPolicies " +
+			"admit no operator, so where they are enforced the operator cannot reach the pods")
+	}
 
-	if err = newReconciler(mgr, flags, operatorNamespace).SetupWithManager(mgr); err != nil {
+	if err = newReconciler(mgr, flags, operatorNamespace, operatorPodLabels).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Valkey")
 		os.Exit(1)
 	}

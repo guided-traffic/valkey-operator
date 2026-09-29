@@ -111,7 +111,12 @@ migration runs (ADR 0032 D2, D4).
   (a node reboot, say), so the repair runs again there as root with `CAP_CHOWN`, finding
   nothing left to re-own; and `spec.initContainers[*].image` stays writable by a pod update
   like the container images ([isolation and tenancy](isolation-and-tenancy.md#what-does-not-hold)), so a stolen sidecar token can point that root
-  container at an image of its choice for its next run. Neither was measured. No root process
+  container at an image of its choice for its next run. Neither was measured. (This pod is
+  already outdated for carrying the repair at all, so the second roll replaces it regardless of
+  the image; and since 2026-09-28 an image swapped onto an init container the template does
+  carry — `check-data-writable`, `init-config-selector` — is caught by the widened image
+  comparison and replaced by the ordinary data-tier roll,
+  [ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2.) No root process
   runs in a pod created after the template dropped the repair, so once a tier's second roll
   completes none of its pods carries a root container. Unit-tested
   (`TestReconcileStatefulSet_RepairComesAndGoesAndTheRetiredRepairRolls`,

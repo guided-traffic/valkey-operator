@@ -35,11 +35,17 @@ chooses is [seccomp profiles](seccomp-profiles.md).
   E2E legs green on `e6a9d7c`, only the user-namespace subtest skipped there)*. A user namespace
   is opt-in per Valkey resource and off by default ([user namespaces](user-namespaces.md)).
 - `spec.networkPolicy.enabled` writes ingress-only NetworkPolicies
-  ([`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go)):
-  the data port accepts traffic from Valkey pods, Sentinel pods, observer pods and
-  **the operator namespace** (matched by `kubernetes.io/metadata.name`); the
-  sidecar health port and the exporter port are open to everyone, because kubelet
-  probes come from the node and Prometheus is not locatable from the CR.
+  ([`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go)) that admit
+  only the components the operator deploys
+  ([ADR 0039](../adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)):
+  the data and Sentinel ports accept traffic from the resource's own data, Sentinel and observer
+  pods and from **the operator pod** — its namespace and a pod selector that matches it alone,
+  in one peer. The sidecar health, exporter and observer ports get no rule: kubelet's probes
+  come from the node, and a scraper or an application client is admitted by a policy the
+  administrator writes ([network-policy.md](../operations/network-policy.md)). Turning the
+  policies off deletes the ones the resource owns. *(corrected 2026-09-29: until this release
+  the data and Sentinel ports admitted the whole operator namespace, and the health and
+  exporter ports admitted every source.)*
 - The PDB cleanup never deletes a budget it does not own (ownerReference check)
   and sends a **UID delete precondition** so a name reused between the read and
   the delete is not destroyed ([`internal/controller/pdb.go`](../../internal/controller/pdb.go)).
@@ -74,6 +80,11 @@ Read this before treating a namespace as a tenant boundary.
 - **The NetworkPolicies are ingress-only.** No egress rule is written, so a
   compromised Valkey pod may open connections anywhere, including to the API
   server.
+- **A NetworkPolicy peer is a label, not an identity.** A pod created in the resource's
+  namespace with a component's selector labels is admitted as that component, and a pod in
+  the operator's namespace carrying the operator pod's labels as the operator. Creating either
+  takes `create pods` in that namespace, a principal the rest of this page already treats as
+  able to reach the data plane.
 - **The sidecar can patch any metadata on its own cluster's pods, and `pods: patch`
   is wider than metadata.** The grant is no longer namespace-wide —
   `resourceNames` limits it to `<cr-name>-0 … <cr-name>-N` ([the per-instance sidecar Role](privilege-footprint.md#the-per-instance-sidecar-role)) — and
@@ -90,10 +101,10 @@ Read this before treating a namespace as a tenant boundary.
   | `vko.gtrfc.com/config-hash` | suppresses the rolling update for a config change |
   | `vko.gtrfc.com/pod-spec-hash` | suppresses the rolling update for a pod-spec change |
   | ~~`vko.gtrfc.com/tls-material-hash`~~ | it did suppress the certificate-rotation roll **and** the `TLSMaterialStale` report; the record moved into pod spec on 2026-08-27 and the annotation is now inert ([ADR 0031](../adr/0031-a-record-the-operator-trusts-lives-in-pod-spec.md)) |
-  | any selector label | deleting one detaches the pod from its StatefulSet controllerRef; `podIsOurs` then reads false |
-  | `metadata.ownerReferences` | not in apimachinery's immutable ObjectMeta set — that set is exactly `name`, `namespace`, `uid`, `creationTimestamp`, `deletionTimestamp`, `deletionGracePeriodSeconds` |
+  | any selector label | deleting one detaches the pod from its StatefulSet controllerRef; `podIsOurs` then reads false. The operator holds that CR's roll and reports `ReconcileBlocked=True/ForeignObject` naming the pod ([ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) D9) until a human deletes or re-attaches it; it never touches the pod |
+  | `metadata.ownerReferences` | not in apimachinery's immutable ObjectMeta set — that set is exactly `name`, `namespace`, `uid`, `creationTimestamp`, `deletionTimestamp`, `deletionGracePeriodSeconds`. Same hold-and-report as above |
   | `metadata.finalizers` | same; a foreign finalizer keeps the pod from ever being deleted |
-  | `spec.containers[*].image` | one of the five entries the API server allows a pod update to change |
+  | `spec.containers[*].image` | one of the five entries the API server allows a pod update to change. Since 2026-09-28 the data and Sentinel tiers compare **every** container and init-container image against the persisted template, so a swapped image runs at once but is replaced by the next data-tier roll — except on a single-replica non-persistent cluster, where a swap that also moves the sidecar image is deferred with it ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2, D6) |
 
   Nine rows, of which the struck-through one is no longer reachable: eight are live.
   For every hash still in that table the **deletion** is cheaper than the forgery,

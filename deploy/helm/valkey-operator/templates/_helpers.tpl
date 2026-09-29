@@ -49,6 +49,37 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+The label that tells the operator pod apart from every other pod of the release,
+the pre-upgrade hook included (it carries component pre-upgrade-hook). The
+generated NetworkPolicies admit the operator as the pod carrying the selector
+labels and this one (docs/adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md,
+D2), so neither podLabels value may set the key: on the operator it would take the
+pod out of its own peer, on the hook it would put the hook into it.
+*/}}
+{{- define "valkey-operator.operatorComponentLabel" -}}
+{{- if hasKey (.Values.podLabels | default dict) "app.kubernetes.io/component" }}
+{{- fail "podLabels must not set app.kubernetes.io/component: it identifies the operator pod in the generated NetworkPolicies" }}
+{{- end }}
+{{- if hasKey (.Values.preUpgradeHook.podLabels | default dict) "app.kubernetes.io/component" }}
+{{- fail "preUpgradeHook.podLabels must not set app.kubernetes.io/component: it identifies the operator pod in the generated NetworkPolicies" }}
+{{- end }}
+{{- "app.kubernetes.io/component: operator" }}
+{{- end }}
+
+{{/*
+The --operator-pod-selector value: the selector labels and the operator component
+label as key=value pairs, sorted by key.
+*/}}
+{{- define "valkey-operator.operatorPodSelector" -}}
+{{- $labels := printf "%s\n%s" (include "valkey-operator.selectorLabels" .) (include "valkey-operator.operatorComponentLabel" .) | fromYaml }}
+{{- $pairs := list }}
+{{- range $k, $v := $labels }}
+{{- $pairs = append $pairs (printf "%s=%s" $k $v) }}
+{{- end }}
+{{- join "," $pairs }}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "valkey-operator.serviceAccountName" -}}

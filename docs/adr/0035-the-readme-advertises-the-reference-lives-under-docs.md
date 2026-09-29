@@ -5,6 +5,11 @@
 Accepted, amended 2026-09-27 (D6 re-decided: the README carries no decisions and does not link to
 ADRs). Date: 2026-09-27.
 
+**Amended 2026-09-29 (no decision changes):** `spec.networkPolicy` has its operations page,
+[network-policy.md](../operations/network-policy.md), written with
+[ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md); the three
+places below that recorded it as missing are struck in place.
+
 **Re-decided 2026-09-27 by the owner: D6.** The README is the project's front page and the entry
 point for administrators who consider or run the operator; decisions have no place in it. Every
 ADR citation, every decision rationale ("no opt-out", "so upgrades change nothing") and the ADR
@@ -58,8 +63,8 @@ the working tree on 2026-09-27:
 - The knowledge graph under `graphify-out/` is rebuilt by a separate run and does not know the
   new directories yet.
 - The operator's command-line flags have neither a reference table nor a page of their own.
-- `spec.networkPolicy` has reference rows in the README but no page under `docs/operations/`
-  that explains what the generated NetworkPolicies allow.
+- ~~`spec.networkPolicy` has reference rows in the README but no page under `docs/operations/`
+  that explains what the generated NetworkPolicies allow.~~ *(Done 2026-09-29.)*
 
 ## Context
 
@@ -142,8 +147,8 @@ and it points at everything else.
 and nowhere else.** Every `spec` and `status` field and every chart value, with its default,
 has exactly one row. A page under `docs/operations/` explains a setting and never restates the
 list, because two lists drift and nobody sees the drift. A reference table whose fields need
-more than their row links the page that explains them. `spec.networkPolicy` has no such page
-yet (Residual risks).
+more than their row links the page that explains them. ~~`spec.networkPolicy` has no such page
+yet (Residual risks).~~ *(It has since 2026-09-29.)*
 
 **D4 — One subject per operations page.** A new subject becomes a new page. It is never added
 as a section to the page of another subject, so a page's file name keeps predicting its
@@ -246,7 +251,9 @@ was an open residual of ADR 0013.
   keeps the two sides apart but review.
 - **Nothing enforces D3, D4 or D6.** An explanation can drift back into the README, and a
   restated list can appear on an operations page. Only review catches either.
-- **Two rows have no operations page that explains them.** Under `docs/operations/`,
+- **Two rows have no operations page that explains them.** *(Since 2026-09-29 one:
+  `spec.networkPolicy` is explained by [network-policy.md](../operations/network-policy.md), and
+  the rest of this sentence about it is history.)* Under `docs/operations/`,
   `spec.networkPolicy` comes up only in passing: an example's security note and ~~the observer's
   object table~~ the observer page's paragraph on what it creates *(corrected 2026-09-27: the
   second review pass replaced that table with prose)*. No page there says what the generated NetworkPolicies allow. The ingress rules
@@ -255,7 +262,7 @@ was an open residual of ADR 0013.
   loop, for when it is written. The operator's command-line flags
   (`--max-concurrent-reconciles`, `--allowed-seccomp-localhost-profiles`,
   `--metrics-bind-address`, `--health-probe-bind-address`, `--operator-image`, `--leader-elect`,
-  read in `cmd/main.go`) have no reference table. ~~All but `--health-probe-bind-address` are
+  and since 2026-09-29 `--operator-pod-selector`, read in `cmd/main.go`) have no reference table. ~~All but `--health-probe-bind-address` are
   mentioned on a page under `docs/` or in `DEVELOPER.md` (searched 2026-09-27), and none has a
   row of its own in a reference table.~~ *(corrected 2026-09-27: ADR 0018 D9 is a page under
   `docs/` and names `--health-probe-bind-address`.)* All but `--health-probe-bind-address` are

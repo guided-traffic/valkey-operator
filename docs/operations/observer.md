@@ -15,9 +15,12 @@ With `spec.observer.enabled`, the operator (not the observer) creates a Deployme
 observer pod running the operator image. The pod runs under a ServiceAccount of its own,
 bound to no Role and with no token mounted, because the observer makes no Kubernetes API
 call ([trust boundaries](../security/trust-boundaries.md)). With `spec.networkPolicy.enabled`
-the operator also creates a NetworkPolicy that admits the health-probe ingress on port
-`8084`, from any source. Their names, including the `spec.networkPolicy.namePrefix` prefix on
-the NetworkPolicy, are in the README [naming conventions](../../README.md#naming-conventions).
+the operator also creates a NetworkPolicy for the observer pod that admits nothing: kubelet's
+probes on `8084` come from the node, and a Prometheus scraping `/metrics` there needs a policy
+of your own ([network-policy.md](network-policy.md#admitting-a-scraper)). *(corrected
+2026-09-29: the policy admitted port `8084` from any source until this release.)* Their names,
+including the `spec.networkPolicy.namePrefix` prefix on the NetworkPolicy, are in the README
+[naming conventions](../../README.md#naming-conventions).
 
 *(corrected 2026-09-27: the table moved here from the old README listed the Deployment and
 the NetworkPolicy only and left out the observer ServiceAccount; the names now live only in

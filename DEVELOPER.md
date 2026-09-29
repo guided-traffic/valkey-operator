@@ -256,6 +256,10 @@ not do for you:
   Deployment take their image from it, so set it (for example
   `OPERATOR_IMAGE=guidedtraffic/valkey-operator:<tag> make run`). What an empty value leads to
   was not verified.
+- **`run` sets neither `POD_NAMESPACE` nor `--operator-pod-selector`**, so the operator logs that
+  the generated NetworkPolicies admit no operator. Outside the cluster that changes nothing: a
+  process on your machine is not a pod any policy could admit
+  ([network-policy.md](docs/operations/network-policy.md#how-the-operator-pod-is-recognised)).
 
 ## The toolchain versions
 

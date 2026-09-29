@@ -4,6 +4,8 @@
 
 Accepted. Date: 2026-08-25.
 
+Amended 2026-09-28: **D11's *Replacement* argument gains the gate it leaned on.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the former master's delete in `replaceRemainingPods`, held past `syncTimeout` as `MasterHandoverStalled` (D6) in the shape of this record's D5. The residual risk below that named the missing key check is closed by decision ~~and open until built~~ *(and implemented 2026-09-28: `gateOutgoingPodDelete` in [`master_handover.go`](../../internal/controller/master_handover.go), called by `replaceRemainingPods` on the Sentinel path, which is the only path that reaches that function; a held delete requeues inside `spec.rollingUpdate.syncTimeout` and past it returns `DeferredRequeueAfter` with `MasterHandoverStalled` set, so the pass continues and the Sentinel roll stays held, as this record's D5 does. Unit-tested in [`master_handover_test.go`](../../internal/controller/master_handover_test.go); the full e2e suite and the writer harness of ADR 0037 ran green on the built code on Kind, both Valkey lines, the refusal shape itself not driven on a cluster)*. Marked in place.
+
 Amended 2026-08-27: **adopting a pod as the master authority is a site that spends it, and
 it was missing from the rule.** Measured in CI (single-node-valkey9): a chaos delete took
 the recorded master in the same second the roll deleted the outgoing one, the dying pod's
@@ -204,7 +206,7 @@ outgoing master still answers `INFO` as master and is therefore still `isMaster`
 ([ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md): the guard
 drops the heuristic, never the answer). Under a blanket change the demotion would be refused and
 the outgoing master would keep accepting writes as a master for the rest of its termination —
-up to the 60 s cap — with no write fencing on either side. Trading a `REPLICAOF` that works
+up to the 60 s cap — with no write fencing on either side (refused in [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md)). Trading a `REPLICAOF` that works
 today for a divergence window is the wrong direction.
 
 ## Decision
@@ -471,10 +473,17 @@ first roll has finalized.)* Traced by reading and unit-tested.)*
 asked at the three delete sites: the standalone delete in `handleStandaloneRollingUpdate`,
 `replaceNextReplica` and `replaceRemainingPods`. The delete spends nothing the roll was not about
 to spend: replica candidates are never masters (`sortReplicaCandidates` filters `isMaster`),
-`replaceRemainingPods` deletes the former master only behind `verifyNewMasterReady`, which asks
-for a current, available master with replicas attached and no sync in progress — it reads that
-master's `DBSIZE` but does not refuse on it, a pre-existing gap D11 does not close (*Residual
-risks*) — the PVC survives a pod delete, a replica re-syncs from its master, and a single pod
+`replaceRemainingPods` deletes the former master only behind `verifyNewMasterReady`, ~~which asks
+for a current, available master with replicas attached (its "no sync in progress" term reads a
+field a master never reports and never fires) — it reads that master's `DBSIZE` but does not
+refuse on it, a pre-existing gap D11 does not close~~ (*Residual
+risks*; closed by decision 2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5, ~~open until built~~) *(since
+2026-09-28 part of the handover gate `gateOutgoingPodDelete`, Sentinel path only: a current,
+available master; every other pod on the current template that exists and is not terminating
+answering as a synced replica, and at least that many replicas, at least one, attached to the
+master; the master's `DBSIZE` readable; the dataset veto of
+[ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D1 on the pod about to be
+deleted; and that pod not answering `role:master`)* — the PVC survives a pod delete, a replica re-syncs from its master, and a single pod
 without persistence loses nothing the same roll would not take from it the moment it turned
 Ready. It is the policy of the upstream StatefulSet update loop for a `Parallel` StatefulSet,
 which both of this operator's are (`k8s.io/kubernetes@v1.36.4`,
@@ -784,13 +793,19 @@ spare vote. Rejected.
   outdated and D11's replacement rule deletes it, so the roll is not stuck; only the report is
   missing. Pre-existing in shape, and the scope limit
   [ADR 0032](0032-generated-pods-run-rootless.md) D7 states. Traced by reading.
-* **`verifyNewMasterReady` reads the new master's `DBSIZE` and does not refuse on it.** Its
+* ~~**`verifyNewMasterReady` reads the new master's `DBSIZE` and does not refuse on it.**~~
+  **Closed 2026-09-28: the handover gate refuses on the key counts** (below). As recorded until
+  then: Its
   comment calls it the check that an empty replica was not promoted while the old master had
   data; the code logs the count and returns verified on any successful read, so the gates in
-  front of the former master's delete in `replaceRemainingPods` are role, attached replicas and
-  no sync in progress. Pre-existing and not fixed by T32; it concerns D11 because D11's
+  front of the former master's delete in `replaceRemainingPods` are role and attached replicas
+  (the "no sync in progress" term reads a field a master never reports). Pre-existing and not fixed by T32; it concerns D11 because D11's
   *Replacement* argument leans on that gate, and D11's comment in `replaceRemainingPods` was
-  corrected not to claim a key check.
+  corrected not to claim a key check. *(Closed by decision 2026-09-28: [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5,
+  held past `syncTimeout` as `MasterHandoverStalled`, D6; ~~open until built~~ built the same
+  day — `gateOutgoingPodDelete` reads the new master's count and, when it is zero, the outgoing
+  pod's, and holds on an empty new master next to a pod holding keys or on a count it cannot read.
+  The comment in `replaceRemainingPods` now names that gate.)*
 * **The `waitForReplicasReady` split is behaviour-neutral, and therefore not mutation-guarded.**
   An available pod carries no not-Ready clock, so routing an available outdated pod into
   `availabilityWait` returns the same plain requeue through the zero-clock branch; the second
@@ -890,7 +905,9 @@ spare vote. Rejected.
   `finishSentinelRollingUpdate`, and `podOutdated` / `podCarriesRetiredRepair` (the template
   moving under a replaced pod, D11, since 2026-09-26); for the
   residual risks `pauseRollingUpdate` (the known release of the Sentinel roll) and
-  `verifyNewMasterReady` (the unrefused `DBSIZE`)
+  ~~`verifyNewMasterReady` (the unrefused `DBSIZE`)~~ *(moved on 2026-09-28 to
+  [`master_handover.go`](../../internal/controller/master_handover.go), with
+  `gateOutgoingPodDelete`, which closed that residual risk)*
 * [`internal/controller/steady_state_master.go`](../../internal/controller/steady_state_master.go) — the D2 construction site
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — the `DeferredRequeueAfter` branch of `reconcileWorkload`; for D11 `handlePostRollingUpdateChecks`, `runSentinelRollingUpdate`, `soonerRequeue`
 * [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go) — the `PodAvailabilityStalled` row and its ownership rule, and the extended `PodTerminationStalled` clear site

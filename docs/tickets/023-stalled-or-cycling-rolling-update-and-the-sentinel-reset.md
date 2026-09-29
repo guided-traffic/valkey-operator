@@ -70,11 +70,11 @@ annotations, the drain stamps) and returns an empty result (`:2646`).
   the steady-state check run on the cleared state (`:421-443`); `updateStatus` overwrites `Error`.
 - **Resume gap.** Without Sentinel `updateStandaloneStatus` reports `OK` once every pod is Ready
   (`:2235-2260`), so no requeue (`:392-396`): minutes where pods churn, hours in a quiet
-  namespace. With Sentinel the pass requeues through `Syncing` (`:2475-2487`) only when the replica
-  is missing from the master's list; `AllSynced`
-  ([`checker.go:129-130`](../../internal/health/checker.go#L129-L130)) is effectively
-  `connected_slaves` (T12), which counts a replica in `wait_bgsave` reporting link down (measured).
-  A slow full sync or zero WAIT acknowledgements read `OK` (`:2488-2500`) with the same gap.
+  namespace. With Sentinel the pass requeues through `Syncing` (`:2475-2487`) while any replica
+  does not report itself synced: `AllSynced` counts replicas by their own replication answer
+  ([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D2),
+  so a replica in full sync or still connecting keeps the requeue. Zero WAIT acknowledgements
+  with every replica synced read `OK` (`:2488-2500`) and leave the gap.
   `ValkeyPhaseNotOK`, `ValkeyReplicasMissing` and `ValkeySpecNotObserved` stay silent.
 - Two test lines promise a halt:
   [`rolling_update_test.go:3898`](../../internal/controller/rolling_update_test.go#L3898),
@@ -159,12 +159,26 @@ measured). No pod template changes.
 - **Loop A, no new master.** `handlePostFailover`
   ([`:3071-3114`](../../internal/controller/rolling_update.go#L3071-L3114)) finds no available
   current pod answering `role:master`; `handleNoMasterFound`
-  ([`:3287-3326`](../../internal/controller/rolling_update.go#L3287-L3326)) waits 30 s, resets
+  ([`:3287-3326`](../../internal/controller/rolling_update.go#L3287-L3326)) waits until the
+  trigger's stamp is 30 s old **and** no pass has found a master for 30 s (`noMasterTimedOut`, an
+  in-memory absence clock), resets
   every Sentinel (`:3308`), rewrites the failover timestamp and enters `stateFailoverReset`;
   `handleFailoverRetrigger` ([`:849-887`](../../internal/controller/rolling_update.go#L849-L887))
   waits 20 s and up to 90 s for Sentinel to know its replicas, then `setFailoverTriggered` and
-  `triggerSentinelFailover` (`:3700-3740`; a refusal by all is only logged). About 50 s per cycle,
+  `triggerSentinelFailover` (`:3700-3740`; a refusal by all is only logged). About 65 s per cycle,
   up to 2.5 min, and the retrigger skips the first trigger's sync gates (`:2710-2719`).
+  Those skipped gates are the route to an empty promotion that
+  [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 and
+  D5 only hold (its Residual risks, 2026-09-28): the coordinated first trigger cannot promote a
+  replica behind the master, the forced retrigger can. The repair `MasterHandoverStalled` names
+  for `DatasetWouldBeDiscarded` runs through this retrigger: once Sentinel is pointed at the
+  outgoing pod, the resolver demotes the empty new master, which starts a full sync from it, and
+  the retrigger fires 20 s after the reset (up to 90 s while Sentinel has not rediscovered the
+  replicas) without asking whether that sync is done — so a dataset whose full sync takes longer
+  can still be promoted away and lost (read from the code and sentinel.c 9.1.1, not driven; ADR
+  0037 *Residual risks*). Closing the route — the retrigger asking
+  `waitForReplicasReady` and `WAIT` first, or a coordinated attempt before the forced one — is
+  this ticket's, with the cycle questions below.
 - **Loop B, a new master with no connected replica.** `handleMasterWithNoReplicas`
   ([`:3145-3187`](../../internal/controller/rolling_update.go#L3145-L3187)) after 90 s sends
   `REPLICAOF` to every other reachable pod (`:3159`) and resets every Sentinel (`:3161`) before it
@@ -188,8 +202,8 @@ measured). No pod template changes.
   connect (loop B). ADR 0025 D9 records ten triggers in 9.5 min on a driver since removed.
 
 Impact: medium. The roll never completes and never says so; loop A resets the tier toward an
-unverified address about once a minute with an ungated failover (T12's route to an empty
-promotion); loop B re-opens ADR 0025 D9's 90 s split-brain window on every timestamp rewrite.
+unverified address about once a minute with an ungated failover (the route to an empty
+promotion ADR 0037 records); loop B re-opens ADR 0025 D9's 90 s split-brain window on every timestamp rewrite.
 
 ### Sentinel deficit report
 
@@ -491,5 +505,4 @@ A: the states worth reporting last until someone acts, so one bound late loses n
 - T40: rewrites the T23 citations outside `docs/tickets/` at this ticket's close.
 - T50: a changed auth Secret pauses the roll; under Q3 = B a master on the old password fails the gate.
 - T43: no CI gate renders the chart (Q2, Q7).
-- T12: closes the Sentinel slow-sync gap of the pause; the other pauses still need Q1.
-- T12: what each `forceReplicaConnections` and ungated retrigger may do; the cap bounds how often.
+- [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done): closed the Sentinel slow-sync gap of the pause and vetoed `forceReplicaConnections` on the dataset; the retrigger it left ungated, and its repair routes through, is this ticket's.

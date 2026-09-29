@@ -542,7 +542,7 @@ func TestHandleMasterFailover_WaitsWhileAReplicaIsStillSyncing(t *testing.T) {
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
-		"hmf-syncing-1": {Role: "slave", MasterSyncInProgress: true},
+		"hmf-syncing-1": {Role: "slave", MasterLinkStatus: "down", MasterSyncInProgress: true},
 		"hmf-syncing-2": replicaInfo(),
 	}}
 
@@ -573,11 +573,19 @@ func TestHandleMasterFailover_WaitsWhenReplicationStateIsUnreadable(t *testing.T
 
 // WAIT is the last barrier against losing acknowledged writes on the promotion. If
 // the master cannot confirm the replicas caught up, no failover is triggered.
+//
+// The reply is the one WAIT gives on a pod that is no longer a master (measured on
+// 9.1.1). WAIT never answers NOREPLICAS, which this fixture used to mock: that is the
+// reply of a write under min-replicas-to-write, a fence the operator does not set
+// (docs/adr/0038-the-operator-does-not-offer-min-replicas-to-write.md, D4). Any error
+// reply blocks the promotion; the assertion does not depend on which.
 func TestHandleMasterFailover_DoesNotFailOverWhenWriteSyncFails(t *testing.T) {
 	r, c, v, pods := midFailoverCluster(t, "hmf-wait", nil, nil)
 	router := newRESPRouter(t, func(_ string, args []string) string {
 		if len(args) > 0 && strings.EqualFold(args[0], "WAIT") {
-			return respErr("NOREPLICAS not enough good replicas")
+			return respErr("WAIT cannot be used with replica instances. Please also note that if a replica " +
+				"is configured to be writable (which is not the default) writes to replicas are just local " +
+				"and are not propagated.")
 		}
 		return clusterAnswer(2, args)
 	})
@@ -622,8 +630,9 @@ func TestHandleMasterFailover_TriggersFailoverOnceEverythingIsSynced(t *testing.
 	assert.Equal(t, []string{dataAddr(v, 0)}, router.targetsFor("WAIT"))
 	assert.Equal(t, []string{sentinelAddr(v, 0, builder.SentinelPort)}, router.targetsFor("SENTINEL FAILOVER"),
 		"the failover is triggered on the first sentinel that accepts it")
-	assert.Contains(t, router.commandsTo(sentinelAddr(v, 0, builder.SentinelPort)),
-		"SENTINEL FAILOVER "+builder.SentinelMonitorName(v))
+	assert.Equal(t, []string{"SENTINEL FAILOVER " + builder.SentinelMonitorName(v) + " COORDINATED"},
+		failoverCommandsTo(router, sentinelAddr(v, 0, builder.SentinelPort)),
+		"the roll's own failover is coordinated where Sentinel supports it (ADR 0037 D1)")
 
 	stored := crGet(t, c, "hmf-go")
 	assert.Equal(t, stateFailoverTriggered, stored.Annotations[annotationRollingUpdateState],
@@ -910,6 +919,22 @@ func TestHandleFailoverRetrigger_RejectedFailoverCommandIsNotFatal(t *testing.T)
 
 // --- verifyNewMasterReady ---------------------------------------------------
 
+// verifyNewMaster calls the gate the way gateOutgoingPodDelete does and reports
+// whether it verified a master, with the result the pass would return otherwise.
+func verifyNewMaster(r *ValkeyReconciler, v *vkov1.Valkey, pods []podState,
+	checker InstanceChecker) (bool, RollingUpdateResult) {
+	ctx := context.Background()
+	master, _, refusal, result := r.verifyNewMasterReady(ctx, v, pods, checker)
+	switch {
+	case refusal != nil:
+		return false, *r.holdHandover(ctx, v, "", *refusal)
+	case master != nil:
+		return true, RollingUpdateResult{}
+	default:
+		return false, *result
+	}
+}
+
 // verifiedMasterCluster is the post-failover shape: pod-0 is the old master still
 // waiting to be replaced, pod-1 has been promoted.
 func verifiedMasterCluster(t *testing.T, name string, promotedInfo *valkeyclient.ReplicationInfo,
@@ -931,7 +956,7 @@ func verifiedMasterCluster(t *testing.T, name string, promotedInfo *valkeyclient
 func TestVerifyNewMasterReady_RejectsWhenNoUpdatedMasterExists(t *testing.T) {
 	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-none", replicaInfo(), nil)
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified)
 	assert.True(t, result.NeedsRequeue)
@@ -952,7 +977,7 @@ func TestVerifyNewMasterReady_IgnoresTheOldMasterAwaitingReplacement(t *testing.
 		"vnm-old-2": replicaInfo(),
 	}}
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified, "a pod that still needs the update cannot be the new master")
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
@@ -964,13 +989,15 @@ func TestVerifyNewMasterReady_IgnoresPodsThatAreNotReady(t *testing.T) {
 	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-notready", masterInfo(2), nil)
 	pods[1].readyCondition = false
 
-	verified, _ := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	verified, _ := verifyNewMaster(r, v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified)
 	assert.Empty(t, router.targetsFor("DBSIZE"))
 }
 
-// An unreadable replication state is skipped rather than assumed to be a replica.
+// An unreadable replication state is skipped rather than assumed to be a replica:
+// the master behind it is still found. The same pod then holds the delete, because it
+// is a current replica whose sync nobody can confirm (ADR 0037 D3).
 func TestVerifyNewMasterReady_SkipsPodsWithoutReplicationInfo(t *testing.T) {
 	r, _, v, pods := midFailoverCluster(t, "vnm-noinfo", nil, nil)
 	router := newRESPRouter(t, healthyCluster(2))
@@ -980,10 +1007,14 @@ func TestVerifyNewMasterReady_SkipsPodsWithoutReplicationInfo(t *testing.T) {
 		"vnm-noinfo-2": masterInfo(1),
 	}}
 
-	verified, _ := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	master, _, _ := r.currentMaster(context.Background(), v, pods, r.getInstanceChecker())
+	require.NotNil(t, master, "an unreachable pod must not hide the master behind it")
+	assert.Equal(t, "vnm-noinfo-2", master.name)
 
-	assert.True(t, verified, "an unreachable pod must not hide the master behind it")
-	assert.Equal(t, []string{dataAddr(v, 2)}, router.targetsFor("DBSIZE"))
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
+	assert.False(t, verified, "a current replica that cannot be asked holds the delete")
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+	assert.Empty(t, router.targetsFor("DBSIZE"), "the replication check comes before the key count")
 }
 
 // A master with no attached replicas means the replicas have not switched over yet.
@@ -991,29 +1022,72 @@ func TestVerifyNewMasterReady_SkipsPodsWithoutReplicationInfo(t *testing.T) {
 func TestVerifyNewMasterReady_RejectsAMasterWithoutConnectedReplicas(t *testing.T) {
 	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-lonely", masterInfo(0), nil)
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
 	assert.Empty(t, router.targetsFor("DBSIZE"), "no point checking the keyspace of an unreplicated master")
 }
 
-func TestVerifyNewMasterReady_RejectsAMasterStillSyncing(t *testing.T) {
-	syncing := masterInfo(2)
-	syncing.MasterSyncInProgress = true
-	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-syncing", syncing, nil)
+// The replica, not the master, says whether a sync is in progress: a master never
+// carries the flag, and it counts a replica from its sync request on. A replica in
+// full sync -- link down, sync in progress -- holds the delete although the new
+// master reports two replicas attached (ADR 0037 D2, D3).
+func TestVerifyNewMasterReady_RejectsWhileACurrentReplicaIsInFullSync(t *testing.T) {
+	r, c, v, pods, router := verifiedMasterCluster(t, "vnm-syncing", masterInfo(2), nil)
+	r.InstanceChecker.(*perPodMockChecker).infos["vnm-syncing-2"] = &valkeyclient.ReplicationInfo{
+		Role: "slave", MasterLinkStatus: "down", MasterSyncInProgress: true,
+	}
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
 
 	assert.False(t, verified)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
 	assert.Empty(t, router.targetsFor("DBSIZE"))
+	assert.NotEmpty(t, crGet(t, c, "vnm-syncing").Annotations[annotationHandoverHoldStarted],
+		"the gate arms its own bound")
 }
 
-// DBSIZE is the check that catches a promotion of an empty replica. If it cannot be
-// read, the master counts as unverified.
-func TestVerifyNewMasterReady_RejectsWhenTheKeyspaceCannotBeRead(t *testing.T) {
-	r, _, v, pods := midFailoverCluster(t, "vnm-dbsize", nil, nil)
+// A replica whose link is up, but to the outgoing master rather than the new one,
+// passes its own predicate; the new master's connected_slaves is what catches it
+// (ADR 0037 D3).
+func TestVerifyNewMasterReady_RejectsAReplicaStillOnTheOutgoingMaster(t *testing.T) {
+	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-chained", masterInfo(0), nil)
+
+	verified, result := verifyNewMaster(r, v, pods, r.getInstanceChecker())
+
+	assert.False(t, verified, "a replica that is synced, but not to the new master, is not on it")
+	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
+	assert.Empty(t, router.targetsFor("DBSIZE"))
+}
+
+// A tier of two has no other current pod to ask; the refusal on connected_slaves == 0
+// is what stays, and one attached replica -- the outgoing pod, converted -- lets it
+// through (ADR 0037 D3).
+func TestVerifyNewMasterReady_TierOfTwo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		slaves   int
+		verified bool
+	}{
+		{name: "no replica attached", slaves: 0, verified: false},
+		{name: "the converted outgoing pod attached", slaves: 1, verified: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, v, pods, _ := verifiedMasterCluster(t, "vnm-two", masterInfo(tc.slaves), nil)
+			pods = pods[:2]
+
+			verified, _ := verifyNewMaster(r, v, pods, r.getInstanceChecker())
+
+			assert.Equal(t, tc.verified, verified)
+		})
+	}
+}
+
+// An unreadable key count of the new master holds the delete: the dataset veto cannot
+// tell whether the outgoing pod holds the only copy (ADR 0037 D5, ADR 0028 D3).
+func TestGateOutgoingPodDelete_HoldsWhenTheKeyspaceCannotBeRead(t *testing.T) {
+	r, c, v, pods := midFailoverCluster(t, "vnm-dbsize", nil, nil)
 	router := newRESPRouter(t, func(_ string, args []string) string {
 		if len(args) > 0 && strings.EqualFold(args[0], "DBSIZE") {
 			return respErr("LOADING Valkey is loading the dataset in memory")
@@ -1026,16 +1100,17 @@ func TestVerifyNewMasterReady_RejectsWhenTheKeyspaceCannotBeRead(t *testing.T) {
 		"vnm-dbsize-2": replicaInfo(),
 	}}
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	result := r.gateOutgoingPodDelete(context.Background(), v, pods, pods[0], r.getInstanceChecker())
 
-	assert.False(t, verified)
+	require.NotNil(t, result)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
 	assert.Equal(t, []string{dataAddr(v, 1)}, router.targetsFor("DBSIZE"))
+	assert.True(t, podExists(t, c, "vnm-dbsize-0"))
 }
 
 // A missing TLS secret makes every client unusable, which is a reason to wait, not
-// a reason to skip the verification.
-func TestVerifyNewMasterReady_RejectsWhenTheTLSConfigCannotBeBuilt(t *testing.T) {
+// a reason to skip the dataset veto.
+func TestGateOutgoingPodDelete_HoldsWhenTheTLSConfigCannotBeBuilt(t *testing.T) {
 	v := sentinelClusterCR("vnm-tls", 3, func(v *vkov1.Valkey) {
 		v.Spec.TLS = &vkov1.TLSSpec{
 			Enabled: true,
@@ -1044,31 +1119,36 @@ func TestVerifyNewMasterReady_RejectsWhenTheTLSConfigCannotBeBuilt(t *testing.T)
 			},
 		}
 	})
+	pod0 := createPodForSts(v, 0, oldValkeyImage, true)
 	pod1 := createPodForSts(v, 1, newValkeyImage, true)
-	r, _ := newTestReconciler(v, pod1) // no TLS secret exists
+	r, _ := newTestReconciler(v, pod0, pod1) // no TLS secret exists
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 	r.InstanceChecker = &perPodMockChecker{infos: map[string]*valkeyclient.ReplicationInfo{
 		"vnm-tls-1": masterInfo(2),
 	}}
 
-	pods := []podState{{name: pod1.Name, pod: pod1, readyCondition: true, exists: true}}
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	pods := []podState{
+		{name: pod0.Name, pod: pod0, needsUpdate: true, isMaster: true, readyCondition: true, exists: true},
+		{name: pod1.Name, pod: pod1, readyCondition: true, exists: true},
+	}
+	result := r.gateOutgoingPodDelete(context.Background(), v, pods, pods[0], r.getInstanceChecker())
 
-	assert.False(t, verified)
+	require.NotNil(t, result)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.RequeueAfter)
 	assert.Empty(t, router.sent(), "no command is sent when the client cannot be built")
 }
 
-func TestVerifyNewMasterReady_AcceptsAMasterWithReplicasAndData(t *testing.T) {
+// The gate reads the new master's key count and, while it holds keys, no other: the
+// outgoing pod's count matters only next to an empty new master (ADR 0037 D5).
+func TestGateOutgoingPodDelete_ReadsOnlyTheNewMastersKeyCount(t *testing.T) {
 	r, _, v, pods, router := verifiedMasterCluster(t, "vnm-ok", masterInfo(2), nil)
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, r.getInstanceChecker())
+	result := r.gateOutgoingPodDelete(context.Background(), v, pods, pods[0], r.getInstanceChecker())
 
-	assert.True(t, verified)
-	assert.Equal(t, RollingUpdateResult{}, result, "a verified master produces no requeue of its own")
+	assert.Nil(t, result, "a verified handover lets the delete through")
 	assert.Equal(t, []string{dataAddr(v, 1)}, router.targetsFor("DBSIZE"),
-		"the keyspace of the promoted pod is what has to be non-empty")
+		"the key count is read from the promoted pod only")
 }
 
 // --- replaceRemainingPods ---------------------------------------------------
@@ -1338,6 +1418,13 @@ func TestHandleMasterWithNoReplicas_SurfacesTheCounterClearFailure(t *testing.T)
 
 // --- handleNoMasterFound ----------------------------------------------------
 
+// noMasterFor makes the no-master clock read as if no pass had found a master for d.
+func noMasterFor(r *ValkeyReconciler, v *vkov1.Valkey, d time.Duration) {
+	key := waitBoundKey(v.Namespace, v.Name, boundNoMaster)
+	r.nudges.forget(key)
+	r.nudges.observe(key, time.Now().Add(-d))
+}
+
 func TestHandleNoMasterFound_WaitsWhileTheFailoverIsStillYoung(t *testing.T) {
 	r, c, v, pods := midFailoverCluster(t, "hnmf-young", map[string]string{
 		annotationRollingUpdateState: stateFailoverTriggered,
@@ -1368,6 +1455,7 @@ func TestHandleNoMasterFound_ResetsSentinelAtTheKnownMasterAndSchedulesARetry(t 
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 
+	noMasterFor(r, v, failoverRetryTimeout+time.Minute)
 	result := r.handleNoMasterFound(context.Background(), v, pods)
 
 	require.NoError(t, result.Error)
@@ -1397,6 +1485,7 @@ func TestHandleNoMasterFound_FallsBackToTheDefaultMasterAddress(t *testing.T) {
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 
+	noMasterFor(r, v, failoverRetryTimeout+time.Minute)
 	result := r.handleNoMasterFound(context.Background(), v, pods)
 
 	require.NoError(t, result.Error)
@@ -1415,6 +1504,7 @@ func TestHandleNoMasterFound_SurfacesTheTimestampWriteFailure(t *testing.T) {
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 
+	noMasterFor(r, v, failoverRetryTimeout+time.Minute)
 	result := r.handleNoMasterFound(context.Background(), v, pods)
 
 	require.Error(t, result.Error)
@@ -1432,6 +1522,7 @@ func TestHandleNoMasterFound_SurfacesTheStateWriteFailure(t *testing.T) {
 	router := newRESPRouter(t, healthyCluster(2))
 	router.attach(r)
 
+	noMasterFor(r, v, failoverRetryTimeout+time.Minute)
 	result := r.handleNoMasterFound(context.Background(), v, pods)
 
 	require.Error(t, result.Error)

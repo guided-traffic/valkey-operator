@@ -12,7 +12,21 @@ operator's per-resource metrics).
 
 ## The exporter sidecar
 
-The exporter (`oliver006/redis_exporter` by default) connects to the local Valkey instance and serves `/metrics` on port `9121`. TLS and authentication are handled automatically — the exporter reuses the pod's mounted certificates and the auth Secret.
+The exporter (`oliver006/redis_exporter` by default) connects to the local Valkey instance and serves `/metrics` on port `9121`. The operator wires the connection: under TLS the exporter uses the pod's mounted certificates, and with `spec.auth` it gets the cluster password from the auth Secret. *(corrected 2026-09-29: this said "TLS and authentication are handled automatically", which read as if the exporter's own port were protected. It is not.)*
+
+The exporter's port is **plain HTTP without authentication**: whatever it serves, it serves to
+anything that reaches the port. The operator therefore switches off the two routes it does not
+use, on every cluster — `/scrape`, which connects to a target named in the request with the
+exporter's credentials, and the export of key values (`REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT`,
+`REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES`). A key you configure through
+`spec.metrics.extraArgs` (`--check-single-keys`, `--check-keys`) is exported with its name and
+size, not its value. An image you set through `spec.metrics.image` must be v1.83.0 or later for
+the first switch to take effect; see the `image` row of the
+[`spec.metrics`](../../README.md#specmetrics) table.
+
+With `spec.networkPolicy.enabled`, the generated policy admits no scraper on the exporter port:
+admit your Prometheus with a policy of your own, as in
+[network-policy.md](network-policy.md#admitting-a-scraper).
 
 Enabling metrics (the [metrics example](examples.md#with-metrics-prometheus-exporter)) adds
 the exporter container to every data pod. It has no readiness probe, so it never affects pod
@@ -28,7 +42,7 @@ The `ServiceMonitor` is managed as an unstructured object, so the operator has *
 
 ### Enabling metrics on a running cluster
 
-> **Lossless migration:** turning `metrics.enabled` on (or off) changes the pod template, which the operator rolls out through its normal failover-aware rolling update — replicas are replaced one by one and the leader is failed over, so **no data is lost even without persistence**. The only exception is a single standalone pod (`replicas: 1`) without persistence: it has no failover target, so adding the sidecar restarts it and its in-memory data is lost.
+> **Migration through the rolling update:** turning `metrics.enabled` on (or off) changes the pod template, which the operator rolls out through its normal failover-aware rolling update — replicas are replaced one by one and the leader is failed over, so **the pre-roll dataset survives even without persistence**. On a Sentinel cluster whose Sentinels cannot run a coordinated failover (before Valkey 9.0, the 8 to 9 upgrade roll included) and on any roll whose coordinated failover fell back to forced, the writes the outgoing master acknowledges during the roll's failover are lost ([the master handover](rolling-updates.md#the-master-handover-on-a-sentinel-cluster)). *(corrected 2026-09-28: this said "lossless" and "no data is lost")* The only exception is a single standalone pod (`replicas: 1`) without persistence: it has no failover target, so adding the sidecar restarts it and its in-memory data is lost.
 
 ## Operator metrics and alerting
 
@@ -67,10 +81,24 @@ up and only the spec change is stuck.
 that cannot read reports "unknown" instead of "healthy". Thresholds are not exposed as values;
 replace the rule if they do not fit.
 
+`ValkeyPhaseNotOK` fires once a resource has held one phase other than `OK` for 30
+minutes. On a Sentinel cluster that includes a replica full sync — after an eviction, a
+restart, a Sentinel reconfiguration — which reads phase `Syncing` for its whole length,
+because a replica counts as synced only on its own answer
+([`Ready`](status.md#ready)): a full sync longer than 30 minutes fires it.
+
 `ValkeyTLSMaterialStale` is the odd one out on timing: its `for:` is **72 hours**, not minutes,
 because the roll it watches is deliberately not time-critical (see
 [Certificate rotation](tls.md#certificate-rotation)). A short threshold would page on every normal
 rotation.
+
+No shipped rule watches [`MasterHandoverStalled`](status.md#masterhandoverstalled), the
+hold in front of the delete of a Sentinel cluster's outgoing master. It is exported like
+every condition, as
+`vko_valkey_status_condition{condition="MasterHandoverStalled",status="True"}` with the
+reason as a label, for a rule of your own; whether the chart ships one is not decided
+([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+D7).
 
 Turning `serviceMonitor.enabled` on renders the Service as well — a ServiceMonitor selects
 Services, and one without the other scrapes nothing.

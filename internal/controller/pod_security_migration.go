@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -97,24 +98,35 @@ func templateRunsRootless(spec *corev1.PodSpec) bool {
 	return sc != nil && sc.RunAsNonRoot != nil && *sc.RunAsNonRoot
 }
 
+// podSecurityPending names the only data pod of a spec.replicas: 1 cluster whose
+// replacement is held back although it carries a security repair, and which
+// repair: PodRunsAsRoot for the rootless posture (ADR 0032 D3), ExporterOutdated
+// for the exporter configuration of ADR 0018 D11. The zero value holds nothing.
+type podSecurityPending struct {
+	pod, reason string
+}
+
 // singlePodDeferral decides whether the only data pod of a spec.replicas: 1
 // cluster keeps running on an outdated spec instead of being replaced, and on
-// whose account. It returns the pod name in rootPending when the pod runs as root
-// and replacing it would discard the dataset (ADR 0032 D3), and in sidecarPending
-// when its sidecar image is the only drift (ADR 0007 D6); both empty means the pod
-// is replaced. Every input comes from the persisted StatefulSet, never from the CR:
-// a persistence toggle the operator refused to write (ADR 0023) would otherwise
-// read as "persistent" and delete the only pod together with its emptyDir.
+// whose account. It returns the pod in securityPending when a security repair is
+// held because replacing the pod would discard the dataset, and the pod name in
+// sidecarPending when its sidecar image is the only image drift (ADR 0007 D6);
+// both empty means the pod is replaced. Every input comes from the persisted
+// StatefulSet, never from the CR: a persistence toggle the operator refused to
+// write (ADR 0023) would otherwise read as "persistent" and delete the only pod
+// together with its emptyDir.
 //
-// The image-only isSidecarOnlyChange no longer decides a root pod. A release ships
-// a new sidecar image together with the new posture, so on the Helm path that
-// test classified the fix as sidecar-only and deferred it; on kustomize or a
-// floating tag the sidecar does not move and the only pod was deleted at once --
-// for a non-persistent cluster with its data (ADR 0007 D7 foresaw this). The line
-// now sits where a restart turns from downtime into data loss:
+// The image-only isSidecarOnlyChange does not decide a pod that carries a
+// security repair. A release ships a new sidecar image together with the repair,
+// so on the Helm path that test classified the repair as sidecar-only and
+// deferred it; on kustomize or a floating tag the sidecar does not move and the
+// only pod was deleted at once -- for a non-persistent cluster with its data
+// (ADR 0007 D7 foresaw this). Two repairs are decided this way: a pod that runs as
+// root (ADR 0032 D3), and a rootless pod whose exporter image or environment
+// differs from the template (ADR 0018 D11). For both, the line sits where a
+// restart turns from downtime into data loss:
 //
-//   - persistent: replaced now, with the ownership repair on its way up. One
-//     restart, data kept.
+//   - persistent: replaced now. One restart, data kept.
 //   - not persistent, Valkey image unchanged: deferred. The operator upgrade alone
 //     never discards a dataset.
 //   - not persistent, Valkey image changed: replaced, because the CR author asked
@@ -124,47 +136,77 @@ func templateRunsRootless(spec *corev1.PodSpec) bool {
 //     moves them; a certificate rotation roll of a non-persistent single pod is the
 //     data loss ADR 0030 already accepted, and a configuration change is the CR
 //     author's. A change the pod-spec hash carries cannot be told apart from the
-//     posture and is held with it -- the condition message says so.
+//     repair and is held with it -- the condition message says so.
+//
+// A rootless pod without exporter drift is decided by isSidecarOnlyChange, as before.
 func singlePodDeferral(v *vkov1.Valkey, sts *appsv1.StatefulSet, pod *corev1.Pod) (
-	rootPending, sidecarPending string) {
+	securityPending podSecurityPending, sidecarPending string) {
 	if v.Spec.Replicas > 1 {
-		return "", ""
+		return podSecurityPending{}, ""
 	}
 	desiredImage := valkeyImageFromSts(sts)
-	sidecarOnly := isSidecarOnlyChange(pod, desiredImage, sidecarImageFromSts(sts))
-	if builder.PodRunsRootless(pod) {
-		if sidecarOnly {
-			return "", pod.Name
-		}
-		return "", ""
+	if isSidecarOnlyChange(pod, desiredImage, sidecarImageFromSts(sts)) {
+		sidecarPending = pod.Name
 	}
-	if stsIsPersistent(sts) || podImageChanged(pod, desiredImage, "") ||
+	var reason string
+	switch {
+	case !builder.PodRunsRootless(pod):
+		reason = vkov1.ReasonPodRunsAsRoot
+	case exporterDrifted(pod, sts):
+		reason = vkov1.ReasonExporterOutdated
+	default:
+		return podSecurityPending{}, sidecarPending
+	}
+	if singlePodReplaceable(pod, sts, desiredImage) {
+		return podSecurityPending{}, ""
+	}
+	return podSecurityPending{pod: pod.Name, reason: reason}, sidecarPending
+}
+
+// singlePodReplaceable reports whether the only data pod is replaced although it
+// carries a held repair: its StatefulSet keeps a volume, or a change the operator
+// upgrade alone never makes -- the Valkey image, the TLS material record, the
+// configuration -- replaces it anyway.
+func singlePodReplaceable(pod *corev1.Pod, sts *appsv1.StatefulSet, desiredImage string) bool {
+	return stsIsPersistent(sts) || podImageChanged(pod, desiredImage, "") ||
 		podTLSMaterialHashChanged(pod, tlsMaterialHashFromSts(sts)) ||
-		podAnnotationHashChanged(pod, configHashFromSts(sts)) {
-		return "", ""
+		podAnnotationHashChanged(pod, configHashFromSts(sts))
+}
+
+// exporterDrifted reports whether the pod runs an exporter container whose image
+// or environment differs from the persisted template's. A pod or template without
+// one is no drift here: adding or removing the exporter is the CR author's change
+// and rides the ordinary comparison.
+func exporterDrifted(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	want := containerNamed(sts.Spec.Template.Spec.Containers, builder.ExporterContainerName)
+	got := containerNamed(pod.Spec.Containers, builder.ExporterContainerName)
+	if want == nil || got == nil {
+		return false
 	}
-	if sidecarOnly {
-		return pod.Name, pod.Name
+	return want.Image != got.Image || !equality.Semantic.DeepEqual(want.Env, got.Env)
+}
+
+func containerNamed(containers []corev1.Container, name string) *corev1.Container {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i]
+		}
 	}
-	return pod.Name, ""
+	return nil
 }
 
 // reportPodSecurityUpdatePending is the one evaluator of PodSecurityUpdatePending,
 // called from checkAndHandleRollingUpdate on every non-error pass: True naming the
-// pod whose replacement is deferred, otherwise a retraction of a standing True.
-// Presence-guarded, so no cluster gains the condition from an upgrade that did not
-// defer anything on it.
-func (r *ValkeyReconciler) reportPodSecurityUpdatePending(ctx context.Context, v *vkov1.Valkey, pod string) {
-	if pod != "" {
+// pod whose replacement is deferred and the repair it waits for, otherwise a
+// retraction of a standing True. Presence-guarded, so no cluster gains the
+// condition from an upgrade that did not defer anything on it.
+func (r *ValkeyReconciler) reportPodSecurityUpdatePending(ctx context.Context, v *vkov1.Valkey, pending podSecurityPending) {
+	if pending.pod != "" {
 		r.setStatusCondition(ctx, v,
 			vkov1.ConditionTypePodSecurityUpdatePending,
 			metav1.ConditionTrue,
-			vkov1.ReasonPodRunsAsRoot,
-			fmt.Sprintf("Pod %s was built by an earlier operator version and runs as root. spec.replicas is 1 and "+
-				"its StatefulSet keeps no volume, so replacing it would discard the dataset; the rootless posture, "+
-				"and every other pending change of the pod spec, applies on its next restart. Delete the pod to "+
-				"apply them now, together with the data",
-				pod))
+			pending.reason,
+			pendingMessage(pending))
 		return
 	}
 	cond := meta.FindStatusCondition(v.Status.Conditions, vkov1.ConditionTypePodSecurityUpdatePending)
@@ -175,5 +217,18 @@ func (r *ValkeyReconciler) reportPodSecurityUpdatePending(ctx context.Context, v
 		vkov1.ConditionTypePodSecurityUpdatePending,
 		metav1.ConditionFalse,
 		vkov1.ReasonPodSecurityUpdateApplied,
-		"No data pod keeps running as root on a deferred update")
+		"No data pod keeps a security update deferred")
+}
+
+// pendingMessage is the PodSecurityUpdatePending message for a held repair.
+func pendingMessage(pending podSecurityPending) string {
+	state, update := "was built by an earlier operator version and runs as root", "the rootless posture"
+	if pending.reason == vkov1.ReasonExporterOutdated {
+		state = "runs the metrics exporter an earlier operator version configured, with routes this version " +
+			"switches off"
+		update = "the exporter update"
+	}
+	return fmt.Sprintf("Pod %s %s. spec.replicas is 1 and its StatefulSet keeps no volume, so replacing it would "+
+		"discard the dataset; %s, and every other pending change of the pod spec, applies on its next restart. "+
+		"Delete the pod to apply them now, together with the data", pending.pod, state, update)
 }

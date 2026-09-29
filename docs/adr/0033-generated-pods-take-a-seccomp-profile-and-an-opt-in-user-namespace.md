@@ -263,7 +263,10 @@ observer's profile, `RuntimeDefault` in ADR 0032 D1, is the one D1 here selects.
 returns a digest: `repo:tag@sha256:…` yields the tag, a digest-only reference yields an empty
 label value, a bare repository still yields `latest`, and the unit test now checks every result
 with `validation.IsValidLabelValue`. `DefaultMetricsExporterImage` is
-`oliver006/redis_exporter:v1.66.0@sha256:d98e6db8…` — the digest of the multi-arch image index
+~~`oliver006/redis_exporter:v1.66.0@sha256:d98e6db8…`~~
+`oliver006/redis_exporter:v1.92.1@sha256:7fbc93d3…` *(moved 2026-09-29,
+[ADR 0018](0018-metrics-and-the-exporter-sidecar.md) D11; the new digest read with
+`docker buildx imagetools inspect` that day)* — the digest of the multi-arch image index
 behind that tag, read with `docker buildx imagetools inspect` on 2026-09-26 and re-read the
 same day from the registry API (the tag's `docker-content-digest`, media type
 `application/vnd.oci.image.index.v1+json`); the tag stays for the reader. The chart takes
@@ -645,7 +648,7 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
 - The chart default for `image.digest` is empty: nothing in the release pipeline stamps the
   digest of the image it pushes into the chart. Pinning the operator is left to the installer.
 - `DefaultMetricsExporterImage` is not maintained by Renovate (it was not before either), so the
-  pinned v1.66.0 ages until someone moves it by hand.
+  pinned ~~v1.66.0~~ version (v1.92.1 since 2026-09-29) ages until someone moves it by hand.
 - `hostUsers` on an API server with the gate off is reported, but a **kubelet or runtime** without
   support behind an API server with the gate on is not detected before a pod fails to start.
 - The chart's `podSecurity.userNamespaces` has no D3: an API server with the gate off drops

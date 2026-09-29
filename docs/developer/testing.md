@@ -42,6 +42,14 @@ decides explicitly whether its command fails (the default) or succeeds
 | `newTestValkey(name, opts...)` | [`internal/builder/configmap_test.go`](../../internal/builder/configmap_test.go) | A `Valkey` for the builder tests; the controller and common packages have their own variants |
 | `newInitScriptEnv` | [`internal/builder/init_script_exec_test.go`](../../internal/builder/init_script_exec_test.go) | A temporary filesystem standing in for the init container's mounts, with stub `valkey-cli` and `timeout` on `PATH`, so the generated election script is executed rather than read ([ADR 0017](../adr/0017-test-and-ci-policy.md) D19) |
 
+A fixture that answers `INFO replication` answers in a shape Valkey gives: a master's reply
+carries neither `master_sync_in_progress` nor `master_link_status`, and a replica in full sync
+reports `master_link_status:down` with `master_sync_in_progress:1` (`replicationInfo` of the
+observer's `fakeValkeyNode` renders both shapes). A master reporting a sync, or a syncing
+replica with its link up, is a state no server is in; the fixtures rewritten with
+[ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D2
+pinned exactly such replies.
+
 Some unit tests guard a convention rather than a behaviour, and name what they enforce when
 they fail:
 
@@ -138,8 +146,25 @@ new test most often needs:
 | `waitForPodRecreated` | Waits until a pod exists under a **new UID** and is Ready — the wait after deleting a pod, because a StatefulSet counts a terminating pod as ready until it is gone ([ADR 0017](../adr/0017-test-and-ci-policy.md) D50) |
 | `readyEndpointPodNames` | The pods behind a Service with a ready address, read from `discovery.k8s.io/v1` EndpointSlices ([ADR 0017](../adr/0017-test-and-ci-policy.md) D51) |
 | `valkeyExec`, `valkeyMSET` | Commands inside a Valkey pod; writing real keys |
-| `waitForConnectedReplicas`, `waitForReplicaSynced`, `replicationEstablished` | Replication checks against the live instances |
+| `waitForConnectedReplicas`, `waitForReplicaSynced`, `replicationEstablished` | Replication checks against the live instances. `replicationEstablished` and `waitForConnectedReplicas` read the master's `INFO replication` (`connected_slaves` and one `state=online` per replica); only `waitForReplicaSynced` asks the replica itself — link up, no sync in progress — which is what a test reading back a value written before the sync needs ([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D2) |
 | `valkeyPodForensics` | Pod state and logs for a failure message |
+
+**The writer harness** in [`handover_writes_test.go`](../../test/e2e/handover_writes_test.go)
+measures what a roll does to client writes, for `TestE2E_RollingUpdate_HA_WritesDuringHandover`
+([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)). A
+pod on the Valkey image writes `SET hw:<n> <n>` through the `-rw` Service, one `valkey-cli`
+process and connection per write, so every write follows the endpoint as it moves; it runs in
+the cluster because the pod network is unreachable from the host on Kind under Docker Desktop.
+A write counts as acknowledged only when its reply is exactly `OK`: `valkey-cli` exits 0 on an
+error reply too, so the exit code proves nothing
+([ADR 0038](../adr/0038-the-operator-does-not-offer-min-replicas-to-write.md) D4). The test
+compares the acknowledged writes with the keys the final master holds, and takes its
+assertions from the major of the image tag (`sentinelRunsCoordinatedFailover`): 9 or later is
+held to no acknowledged write lost, exactly one `+switch-master`, no drain failover on the
+outgoing master and `failoverMode` `coordinated` in the operator log; anything else — an
+`E2E_VALKEY_IMAGE` without a numeric tag included — to the logged forced fallback. Both are held
+to no lost pre-roll key, no Warning Event, and writes acknowledged on both sides of the
+outgoing master's delete.
 
 ## Image tools
 

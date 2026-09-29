@@ -81,11 +81,16 @@ func TestBuildObserverLogger_WarnLevelSuppressesInfoLogs(t *testing.T) {
 
 // --- fixtures ---
 
-// greenCluster is a Sentinel-fronted single-node cluster where every check
-// passes. Tests break exactly one thing and assert on the verdict.
+// greenCluster is a Sentinel-fronted cluster where every check passes. It runs
+// as a single node by default; a test that raises cfg.Replicas to 3 gets two
+// replicas holding the master's dataset behind ordinals 1 and 2 when it builds
+// its Observer with c.observer. Tests break exactly one thing and assert on the
+// verdict.
 type greenCluster struct {
 	node       *fakeValkeyNode
 	nodeEP     *fakeRESP
+	replicas   []*fakeValkeyNode
+	replicaEPs []*fakeRESP
 	sentinel   *fakeSentinelNode
 	sentinelEP *fakeRESP
 	cfg        Config
@@ -98,6 +103,12 @@ func newGreenCluster(t *testing.T) *greenCluster {
 	node.connectedSlaves = 2
 	nodeEP := startFakeRESP(t, node.handle)
 
+	replicas := []*fakeValkeyNode{newFakeReplicaNode(), newFakeReplicaNode()}
+	replicaEPs := make([]*fakeRESP, 0, len(replicas))
+	for _, replica := range replicas {
+		replicaEPs = append(replicaEPs, startFakeRESP(t, replica.handle))
+	}
+
 	// Sentinel reports the data node under a hostname, which is both what the
 	// hostname checks demand and an address that resolves back to the endpoint.
 	sentinel := newFakeSentinelNode("localhost", nodeEP.port)
@@ -106,6 +117,8 @@ func newGreenCluster(t *testing.T) *greenCluster {
 	return &greenCluster{
 		node:       node,
 		nodeEP:     nodeEP,
+		replicas:   replicas,
+		replicaEPs: replicaEPs,
 		sentinel:   sentinel,
 		sentinelEP: sentinelEP,
 		cfg: Config{
@@ -125,6 +138,18 @@ func mustObserver(t *testing.T, cfg Config) *Observer {
 	t.Helper()
 	obs, err := New(cfg)
 	require.NoError(t, err)
+	return obs
+}
+
+// observer builds the observer for c.cfg with the data pods behind their
+// ordinals: 0 is the master node, 1 and 2 the replicas. Only the replica sync
+// check reaches the pods by ordinal through this seam; the replica read check
+// still addresses them by StatefulSet hostname.
+func (c *greenCluster) observer(t *testing.T) *Observer {
+	t.Helper()
+	obs := mustObserver(t, c.cfg)
+	addrs := []string{c.nodeEP.addr, c.replicaEPs[0].addr, c.replicaEPs[1].addr}
+	obs.dataPodAddrFn = func(ordinal int) string { return addrs[ordinal] }
 	return obs
 }
 
@@ -178,12 +203,12 @@ func TestRunChecks_MultiReplicaAddsTheReplicaChecks(t *testing.T) {
 	c := newGreenCluster(t)
 	c.cfg.Replicas = 3
 	c.cfg.UnreadyWhen = allUnreadyWhen(false)
-	obs := mustObserver(t, c.cfg)
+	obs := c.observer(t)
 
 	obs.runChecks(context.Background())
 
 	res := obs.GetResult()
-	assert.True(t, res.Checks["replica_sync"], "the master reports both replicas connected")
+	assert.True(t, res.Checks["replica_sync"], "both replicas report a live link and no sync in progress")
 	// The replica read check addresses pods by their StatefulSet hostname, which
 	// does not resolve in a unit test - it must still have been attempted.
 	assert.Contains(t, res.Checks, "replica_read_test")
@@ -237,7 +262,7 @@ func TestRunCoreChecks_ReplicaReadIsSkippedWhenTheWriteFailed(t *testing.T) {
 	c.node.configure(func(n *fakeValkeyNode) {
 		n.setReply = respError("READONLY You can't write against a read only replica")
 	})
-	obs := mustObserver(t, c.cfg)
+	obs := c.observer(t)
 
 	obs.runChecks(context.Background())
 
@@ -298,8 +323,10 @@ func unreadyCases() []unreadyCase {
 			checkKey: "replica_sync",
 			setFlag:  func(uw *UnreadyWhenConfig, v bool) { uw.ReplicaSyncFailure = v },
 			arrange: func(_ *testing.T, c *greenCluster) {
+				// The master still counts the replica as connected; only the
+				// replica says it holds nothing yet.
 				c.cfg.Replicas = 3
-				c.node.configure(func(n *fakeValkeyNode) { n.connectedSlaves = 0 })
+				c.replicas[1].configure(inFullSync)
 			},
 		},
 		{
@@ -308,7 +335,7 @@ func unreadyCases() []unreadyCase {
 			checkKey: "replica_read_test",
 			setFlag:  func(uw *UnreadyWhenConfig, v bool) { uw.ReplicaReadTestFailure = v },
 			arrange: func(_ *testing.T, c *greenCluster) {
-				// Replica sync passes (two replicas connected), only the direct
+				// Replica sync passes (both replicas synced), only the direct
 				// read against the replica pods cannot be served.
 				c.cfg.Replicas = 3
 			},
@@ -376,7 +403,7 @@ func TestRunChecks_UnreadyWhenMatrix(t *testing.T) {
 			tc.arrange(t, c)
 			c.cfg.UnreadyWhen = allUnreadyWhen(false)
 			tc.setFlag(&c.cfg.UnreadyWhen, true)
-			obs := mustObserver(t, c.cfg)
+			obs := c.observer(t)
 
 			obs.runChecks(context.Background())
 
@@ -391,7 +418,7 @@ func TestRunChecks_UnreadyWhenMatrix(t *testing.T) {
 			c := newGreenCluster(t)
 			tc.arrange(t, c)
 			c.cfg.UnreadyWhen = allUnreadyWhen(false)
-			obs := mustObserver(t, c.cfg)
+			obs := c.observer(t)
 
 			obs.runChecks(context.Background())
 

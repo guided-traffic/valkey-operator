@@ -81,6 +81,12 @@ type ValkeyReconciler struct {
 	OperatorNamespace string
 	OperatorVersion   string
 
+	// OperatorPodLabels select the operator pod alone inside OperatorNamespace
+	// (--operator-pod-selector). Together they are the operator's peer in the
+	// generated NetworkPolicies; without both, no operator peer is written
+	// (ADR 0039 D2).
+	OperatorPodLabels map[string]string
+
 	// APIReader reads straight from the API server, bypassing the manager cache.
 	// It exists for exactly one class of read: the delete gate's last look at the
 	// tier immediately before a pod delete (ADR 0026 D5). The cache is allowed to
@@ -558,7 +564,9 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		{name: "StatefulSet", run: r.reconcileStatefulSet},
 		{name: "Sentinel resources", when: (*vkov1.Valkey).IsSentinelEnabled, run: r.reconcileSentinelResources},
 		{name: "PodDisruptionBudgets", run: r.reconcilePodDisruptionBudgets},
-		{name: "NetworkPolicies", when: (*vkov1.Valkey).IsNetworkPolicyEnabled, run: r.reconcileNetworkPolicies},
+		// No when: gate. The step also deletes the policies this Valkey no longer
+		// asks for, spec.networkPolicy.enabled turned off included.
+		{name: "NetworkPolicies", run: r.reconcileNetworkPolicies},
 		{name: "monitoring", run: r.reconcileMonitoringResources},
 		// Last, and a report rather than a write: it measures the pods against the
 		// fingerprints the two StatefulSet steps above have just stamped. It lives
@@ -570,6 +578,14 @@ func (r *ValkeyReconciler) resourceReconcileSteps() []reconcileStep {
 		// here silences the condition's only writer the moment TLS is turned off
 		// and freezes a True forever (T24(d), the T15 shape again).
 		{name: "TLS material", run: r.reportTLSMaterialStale},
+		// Also last and also a report rather than a write: it brings a pod under a
+		// generated name that its StatefulSet did not create to the ReconcileBlocked
+		// condition, which the rolling update's own refusal of that pod never reaches
+		// (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D13; ADR 0020 D9).
+		// Same reasons as "TLS material" for living here: a level re-measured every
+		// pass, and no when: gate, because the evaluator that clears it runs
+		// unconditionally and a gate would freeze a True.
+		{name: "pod name collision", run: r.reportPodNameCollision},
 	}
 }
 
@@ -1946,17 +1962,34 @@ func cleanseCertificateSpec(spec map[string]interface{}) {
 	delete(spec, "privateKey")
 }
 
-// reconcileNetworkPolicies reconciles all NetworkPolicy resources.
+// reconcileNetworkPolicies reconciles all NetworkPolicy resources, then deletes
+// every policy this Valkey controls that the spec no longer asks for.
 func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov1.Valkey) error {
+	desired := map[string]bool{}
+	if v.IsNetworkPolicyEnabled() {
+		if err := r.reconcileDesiredNetworkPolicies(ctx, v, desired); err != nil {
+			return err
+		}
+	}
+	return r.cleanupNetworkPolicies(ctx, v, desired)
+}
+
+// reconcileDesiredNetworkPolicies writes the policies the spec asks for and
+// records each name in desired.
+func (r *ValkeyReconciler) reconcileDesiredNetworkPolicies(ctx context.Context, v *vkov1.Valkey, desired map[string]bool) error {
+	operator := builder.OperatorPeer{Namespace: r.OperatorNamespace, PodLabels: r.OperatorPodLabels}
+
 	// Valkey NetworkPolicy.
-	desiredValkey := builder.BuildValkeyNetworkPolicy(v, r.OperatorNamespace)
+	desiredValkey := builder.BuildValkeyNetworkPolicy(v, operator)
+	desired[desiredValkey.Name] = true
 	if err := r.reconcileNetworkPolicy(ctx, v, desiredValkey); err != nil {
 		return fmt.Errorf("valkey networkpolicy: %w", err)
 	}
 
 	// Sentinel NetworkPolicy (only if Sentinel is enabled).
 	if v.IsSentinelEnabled() {
-		desiredSentinel := builder.BuildSentinelNetworkPolicy(v, r.OperatorNamespace)
+		desiredSentinel := builder.BuildSentinelNetworkPolicy(v, operator)
+		desired[desiredSentinel.Name] = true
 		if err := r.reconcileNetworkPolicy(ctx, v, desiredSentinel); err != nil {
 			return fmt.Errorf("sentinel networkpolicy: %w", err)
 		}
@@ -1965,6 +1998,7 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 	// Observer NetworkPolicy (only if observer is enabled).
 	if v.IsObserverEnabled() {
 		desiredObserver := builder.BuildObserverNetworkPolicy(v)
+		desired[desiredObserver.Name] = true
 		// The observer's own policy takes the observer's fail direction, not the
 		// NetworkPolicy one: the component is diagnostic, it mounts no token, and
 		// no RoleBinding names it, so a collision on its policy name costs the CR
@@ -1977,6 +2011,30 @@ func (r *ValkeyReconciler) reconcileNetworkPolicies(ctx context.Context, v *vkov
 		}
 	}
 
+	return nil
+}
+
+// cleanupNetworkPolicies deletes every NetworkPolicy in the Valkey's namespace
+// that this Valkey controls and whose name is not in desired: all of them once
+// spec.networkPolicy.enabled is off, the Sentinel or observer policy once that
+// component is off, and the policies under the old names after a namePrefix
+// change. A policy left behind would keep isolating the pods with rules nobody
+// updates any more. The controller reference is the proof, never a name or a
+// label, and the delete carries the UID precondition (ADR 0006 D8, D9).
+func (r *ValkeyReconciler) cleanupNetworkPolicies(ctx context.Context, v *vkov1.Valkey, desired map[string]bool) error {
+	var list networkingv1.NetworkPolicyList
+	if err := r.List(ctx, &list, client.InNamespace(v.Namespace)); err != nil {
+		return fmt.Errorf("listing networkpolicies: %w", err)
+	}
+	for i := range list.Items {
+		np := &list.Items[i]
+		if desired[np.Name] || !metav1.IsControlledBy(np, v) {
+			continue
+		}
+		if err := r.deleteIfOwned(ctx, v, np, "NetworkPolicy"); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2078,7 +2136,7 @@ func (r *ValkeyReconciler) reconcileObserverDeployment(ctx context.Context, v *v
 	return nil
 }
 
-// cleanupObserverDeployment removes the Observer Deployment and NetworkPolicy if they exist.
+// cleanupObserverDeployment removes the Observer Deployment and ServiceAccount if they exist.
 func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 
@@ -2119,20 +2177,8 @@ func (r *ValkeyReconciler) cleanupObserverDeployment(ctx context.Context, v *vko
 		return err
 	}
 
-	// Delete Observer NetworkPolicy if NP is enabled. Ownership-checked and
-	// UID-preconditioned like the ServiceAccount above: this was the last name-only
-	// delete left on the observer path
-	// (docs/adr/0006-delete-only-what-the-operator-owns.md, D2, D8).
-	if v.IsNetworkPolicyEnabled() {
-		np := &networkingv1.NetworkPolicy{}
-		npName := types.NamespacedName{Name: builder.ObserverNetworkPolicyName(v), Namespace: v.Namespace}
-		if err := r.Get(ctx, npName, np); err == nil {
-			if err := r.deleteIfOwned(ctx, v, np, "observer NetworkPolicy"); err != nil {
-				return err
-			}
-		}
-	}
-
+	// The observer's NetworkPolicy is deleted by cleanupNetworkPolicies, the one
+	// deleter of every generated policy.
 	return nil
 }
 

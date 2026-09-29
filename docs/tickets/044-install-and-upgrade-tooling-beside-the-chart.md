@@ -387,4 +387,4 @@ matters early. G3 is right only if Q3 = C and it ships in the same release.
 - T29: cites the hook ClusterRole at `pre-upgrade-rbac.yaml:29-50`, which changes under Q4 = G1 or
   Q3 = C.
 - T43: no CI gate renders the chart, so the `helm template` checks here stay manual.
-- T30: embargoed security finding.
+- T30: embargoed security finding, dropped.

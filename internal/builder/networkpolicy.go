@@ -33,14 +33,44 @@ func networkPolicyPrefix(v *vkov1.Valkey) string {
 	return ""
 }
 
-// BuildValkeyNetworkPolicy builds the NetworkPolicy that allows Valkey↔Valkey
-// and Sentinel→Valkey traffic within the cluster.
-// It restricts ingress to the Valkey port from other Valkey pods, Sentinel pods,
-// and (when operatorNamespace is non-empty) all pods in the operator namespace
-// so the operator can reach Valkey pods for health checks (e.g. INFO replication).
-// It unconditionally allows ingress on the sidecar health port from all sources
-// so that kubelet readiness/liveness probes always succeed.
-func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networkingv1.NetworkPolicy {
+// OperatorPeer identifies the operator pod for the generated NetworkPolicies:
+// the namespace it runs in and labels that select it alone, not the chart's
+// pre-upgrade hook and not any other pod of that namespace (ADR 0039 D2).
+type OperatorPeer struct {
+	Namespace string
+	PodLabels map[string]string
+}
+
+// networkPolicyPeer returns the peer that admits the operator pod, and false
+// when either half is unknown: a namespace alone would admit every pod in it,
+// labels alone would select pods in the Valkey resource's namespace. Without
+// both the policies admit no operator at all (ADR 0039, Residual risks).
+func (o OperatorPeer) networkPolicyPeer() (networkingv1.NetworkPolicyPeer, bool) {
+	if o.Namespace == "" || len(o.PodLabels) == 0 {
+		return networkingv1.NetworkPolicyPeer{}, false
+	}
+	// A copy: the client decodes the server's answer into the object it wrote, and
+	// the reconciler's one map would be written by every concurrent pass (ADR 0019).
+	podLabels := make(map[string]string, len(o.PodLabels))
+	for k, val := range o.PodLabels {
+		podLabels[k] = val
+	}
+	return networkingv1.NetworkPolicyPeer{
+		// Both selectors in one peer: the pod must match both.
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{"kubernetes.io/metadata.name": o.Namespace},
+		},
+		PodSelector: &metav1.LabelSelector{MatchLabels: podLabels},
+	}, true
+}
+
+// BuildValkeyNetworkPolicy builds the NetworkPolicy of the data pods. It admits
+// the data port (and the TLS port) from the components this repository deploys
+// and nothing else (ADR 0039 D1, D2): the other data pods, the Sentinel and
+// observer pods when enabled, and the operator pod. The sidecar health port and
+// the exporter port get no rule: kubelet's probes come from the node, which the
+// API admits anyway, and a scraper is the administrator's to admit (D3).
+func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operator OperatorPeer) *networkingv1.NetworkPolicy {
 	labels := common.BaseLabels(v, common.ComponentValkey)
 	valkeySelector := common.SelectorLabels(v, common.ComponentValkey)
 
@@ -74,17 +104,9 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networ
 		})
 	}
 
-	// Allow ingress from the operator namespace so the operator can reach Valkey
-	// pods for health checks (INFO replication). Uses the standard
-	// kubernetes.io/metadata.name namespace label (available since Kubernetes 1.21).
-	if operatorNamespace != "" {
-		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": operatorNamespace,
-				},
-			},
-		})
+	// The operator reaches the data pods for its health checks (INFO replication).
+	if peer, ok := operator.networkPolicyPeer(); ok {
+		ingressPeers = append(ingressPeers, peer)
 	}
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
@@ -113,35 +135,6 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networ
 		})
 	}
 
-	// Always allow ingress on the sidecar health port from all sources.
-	// Kubelet readiness/liveness probes originate from the node (host network),
-	// which cannot be matched by a pod selector, so no From restriction is applied.
-	healthPort := intstr.FromInt32(SidecarHealthPort)
-	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
-		Ports: []networkingv1.NetworkPolicyPort{
-			{
-				Protocol: &tcpProtocol,
-				Port:     &healthPort,
-			},
-		},
-	})
-
-	// When the metrics exporter is enabled, allow ingress on the exporter port.
-	// The scrape traffic originates from Prometheus pods whose location is not
-	// known to the operator, so — like the health port — no From restriction is
-	// applied. The exporter endpoint is read-only.
-	if v.IsMetricsEnabled() {
-		metricsPort := intstr.FromInt32(v.MetricsPort())
-		ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{
-					Protocol: &tcpProtocol,
-					Port:     &metricsPort,
-				},
-			},
-		})
-	}
-
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      NetworkPolicyName(v),
@@ -158,12 +151,10 @@ func BuildValkeyNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networ
 	}
 }
 
-// BuildSentinelNetworkPolicy builds the NetworkPolicy that allows Valkey→Sentinel
-// and Sentinel↔Sentinel traffic.
-// It restricts ingress to the Sentinel port from Valkey and Sentinel pods, and
-// (when operatorNamespace is non-empty) also from all pods in the operator namespace
-// so the operator can reach Sentinel pods for health checks.
-func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *networkingv1.NetworkPolicy {
+// BuildSentinelNetworkPolicy builds the NetworkPolicy of the Sentinel pods. It
+// admits the Sentinel port (and the TLS port) from the other Sentinel pods, the
+// data pods, the observer pods when enabled, and the operator pod (ADR 0039 D2).
+func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operator OperatorPeer) *networkingv1.NetworkPolicy {
 	labels := common.BaseLabels(v, common.ComponentSentinel)
 	sentinelSelector := common.SelectorLabels(v, common.ComponentSentinel)
 
@@ -194,16 +185,9 @@ func BuildSentinelNetworkPolicy(v *vkov1.Valkey, operatorNamespace string) *netw
 		})
 	}
 
-	// Allow ingress from the operator namespace so the operator can reach Sentinel
-	// pods for health checks (SENTINEL MASTER).
-	if operatorNamespace != "" {
-		ingressPeers = append(ingressPeers, networkingv1.NetworkPolicyPeer{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": operatorNamespace,
-				},
-			},
-		})
+	// The operator reaches the Sentinel pods for its health checks (SENTINEL MASTER).
+	if peer, ok := operator.networkPolicyPeer(); ok {
+		ingressPeers = append(ingressPeers, peer)
 	}
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
@@ -254,34 +238,21 @@ func ObserverNetworkPolicyName(v *vkov1.Valkey) string {
 	return fmt.Sprintf("%s%s-observer", prefix, v.Name)
 }
 
-// BuildObserverNetworkPolicy builds the NetworkPolicy for the observer pod.
-// It only allows ingress on the health port (8084) from all sources for kubelet probes.
+// BuildObserverNetworkPolicy builds the NetworkPolicy for the observer pod. It
+// has no ingress rule: no deployed component connects to the observer, kubelet's
+// probes come from the node, and a scraper of its /metrics is the
+// administrator's to admit (ADR 0039 D2, D3). Ingress stays nil, not empty, so
+// the desired spec compares equal to what the API server returns.
 func BuildObserverNetworkPolicy(v *vkov1.Valkey) *networkingv1.NetworkPolicy {
-	labels := ObserverLabels(v)
-	observerSelector := ObserverSelectorLabels(v)
-
-	tcpProtocol := corev1.ProtocolTCP
-	healthPort := intstr.FromInt32(ObserverHealthPort)
-
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ObserverNetworkPolicyName(v),
 			Namespace: v.Namespace,
-			Labels:    labels,
+			Labels:    ObserverLabels(v),
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{
-				MatchLabels: observerSelector,
-			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						{
-							Protocol: &tcpProtocol,
-							Port:     &healthPort,
-						},
-					},
-				},
+				MatchLabels: ObserverSelectorLabels(v),
 			},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		},

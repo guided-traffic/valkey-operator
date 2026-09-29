@@ -142,8 +142,8 @@ func (r *probeRouter) dialedAddrs() []string {
 
 // dialedAddrsSorted returns the same multiset sorted, for the assertions that
 // have to survive findMaster probing its pods concurrently: the count per address
-// still carries the meaning (a master is dialled a second time for its own
-// replication info), the arrival order no longer does.
+// still carries the meaning (every pod is dialled once, the master included), the
+// arrival order no longer does.
 func (r *probeRouter) dialedAddrsSorted() []string {
 	addrs := r.dialedAddrs()
 	sort.Strings(addrs)
@@ -175,7 +175,10 @@ func infoReply(lines ...string) string {
 	return respBulk("# Replication\r\n" + strings.Join(lines, "\r\n") + "\r\n")
 }
 
-// masterInfo is the INFO replication payload of a master with n replicas attached.
+// masterInfo is the INFO replication payload of a master reporting
+// connected_slaves:n. That count includes a replica from its sync request on,
+// while it still holds nothing, and a master's reply never carries
+// master_sync_in_progress, so nothing in it says whether a replica is synced.
 func masterInfo(connectedSlaves int) string {
 	return infoReply("role:master", fmt.Sprintf("connected_slaves:%d", connectedSlaves))
 }
@@ -183,6 +186,19 @@ func masterInfo(connectedSlaves int) string {
 // replicaInfo is the INFO replication payload of a replica synced to a master.
 func replicaInfo() string {
 	return infoReply("role:slave", "master_link_status:up", "connected_slaves:0")
+}
+
+// replicaInFullSync is the payload of a replica receiving its master's dataset:
+// the link is down for the whole transfer and master_sync_in_progress is 1
+// (measured on Valkey 9.1.1 and 8.1.9). The pod holds nothing yet.
+func replicaInFullSync() string {
+	return infoReply("role:slave", "master_link_status:down", "master_sync_in_progress:1", "connected_slaves:0")
+}
+
+// replicaConnecting is the payload of a replica right after REPLICAOF: the link is
+// not up and no transfer has started, so master_sync_in_progress is still 0.
+func replicaConnecting() string {
+	return infoReply("role:slave", "master_link_status:down", "master_sync_in_progress:0", "connected_slaves:0")
 }
 
 // sentinelMasterReply is the SENTINEL MASTER response of a Sentinel that agrees
@@ -210,7 +226,7 @@ func answers(reply string) respondFn {
 }
 
 // diesAfterFirstAnswer answers the first command and hangs up on every later
-// one, which is what a master that is killed between two probes looks like.
+// one, which is what a pod that is killed right after answering looks like.
 func diesAfterFirstAnswer(reply string) respondFn {
 	var mu sync.Mutex
 	answered := false
@@ -253,55 +269,79 @@ func TestCheckCluster_ReportsTheMasterAndItsSyncedReplicas(t *testing.T) {
 	assert.Equal(t, "test-1", state.MasterPod, "the pod reporting role:master is the master")
 	assert.Equal(t, "test-1.test-headless.default.svc.cluster.local:6379", state.MasterAddress)
 	assert.Equal(t, int32(2), state.TotalReplicas)
-	assert.Equal(t, int32(2), state.ReadyReplicas, "connected_slaves is the master's own count")
+	assert.Equal(t, int32(2), state.ReadyReplicas,
+		"the two replicas prove their sync in their own replies, not in the master's connected_slaves")
 	assert.True(t, state.AllSynced)
 	assert.False(t, state.SentinelMonitoring, "sentinel is disabled, so it is never consulted")
 	assert.Equal(t, []string{
 		"test-0.test-headless.default.svc.cluster.local:6379",
 		"test-1.test-headless.default.svc.cluster.local:6379",
-		// The master is dialled a second time for its own replication info.
-		"test-1.test-headless.default.svc.cluster.local:6379",
 		"test-2.test-headless.default.svc.cluster.local:6379",
-	}, router.dialedAddrsSorted())
+	}, router.dialedAddrsSorted(),
+		"every pod is dialled once: the replicas are judged on the replies findMaster collected, "+
+			"and the master is not asked a second time")
 }
 
+// TestCheckCluster_ReplicaAccounting pins where "synced" is read: in each
+// replica's own INFO replication, never in the master's
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2).
+// The master replies below are the shape Valkey gives -- connected_slaves already
+// counts a replica that is still receiving the dataset -- and none of them decides
+// the count. An empty replica reply is a pod that does not answer.
 func TestCheckCluster_ReplicaAccounting(t *testing.T) {
 	tests := []struct {
 		name              string
 		master            string
+		replicas          [2]string // test-1, test-2
 		wantReadyReplicas int32
 		wantAllSynced     bool
 	}{
 		{
-			name:              "every replica attached",
+			name:              "both replicas synced",
 			master:            masterInfo(2),
+			replicas:          [2]string{replicaInfo(), replicaInfo()},
 			wantReadyReplicas: 2,
 			wantAllSynced:     true,
 		},
 		{
-			name:              "one replica still missing",
-			master:            masterInfo(1),
+			// The case the master-side count got wrong: the master reports
+			// connected_slaves:2 and no master_sync_in_progress while test-2 is
+			// still receiving the dataset.
+			name:              "a replica in full sync is not synced though the master counts it",
+			master:            masterInfo(2),
+			replicas:          [2]string{replicaInfo(), replicaInFullSync()},
 			wantReadyReplicas: 1,
 			wantAllSynced:     false,
 		},
 		{
-			name:              "no replica attached at all",
-			master:            masterInfo(0),
-			wantReadyReplicas: 0,
+			name:              "a replica still connecting is not synced",
+			master:            masterInfo(1),
+			replicas:          [2]string{replicaInfo(), replicaConnecting()},
+			wantReadyReplicas: 1,
 			wantAllSynced:     false,
 		},
 		{
-			name: "a full sync in progress is not synced",
-			master: infoReply("role:master", "connected_slaves:2",
-				"master_sync_in_progress:1"),
-			wantReadyReplicas: 2,
+			name:              "a replica that does not answer is not counted",
+			master:            masterInfo(2),
+			replicas:          [2]string{replicaInfo(), ""},
+			wantReadyReplicas: 1,
 			wantAllSynced:     false,
 		},
 		{
-			name:              "more attached replicas than the spec expects are clamped",
+			// Replaces the old clamp case: a master count above the spec used to be
+			// cut down to it and read as every replica synced.
+			name:              "a master counting more replicas than the spec expects does not raise the count",
 			master:            masterInfo(7),
-			wantReadyReplicas: 2,
-			wantAllSynced:     true,
+			replicas:          [2]string{replicaInfo(), replicaInFullSync()},
+			wantReadyReplicas: 1,
+			wantAllSynced:     false,
+		},
+		{
+			name:              "a second master is not a synced replica",
+			master:            masterInfo(1),
+			replicas:          [2]string{replicaInfo(), masterInfo(0)},
+			wantReadyReplicas: 1,
+			wantAllSynced:     false,
 		},
 	}
 
@@ -312,6 +352,11 @@ func TestCheckCluster_ReplicaAccounting(t *testing.T) {
 
 			router := newProbeRouter()
 			router.serve(t, "test-0", answers(tc.master))
+			for i, reply := range tc.replicas {
+				if reply != "" {
+					router.serve(t, fmt.Sprintf("test-%d", i+1), answers(reply))
+				}
+			}
 
 			state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
 
@@ -323,10 +368,39 @@ func TestCheckCluster_ReplicaAccounting(t *testing.T) {
 	}
 }
 
-// A master that answers findMaster and is gone by the second probe must surface
-// as a health-check error, not as a cluster with zero ready replicas.
-func TestCheckCluster_MasterLostBetweenTheTwoProbes(t *testing.T) {
-	ctx, capture := newProbeContext(t)
+// TestCheckCluster_ReplicasInFullSyncAreNotSyncedThoughTheMasterCountsThem is the
+// case the master-side count reported as healthy. While both replicas receive the
+// dataset the master already counts them in connected_slaves, and its reply
+// carries no master_sync_in_progress -- that field exists only in a replica's
+// reply, where a full sync shows as master_link_status:down with
+// master_sync_in_progress:1 (measured on Valkey 9.1.1 and 8.1.9). Read from the
+// master, this was AllSynced with two replicas that held nothing.
+func TestCheckCluster_ReplicasInFullSyncAreNotSyncedThoughTheMasterCountsThem(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default", noSentinel)
+
+	router := newProbeRouter()
+	router.serve(t, "test-0", answers(masterInfo(2)))
+	router.serve(t, "test-1", answers(replicaInFullSync()))
+	router.serve(t, "test-2", answers(replicaInFullSync()))
+
+	state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
+
+	require.NoError(t, state.Error)
+	assert.Equal(t, "test-0", state.MasterPod)
+	assert.Equal(t, int32(0), state.ReadyReplicas, "a replica in full sync holds no dataset yet")
+	assert.False(t, state.AllSynced, "connected_slaves:2 counts both replicas from their sync request on")
+}
+
+// TestCheckCluster_ReplicasThatDoNotAnswerAreNotSynced replaces the test of the
+// second master probe, which ADR 0037 D2 removed: CheckCluster used to dial the
+// master again for its INFO replication, count from its connected_slaves, and fail
+// the check when that second dial failed. The master is now asked once, in
+// findMaster, and nothing in its reply is counted, so a master that hangs up
+// after its first answer is no error, and a master whose replicas stay silent
+// reports no synced replica whatever its connected_slaves says.
+func TestCheckCluster_ReplicasThatDoNotAnswerAreNotSynced(t *testing.T) {
+	ctx, _ := newProbeContext(t)
 	v := newTestValkey("test", "default", noSentinel)
 
 	router := newProbeRouter()
@@ -334,16 +408,14 @@ func TestCheckCluster_MasterLostBetweenTheTwoProbes(t *testing.T) {
 
 	state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
 
-	require.Error(t, state.Error)
-	assert.Contains(t, state.Error.Error(), "master replication info:")
-	assert.Equal(t, "test-0", state.MasterPod, "the master found first is still reported")
-	assert.Zero(t, state.ReadyReplicas)
+	require.NoError(t, state.Error, "the master is asked once; there is no second probe left for it to fail")
+	assert.Equal(t, "test-0", state.MasterPod)
+	assert.Zero(t, state.ReadyReplicas, "a silent pod proves nothing, and the master's count is not read")
 	assert.False(t, state.AllSynced)
-	assert.Contains(t, capture.joined(), "Could not get master replication info")
 }
 
-// The password from the auth Secret has to reach every probe, including the
-// second one against the master.
+// The password from the auth Secret has to reach every probe findMaster sends,
+// to the master and the replicas alike.
 func TestCheckCluster_AuthenticatedClusterSendsThePasswordOnEveryProbe(t *testing.T) {
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("test", "default", noSentinel, func(v *vkov1.Valkey) {
@@ -405,41 +477,51 @@ func TestFindMaster_LiveResponses(t *testing.T) {
 		serve   map[string]string
 		wantPod string
 		wantErr string
+		// wantRoles is the Role of every ordinal whose reply findMaster must hand
+		// back at that ordinal; every other slot must be nil.
+		wantRoles map[int]string
 	}{
 		{
-			name:    "the sole master is returned even with no replicas attached",
-			serve:   map[string]string{"test-1": masterInfo(0)},
-			wantPod: "test-1",
+			name:      "the sole master is returned even with no replicas attached",
+			serve:     map[string]string{"test-1": masterInfo(0)},
+			wantPod:   "test-1",
+			wantRoles: map[int]string{1: "master"},
 		},
 		{
-			name:    "pods that refuse the connection are skipped",
-			serve:   map[string]string{"test-2": masterInfo(1)},
-			wantPod: "test-2",
+			name:      "pods that refuse the connection are skipped",
+			serve:     map[string]string{"test-2": masterInfo(1)},
+			wantPod:   "test-2",
+			wantRoles: map[int]string{2: "master"},
 		},
 		{
-			name:    "a role the operator does not know is not a master",
-			serve:   map[string]string{"test-0": infoReply("role:sentinel")},
-			wantErr: "no master found among 3 pods",
+			name:      "a role the operator does not know is not a master",
+			serve:     map[string]string{"test-0": infoReply("role:sentinel")},
+			wantErr:   "no master found among 3 pods",
+			wantRoles: map[int]string{0: "sentinel"},
 		},
 		{
-			name:    "a replica-only cluster has no master",
-			serve:   map[string]string{"test-0": replicaInfo(), "test-1": replicaInfo()},
-			wantErr: "no master found among 3 pods",
+			name:      "a replica-only cluster has no master",
+			serve:     map[string]string{"test-0": replicaInfo(), "test-1": replicaInfo()},
+			wantErr:   "no master found among 3 pods",
+			wantRoles: map[int]string{0: "slave", 1: "slave"},
 		},
 		{
-			name:    "an INFO payload without a role line yields no candidate",
-			serve:   map[string]string{"test-0": respBulk("this is not an INFO payload")},
-			wantErr: "no master found among 3 pods",
+			name:      "an INFO payload without a role line yields no candidate",
+			serve:     map[string]string{"test-0": respBulk("this is not an INFO payload")},
+			wantErr:   "no master found among 3 pods",
+			wantRoles: map[int]string{0: ""},
 		},
 		{
-			name:    "an empty bulk reply yields no candidate",
-			serve:   map[string]string{"test-0": "$-1\r\n"},
-			wantErr: "no master found among 3 pods",
+			name:      "an empty bulk reply yields no candidate",
+			serve:     map[string]string{"test-0": "$-1\r\n"},
+			wantErr:   "no master found among 3 pods",
+			wantRoles: map[int]string{0: ""},
 		},
 		{
-			name:    "a RESP error reply skips the pod",
-			serve:   map[string]string{"test-0": "-ERR unknown command 'INFO'\r\n"},
-			wantErr: "no master found among 3 pods",
+			name:      "a RESP error reply skips the pod",
+			serve:     map[string]string{"test-0": "-ERR unknown command 'INFO'\r\n"},
+			wantErr:   "no master found among 3 pods",
+			wantRoles: map[int]string{},
 		},
 	}
 
@@ -454,7 +536,21 @@ func TestFindMaster_LiveResponses(t *testing.T) {
 			}
 			checker := router.install(newFakeChecker(runningTestPods(3)...))
 
-			pod, addr, err := checker.findMaster(ctx, v, "", nil)
+			pod, addr, replies, err := checker.findMaster(ctx, v, "", nil)
+
+			// The replies come back on success and on failure alike, one slot per
+			// ordinal: CheckCluster judges the replicas on them without a second dial.
+			require.Len(t, replies, 3, "one slot per ordinal, answered or not")
+			for i, info := range replies {
+				role, answered := tc.wantRoles[i]
+				if !answered {
+					assert.Nil(t, info, "test-%d gave no reply, so its slot stays nil", i)
+					continue
+				}
+				if assert.NotNil(t, info, "test-%d answered, so its reply sits at its ordinal", i) {
+					assert.Equal(t, role, info.Role, "test-%d", i)
+				}
+			}
 
 			if tc.wantErr != "" {
 				require.EqualError(t, err, tc.wantErr)
@@ -480,7 +576,7 @@ func TestFindMaster_SplitBrainPrefersTheMasterWithMostReplicas(t *testing.T) {
 	router.serve(t, "test-2", answers(masterInfo(2)))
 	checker := router.install(newFakeChecker(runningTestPods(3)...))
 
-	pod, addr, err := checker.findMaster(ctx, v, "", nil)
+	pod, addr, _, err := checker.findMaster(ctx, v, "", nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, "test-2", pod, "the lowest ordinal must not win over the pod serving the replicas")
@@ -633,6 +729,8 @@ func TestCheckCluster_SentinelAgreementReachesTheState(t *testing.T) {
 
 	router := newProbeRouter()
 	router.serve(t, "test-0", answers(masterInfo(2)))
+	router.serve(t, "test-1", answers(replicaInfo()))
+	router.serve(t, "test-2", answers(replicaInfo()))
 	for i := 0; i < 3; i++ {
 		router.serve(t, fmt.Sprintf("test-sentinel-%d", i), answers(sentinelMasterReply("master")))
 	}

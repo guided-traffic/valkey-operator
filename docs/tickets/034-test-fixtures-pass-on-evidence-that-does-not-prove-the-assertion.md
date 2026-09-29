@@ -485,8 +485,7 @@ Sentinel-branch data init is covered cheaper by the D19 unit exec harness T35 ne
 
 ## Related
 
-- [T12](012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) - write fencing needs
-  refused writes to be errors in the e2e helpers first; on done, update its pointer.
+- [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done) - refused the write fence (ADR 0038); its writer harness classifies replies itself, and it corrected the stale-master diagnosis, not the helpers.
 - [T31](archive/031-generated-pods-run-as-root.md) - holds the reproduction of the fixed cache read.
 - [T35](035-who-the-master-is-after-a-restart-or-failover.md) - source of the Sentinel lag figures; rewrites
   the Sentinel-branch data init with the D19 unit exec harness; its Pod informer is untouched by Q3.

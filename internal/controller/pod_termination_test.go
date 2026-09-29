@@ -202,7 +202,7 @@ func TestVerifyNewMasterReady_RefusesATerminatingNewMaster(t *testing.T) {
 			if podName == "vnm-1" {
 				return &valkeyclient.ReplicationInfo{Role: common.RoleMaster, ConnectedSlaves: 2}, nil
 			}
-			return &valkeyclient.ReplicationInfo{Role: common.RoleReplica}, nil
+			return &valkeyclient.ReplicationInfo{Role: "slave", MasterLinkStatus: "up"}, nil
 		},
 	}
 
@@ -212,7 +212,7 @@ func TestVerifyNewMasterReady_RefusesATerminatingNewMaster(t *testing.T) {
 		{name: "vnm-2", exists: true, readyCondition: true},
 	}
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, checker)
+	verified, result := verifyNewMaster(r, v, pods, checker)
 	assert.False(t, verified, "a terminating pod must not be accepted as the new master")
 	assert.True(t, result.NeedsRequeue)
 
@@ -220,7 +220,7 @@ func TestVerifyNewMasterReady_RefusesATerminatingNewMaster(t *testing.T) {
 	// is the availability guard and nothing else in the fixture.
 	pods[1].terminating = false
 	pods[1].terminatingSince = time.Time{}
-	verified, _ = r.verifyNewMasterReady(context.Background(), v, pods, checker)
+	verified, _ = verifyNewMaster(r, v, pods, checker)
 	assert.True(t, verified)
 }
 
@@ -254,7 +254,9 @@ func TestSortReplicaCandidates_TerminatingPodStaysFirst(t *testing.T) {
 // change could plausibly have caused. A blanket readiness change would refuse the
 // demotion of the outgoing master, which then keeps accepting writes as a master
 // for the rest of its termination -- up to the 60 s cap of the drain hook, and
-// with no write fencing on either side (T12).
+// with no write fencing on either side: the operator sets min-replicas-to-write
+// nowhere, neither as a CRD field nor at runtime
+// (docs/adr/0038-the-operator-does-not-offer-min-replicas-to-write.md, D1, D2).
 func TestDemoteRogueMaster_StillDemotesATerminatingMaster(t *testing.T) {
 	v := newTestValkey("drm", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 3 })
 	r, _ := newTestReconciler(v)
@@ -1093,7 +1095,7 @@ func TestVerifyNewMasterReady_StalledTerminatingCandidateDefers(t *testing.T) {
 		{name: "vnm2-2", exists: true, readyCondition: true, needsUpdate: true},
 	}
 
-	verified, result := r.verifyNewMasterReady(context.Background(), v, pods, checker)
+	verified, result := verifyNewMaster(r, v, pods, checker)
 	assert.False(t, verified)
 	assert.False(t, result.NeedsRequeue)
 	assert.Equal(t, rollingUpdateRequeueDelay, result.DeferredRequeueAfter)

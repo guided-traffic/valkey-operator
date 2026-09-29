@@ -43,10 +43,10 @@ flowchart LR
 - 🛡️ **Rootless pods** — every generated pod runs as a non-root user with all capabilities dropped, a read-only root filesystem and a seccomp filter, so it is admitted in a namespace enforcing Pod Security `restricted`
 - 🧱 **Pod hardening knobs** — [`spec.podSecurity`](#specpodsecurity) picks the seccomp profile (`RuntimeDefault`, or a `Localhost` profile an administrator has put on the operator's allow-list — never `Unconfined`) and opts into user namespaces (`hostUsers: false`); images can be pinned by digest
 - 🩺 **Cluster Observer** — optional diagnostic deployment that continuously verifies cluster health (master reachable, replication sync, write/read tests, Sentinel quorum) and exposes Prometheus metrics
-- 📊 **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update without data loss
+- 📊 **Metrics exporter** — optional per-pod Prometheus exporter sidecar with a dedicated Service and Prometheus-Operator `ServiceMonitor`; enabling it on a running cluster migrates through the failover-aware rolling update, which keeps the pre-roll dataset; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before Valkey 9.0, the 8 to 9 upgrade roll included) and on any roll whose coordinated failover fell back to forced, the writes the outgoing master acknowledges during the roll's failover are lost ([the master handover](docs/operations/rolling-updates.md#the-master-handover-on-a-sentinel-cluster))
 - 🚧 **Disruption budgets** — optional PodDisruptionBudgets that keep a node drain from evicting all data pods or the Sentinel quorum at once
 - 🧭 **Pod anti-affinity** — opt-in spreading of data and Sentinel pods across nodes: `mode: soft` (scheduler preference) or `mode: hard` (guaranteed spread)
-- 🌐 **Network policies** — optional firewall rules for Valkey and Sentinel traffic
+- 🌐 **Network policies** — optional ingress policies that admit only the operator's own components; your clients and scrapers stay yours to admit
 - ⎈ **Helm deployment** — install the operator with a single `helm install`
 
 <a id="naming-conventions"></a>
@@ -147,9 +147,9 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 | TLS fingerprint | environment variable `VKO_TLS_MATERIAL_HASH` on the `sidecar` (data) and `sentinel` containers ([certificate rotation](docs/operations/tls.md#certificate-rotation)) |
 | Environment, auth password | `VALKEY_PASSWORD` from `spec.auth.secretName`/`secretPasswordKey` when auth is enabled. It goes on the data pod's `valkey` and `sidecar` containers and the `init-config-selector` init container; on the Sentinel pod's `init-sentinel-config`, and on `sentinel` unless `spec.sentinel.disableAuth`; and on `observer`. The exporter gets the same key as `REDIS_PASSWORD` ([secrets and TLS](docs/security/secrets-and-tls.md)) |
 | Environment, pod identity | `POD_NAME`, `POD_NAMESPACE` (downward API) on `sidecar`; `POD_NAMESPACE` on `observer` |
-| Environment, exporter | `REDIS_ADDR`, `REDIS_EXPORTER_WEB_LISTEN_ADDRESS` always; `REDIS_PASSWORD` with auth; `REDIS_EXPORTER_SKIP_TLS_VERIFICATION`, `REDIS_EXPORTER_TLS_CA_CERT_FILE`, `REDIS_EXPORTER_TLS_CLIENT_CERT_FILE`, `REDIS_EXPORTER_TLS_CLIENT_KEY_FILE` under TLS (on `exporter`, with `spec.metrics.enabled`) |
+| Environment, exporter | `REDIS_ADDR`, `REDIS_EXPORTER_WEB_LISTEN_ADDRESS`, `REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT=true`, `REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES=true` always; `REDIS_PASSWORD` with auth; `REDIS_EXPORTER_SKIP_TLS_VERIFICATION`, `REDIS_EXPORTER_TLS_CA_CERT_FILE`, `REDIS_EXPORTER_TLS_CLIENT_CERT_FILE`, `REDIS_EXPORTER_TLS_CLIENT_KEY_FILE` under TLS (on `exporter`, with `spec.metrics.enabled`) |
 | Operator metrics | `vko_valkey_*`, `vko_operator_build_info` ([monitoring](docs/operations/monitoring.md#operator-metrics-and-alerting)) |
-| Operator release, as installed below | Deployment `valkey-operator` in namespace `valkey-operator-system`; pre-upgrade hook Job `valkey-operator-pre-upgrade`; environment `OPERATOR_IMAGE`, `POD_NAMESPACE` on the operator container |
+| Operator release, as installed below | Deployment `valkey-operator` in namespace `valkey-operator-system`, its pod labelled `app.kubernetes.io/component: operator`; pre-upgrade hook Job `valkey-operator-pre-upgrade`; environment `OPERATOR_IMAGE`, `POD_NAMESPACE` on the operator container |
 
 </details>
 
@@ -159,7 +159,7 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 | Key | On | Meaning |
 |---|---|---|
 | `vko.gtrfc.com/known-master` | the `Valkey` resource | The master the operator has recorded for the cluster |
-| `vko.gtrfc.com/rolling-update-state`, `failover-timestamp`, `promoted-pod`, `reconnect-reset-count`, `sync-wait-started`, `topology-restore-started`, `manual-failover-started`, `sentinel-awareness-started`, `finalization-started`, `recreation-wait-started` (all under `vko.gtrfc.com/`) | the `Valkey` resource | State of a rolling update in flight, kept across reconcile passes |
+| `vko.gtrfc.com/rolling-update-state`, `failover-timestamp`, `promoted-pod`, `reconnect-reset-count`, `sync-wait-started`, `topology-restore-started`, `manual-failover-started`, `sentinel-awareness-started`, `finalization-started`, `recreation-wait-started`, `handover-hold-started` (all under `vko.gtrfc.com/`) | the `Valkey` resource | State of a rolling update in flight, kept across reconcile passes |
 | `vko.gtrfc.com/operator-version` | every resource the operator creates or updates | The operator version that last reconciled it |
 | `vko.gtrfc.com/config-hash`, `vko.gtrfc.com/pod-spec-hash` | the pod template of both StatefulSets | Hashes of the generated configuration and of the pod spec; a changed hash is how a rolling update detects a change |
 | `vko.gtrfc.com/nudge` | a StatefulSet that is short of pods | A timestamp bump that makes the StatefulSet controller sync at once; never rolls a pod |
@@ -174,7 +174,7 @@ The Sentinel tier monitors the master under the name `<name>` (`sentinel monitor
 
 | Document | What it covers |
 |---|---|
-| **[docs/operations/](docs/operations/README.md)** | Running it: installation, upgrading, examples, authentication, TLS, persistence, rolling updates, disruption budgets, anti-affinity, compute resources, pod security, monitoring, the cluster observer, reading the status |
+| **[docs/operations/](docs/operations/README.md)** | Running it: installation, upgrading, examples, authentication, TLS, persistence, rolling updates, disruption budgets, anti-affinity, compute resources, network policies, pod security, monitoring, the cluster observer, reading the status |
 | **[CRD reference](#crd-reference)** and **[Helm chart values](#helm-chart-values)** (below) | Every `spec` and `status` field and every chart value, with its default |
 | **[docs/security/](docs/security/)** | The security architecture: trust boundaries, every RBAC rule the operator and the per-instance sidecar hold and what each one permits, where the password and the TLS material live, and what the isolation does **not** cover |
 | **[SECURITY.md](SECURITY.md)** | How to report a vulnerability |
@@ -363,8 +363,8 @@ Explained in: [tls.md](docs/operations/tls.md).
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Add a Prometheus exporter sidecar to each Valkey pod |
-| `image` | `string` | `oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1` | Exporter container image. The default is pinned by the digest of the multi-arch image index behind the tag, so a re-pushed tag cannot change what runs; the tag is kept for the reader. It is not updated automatically. An image you set here is used as given — pin it by digest the same way. |
-| `port` | `int32` | `9121` | Container/Service port serving `/metrics` (named `metrics`) |
+| `image` | `string` | `oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd` | Exporter container image. The default is pinned by the digest of the multi-arch image index behind the tag, so a re-pushed tag cannot change what runs; the tag is kept for the reader. It is not updated automatically. An image you set here is used as given — pin it by digest the same way. **Use v1.83.0 or later:** an older image starts, but keeps the `/scrape` route the operator switches off ([monitoring.md](docs/operations/monitoring.md#the-exporter-sidecar)). |
+| `port` | `int32` | `9121` | Container/Service port serving `/metrics` (named `metrics`), plain HTTP without authentication |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits for the exporter container |
 | `extraArgs` | `[]string` | — | Additional command-line arguments passed to the exporter (e.g. `["--check-keys=*"]`) |
 | `service` | `MetricsServiceSpec` | — | Dedicated metrics Service configuration |
@@ -394,8 +394,10 @@ Requires the Prometheus-Operator CRDs (`monitoring.coreos.com`) to be installed;
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `bool` | `false` | Create a NetworkPolicy for the data pods, and one each for the Sentinel and observer pods where those are enabled |
-| `namePrefix` | `string` | — | Prepended, followed by `-`, to the names of the generated NetworkPolicies |
+| `enabled` | `bool` | `false` | Create an ingress NetworkPolicy for the data pods, and one each for the Sentinel and observer pods where those are enabled. They admit only the operator's own components; `false` deletes them |
+| `namePrefix` | `string` | — | Prepended, followed by `-`, to the names of the generated NetworkPolicies; a change replaces them |
+
+Explained in: [network-policy.md](docs/operations/network-policy.md).
 
 ### `spec.persistence`
 
@@ -469,7 +471,7 @@ Explained in: [anti-affinity.md](docs/operations/anti-affinity.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting, and how long a rolling update waits on a pod that never becomes available before it reports that pod |
+| `syncTimeout` | `Duration` | `5m` | How long the operator waits for a replaced pod to finish replication sync before it stops waiting, how long a rolling update waits on a pod that never becomes available before it reports that pod, and how long a held delete of the outgoing master lasts before it is reported as `MasterHandoverStalled` (the hold itself does not end) |
 
 Explained in: [rolling-updates.md](docs/operations/rolling-updates.md).
 
@@ -518,6 +520,7 @@ A **level** is re-measured on every pass, an **edge** records something and is c
 | `PodRecreationStalled` | edge | [status.md](docs/operations/status.md#podrecreationstalled) |
 | `PodAvailabilityStalled` | level | [status.md](docs/operations/status.md#podavailabilitystalled) |
 | `RWServiceEmpty` | level | [status.md](docs/operations/status.md#rwserviceempty) |
+| `MasterHandoverStalled` | edge | [status.md](docs/operations/status.md#masterhandoverstalled) |
 
 #### Phase Values
 
@@ -553,7 +556,7 @@ default from [`values.yaml`](deploy/helm/valkey-operator/values.yaml); a value s
 | `serviceAccount.annotations` | `{}` | Annotations on the ServiceAccount |
 | `serviceAccount.name` | `""` | The ServiceAccount to use; empty with `create: true` generates one from the full name |
 | `podAnnotations` | `{}` | Extra annotations on the operator pod |
-| `podLabels` | `{}` | Extra labels on the operator pod |
+| `podLabels` | `{}` | Extra labels on the operator pod; must not set `app.kubernetes.io/component` ([network-policy.md](docs/operations/network-policy.md#how-the-operator-pod-is-recognised)) |
 | `podSecurity.seccompProfile.type` | `RuntimeDefault` | Or `Localhost`. The operator and pre-upgrade hook pods only, not the Valkey pods — see [pod-security.md](docs/operations/pod-security.md#the-operators-own-pods) |
 | `podSecurity.seccompProfile.localhostProfile` | `""` | Required with `Localhost`, relative, no `..`; *example* `profiles/operator.json` |
 | `podSecurity.userNamespaces` | `false` | `true` sets `hostUsers: false` |
@@ -574,7 +577,7 @@ default from [`values.yaml`](deploy/helm/valkey-operator/values.yaml); a value s
 | `metrics.prometheusRule.enabled` | `false` | Ships the alert rules — see [monitoring.md](docs/operations/monitoring.md#operator-metrics-and-alerting) |
 | `metrics.prometheusRule.labels` | `{}` | Must match your `ruleSelector` |
 | `preUpgradeHook.enabled` | `true` | Renders the pre-upgrade Job and its RBAC — see [upgrading.md](docs/operations/upgrading.md#what-an-upgrade-does-to-running-clusters) |
-| `preUpgradeHook.podLabels` | `{}` | Extra labels on the pre-upgrade pod |
+| `preUpgradeHook.podLabels` | `{}` | Extra labels on the pre-upgrade pod; must not set `app.kubernetes.io/component` |
 | `preUpgradeHook.resources` | requests `cpu: 50m`, `memory: 64Mi`; limits `cpu: 200m`, `memory: 128Mi` | The pre-upgrade container |
 
 <a id="development"></a>

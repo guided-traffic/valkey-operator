@@ -17,6 +17,22 @@ Everything in this ADR was **verified by reading** the builders, `cmd/main.go`, 
 `deployment.yaml` and the controller-runtime version pinned in `go.mod`. Nothing here was
 reproduced against a cluster, and no scrape, dashboard or endpoint response was measured.
 
+Amended 2026-09-28 (correction): **D7 and one rejected alternative said the migration loses
+nothing.** It keeps the pre-roll dataset, not every acknowledged write;
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8 states what
+a multi-replica roll loses. The rule of D7 — migrate through the rolling update, no persistence
+required — is unchanged; both claims are struck and corrected in place.
+
+Amended 2026-09-29: **D6 is re-decided by [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)** — a shipped NetworkPolicy opens no port for
+a scraper, the exporter port included; the administrator admits the scraper. Implemented.
+
+Amended 2026-09-29, with **D11**: the exporter's listener served more than `/metrics`, and one of
+its routes dialled a target named in the request with the exporter's password. D1's bound on the
+unverified TLS connection — it "never leaves the pod's network namespace" — was therefore false
+for the pinned image, and is corrected in place. D11 switches that route and the export of key
+values off on every cluster and moves the default image from v1.66.0 to v1.92.1, the newest
+release on 2026-09-29. Implemented; the measurements are under D11.
+
 ## Context
 
 Two metrics surfaces are in scope here, and they are easy to confuse:
@@ -54,8 +70,15 @@ Under TLS it is not a bare skip-verify: the exporter sets
 Verification is skipped for a mechanical reason — the name it dials, `localhost`, is not on the
 server certificate — not because server identity is deemed irrelevant; the residual of an
 unverified server is bounded **precisely because** the connection never leaves the pod's network
-namespace. The client certificate is presented regardless, which is what keeps the sidecar
-working when the server enables `tls-auth-clients`.
+namespace. *(Corrected 2026-09-29: that held only for the connection the exporter makes on its
+own. Until D11, `GET /scrape?target=<host>` on the unauthenticated exporter port made it dial a
+caller-named host with a copy of its options — the password and, under TLS, the unverified TLS
+settings included — so the connection left the pod whenever a caller asked; a `redis://` target
+received the password in cleartext, measured against v1.66.0. Since D11 the pinned image has no
+such route and the bound holds again; it does not hold for an image set through
+`spec.metrics.image` that predates the switch, see Residual risks.)* The client certificate is
+presented regardless, which is what keeps the sidecar working when the server enables
+`tls-auth-clients`.
 
 **D2 — The exporter carries no readiness probe.** A readiness probe on the sidecar makes the
 whole pod unready when the exporter fails, which removes the pod from the `-rw` and `-r`
@@ -93,13 +116,20 @@ expected pattern for any future optional third-party CRD.
 `reconcileMonitoringResources`, so disabling the feature removes the resources rather than
 orphaning them ([ADR 0004](0004-opt-in-poddisruptionbudgets.md) D6 has the same shape).
 
-**D6 — The NetworkPolicy opens the exporter port only when metrics are enabled.** The policy
-surface tracks the feature set rather than being permanently widened for a feature most
-clusters do not enable.
+**D6 — ~~The NetworkPolicy opens the exporter port only when metrics are enabled.~~ The
+NetworkPolicy opens no rule for the exporter port** *(re-decided 2026-09-29, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D1–D3:
+nothing this repository deploys reads it, and the scraper that does is the administrator's to
+admit, with a policy of their own)*. ~~The policy surface tracks the feature set rather than
+being permanently widened for a feature most clusters do not enable.~~
 
-**D7 — Enabling metrics migrates through the failover-aware rolling update, losslessly.** The
+**D7 — Enabling metrics migrates through the failover-aware rolling update~~, losslessly~~.** The
 sidecar changes the pod-spec hash, so the existing machinery migrates the pods and **no
-persistence is required**. Routing every pod-spec change through the same rolling update means
+persistence is required**. *(Corrected 2026-09-28,
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8: on a
+multi-replica cluster the pre-roll dataset survives; on a Sentinel cluster whose Sentinels cannot
+run a coordinated failover — before Valkey 9.0, the 8 to 9 upgrade roll included — and on any
+roll whose coordinated failover fell back to forced, the writes the outgoing master acknowledges
+during the roll's failover are lost.)* Routing every pod-spec change through the same rolling update means
 new features do not each need their own migration story
 ([ADR 0007](0007-failover-aware-rolling-update.md)).
 
@@ -126,6 +156,73 @@ or disable the metrics endpoint, because the flag was silently ignored.)*
 deliberate trade, not free hardening.** It requires a `TokenReview`/`SubjectAccessReview` grant
 on the ClusterRole ([ADR 0013](0013-operator-is-cluster-wide-privileged.md)).
 
+**D11 — The exporter serves metrics, not a proxy: `/scrape` and the export of key values are off
+on every cluster, with no switch.** The exporter's listener takes no credentials, so whatever it
+serves it serves to anything that reaches `spec.metrics.port`. `buildExporterContainer` sets
+`REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT=true` and
+`REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES=true` unconditionally. Before, the listener served:
+
+- `/scrape?target=…`, which dials the named target with the exporter's own options — the
+  configured password included, credentials in the target URL discarded — and accepts
+  `check-keys`, `check-single-keys`, `check-streams`, `check-single-streams` and `count-keys`
+  from the query string, exporting a string key's value as the `val` label of
+  `redis_key_value_as_string`. One request sent the password of the default user to a host of
+  the caller's choosing; another, aimed at `localhost`, read key values through the exporter's
+  own session, past any data-port rule of a NetworkPolicy;
+- `/metrics`, `/` (every unknown path answers with the index page), `/health`, `/-/reload`
+  (answers 400: no password file is mounted) and, since upstream v1.70.0,
+  `/discover-cluster-nodes` (answers 400 without `--is-cluster`). These stay, and none of them
+  dials a caller-named target or returns key data.
+
+The rules:
+
+- **Environment variables, not flags.** An image set through `spec.metrics.image` that predates
+  a flag stops on it ("flag provided but not defined", exit 2), and an exporter that restarts in
+  a loop is a not-ready container in a data pod — the outage D2 exists to prevent. An unknown
+  variable is ignored. The price is that such an image keeps `/scrape` (Residual risks).
+- **The key-value switch is there for two cases the route switch does not cover:** a key a CR
+  author configures through `spec.metrics.extraArgs` (`--check-single-keys`), whose value would
+  otherwise be a label on `/metrics`, and an image older than v1.83.0, which ignores the route
+  switch but honours this one (measured with v1.66.0, Residual risks). Key names and sizes are
+  still exported for a configured key.
+- **The default image is `oliver006/redis_exporter` v1.92.1**, the newest release on 2026-09-29,
+  pinned by the digest of its multi-arch index (ADR 0033 D5). `--disable-scrape-endpoint` exists
+  since v1.83.0; the newest release rather than the lowest one with the flag, because every
+  release between them is a dependency or Go update or adds metrics, and none removes a flag
+  the builder sets or a route `/metrics` depends on (read in the upstream release notes v1.67.0
+  to v1.92.1). v1.90.0 changes the keyspace metrics; no dashboard, alert or test in this
+  repository reads an exporter series.
+- **The exporter's env is in the pod-spec hash**, so this change rolls every metrics-enabled
+  multi-replica data tier once through the failover-aware rolling update (D7).
+- **A single data pod (`spec.replicas: 1`, no Sentinel) is decided by persistence.** The same
+  release moves the sidecar image, and `isSidecarOnlyChange` compares only the Valkey and sidecar
+  images, so the exporter update read as sidecar-only and was deferred on every such cluster
+  until its next restart ([ADR 0007](0007-failover-aware-rolling-update.md) D6, D7).
+  `singlePodDeferral` now treats a differing exporter image or environment (`exporterDrifted`)
+  like the root posture of [ADR 0032](0032-generated-pods-run-rootless.md) D3: a persistent pod
+  is replaced at once, one restart with the data kept; a non-persistent one is held — an
+  operator upgrade never discards a dataset — and reported as
+  `PodSecurityUpdatePending=True/ExporterOutdated` naming it, unless its Valkey image, TLS
+  material record or configuration changed, which replaces it as before. Decided 2026-09-29 by
+  the owner over two alternatives: leaving the deferral and documenting it (the route stays open
+  on every single-pod cluster until someone deletes the pod), and replacing every such pod (the
+  dataset of a non-persistent one lost to an operator upgrade).
+
+Measured 2026-09-29 by `TestExporter_ServesNoScrapeRoute`
+([`test/imagetools/exporter_routes_test.go`](../../test/imagetools/exporter_routes_test.go)),
+which runs the pinned image with the builder's env, rootless as in a data pod, in a Valkey
+container's network namespace on both pinned Valkey lines: `/metrics` reports `redis_up 1`,
+`/scrape` naming a foreign listener opens no connection, `/scrape` with `check-single-keys`
+returns no value, and a key configured through `extraArgs` shows `redis_key_size` without its
+value. Its negative control runs the same image without the two variables and must see the
+password arrive — it receives exactly `*2\r\n$4\r\nAUTH\r\n$6\r\ns3cret\r\n` — and the value
+returned. Removing either variable from the builder turns the test red (both mutations run).
+The TLS wiring of D1 is not in that test; it was run once by hand on 2026-09-29 against
+`valkey/valkey:9` with a self-signed CA and `tls-auth-clients optional`, the builder's TLS
+variables and the rootless flags: `redis_up 1` over `rediss://localhost:16379`. The builder's
+variable names were read in the v1.92.1 `main.go`; all of them exist. Only the arm64 variant of
+the image index ran.
+
 ## Consequences
 
 * Every data pod carries an extra container and its resource requests, and — **only when auth
@@ -139,8 +236,12 @@ on the ClusterRole ([ADR 0013](0013-operator-is-cluster-wide-privileged.md)).
   but not the three shared selector labels is not scraped either, and neither is one outside the
   CR's namespace, which the `namespaceSelector` excludes before any label is compared (D3).
 * No compile-time checking of the ServiceMonitor field names (D4); correctness rests on tests.
-* Enabling metrics changes the NetworkPolicy **as well as** the pod spec, and both must be
-  reconciled together.
+* ~~Enabling metrics changes the NetworkPolicy **as well as** the pod spec, and both must be
+  reconciled together.~~ *(Since 2026-09-29, D6: enabling metrics leaves the NetworkPolicy
+  unchanged.)*
+* **A scraper reaches the exporter only where no policy, or the administrator's own, admits it**
+  (D6); with `spec.networkPolicy.enabled` the administrator writes that policy
+  ([ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D3).
 * A single standalone pod (`replicas: 1`, no persistence) has no failover target, so adding the
   sidecar restarts it and loses in-memory data. Physically unavoidable, not a design gap — and
   the guarantee in D7 holds only as long as new features change the pod spec rather than
@@ -172,11 +273,13 @@ run identically whether or not those CRDs are present.
 
 ### Always open port 9121 in the NetworkPolicy
 
-Rejected as unnecessary exposure.
+Rejected as unnecessary exposure. *(Since 2026-09-29 the port is not opened at all, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md).)*
 
 ### Require persistence before enabling metrics
 
-Rejected: unnecessary for multi-replica clusters, which migrate losslessly.
+Rejected: unnecessary for multi-replica clusters, which migrate ~~losslessly~~ *(corrected
+2026-09-28: with the pre-roll dataset intact without persistence; the writes an outgoing master
+acknowledges during a forced failover are lost with persistence as without it — D7)*.
 
 ### Leave `--metrics-bind-address` unwired
 
@@ -207,15 +310,36 @@ flag alone is the recommended minimum.
   controller-runtime and workqueue metrics — no Secret material and no CR contents".)*
 * The health endpoint (`:8081`) is likewise plain HTTP and unauthenticated; it serves
   `healthz.Ping` only.
+* **An exporter image set through `spec.metrics.image` that predates v1.83.0 keeps `/scrape`**
+  (D11). Measured 2026-09-29 with v1.66.0 and the builder's two variables: it starts, reports
+  `redis_up 1`, answers `/scrape` with 200 and suppresses the key value (only `redis_key_size`);
+  the dial to a caller-named target with the password is not prevented. Nothing refuses such an
+  image. The same holds for `spec.metrics.extraArgs` naming `--disable-scrape-endpoint=false`:
+  a flag wins over the variable. Both are the CR author's choice, and a CR author who picks the
+  exporter image already runs code of their choosing with the password in its environment.
+* **The exporter still authenticates as the default user**, with every right that user holds;
+  D11 removes the routes that handed that credential or key data to a caller, not the
+  credential.
+* **A non-persistent single data pod keeps the old exporter until it restarts** (D11): held
+  rather than discarded, and reported as `PodSecurityUpdatePending=True/ExporterOutdated`.
+  Until an administrator deletes the pod, its exporter serves `/scrape` as before.
+* **The listener is still unauthenticated** and serves the remaining routes of D11 to anything
+  that reaches the port; what `/metrics` discloses is the instance's INFO and, for a key a CR
+  author configures, its name and size.
 
 ## References
 
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `buildExporterContainer`, `buildPodContainers`
 * [`internal/builder/service.go`](../../internal/builder/service.go) — `BuildMetricsService`, `MetricsServiceLabel`
 * [`internal/builder/servicemonitor.go`](../../internal/builder/servicemonitor.go) — `BuildServiceMonitor`
-* [`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go) — the exporter-port ingress rule
+* [`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go) — `BuildValkeyNetworkPolicy`, which opens no exporter-port rule (D6)
+* [`test/imagetools/exporter_routes_test.go`](../../test/imagetools/exporter_routes_test.go) — `TestExporter_ServesNoScrapeRoute` (D11)
+* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `exporterDrifted` (D11)
+* [`api/v1/valkey_types.go`](../../api/v1/valkey_types.go) — `DefaultMetricsExporterImage`
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `reconcileMetrics`, `reconcileMonitoringResources`
 * [`cmd/main.go`](../../cmd/main.go) — `bindOperatorFlags`, `managerOptions`
 * [ADR 0007](0007-failover-aware-rolling-update.md) — the migration path enabling metrics rides on
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the operator's exposure surface
 * [ADR 0016](0016-authentication-and-tls-posture.md) — the `unstructured` third-party CRD pattern, and the password's reach
+* [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) D5 — the digest pin of the default image
+* [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) — what a generated NetworkPolicy admits (D6)

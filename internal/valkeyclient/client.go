@@ -33,6 +33,33 @@ type ReplicationInfo struct {
 	MasterSyncInProgress bool
 }
 
+// NotEstablishedReason answers the question every site that says "synced" asks of a
+// pod -- has it actually received its master's dataset? -- and returns why not, or
+// "" when it has: the pod is a replica, its link to the master is up, and no sync is
+// in progress.
+//
+// The three fields are one answer, not three:
+//   - role master: a REPLICAOF has not taken effect, or the pod was never a replica.
+//   - master_link_status not "up": the handshake or the transfer is still running.
+//     The field only ever reads "up" or "down". Right after REPLICAOF it reads down
+//     with master_sync_in_progress 0 while no byte has moved; during the transfer it
+//     reads down with master_sync_in_progress 1.
+//   - master_sync_in_progress: both fields come from one replication state (up only
+//     once connected, 1 only while transferring; server.c 9.1.1), so it cannot be 1
+//     on a link that is up. It is kept so the answer does not rest on that reading.
+//
+// It is asked of the replica, never of its master. master_sync_in_progress exists only
+// in a replica's reply, so a master never carries it, and connected_slaves counts a
+// replica from its sync request on, while it still holds nothing
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2).
+func (i *ReplicationInfo) NotEstablishedReason() string {
+	if i.Role == "master" || i.MasterLinkStatus != "up" || i.MasterSyncInProgress {
+		return fmt.Sprintf("replication not established (role=%s, linkStatus=%s, syncInProgress=%t)",
+			i.Role, i.MasterLinkStatus, i.MasterSyncInProgress)
+	}
+	return ""
+}
+
 // SentinelMasterInfo holds parsed SENTINEL MASTER output.
 type SentinelMasterInfo struct {
 	Name      string
@@ -56,6 +83,28 @@ type SentinelReplicaInfo struct {
 	IP    string
 	Port  string
 	Flags string
+}
+
+// ReplyError is an error reply the server sent ("-ERR ...", "-INPROG ..."), as
+// opposed to a failure to reach it or to read its answer. Its text is the one this
+// package always returned for an error reply, so callers that only log it see no
+// difference; a caller that has to act on what the server refused matches it with
+// errors.As and reads Code.
+type ReplyError struct {
+	// Message is the reply without its leading '-': the error code, a space and the
+	// server's text, e.g. "INPROG Failover already in progress".
+	Message string
+}
+
+func (e *ReplyError) Error() string {
+	return "valkey error: " + e.Message
+}
+
+// Code returns the first word of the reply -- ERR, INPROG, NOGOODSLAVE, ... -- the
+// part of an error reply the server keeps stable across releases.
+func (e *ReplyError) Code() string {
+	code, _, _ := strings.Cut(e.Message, " ")
+	return code
 }
 
 // ConnectionError is returned whenever a TCP connection to a Valkey or Sentinel
@@ -233,6 +282,21 @@ func (c *Client) SentinelFailover(name string) error {
 	_, err := c.exec("SENTINEL", "FAILOVER", name)
 	if err != nil {
 		return fmt.Errorf("sentinel failover %s on %s: %w", name, c.addr, err)
+	}
+	return nil
+}
+
+// SentinelFailoverCoordinated sends SENTINEL FAILOVER <name> COORDINATED. Unlike the
+// plain command it does not force the promotion: the Sentinel wins an election first
+// and then asks the master to hand over itself (FAILOVER TO the selected replica),
+// so the master stops taking writes before the replica is promoted and becomes its
+// replica at once. Sentinels before Valkey 9.0 answer it with
+// "ERR wrong number of arguments for 'sentinel|failover' command"; the error is
+// returned as a *ReplyError, wrapped like every other error of this client.
+func (c *Client) SentinelFailoverCoordinated(name string) error {
+	_, err := c.exec("SENTINEL", "FAILOVER", name, "COORDINATED")
+	if err != nil {
+		return fmt.Errorf("sentinel failover %s coordinated on %s: %w", name, c.addr, err)
 	}
 	return nil
 }
@@ -478,7 +542,7 @@ func readFullResponse(conn net.Conn) (string, error) {
 
 	case strings.HasPrefix(line, "-"):
 		// Error.
-		return "", fmt.Errorf("valkey error: %s", line[1:])
+		return "", &ReplyError{Message: line[1:]}
 
 	case strings.HasPrefix(line, ":"):
 		// Integer response.

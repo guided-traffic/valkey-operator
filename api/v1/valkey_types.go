@@ -258,6 +258,28 @@ const (
 	// state never gains the condition -- the False is only ever written over an
 	// existing condition, never stamped onto the fleet.
 	ConditionTypeRWServiceEmpty ConditionType = "RWServiceEmpty"
+
+	// ConditionTypeMasterHandoverStalled reports that the Sentinel rolling update
+	// has held the delete of the outgoing master for longer than
+	// spec.rollingUpdate.syncTimeout. Before that delete the handover asks three
+	// things, and the reason names the one that is not yet true:
+	// ReplicaNotSynced (a replica on the current spec has not completed its sync
+	// from the new master, or the new master has fewer replicas attached than
+	// there are), DatasetWouldBeDiscarded (the new master holds no keys while the
+	// pod about to be deleted holds some, or a key count cannot be read) and
+	// FormerMasterStillMaster (the pod about to be deleted still answers
+	// role:master). The message names both pods, the counts or the sync reason, and
+	// the repair.
+	//
+	// The hold itself is never lifted by a timeout: deleting the pod is the one step
+	// that cannot be undone. What the condition marks is the moment the operator
+	// stops ending the reconcile pass on it, so the status write and the split-brain
+	// check run again; the rolling-update state is kept and the Sentinel roll waits.
+	// It is an edge: set once the wait outlived the timeout, with one Warning Event,
+	// and cleared -- only over an existing condition -- when the delete goes through
+	// or the rolling-update state is cleared.
+	// See docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D6.
+	ConditionTypeMasterHandoverStalled ConditionType = "MasterHandoverStalled"
 )
 
 const (
@@ -427,9 +449,15 @@ const (
 	// deferred. The message names the pod.
 	ReasonPodRunsAsRoot = "PodRunsAsRoot"
 
+	// ReasonExporterOutdated is the PodSecurityUpdatePending reason while the only data
+	// pod of a non-persistent single-pod cluster runs an exporter whose image or
+	// environment an earlier operator version set, and its replacement is deferred.
+	// The message names the pod.
+	ReasonExporterOutdated = "ExporterOutdated"
+
 	// ReasonPodSecurityUpdateApplied clears PodSecurityUpdatePending once no data pod
-	// update is deferred on account of the rootless migration any more. Only written
-	// over a standing True.
+	// update is deferred on account of the rootless migration or the exporter update
+	// any more. Only written over a standing True.
 	ReasonPodSecurityUpdateApplied = "PodSecurityUpdateApplied"
 
 	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
@@ -440,6 +468,25 @@ const (
 	// ReasonMasterLabeled clears RWServiceEmpty once a data pod carries the
 	// master label again. Only written over an existing condition.
 	ReasonMasterLabeled = "MasterLabeled"
+
+	// ReasonReplicaNotSynced is the MasterHandoverStalled reason while a replica on
+	// the current spec has not completed its sync from the new master, or the new
+	// master has fewer replicas attached than there are.
+	ReasonReplicaNotSynced = "ReplicaNotSynced"
+
+	// ReasonDatasetWouldBeDiscarded is the MasterHandoverStalled reason while the
+	// new master holds no keys and the pod about to be deleted holds some, or while
+	// either key count cannot be read.
+	ReasonDatasetWouldBeDiscarded = "DatasetWouldBeDiscarded"
+
+	// ReasonFormerMasterStillMaster is the MasterHandoverStalled reason while the pod
+	// about to be deleted still answers role:master.
+	ReasonFormerMasterStillMaster = "FormerMasterStillMaster"
+
+	// ReasonMasterHandoverNotHeld clears MasterHandoverStalled once the delete went
+	// through or the rolling-update state was cleared. Only written over an existing
+	// condition.
+	ReasonMasterHandoverNotHeld = "MasterHandoverNotHeld"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -642,7 +689,7 @@ const (
 	// Pinned by the digest of the multi-arch image index behind the tag, so a re-pushed
 	// tag cannot change what runs in the pods (ADR 0033 D5); the tag stays for the
 	// reader and for the version it names.
-	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1"
+	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd"
 
 	// DefaultMetricsExporterPort is the default port the exporter serves /metrics on.
 	DefaultMetricsExporterPort int32 = 9121

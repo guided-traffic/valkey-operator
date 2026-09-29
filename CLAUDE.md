@@ -134,7 +134,7 @@ spec:
     secretPasswordKey: password
   metrics:
     enabled: true                 # adds a Prometheus exporter sidecar to each Valkey pod
-    image: oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1
+    image: oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd
                                   # optional; this is the default when omitted, pinned by
                                   # digest (DefaultMetricsExporterImage, ADR 0033 D5)
     port: 9121                    # optional; exporter /metrics port (default 9121)
@@ -468,9 +468,13 @@ itself — every rule, what it permits, and the hardening items it leaves open �
 1. Replace replica pods one by one
 2. Verify new pod joins cluster and is seen by other instances
 3. Wait for replication sync to complete
-4. After 2 replicas are migrated: initiate controlled leader failover
+4. After 2 replicas are migrated: initiate controlled leader failover — `SENTINEL FAILOVER <name>
+   COORDINATED`, the forced command only as fallback on a Sentinel that refuses the option
+   (before Valkey 9.0) and on the retrigger (ADR 0037 D1)
 5. Verify failover succeeded
-6. Replace last pod (former master)
+6. Replace last pod (former master) — once it no longer answers master, every current replica is
+   synced from and attached to the new master, and the delete discards no dataset; otherwise held
+   and, past `syncTimeout`, reported as `MasterHandoverStalled` (ADR 0037 D3, D5, D6)
 
 The data StatefulSet uses `updateStrategy: OnDelete` and `podManagementPolicy: Parallel`, so
 pod replacement is the operator's job, not the StatefulSet controller's — which is also why a
@@ -481,7 +485,10 @@ cannot turn an image change into a pod-delete loop.
 **"Synced" in step 3 and 4 is the full replication answer** — role, `master_link_status:up`
 and no sync in progress (`replicationNotEstablishedReason`), never the sync flag alone: a
 replica whose link is still connecting reports `master_sync_in_progress:0` while holding
-nothing, and step 4 is followed by the delete of the outgoing master. Zero WAIT
+nothing, and step 4 is followed by the delete of the outgoing master. The same predicate,
+asked of the replica itself (`ReplicationInfo.NotEstablishedReason`), is what `Syncing`, the
+observer's `replica_sync` and the gate in front of that delete read — never the master's
+`connected_slaves` or its sync flag, which a master does not carry (ADR 0037 D2, D3). Zero WAIT
 acknowledgements is not a partial acknowledgement, and a promotion candidate holding no keys
 while the master holds some is refused (`verifyPromotionCandidateHoldsData`). Every one of
 these waits is bounded by `spec.rollingUpdate.syncTimeout` and pauses the update rather than
@@ -540,7 +547,11 @@ fire early), ADR 0010 D14; one test per site. ~~The final e2e runs of 2026-09-26
 were the runs with the guard, before its clock and the one-update arm, not the final one)* The
 e2e runs of 2026-09-26 with the guard logged, on that cluster `hard`, 4 failover triggers (one
 per run of the test), 0 demotions and 0 timeouts — 11, 11 and 9 in the run before D9, both legs
-together.
+together. **Since ADR 0037 D1 the roll's own failover is coordinated on Valkey 9 Sentinels**: the
+old master hands over and turns replica at once, so the window closes with no acknowledged write
+lost (measured on Kind: 0 of 22 772); on the forced fallback (Valkey 8 Sentinels, the 8 to 9
+upgrade roll, the retrigger) it lasts until Sentinel converts the old master, and the writes it
+acknowledges meanwhile are lost.
 → [ADR 0025](docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md)
 
 ## Every condition is a level, an edge or history
@@ -620,8 +631,8 @@ terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel 
 delete, `replaceNextReplica`, `replaceRemainingPods` — ask of the pod they delete only whether it
 is terminating (`terminationWait`); its readiness is not asked. The tier gate above and the
 preconditions each site already had stay (`verifyReplacedReplicasSynced`,
-`verifyNewMasterReady` — which reads the new master's `DBSIZE` but does not refuse on it, a
-pre-existing gap T32 does not close). The old wait was justified as "recently replaced", which
+the handover gate `gateOutgoingPodDelete`, which since ADR 0037 D5 also refuses the delete while
+the new master holds no keys and the outgoing pod some). The old wait was justified as "recently replaced", which
 no outdated pod ever is, and after a spec fix the replacement that never came up *is* the next
 candidate, so the roll waited for it forever. The Sentinel roll
 deletes an unavailable outdated pod ahead of `firstOutdatedPod`, and its quorum guard
@@ -729,8 +740,25 @@ them, so the proof is two-hop: `podIsOurs(pod, sts)` against a StatefulSet alrea
 never a label and never a name. It binds touching a pod, deleting one, and putting its name
 into the sidecar Role — that grant follows the name of the *object*, so an unfiltered pod hands
 this cluster's sidecar `patch` on a stranger's pod.
+
+**A pod at a generated ordinal name the StatefulSet did not create holds the roll and is
+reported, it is not failed on.** The two roll entry scans
+(`checkAndHandleRollingUpdate`, `checkAndHandleSentinelRollingUpdate`) prove every ordinal
+before acting on an outdated one and, on an unproven pod, return `heldByPodCollision` with
+`DeferredRequeueAfter`: nothing on the pod is touched, the roll of every pod of that tier is
+held, and the pass continues to the status write, the split-brain check and the no-master
+recovery. The report is a separate report-only resource step, `reportPodNameCollision`, which
+carries the collision to `ReconcileBlocked=True/ForeignObject` through the one evaluator — the
+roll itself reports nothing. The three inner refusals (`collectPodStates`,
+`handleStandaloneRollingUpdate`, `handlePostManualFailover`) stay as race guards and still fail
+the step. This replaced the earlier "refuse and fail the step" that froze the CR status; the
+image-comparison side of the same lever — the data and Sentinel tiers now compare every
+container and init-container image against the persisted template (`podImagesDrifted`), so a
+swapped `exporter` or init image is rolled away — rides `podOutdated`.
 → [ADR 0020](docs/adr/0020-write-only-what-the-operator-owns.md) (writes, grants and pods),
-[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes)
+[ADR 0006](docs/adr/0006-delete-only-what-the-operator-owns.md) (deletes),
+[ADR 0002](docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D13 (the collision report),
+[ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D2 (the image inputs)
 
 ## Sentinel identity is pinned to the pod
 
@@ -922,7 +950,10 @@ overwritten.
   repair running on its way up; non-persistent is deferred and reported as
   `PodSecurityUpdatePending=True/PodRunsAsRoot`, because an operator upgrade never discards a
   dataset — unless its Valkey image, TLS material record or config hash changed, which the CR
-  author or a rotation caused and which replace it as they always did.
+  author or a rotation caused and which replace it as they always did. *(2026-09-29, ADR 0018
+  D11)* A rootless single pod whose **exporter image or env** differs from the template takes
+  the same line (`exporterDrifted`, reason `ExporterOutdated`): the release's new sidecar image
+  otherwise made `isSidecarOnlyChange` defer the exporter fix on every such cluster.
 - **The drift comparisons treat `securityContext` as a subset** (`podSpecChanged`,
   `containerChanged`, `ObserverDeploymentHasChanged`): a field the operator does not set is not
   compared, so a mutating admission policy is not fought over — **except `capabilities.add`**,
@@ -1065,11 +1096,18 @@ tools and release tooling green; the rerun on the final code has no recorded res
 
 `spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on
 `spec.metrics.port` (default 9121). It carries **no readiness probe**, so a failing exporter
-never removes the pod from the `-rw`/`-r` Services. The `<name>-metrics` Service carries the
+never removes the pod from the `-rw`/`-r` Services. Its listener is unauthenticated, so `/scrape` (it dials a
+caller-named target with the password) and the key-value export are switched off by **env
+variables, not flags** — an older own image ignores an unknown variable, where an unknown flag
+crash-loops it and takes the pod's readiness with it (ADR 0018 D11). `make test-image-tools`
+proves both against the pinned image, with a negative control. The `<name>-metrics` Service carries the
 marker label `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it; the
 ServiceMonitor is `unstructured` (`monitoring.coreos.com/v1`) and skipped when the CRD is
 absent. Enabling metrics changes the pod-spec hash and therefore rides the failover-aware
-rolling update — lossless except for a single standalone pod without persistence.
+rolling update — the pre-roll dataset survives except on a single standalone pod without
+persistence; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before
+Valkey 9.0) and on any roll whose coordinated failover fell back to forced, the writes the
+outgoing master acknowledges during the roll's failover are lost (ADR 0037 D8).
 → [ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
 
 **The operator's own endpoint is a separate surface.** `:8080/metrics` serves one set of
@@ -1083,6 +1121,18 @@ spec the operator accepted and never converged. The chart's Service, ServiceMoni
 PrometheusRule for this endpoint are all **default off**, and the endpoint is unauthenticated
 wherever it binds — the per-resource series make it an inventory of the fleet.
 → [ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)
+
+## A generated NetworkPolicy admits only what this repository deploys
+
+The data and Sentinel ports admit the resource's own data, Sentinel and observer pods and the
+**operator pod** — its namespace **and** its labels in one peer (`builder.OperatorPeer`,
+`--operator-pod-selector` + `POD_NAMESPACE`, both set by the chart, which labels the operator pod
+`app.kubernetes.io/component: operator`). Half an identity writes no operator peer, never a
+namespace-only one. No rule without a `from`, no `ipBlock`, no rule for the sidecar health, exporter
+or observer port — kubelet comes from the node, clients and scrapers are the administrator's.
+**The NetworkPolicies step is ungated** and deletes every policy the Valkey controls that the spec
+no longer asks for (`cleanupNetworkPolicies`); a new policy kind or name inherits that sweep.
+→ [ADR 0039](docs/adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)
 
 # Important Notes
 

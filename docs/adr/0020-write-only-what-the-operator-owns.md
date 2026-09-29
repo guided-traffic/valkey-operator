@@ -4,6 +4,18 @@
 
 Accepted. Date: 2026-08-21.
 
+**Amended 2026-09-28 (re-decision):** D9's rolling-update fail direction changes from
+"refuse and fail the step" to "refuse and **hold**", and the collision now reaches
+`ReconcileBlocked=True/ForeignObject` through a new report-only resource step,
+`reportPodNameCollision` ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D13). The
+two roll entry scans set `heldByPodCollision`/`DeferredRequeueAfter` and continue the pass —
+the status write, the split-brain check and the no-master recovery still run — so a
+collision no longer freezes the status of an otherwise-serving cluster; the three inner
+guards keep failing the step as race guards. This supersedes the 2026-09-27 correction below
+(which recorded the pre-report state and left the reporting question open) and closes the
+Residual-risks entry it added. The superseded direction and the open question are marked in
+place, not deleted.
+
 **Amended again 2026-09-27 (correction, no decision changes):** D9 and its Consequences bullet
 said the rolling update's pod refusal reaches the CR as `ReconcileBlocked/ForeignObject`. It
 reaches it as phase `Error` and `status.message` only, and never did otherwise:
@@ -473,30 +485,58 @@ The fail direction splits by door, on the same D2 question:
 |---|---|
 | `listDataPodNames` (the sidecar grant), `listMasterLabeledPods`, `clearDrainStamps` | filter the pod out |
 | `checkAndRecoverNoMaster`, `recreatedAfter`, `sentinelRolloutComplete`, `replicaConfigMaster` | treat as absent, which each already reads as "unknown" and fails closed on |
-| the rolling update: `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handlePostManualFailover`, `checkAndHandleSentinelRollingUpdate` | refuse and fail the step |
+| the roll entry scans: `checkAndHandleRollingUpdate`, `checkAndHandleSentinelRollingUpdate` | refuse and **hold** the roll (`heldByPodCollision`, `DeferredRequeueAfter`) — the pass continues to the recovery checks and the status write, nothing on the pod is touched |
+| the inner roll guards: `collectPodStates`, `handleStandaloneRollingUpdate`, `handlePostManualFailover` | refuse and fail the step (race guards: a pod turned foreign after the entry scan proved it, in the same pass) |
+| the resource step `reportPodNameCollision` | refuse and fail the step — the reporter (below) |
 
-The rolling update is the one that fails rather than filters, because treat-as-absent maps
-onto its existing `exists=false, needsUpdate=true` branch and would leave it waiting for a pod
-that can never appear, reporting "waiting for pod-N" while the truth is "a foreign object
-holds that name". A collision clears only when a human acts, which is the same argument D5
-makes for `ForeignObject` outranking a transient cause. Failing keeps the rolling-update state
-annotation in place, so its bounded waits stay armed
-([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)).
+The rolling update refuses rather than filters, because treat-as-absent maps onto its
+existing `exists=false, needsUpdate=true` branch and would leave it waiting for a pod that can
+never appear, reporting "waiting for pod-N" while the truth is "a foreign object holds that
+name". A collision clears only when a human acts, which is the same argument D5 makes for
+`ForeignObject` outranking a transient cause.
 
-**One reporter, and it is not the rolling update.** `reconcileSidecarRole` runs on every pass
-and lists the data pods anyway, so it emits the `PodNotOwned` Warning for the whole family at
-no extra read; every filtering path stays quiet. The rolling update emits no Event of its own —
-~~its refusal already reaches the CR as `ReconcileBlocked/ForeignObject` with the pod name in the
-message~~ *(corrected 2026-09-27: its refusal reaches the CR only as phase `Error` with the pod
-name in `status.message` — `Rolling update error: …`, or `Sentinel rolling update error: …` for a
-Sentinel pod — and on a pass the resource step also blocks, not even there, because that pass's
-one phase write names the resource error. `ReconcileBlocked` is evaluated from
-`reconcileResources` alone, which a pod collision does not fail, so the condition does not report
-it and the `ValkeyReconcileBlocked` alert, which reads the condition, does not fire. It was never
-true: the evaluator has taken only the resource-step error since this paragraph was written. And
-`reconcileSidecarRole` lists only pods carrying the data-pod selector labels, so a colliding
-Sentinel pod, or a pod under a data-pod name without those labels, gets no Event either)* — so a collision produces ~~one~~ *(corrected 2026-09-27: at most one)* Event series per
-pass, the same rule D8 sets.
+*Amended 2026-09-28:* the two roll entry scans **hold** rather than fail the workload pass.
+Failing the pass froze the status of that CR — `readyReplicas`, `Ready`, the split-brain
+check and the no-master recovery all stopped, so a pod lost after the collision was never
+recreated and `ValkeyReplicasMissing` could not fire, on a cluster that is otherwise serving.
+The hold sets `DeferredRequeueAfter` and continues the pass exactly as a stalled availability
+wait does ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11): nothing on the
+unproven pod is deleted, promoted or commanded, and the roll of every other pod stays held —
+the entry scan proves every ordinal's ownership before it acts on an outdated one, so an owned
+outdated pod at a lower ordinal cannot roll past a collision at a higher one. The
+rolling-update state annotation stays in place, so its bounded waits stay armed
+([ADR 0010](0010-every-rolling-update-wait-is-bounded.md)). What makes the hold safe to report
+nowhere itself is the new resource step below: it, not the roll, carries the collision to the
+CR. The three inner guards keep failing the step — they run only after the entry scan proved
+every ordinal, so reaching one means a pod turned foreign mid-pass, and failing closed is
+correct there.
+
+**One reporter, and it reaches `ReconcileBlocked`.** *(2026-09-28.)* The reporter is the
+`reportPodNameCollision` resource step ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)
+D13): last among the resource steps, a read and not a write, it walks each tier's ordinal range
+(data always, Sentinel when enabled), treats a foreign or absent StatefulSet as absent — that
+StatefulSet's own step is its reporter — and returns `foreignObjectError("Pod", name)` for the
+first pod `podIsOurs` refuses. That error joins `resourceErr`, so the one `ReconcileBlocked`
+evaluator writes `True/ForeignObject` naming the pod and the critical `ValkeyReconcileBlocked`
+alert can see it; the registry stays at one evaluator, and a clean pass clears it. A read error
+other than NotFound is returned, so the evaluator cannot clear a standing report on a pass that
+measured nothing (ADR 0027). The step emits no Event — the condition names the pod.
+
+`reconcileSidecarRole` still runs on every pass and lists the data pods anyway, so it emits the
+`PodNotOwned` Warning for the whole data-pod family at no extra read; it lists only pods
+carrying the data-pod selector labels, so a colliding Sentinel pod, or a pod under a data-pod
+name without those labels, gets no Event — the condition, not the Event, is the complete
+report. The roll itself emits no Event and, since the 2026-09-28 amendment, no phase of its own
+for a collision: the pass is blocked by the resource step, and the blocked pass's one phase
+write names the resource error (`Failed to reconcile resources: pod name collision: …`). So a
+collision produces at most one Event series per pass and one condition, the same one-reporter
+rule D8 sets.
+
+*History (pre-2026-09-28):* before the report step, the roll's refusal failed the workload pass
+and reached the CR only as phase `Error` with the pod in `status.message`
+(`Rolling update error: …`); `ReconcileBlocked` never reported it, because its evaluator has
+always taken the resource-step error alone, and the alert stayed blind. That gap is what the
+report step closes.
 
 **D10 — A value the operator writes onto a pod and later trusts is not protected by D9.**
 *(2026-08-27.)* D9 answers "is this pod ours". It does not answer "did we write what this pod
@@ -586,12 +626,16 @@ watched the recreated one adopt the surviving pods under its new UID.
   old behaviour by design — a no-master verdict is what promotes pod-0 with `REPLICAOF NO ONE`
   — and it surfaced as a unit test that had been asserting the recovery with no pods staged
   at all.
-* **(2026-08-22, NA63) The rolling update stops on a colliding pod instead of deleting it.**
-  A cluster whose `<cr>-N` is held by a foreign pod now reports ~~`ReconcileBlocked/ForeignObject`
-  and~~ phase `Error` *(corrected 2026-09-27: not the condition, see D9)* rather than quietly
-  rolling. It could not have completed either way — the
-  statefulset-controller cannot create its own pod under a taken name — but the failure is now
-  the reported one rather than a rollout that never finishes.
+* **(2026-08-22, NA63; amended 2026-09-28) The rolling update holds on a colliding pod
+  instead of deleting it, and now reports it through `ReconcileBlocked`.** A cluster whose
+  `<cr>-N` is held by a foreign pod reports `ReconcileBlocked=True/ForeignObject` naming the
+  pod — through the `reportPodNameCollision` resource step, see D9 and
+  [ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D13 — and phase `Error`, while the
+  roll holds and the rest of the pass (status, split-brain check, no-master recovery) keeps
+  running. ~~now reports phase `Error` rather than quietly rolling~~ *(the roll used to fail the
+  pass and freeze the status; the hold and the condition report are the 2026-09-28 change.)* It
+  could not have completed either way — the statefulset-controller cannot create its own pod
+  under a taken name.
 * **(2026-08-22, NA63) Every pod fixture in the unit tests had to declare its parent.** The
   suite staged pods built straight from literals, and the fake client assigns no UID, so a
   StatefulSet the reconciler created under test had an empty one. Both halves are fixed
@@ -797,12 +841,19 @@ that alters nothing a user asked for.
 * **A pod still carries the ServiceAccount *name* as its identity** for a service mesh, SPIFFE
   or an admission policy, and that name is CR-derived whether or not the operator owns the
   object. The guard does not change it.
-* **The rolling update's pod refusal carries no condition** *(added 2026-09-27)*. A foreign
-  pod under a generated pod name stops the roll and reaches the CR as phase `Error` and
-  `status.message` only (D9): `ReconcileBlocked` does not report it, so nothing that reads the
-  condition — the `ValkeyReconcileBlocked` alert included — sees the collision, and a
-  colliding Sentinel pod, or one without the data-pod selector labels, gets no Event either. Whether the pod door is reported through
-  `ReconcileBlocked`, as D5 asks of a refusal, is open.
+* ~~**The rolling update's pod refusal carries no condition** *(added 2026-09-27)*.~~
+  *(Closed 2026-09-28 by the `reportPodNameCollision` resource step, D9 and
+  [ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D13: a foreign pod under a
+  generated pod name is now reported as `ReconcileBlocked=True/ForeignObject` naming the pod,
+  through the one evaluator, so the `ValkeyReconcileBlocked` alert sees it. A colliding pod
+  without the data-pod selector labels still gets no `PodNotOwned` Event — the condition, not
+  the Event, is the report.)*
+* **An unproven pod at a data ordinal ends the workload half of every roll until a human acts**
+  *(2026-09-28)*. The report and the hold make the collision visible and keep the rest of the
+  pass live, but they do not remove the pod: the roll of that CR stays held, and every later
+  pod loss on that tier goes unrecreated, until a human deletes or re-attaches the pod (a name
+  collision or a stray). Closing it without a human means an admission policy that refuses the
+  write which produced the unproven pod, and that is a separate decision.
 * **`errors.Is` over a joined pass error decides the ReconcileBlocked reason.** If a future
   step wraps a refusal in a way that breaks unwrapping, the reason silently degrades to
   `WriteFailed`. The condition still fires; only its reason would be wrong.
