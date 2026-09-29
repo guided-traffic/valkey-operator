@@ -35,11 +35,17 @@ chooses is [seccomp profiles](seccomp-profiles.md).
   E2E legs green on `e6a9d7c`, only the user-namespace subtest skipped there)*. A user namespace
   is opt-in per Valkey resource and off by default ([user namespaces](user-namespaces.md)).
 - `spec.networkPolicy.enabled` writes ingress-only NetworkPolicies
-  ([`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go)):
-  the data port accepts traffic from Valkey pods, Sentinel pods, observer pods and
-  **the operator namespace** (matched by `kubernetes.io/metadata.name`); the
-  sidecar health port and the exporter port are open to everyone, because kubelet
-  probes come from the node and Prometheus is not locatable from the CR.
+  ([`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go)) that admit
+  only the components the operator deploys
+  ([ADR 0039](../adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)):
+  the data and Sentinel ports accept traffic from the resource's own data, Sentinel and observer
+  pods and from **the operator pod** — its namespace and a pod selector that matches it alone,
+  in one peer. The sidecar health, exporter and observer ports get no rule: kubelet's probes
+  come from the node, and a scraper or an application client is admitted by a policy the
+  administrator writes ([network-policy.md](../operations/network-policy.md)). Turning the
+  policies off deletes the ones the resource owns. *(corrected 2026-09-29: until this release
+  the data and Sentinel ports admitted the whole operator namespace, and the health and
+  exporter ports admitted every source.)*
 - The PDB cleanup never deletes a budget it does not own (ownerReference check)
   and sends a **UID delete precondition** so a name reused between the read and
   the delete is not destroyed ([`internal/controller/pdb.go`](../../internal/controller/pdb.go)).
@@ -74,6 +80,11 @@ Read this before treating a namespace as a tenant boundary.
 - **The NetworkPolicies are ingress-only.** No egress rule is written, so a
   compromised Valkey pod may open connections anywhere, including to the API
   server.
+- **A NetworkPolicy peer is a label, not an identity.** A pod created in the resource's
+  namespace with a component's selector labels is admitted as that component, and a pod in
+  the operator's namespace carrying the operator pod's labels as the operator. Creating either
+  takes `create pods` in that namespace, a principal the rest of this page already treats as
+  able to reach the data plane.
 - **The sidecar can patch any metadata on its own cluster's pods, and `pods: patch`
   is wider than metadata.** The grant is no longer namespace-wide —
   `resourceNames` limits it to `<cr-name>-0 … <cr-name>-N` ([the per-instance sidecar Role](privilege-footprint.md#the-per-instance-sidecar-role)) — and

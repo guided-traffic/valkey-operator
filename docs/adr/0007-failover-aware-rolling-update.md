@@ -6,6 +6,15 @@ Accepted. Date: 2026-08-21.
 
 Amended 2026-09-28: **D1's controlled failover is coordinated where Sentinel supports it, and D10's predicate binds the delete of the outgoing master.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1 sends `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback; its D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the delete in `replaceRemainingPods`, held past `syncTimeout` rather than paused (D6). The residual risk below that named the missing key check is closed by decision ~~and open until built~~ *(and implemented 2026-09-28: `triggerSentinelFailover` with the coordinated option on the first trigger, and the handover gate `gateOutgoingPodDelete` in [`master_handover.go`](../../internal/controller/master_handover.go); unit-tested in [`coordinated_failover_test.go`](../../internal/controller/coordinated_failover_test.go), [`master_handover_test.go`](../../internal/controller/master_handover_test.go) and [`sentinel_failover_test.go`](../../internal/controller/sentinel_failover_test.go); no run of the built code on Kubernetes is recorded here)*. Marked in place.
 
+Amended 2026-09-29 ([ADR 0018](0018-metrics-and-the-exporter-sidecar.md) D11): **D6 and D7 no
+longer decide a rootless single pod whose exporter image or environment differs from the
+template.** That release moves the exporter image and its environment together with the sidecar
+image — the change D7 warned about and the 2026-09-28 residual under D6 named — and the
+image-only test deferred the exporter fix as "sidecar-only" on every single-replica cluster with
+metrics. Such a pod is decided by `singlePodDeferral` the way a root pod is, and reported as
+`PodSecurityUpdatePending=True/ExporterOutdated` when it is held. The residual's sentence that
+the deferral "cannot be tightened" is marked in place.
+
 The strategy itself predates this ADR set; the template-source and freshness-guard
 decisions below landed on branch `feat/support-pdb`.
 
@@ -312,10 +321,15 @@ and delete the only pod together with its `emptyDir`. A rootless single pod goes
 non-persistent single-replica non-Sentinel cluster the deferral still reads the valkey and
 sidecar images only. An image written onto that pod's `exporter` or an init container while
 the sidecar image also differs reads to `isSidecarOnlyChange` as sidecar-only and is
-deferred with it — reported as `SidecarUpdatePending`, not replaced. The deferral cannot be
+deferred with it — reported as `SidecarUpdatePending`, not replaced. ~~The deferral cannot be
 tightened to notice it: a release that bumps `DefaultMetricsExporterImage` moves the sidecar
 and the exporter image together, and replacing a single non-persistent pod for that would
-discard its dataset, which D7 forbids. The pod-spec-hash record that would tell a swap from
+discard its dataset, which D7 forbids.~~ *(Tightened 2026-09-29 for the exporter,
+[ADR 0018](0018-metrics-and-the-exporter-sidecar.md) D11: a differing exporter image or
+environment is decided by persistence, as a root pod is — a persistent pod is replaced, a
+non-persistent one is held and reported as `PodSecurityUpdatePending=True/ExporterOutdated`
+instead of `SidecarUpdatePending` alone, so the dataset is still never discarded. An image
+written onto an init container is still read as sidecar-only.)* The pod-spec-hash record that would tell a swap from
 an upgrade is writable by the same principal (`vko.gtrfc.com/pod-spec-hash`). On every other
 topology — multi-replica or persistent — the swap is replaced by the ordinary
 failover-aware roll.

@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -205,7 +206,7 @@ func TestReconcilers_AbortWithoutWriting_WhenOwnerReferenceCannotBeSet(t *testin
 			return r.reconcileObserverDeployment(ctx, v)
 		}, "setting owner reference on Observer Deployment"},
 		{"networkPolicy", func(r *ValkeyReconciler, ctx context.Context) error {
-			return r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, "valkey-system"))
+			return r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, testOperatorPeer))
 		}, "setting owner reference on NetworkPolicy"},
 	}
 
@@ -224,6 +225,16 @@ func TestReconcilers_AbortWithoutWriting_WhenOwnerReferenceCannotBeSet(t *testin
 
 // --- reconcileNetworkPolicy ---
 
+// testOperatorPeer is the operator pod as the chart identifies it.
+var testOperatorPeer = builder.OperatorPeer{
+	Namespace: "valkey-system",
+	PodLabels: map[string]string{
+		"app.kubernetes.io/name":      "valkey-operator",
+		"app.kubernetes.io/instance":  "vko",
+		"app.kubernetes.io/component": "operator",
+	},
+}
+
 func networkPolicyValkey() *vkov1.Valkey {
 	return newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.UID = types.UID("np-uid")
@@ -235,7 +246,7 @@ func networkPolicyValkey() *vkov1.Valkey {
 func TestReconcileNetworkPolicy_Update_RestoresIngressAndLabels(t *testing.T) {
 	const version = "3.0.0"
 	v := networkPolicyValkey()
-	desired := builder.BuildValkeyNetworkPolicy(v, "valkey-system")
+	desired := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
 
 	// Somebody stripped the ingress rules and the labels off the live object.
 	stale := desired.DeepCopy()
@@ -246,7 +257,7 @@ func TestReconcileNetworkPolicy_Update_RestoresIngressAndLabels(t *testing.T) {
 	r, c := newReconcilerWithInterceptor(version, interceptor.Funcs{}, v, stale)
 
 	require.NoError(t, r.reconcileNetworkPolicy(context.Background(), v,
-		builder.BuildValkeyNetworkPolicy(v, "valkey-system")))
+		builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)))
 
 	got := &networkingv1.NetworkPolicy{}
 	require.NoError(t, c.Get(context.Background(),
@@ -262,13 +273,13 @@ func TestReconcileNetworkPolicy_SecondPass_IssuesNoUpdate(t *testing.T) {
 	v := networkPolicyValkey()
 	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v)
 	ctx := context.Background()
-	name := builder.BuildValkeyNetworkPolicy(v, "valkey-system").Name
+	name := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer).Name
 
-	require.NoError(t, r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, "valkey-system")))
+	require.NoError(t, r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)))
 	first := &networkingv1.NetworkPolicy{}
 	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, first))
 
-	require.NoError(t, r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, "valkey-system")))
+	require.NoError(t, r.reconcileNetworkPolicy(ctx, v, builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)))
 	second := &networkingv1.NetworkPolicy{}
 	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, second))
 
@@ -289,7 +300,7 @@ func TestReconcileNetworkPolicy_PropagatesGetError(t *testing.T) {
 	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v)
 
 	err := r.reconcileNetworkPolicy(context.Background(), v,
-		builder.BuildValkeyNetworkPolicy(v, "valkey-system"))
+		builder.BuildValkeyNetworkPolicy(v, testOperatorPeer))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "networkpolicy read failed")
@@ -320,6 +331,156 @@ func TestReconcileNetworkPolicies_WrapsPerPolicyError(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
 		Name: builder.NetworkPolicyName(v), Namespace: "default",
 	}, &networkingv1.NetworkPolicy{}))
+}
+
+// operatorPeerReconciler wires testOperatorPeer into r, as main does from
+// POD_NAMESPACE and --operator-pod-selector.
+func operatorPeerReconciler(r *ValkeyReconciler) *ValkeyReconciler {
+	r.OperatorNamespace = testOperatorPeer.Namespace
+	r.OperatorPodLabels = testOperatorPeer.PodLabels
+	return r
+}
+
+func getNetworkPolicy(t *testing.T, c client.Client, name string) (*networkingv1.NetworkPolicy, error) {
+	t.Helper()
+	np := &networkingv1.NetworkPolicy{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, np)
+	return np, err
+}
+
+// A policy written by an operator before ADR 0039 carries any-source rules for
+// the health and exporter ports and admits the whole operator namespace. The
+// upgrade rewrites it to the new rules even when the operator version did not
+// change: the stale rules are an Ingress difference, which is what
+// NetworkPolicyHasChanged compares.
+func TestReconcileNetworkPolicies_RewritesThePreADR0039Rules(t *testing.T) {
+	v := networkPolicyValkey()
+	v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+	stale := builder.BuildValkeyNetworkPolicy(v, builder.OperatorPeer{})
+	tcp := corev1.ProtocolTCP
+	health := intstr.FromInt32(builder.SidecarHealthPort)
+	exporter := intstr.FromInt32(v.MetricsPort())
+	stale.Spec.Ingress[0].From = append(stale.Spec.Ingress[0].From, networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{"kubernetes.io/metadata.name": "valkey-system"},
+		},
+	})
+	stale.Spec.Ingress = append(stale.Spec.Ingress,
+		networkingv1.NetworkPolicyIngressRule{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &health}}},
+		networkingv1.NetworkPolicyIngressRule{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &exporter}}},
+	)
+	stale.Annotations = map[string]string{builder.AnnotationOperatorVersion: "1.0.0"}
+	ownedByValkey(t, v, stale)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, stale)
+	operatorPeerReconciler(r)
+
+	require.NoError(t, r.reconcileNetworkPolicies(context.Background(), v))
+
+	got, err := getNetworkPolicy(t, c, stale.Name)
+	require.NoError(t, err)
+	assert.Equal(t, builder.BuildValkeyNetworkPolicy(v, testOperatorPeer).Spec.Ingress, got.Spec.Ingress)
+	for _, rule := range got.Spec.Ingress {
+		assert.NotEmpty(t, rule.From, "no rule may admit every source")
+	}
+}
+
+// Turning spec.networkPolicy.enabled off deletes the policies this Valkey owns;
+// a frozen policy would keep isolating the pods with rules nobody updates. A
+// foreign policy in the namespace, and one owned by another Valkey, stay.
+func TestReconcileNetworkPolicies_DisabledDeletesOwnedPolicies(t *testing.T) {
+	v := networkPolicyValkey()
+	v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	observerEnabled(v)
+	valkeyNP := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
+	sentinelNP := builder.BuildSentinelNetworkPolicy(v, testOperatorPeer)
+	observerNP := builder.BuildObserverNetworkPolicy(v)
+	for _, np := range []*networkingv1.NetworkPolicy{valkeyNP, sentinelNP, observerNP} {
+		ownedByValkey(t, v, np)
+	}
+	foreign := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "theirs", Namespace: "default"}}
+	other := newTestValkey("other", "default", func(o *vkov1.Valkey) { o.UID = types.UID("other-uid") })
+	othersNP := builder.BuildValkeyNetworkPolicy(other, testOperatorPeer)
+	ownedByValkey(t, other, othersNP)
+	v.Spec.NetworkPolicy.Enabled = false
+
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, valkeyNP, sentinelNP, observerNP, foreign, othersNP)
+
+	require.NoError(t, r.reconcileNetworkPolicies(context.Background(), v))
+
+	for _, name := range []string{valkeyNP.Name, sentinelNP.Name, observerNP.Name} {
+		_, err := getNetworkPolicy(t, c, name)
+		assert.True(t, apierrors.IsNotFound(err), "%s must be deleted", name)
+	}
+	for _, name := range []string{foreign.Name, othersNP.Name} {
+		_, err := getNetworkPolicy(t, c, name)
+		assert.NoError(t, err, "%s is not this Valkey's and must stay", name)
+	}
+}
+
+// Sentinel turned off and a changed namePrefix: the policies under names the
+// spec no longer produces are deleted, the new ones are written.
+func TestReconcileNetworkPolicies_DeletesPoliciesTheSpecNoLongerAsksFor(t *testing.T) {
+	v := networkPolicyValkey()
+	v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	oldValkey := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
+	oldSentinel := builder.BuildSentinelNetworkPolicy(v, testOperatorPeer)
+	ownedByValkey(t, v, oldValkey)
+	ownedByValkey(t, v, oldSentinel)
+	v.Spec.Sentinel = nil
+	v.Spec.NetworkPolicy.NamePrefix = "iso"
+
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, oldValkey, oldSentinel)
+
+	require.NoError(t, r.reconcileNetworkPolicies(context.Background(), v))
+
+	for _, name := range []string{oldValkey.Name, oldSentinel.Name} {
+		_, err := getNetworkPolicy(t, c, name)
+		assert.True(t, apierrors.IsNotFound(err), "%s must be deleted", name)
+	}
+	_, err := getNetworkPolicy(t, c, "iso-"+v.Name)
+	assert.NoError(t, err, "the policy under the new name must be written")
+}
+
+func TestReconcileNetworkPolicies_PropagatesCleanupErrors(t *testing.T) {
+	v := networkPolicyValkey()
+	np := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
+	ownedByValkey(t, v, np)
+	v.Spec.NetworkPolicy.Enabled = false
+
+	for name, funcs := range map[string]interceptor.Funcs{
+		"listing networkpolicies": {
+			List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+				return internalErr("list denied")
+			},
+		},
+		"deleting NetworkPolicy": {
+			Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+				return internalErr("delete denied")
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, np)
+			err := r.reconcileNetworkPolicies(context.Background(), v)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), name)
+		})
+	}
+}
+
+// The NetworkPolicies step carries no when: gate: a CR with the policies turned
+// off still runs it, or the cleanup above never happens.
+func TestReconcileResources_NetworkPolicyCleanupRunsWhenDisabled(t *testing.T) {
+	v := networkPolicyValkey()
+	np := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
+	ownedByValkey(t, v, np)
+	v.Spec.NetworkPolicy = nil
+
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, np)
+	_ = r.reconcileResources(context.Background(), v)
+
+	_, err := getNetworkPolicy(t, c, np.Name)
+	assert.True(t, apierrors.IsNotFound(err))
 }
 
 // --- reconcileObserverDeployment ---
@@ -1333,17 +1494,14 @@ func TestReconcileNetworkPolicies_WrapsObserverPolicyError(t *testing.T) {
 
 // --- cleanupObserverDeployment ---
 
-func TestCleanupObserverDeployment_RemovesDeploymentAndPolicy(t *testing.T) {
+func TestCleanupObserverDeployment_RemovesDeployment(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
-		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
 		// Observer intentionally left disabled: this is the "turned off" path.
 	})
 	deploy := builder.BuildObserverDeployment(v, "img")
 	ownedByValkey(t, v, deploy)
-	np := builder.BuildObserverNetworkPolicy(v)
-	ownedByValkey(t, v, np)
-	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy, np)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy)
 
 	require.NoError(t, r.cleanupObserverDeployment(context.Background(), v))
 
@@ -1351,25 +1509,22 @@ func TestCleanupObserverDeployment_RemovesDeploymentAndPolicy(t *testing.T) {
 		Name: builder.ObserverDeploymentName(v), Namespace: "default",
 	}, &appsv1.Deployment{})
 	assert.True(t, apierrors.IsNotFound(deployErr))
-	npErr := c.Get(context.Background(), types.NamespacedName{
-		Name: builder.ObserverNetworkPolicyName(v), Namespace: "default",
-	}, &networkingv1.NetworkPolicy{})
-	assert.True(t, apierrors.IsNotFound(npErr))
 }
 
-func TestCleanupObserverDeployment_LeavesPolicyWhenNetworkPolicyDisabled(t *testing.T) {
-	v := newTestValkey("test", "default")
-	deploy := builder.BuildObserverDeployment(v, "img")
-	ownedByValkey(t, v, deploy)
+// The observer turned off with the policies on: its policy goes with the next
+// NetworkPolicies step, the one deleter of every generated policy.
+func TestReconcileNetworkPolicies_ObserverOffDeletesItsPolicy(t *testing.T) {
+	v := networkPolicyValkey()
 	np := builder.BuildObserverNetworkPolicy(v)
-	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, deploy, np)
+	ownedByValkey(t, v, np)
+	r, c := newReconcilerWithInterceptor("1.0.0", interceptor.Funcs{}, v, np)
 
-	require.NoError(t, r.cleanupObserverDeployment(context.Background(), v))
+	require.NoError(t, r.reconcileNetworkPolicies(context.Background(), v))
 
-	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
-		Name: builder.ObserverNetworkPolicyName(v), Namespace: "default",
-	}, &networkingv1.NetworkPolicy{}),
-		"with networkPolicy disabled the operator does not manage the observer policy")
+	_, err := getNetworkPolicy(t, c, np.Name)
+	assert.True(t, apierrors.IsNotFound(err))
+	_, err = getNetworkPolicy(t, c, builder.NetworkPolicyName(v))
+	assert.NoError(t, err, "the data policy stays")
 }
 
 func TestCleanupObserverDeployment_PropagatesDeploymentDeleteError(t *testing.T) {
@@ -1387,28 +1542,6 @@ func TestCleanupObserverDeployment_PropagatesDeploymentDeleteError(t *testing.T)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deleting observer deployment")
-}
-
-func TestCleanupObserverDeployment_PropagatesNetworkPolicyDeleteError(t *testing.T) {
-	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
-		v.Spec.NetworkPolicy = &vkov1.NetworkPolicySpec{Enabled: true}
-	})
-	np := builder.BuildObserverNetworkPolicy(v)
-	ownedByValkey(t, v, np)
-	funcs := interceptor.Funcs{
-		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
-			if _, ok := obj.(*networkingv1.NetworkPolicy); ok {
-				return internalErr("networkpolicy delete denied")
-			}
-			return nil
-		},
-	}
-	r, _ := newReconcilerWithInterceptor("1.0.0", funcs, v, np)
-
-	err := r.cleanupObserverDeployment(context.Background(), v)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deleting observer NetworkPolicy")
 }
 
 // --- isObserverDeploymentReady ---

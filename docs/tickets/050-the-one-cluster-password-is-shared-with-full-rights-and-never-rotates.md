@@ -50,10 +50,11 @@ measurements below are docker, `valkey/valkey:9.1.1` and `8.1.9`, identical on b
 ### Exporter user
 
 The exporter runs `spec.metrics.image`, default `DefaultMetricsExporterImage`
-([`valkey_types.go:645`](../../api/v1/valkey_types.go), redis_exporter v1.66.0, pinned by
+([`valkey_types.go:692`](../../api/v1/valkey_types.go), redis_exporter v1.92.1, pinned by
 digest), the only third-party client process in the pod. Its container gets `REDIS_ADDR`
-(`redis://localhost:6379`, or `rediss://localhost:16379` under TLS, `statefulset.go:1063–1073`),
-the listen address, `REDIS_PASSWORD` (1076–1088) and the TLS paths; no token, no config volume.
+(`redis://localhost:6379`, or `rediss://localhost:16379` under TLS, `statefulset.go:1071–1079`),
+the listen address, the two variables that switch off `/scrape` and key-value export (1081–1082),
+`REDIS_PASSWORD` (1086–1098) and the TLS paths; no token, no config volume.
 The other components stay out of scope: probes and init containers run beside the `valkey`
 container, which holds the password anyway, and a probe user would check nothing (M5); the
 `sidecar` needs `REPLICAOF` and `SENTINEL FAILOVER` ([`drain.go:139,172,365`](../../internal/sidecar/drain.go));
@@ -97,8 +98,8 @@ and leaving metrics off.
   `redis_up 1` (9.1.1). Read once at start, only when `REDIS_PASSWORD` is empty, looked up by the
   exact URI; a key differing from `REDIS_ADDR` sends no `AUTH`.
 - **The command set moves** with the pin, `spec.metrics.image` and `spec.metrics.extraArgs`
-  ([`valkey_types.go:675–677`](../../api/v1/valkey_types.go), appended at
-  `statefulset.go:1127–1129`): `--check-keys`, `--check-single-keys`, `--count-keys` need
+  ([`valkey_types.go`](../../api/v1/valkey_types.go) `MetricsSpec.ExtraArgs`, appended at
+  `statefulset.go:1137–1139`): `--check-keys`, `--check-single-keys`, `--count-keys` need
   `SELECT`, `SCAN`, `TYPE`, `GET`, `STRLEN`; `--export-client-list` needs `CLIENT LIST`; v1.92.0
   adds `COMMANDLOG`. By reading, `extraArgs` can pass `--include-config-metrics
   --redact-config-metrics=false`, publishing `masterauth` as a label; no `config|get` closes that.

@@ -232,7 +232,7 @@ spec:
     replicas: 3
   metrics:
     enabled: true
-    # image: oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1  # optional; default shown
+    # image: oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd  # optional; default shown
     # port: 9121                               # optional; exporter /metrics port
     resources:
       requests:

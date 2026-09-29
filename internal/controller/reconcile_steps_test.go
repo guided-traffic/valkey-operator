@@ -127,7 +127,7 @@ func TestReconcileResources_ContinuesPastRejectedStatefulSet(t *testing.T) {
 	// on 1.10.46 a single rejection ended the pass here.
 	np := &networkingv1.NetworkPolicy{}
 	assert.NoError(t, c.Get(ctx, types.NamespacedName{
-		Name: builder.BuildValkeyNetworkPolicy(v, "").Name, Namespace: v.Namespace}, np),
+		Name: builder.BuildValkeyNetworkPolicy(v, builder.OperatorPeer{}).Name, Namespace: v.Namespace}, np),
 		"NetworkPolicies must be reconciled even though the StatefulSet write was rejected")
 
 	svc := &corev1.Service{}

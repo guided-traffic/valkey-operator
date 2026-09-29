@@ -12,7 +12,21 @@ operator's per-resource metrics).
 
 ## The exporter sidecar
 
-The exporter (`oliver006/redis_exporter` by default) connects to the local Valkey instance and serves `/metrics` on port `9121`. TLS and authentication are handled automatically — the exporter reuses the pod's mounted certificates and the auth Secret.
+The exporter (`oliver006/redis_exporter` by default) connects to the local Valkey instance and serves `/metrics` on port `9121`. The operator wires the connection: under TLS the exporter uses the pod's mounted certificates, and with `spec.auth` it gets the cluster password from the auth Secret. *(corrected 2026-09-29: this said "TLS and authentication are handled automatically", which read as if the exporter's own port were protected. It is not.)*
+
+The exporter's port is **plain HTTP without authentication**: whatever it serves, it serves to
+anything that reaches the port. The operator therefore switches off the two routes it does not
+use, on every cluster — `/scrape`, which connects to a target named in the request with the
+exporter's credentials, and the export of key values (`REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT`,
+`REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES`). A key you configure through
+`spec.metrics.extraArgs` (`--check-single-keys`, `--check-keys`) is exported with its name and
+size, not its value. An image you set through `spec.metrics.image` must be v1.83.0 or later for
+the first switch to take effect; see the `image` row of the
+[`spec.metrics`](../../README.md#specmetrics) table.
+
+With `spec.networkPolicy.enabled`, the generated policy admits no scraper on the exporter port:
+admit your Prometheus with a policy of your own, as in
+[network-policy.md](network-policy.md#admitting-a-scraper).
 
 Enabling metrics (the [metrics example](examples.md#with-metrics-prometheus-exporter)) adds
 the exporter container to every data pod. It has no readiness probe, so it never affects pod

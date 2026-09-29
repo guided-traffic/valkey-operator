@@ -101,7 +101,8 @@ struck through in place below, with the rule that replaced it. The residual
 document now names the page that holds the material: the footprint and gaps H-1 to H-3 are on
 [privilege-footprint.md](../security/privilege-footprint.md), the generated-name, egress and
 CR-author gaps H-9 to H-11 on [isolation-and-tenancy.md](../security/isolation-and-tenancy.md).
-D1–D11 are unchanged as rules. In the same change, a stale sentence in D8 was corrected: the chart has refused an
+D1–D11 are unchanged as rules. *(Amended 2026-09-29: D7's any-source rules and its
+namespace-wide operator peer are re-decided by [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md), implemented the same day.)* In the same change, a stale sentence in D8 was corrected: the chart has refused an
 absolute or `..` path for the operator's own `Localhost` profile since ADR 0033's amendment of
 2026-09-26. Verified by reading `docs/security/`, `SECURITY.md`, `DEVELOPER.md` and the
 `valkey-operator.podHardening` helper in
@@ -200,11 +201,15 @@ whatever `default` is bound to — nothing, in a stock cluster.
 to three policies, every one with `PolicyTypes: [Ingress]`: the Valkey policy always, the
 Sentinel and observer policies only when those components are enabled, so a standalone
 cluster gets exactly one. The data port accepts traffic from Valkey pods,
-Sentinel pods, observer pods and **the operator namespace** (matched on
-`kubernetes.io/metadata.name`, because the operator connects directly to the data plane). The
-sidecar health port and the exporter port are deliberately **open to everyone**: kubelet
-probes originate from the node, not from a pod a policy can select, and Prometheus is not
-locatable from the CR.
+Sentinel pods, observer pods and ~~**the operator namespace** (matched on
+`kubernetes.io/metadata.name`, because the operator connects directly to the data plane)~~
+*(re-decided 2026-09-29, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D2: the operator pod — its namespace and a pod selector matching
+it alone)*. ~~The sidecar health port and the exporter port are deliberately **open to
+everyone**: kubelet probes originate from the node, not from a pod a policy can select, and
+Prometheus is not locatable from the CR.~~ *(Re-decided 2026-09-29, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D1–D3: a shipped
+policy admits only traffic between the components this repository deploys, so the sidecar
+health, exporter and observer ports get no rule — kubelet's traffic comes from the node, which
+the API admits anyway, and a scraper is the administrator's to admit. Implemented.)*
 
 **D8 — The operator process itself runs fully restricted.** Verified by reading the chart
 Deployment: five `securityContext` controls, split across the two levels the field exists
