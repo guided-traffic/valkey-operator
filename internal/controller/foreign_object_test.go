@@ -728,7 +728,7 @@ func TestReconcileNetworkPolicy_RefusesAForeignNetworkPolicy(t *testing.T) {
 	// a CR reporting OK while the policy it names belongs to somebody else is a
 	// security statement that is not true.
 	v := networkPolicyValkey()
-	desired := builder.BuildValkeyNetworkPolicy(v, "valkey-system")
+	desired := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
 	foreign := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      desired.Name,
@@ -744,7 +744,7 @@ func TestReconcileNetworkPolicy_RefusesAForeignNetworkPolicy(t *testing.T) {
 	r.Recorder = rec
 
 	err := r.reconcileNetworkPolicy(context.Background(), v,
-		builder.BuildValkeyNetworkPolicy(v, "valkey-system"))
+		builder.BuildValkeyNetworkPolicy(v, testOperatorPeer))
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errForeignObject)

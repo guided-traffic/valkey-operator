@@ -88,22 +88,24 @@ releases that roll the fleet for nothing shipped.
 
 Operator-facing statement: gap [H-17](../security/workload-pod-posture.md#h-17).
 
-- `DefaultMetricsExporterImage` is `oliver006/redis_exporter:v1.66.0@sha256:d98e6db8…`
-  ([`valkey_types.go:645`](../../api/v1/valkey_types.go), doc comment `:640-644`); `MetricsImage()`
-  (`:1211-1217`) falls back to it when `spec.metrics.image` is empty. The Docker Hub digest of
-  `v1.66.0` equals the pin. It has never moved; upstream is at v1.92.0, 30 releases, none naming a
-  CVE; they bump Go (1.24 to 1.27) and `x/crypto`, and v1.90.0 changes the metric set (#1168, #1170,
-  #1172). The pinned arm64 binary is built with `go1.23.2`, out of support; go1.23.5 to .12 carry
-  security fixes it predates.
+- `DefaultMetricsExporterImage` is `oliver006/redis_exporter:v1.92.1@sha256:7fbc93d3…`
+  ([`valkey_types.go:692`](../../api/v1/valkey_types.go), doc comment `:687-691`); `MetricsImage()`
+  (`:1259-1264`) falls back to it when `spec.metrics.image` is empty. The digest is the multi-arch
+  index of `v1.92.1`, upstream's newest release on 2026-09-29, read with `docker buildx imagetools
+  inspect`; T65 moved it there by hand from v1.66.0. The pinned arm64 binary is built with
+  `go1.27.1`.
 - The exporter holds the password as `REDIS_PASSWORD` and, under TLS, uses the data tier's `tls.key`
   (the Valkey server key) as its client key
-  ([`statefulset.go:1076-1107`](../../internal/builder/statefulset.go)).
+  ([`statefulset.go:1086-1117`](../../internal/builder/statefulset.go)).
 - No manager reads the file (the custom managers match other files, no built-in manager matches Go
   source); none of the files carrying the reference matches an `ignorePaths` glob. A new custom
-  manager would automerge v1.66.0 to v1.92.0 (a minor) as a `fix` release, the right type for a
-  shipped image. One dependency matched in several files becomes one PR.
-- CI only proves the exporter starts: metrics are enabled in `pod_security_test.go:134` and
-  `pod_hardening_test.go:216`, no test reads `/metrics`. With a wrong password the exporter stays up
+  manager would automerge the next minor as a `fix` release, the right type for a shipped image.
+  One dependency matched in several files becomes one PR.
+- CI proves the exporter starts on a node — metrics are enabled in `pod_security_test.go:134` and
+  `pod_hardening_test.go:216` — and no e2e reads `/metrics`. `TestExporter_ServesNoScrapeRoute`
+  ([`exporter_routes_test.go`](../../test/imagetools/exporter_routes_test.go), `make
+  test-image-tools`) runs the pinned image with the builder's env in docker, plaintext with auth,
+  and asserts `redis_up 1`; it does not cover TLS. With a wrong password the exporter stays up
   and serves `redis_up 0` (measured on `valkey/valkey:9.1.1`). Trivy scans only the operator image;
   the shipped PrometheusRule uses only `vko_*` series.
   `TestDefaultMetricsExporterImage_IsPinnedByDigest` ([`valkey_types_test.go:1367`](../../api/v1/valkey_types_test.go))
@@ -224,7 +226,8 @@ release run. Installers can pin today with [`image.digest`](../operations/instal
     regex in a scratch copy does not; after the merge, dashboard #229.
 14. **(Q5)** the copies; either way ADR 0033 `:266` and `workload-pod-posture.md:96-97`, `:212` name
     the constant instead of a version. **Close:** rewrite the five hand-maintenance statements. The
-    first Renovate PR (v1.66.0 to v1.92.0) is not part of this ticket.
+    first bump, to v1.92.1, was made by hand with T65; this manager keeps the pin current from
+    there.
 
 ### Operator image digest
 

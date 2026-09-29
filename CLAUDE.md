@@ -134,7 +134,7 @@ spec:
     secretPasswordKey: password
   metrics:
     enabled: true                 # adds a Prometheus exporter sidecar to each Valkey pod
-    image: oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1
+    image: oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd
                                   # optional; this is the default when omitted, pinned by
                                   # digest (DefaultMetricsExporterImage, ADR 0033 D5)
     port: 9121                    # optional; exporter /metrics port (default 9121)
@@ -950,7 +950,10 @@ overwritten.
   repair running on its way up; non-persistent is deferred and reported as
   `PodSecurityUpdatePending=True/PodRunsAsRoot`, because an operator upgrade never discards a
   dataset — unless its Valkey image, TLS material record or config hash changed, which the CR
-  author or a rotation caused and which replace it as they always did.
+  author or a rotation caused and which replace it as they always did. *(2026-09-29, ADR 0018
+  D11)* A rootless single pod whose **exporter image or env** differs from the template takes
+  the same line (`exporterDrifted`, reason `ExporterOutdated`): the release's new sidecar image
+  otherwise made `isSidecarOnlyChange` defer the exporter fix on every such cluster.
 - **The drift comparisons treat `securityContext` as a subset** (`podSpecChanged`,
   `containerChanged`, `ObserverDeploymentHasChanged`): a field the operator does not set is not
   compared, so a mutating admission policy is not fought over — **except `capabilities.add`**,
@@ -1093,7 +1096,11 @@ tools and release tooling green; the rerun on the final code has no recorded res
 
 `spec.metrics.enabled` adds an exporter sidecar to every Valkey pod, serving `/metrics` on
 `spec.metrics.port` (default 9121). It carries **no readiness probe**, so a failing exporter
-never removes the pod from the `-rw`/`-r` Services. The `<name>-metrics` Service carries the
+never removes the pod from the `-rw`/`-r` Services. Its listener is unauthenticated, so `/scrape` (it dials a
+caller-named target with the password) and the key-value export are switched off by **env
+variables, not flags** — an older own image ignores an unknown variable, where an unknown flag
+crash-loops it and takes the pod's readiness with it (ADR 0018 D11). `make test-image-tools`
+proves both against the pinned image, with a negative control. The `<name>-metrics` Service carries the
 marker label `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it; the
 ServiceMonitor is `unstructured` (`monitoring.coreos.com/v1`) and skipped when the CRD is
 absent. Enabling metrics changes the pod-spec hash and therefore rides the failover-aware
@@ -1114,6 +1121,18 @@ spec the operator accepted and never converged. The chart's Service, ServiceMoni
 PrometheusRule for this endpoint are all **default off**, and the endpoint is unauthenticated
 wherever it binds — the per-resource series make it an inventory of the fleet.
 → [ADR 0021](docs/adr/0021-per-resource-metrics-and-the-alert-that-was-missing.md)
+
+## A generated NetworkPolicy admits only what this repository deploys
+
+The data and Sentinel ports admit the resource's own data, Sentinel and observer pods and the
+**operator pod** — its namespace **and** its labels in one peer (`builder.OperatorPeer`,
+`--operator-pod-selector` + `POD_NAMESPACE`, both set by the chart, which labels the operator pod
+`app.kubernetes.io/component: operator`). Half an identity writes no operator peer, never a
+namespace-only one. No rule without a `from`, no `ipBlock`, no rule for the sidecar health, exporter
+or observer port — kubelet comes from the node, clients and scrapers are the administrator's.
+**The NetworkPolicies step is ungated** and deletes every policy the Valkey controls that the spec
+no longer asks for (`cleanupNetworkPolicies`); a new policy kind or name inherits that sweep.
+→ [ADR 0039](docs/adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)
 
 # Important Notes
 

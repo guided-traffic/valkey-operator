@@ -22,7 +22,7 @@ remaining barrier is the network.
 | `valkey` container | env `VALKEY_PASSWORD` from `secretKeyRef`, expanded into `--requirepass` / `--masterauth` by a shell wrapper | [`statefulset.go:830,874`](../../internal/builder/statefulset.go) |
 | init container | same env var, used for the `-a` flag of its discovery probes | [`statefulset.go:376,561`](../../internal/builder/statefulset.go) |
 | `sidecar` container | same env var | [`statefulset.go:946`](../../internal/builder/statefulset.go) |
-| `exporter` sidecar | env `REDIS_PASSWORD` from the same `secretKeyRef` | [`statefulset.go:1078`](../../internal/builder/statefulset.go) |
+| `exporter` sidecar | env `REDIS_PASSWORD` from the same `secretKeyRef` | [`statefulset.go:1088`](../../internal/builder/statefulset.go) |
 | observer | same env var | [`internal/builder/observer.go:249`](../../internal/builder/observer.go) |
 | **operator** | reads the Secret through the API and holds the plaintext in memory for the duration of a call | [`readValkeyPassword`, `valkey_controller.go:177`](../../internal/controller/valkey_controller.go) |
 
@@ -35,6 +35,18 @@ another container of the pod, because no generated pod shares its process namesp
 ([workload pod posture](workload-pod-posture.md#the-fields-on-every-generated-pod)). Both are the
 standard Redis/Valkey deployment pattern; neither is a defect, but neither is a
 secret store either.
+
+**The exporter is the one consumer that also listens on the network**, and its listener on
+`spec.metrics.port` is plain HTTP without authentication. Until 2026-09-29 it served a route,
+`/scrape`, that connected to any target a request named, with this password, and returned key
+values; one unauthenticated request from anything that reached the port sent the password of
+the default user to a host of the caller's choosing. The operator now switches that route and
+the export of key values off on every cluster
+([ADR 0018](../adr/0018-metrics-and-the-exporter-sidecar.md) D11), and the generated
+NetworkPolicy no longer admits every source on the port. It stays open where the switch does
+not reach: an image set through `spec.metrics.image` older than v1.83.0, and the pod of a
+non-persistent single-replica cluster until it restarts
+(`PodSecurityUpdatePending=True/ExporterOutdated` names it).
 
 ## TLS material
 

@@ -449,9 +449,15 @@ const (
 	// deferred. The message names the pod.
 	ReasonPodRunsAsRoot = "PodRunsAsRoot"
 
+	// ReasonExporterOutdated is the PodSecurityUpdatePending reason while the only data
+	// pod of a non-persistent single-pod cluster runs an exporter whose image or
+	// environment an earlier operator version set, and its replacement is deferred.
+	// The message names the pod.
+	ReasonExporterOutdated = "ExporterOutdated"
+
 	// ReasonPodSecurityUpdateApplied clears PodSecurityUpdatePending once no data pod
-	// update is deferred on account of the rootless migration any more. Only written
-	// over a standing True.
+	// update is deferred on account of the rootless migration or the exporter update
+	// any more. Only written over a standing True.
 	ReasonPodSecurityUpdateApplied = "PodSecurityUpdateApplied"
 
 	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
@@ -683,7 +689,7 @@ const (
 	// Pinned by the digest of the multi-arch image index behind the tag, so a re-pushed
 	// tag cannot change what runs in the pods (ADR 0033 D5); the tag stays for the
 	// reader and for the version it names.
-	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0@sha256:d98e6db8094f491b95791e9f776b0ba30a20aeacb90e18334935d5e51bf2e6a1"
+	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd"
 
 	// DefaultMetricsExporterPort is the default port the exporter serves /metrics on.
 	DefaultMetricsExporterPort int32 = 9121

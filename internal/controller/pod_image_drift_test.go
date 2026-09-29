@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	vkov1 "github.com/guided-traffic/valkey-operator/api/v1"
@@ -192,9 +191,10 @@ func TestSentinelPodNeedsUpdate_ComparesInitContainerImages(t *testing.T) {
 	assert.True(t, sentinelPodNeedsUpdate(pod, sts.Spec.Template), "the sentinel container is still compared")
 }
 
-// A single rootless pod whose exporter image alone differs is replaced through the
-// ordinary dispatch: the entry scan finds it outdated, and the single-pod deferral
-// holds only a change that includes the sidecar image (ADR 0007 D6).
+// A single rootless persistent pod whose exporter image alone differs is replaced
+// through the ordinary dispatch: the entry scan finds it outdated, and the
+// single-pod deferral holds an exporter change only on a pod without a volume
+// (ADR 0018 D11).
 func TestCheckAndHandleRollingUpdate_ReplacesAStandalonePodWithAnExporterImageDrift(t *testing.T) {
 	v, sts := metricsCluster("single", 1)
 	pod := podWithTemplateInits(v, sts, 0)
@@ -207,12 +207,12 @@ func TestCheckAndHandleRollingUpdate_ReplacesAStandalonePodWithAnExporterImageDr
 	assert.False(t, podExists(t, c, "single-0"), "the pod is replaced onto the template's images")
 }
 
-// The single-pod residual: when the sidecar image differs as well, the change reads
-// as sidecar-only to the deferral, which keeps the pod and reports it. The deferral
-// cannot tell this apart from a release that moves the sidecar and the exporter
-// image together, and replacing a single non-persistent pod for that would discard
-// its dataset (ADR 0007 D6, D7).
-func TestCheckAndHandleRollingUpdate_DefersAStandalonePodWithAnExporterAndSidecarDrift(t *testing.T) {
+// The former single-pod residual: when the sidecar image differs as well, the change
+// read as sidecar-only to the deferral and the pod kept its exporter. A differing
+// exporter is decided by persistence since ADR 0018 D11, so this persistent pod is
+// replaced; the non-persistent case is held and reported as ExporterOutdated
+// (TestCheckAndHandleRollingUpdate_DefersAnOutdatedExporterOnANonPersistentPodAndReportsIt).
+func TestCheckAndHandleRollingUpdate_ReplacesAPersistentStandalonePodWithAnExporterAndSidecarDrift(t *testing.T) {
 	v, sts := metricsCluster("single", 1)
 	pod := podWithTemplateInits(v, sts, 0)
 	setImage(t, pod, builder.ExporterContainerName, driftedImage)
@@ -221,10 +221,6 @@ func TestCheckAndHandleRollingUpdate_DefersAStandalonePodWithAnExporterAndSideca
 
 	result := r.checkAndHandleRollingUpdate(context.Background(), crGet(t, c, "single"))
 	require.NoError(t, result.Error)
-	assert.False(t, result.NeedsRequeue)
-	assert.True(t, podExists(t, c, "single-0"))
-	cond := meta.FindStatusCondition(crGet(t, c, "single").Status.Conditions, vkov1.ConditionTypeSidecarUpdatePending)
-	require.NotNil(t, cond)
-	assert.Equal(t, metav1.ConditionTrue, cond.Status)
-	assert.Contains(t, cond.Message, "single-0")
+	assert.True(t, result.NeedsRequeue)
+	assert.False(t, podExists(t, c, "single-0"), "the exporter update replaces a persistent single pod")
 }

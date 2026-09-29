@@ -51,7 +51,7 @@ func TestSentinelNetworkPolicyName_WithPrefix(t *testing.T) {
 func TestBuildValkeyNetworkPolicy_Standalone(t *testing.T) {
 	v := newTestValkey("test")
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
 	assert.Equal(t, "test", np.Name)
 	assert.Equal(t, "default", np.Namespace)
@@ -67,19 +67,12 @@ func TestBuildValkeyNetworkPolicy_Standalone(t *testing.T) {
 	// PolicyTypes.
 	assert.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
 
-	// Ingress rules: Valkey port (from Valkey pods) + sidecar health port (open to all).
-	require.Len(t, np.Spec.Ingress, 2)
-
-	// Rule 0: Valkey port from Valkey pods only.
+	// One ingress rule: the Valkey port from Valkey pods only.
+	require.Len(t, np.Spec.Ingress, 1)
 	require.Len(t, np.Spec.Ingress[0].Ports, 1)
 	assert.Equal(t, intstr.FromInt32(ValkeyPort), *np.Spec.Ingress[0].Ports[0].Port)
 	require.Len(t, np.Spec.Ingress[0].From, 1)
 	assert.Equal(t, "valkey", np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app.kubernetes.io/component"])
-
-	// Rule 1: sidecar health port open to all (no From restriction) for kubelet probes.
-	require.Len(t, np.Spec.Ingress[1].Ports, 1)
-	assert.Equal(t, intstr.FromInt32(SidecarHealthPort), *np.Spec.Ingress[1].Ports[0].Port)
-	assert.Empty(t, np.Spec.Ingress[1].From, "health port must be open to all sources")
 }
 
 // --- BuildValkeyNetworkPolicy (HA with Sentinel) ---
@@ -93,18 +86,14 @@ func TestBuildValkeyNetworkPolicy_WithSentinel(t *testing.T) {
 		}
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
-	// Ingress: Valkey port from Valkey+Sentinel + sidecar health port open to all.
-	require.Len(t, np.Spec.Ingress, 2)
+	// Ingress: the Valkey port from Valkey and Sentinel pods.
+	require.Len(t, np.Spec.Ingress, 1)
 	require.Len(t, np.Spec.Ingress[0].From, 2)
 
 	assert.Equal(t, "valkey", np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app.kubernetes.io/component"])
 	assert.Equal(t, "sentinel", np.Spec.Ingress[0].From[1].PodSelector.MatchLabels["app.kubernetes.io/component"])
-
-	// Health port rule (last rule, no From restriction).
-	assert.Equal(t, intstr.FromInt32(SidecarHealthPort), *np.Spec.Ingress[1].Ports[0].Port)
-	assert.Empty(t, np.Spec.Ingress[1].From)
 }
 
 // --- BuildValkeyNetworkPolicy (with TLS) ---
@@ -114,15 +103,13 @@ func TestBuildValkeyNetworkPolicy_WithTLS(t *testing.T) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
-	// Should have 3 ingress rules: plain port, TLS port, and sidecar health port.
-	require.Len(t, np.Spec.Ingress, 3)
+	// Two ingress rules: the plain port and the TLS port.
+	require.Len(t, np.Spec.Ingress, 2)
 
 	assert.Equal(t, intstr.FromInt32(ValkeyPort), *np.Spec.Ingress[0].Ports[0].Port)
 	assert.Equal(t, intstr.FromInt32(int32(ValkeyPort+10000)), *np.Spec.Ingress[1].Ports[0].Port)
-	assert.Equal(t, intstr.FromInt32(SidecarHealthPort), *np.Spec.Ingress[2].Ports[0].Port)
-	assert.Empty(t, np.Spec.Ingress[2].From, "health port must be open to all sources")
 }
 
 // --- BuildValkeyNetworkPolicy (HA + TLS) ---
@@ -134,15 +121,12 @@ func TestBuildValkeyNetworkPolicy_SentinelAndTLS(t *testing.T) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
-	// 3 ingress rules: plain Valkey port, TLS Valkey port, and sidecar health port.
-	// Plain and TLS rules each have 2 peers (Valkey + Sentinel); health port has no From restriction.
-	require.Len(t, np.Spec.Ingress, 3)
+	// Two ingress rules, plain and TLS Valkey port, each with 2 peers (Valkey + Sentinel).
+	require.Len(t, np.Spec.Ingress, 2)
 	assert.Len(t, np.Spec.Ingress[0].From, 2)
 	assert.Len(t, np.Spec.Ingress[1].From, 2)
-	assert.Equal(t, intstr.FromInt32(SidecarHealthPort), *np.Spec.Ingress[2].Ports[0].Port)
-	assert.Empty(t, np.Spec.Ingress[2].From, "health port must be open to all sources")
 }
 
 // --- BuildValkeyNetworkPolicy (with NamePrefix) ---
@@ -155,7 +139,7 @@ func TestBuildValkeyNetworkPolicy_NamePrefix(t *testing.T) {
 		}
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 	assert.Equal(t, "my-prefix-test", np.Name)
 }
 
@@ -163,50 +147,86 @@ func TestBuildValkeyNetworkPolicy_NamePrefix(t *testing.T) {
 
 func TestBuildValkeyNetworkPolicy_TCP(t *testing.T) {
 	v := newTestValkey("test")
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
 	require.Len(t, np.Spec.Ingress[0].Ports, 1)
 	assert.Equal(t, corev1.ProtocolTCP, *np.Spec.Ingress[0].Ports[0].Protocol)
 }
 
-// --- BuildValkeyNetworkPolicy: sidecar health port ---
+// --- Only the deployed components are admitted (ADR 0039 D1, D2) ---
 
-// TestBuildValkeyNetworkPolicy_SidecarHealthPort verifies that the last ingress
-// rule always allows traffic on SidecarHealthPort from all sources (no From
-// restriction) so that kubelet readiness/liveness probes are never blocked.
-func TestBuildValkeyNetworkPolicy_SidecarHealthPort(t *testing.T) {
+// testOperator is an operator peer as the chart passes it.
+var testOperator = OperatorPeer{
+	Namespace: "database-operators",
+	PodLabels: map[string]string{
+		"app.kubernetes.io/name":      "valkey-operator",
+		"app.kubernetes.io/instance":  "vko",
+		"app.kubernetes.io/component": "operator",
+	},
+}
+
+// allFeatures turns on every component and port a policy could be widened for.
+func allFeatures(v *vkov1.Valkey) {
+	v.Spec.Replicas = 3
+	v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+	v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+	v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+	v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
+}
+
+// assertOnlyComponentRules fails on a rule without a From (every source), on a
+// peer that is a namespace alone, on an ipBlock, and on a port outside allowed.
+func assertOnlyComponentRules(t *testing.T, np *networkingv1.NetworkPolicy, allowed ...int32) {
+	t.Helper()
+	for i, rule := range np.Spec.Ingress {
+		assert.NotEmpty(t, rule.From, "rule %d admits every source", i)
+		for _, peer := range rule.From {
+			assert.Nil(t, peer.IPBlock, "rule %d carries an ipBlock", i)
+			assert.NotNil(t, peer.PodSelector, "rule %d admits a whole namespace", i)
+		}
+		for _, p := range rule.Ports {
+			assert.Contains(t, allowed, p.Port.IntVal, "rule %d opens port %s", i, p.Port.String())
+		}
+	}
+}
+
+// The data policy opens the data ports and nothing else: no rule for the sidecar
+// health port (kubelet comes from the node) and none for the exporter port (a
+// scraper is the administrator's to admit), in every topology.
+func TestBuildValkeyNetworkPolicy_NoRuleOutsideTheDataPorts(t *testing.T) {
 	testCases := []struct {
 		name    string
 		mutator func(v *vkov1.Valkey)
 	}{
 		{"standalone", func(_ *vkov1.Valkey) {}},
-		{"with-sentinel", func(v *vkov1.Valkey) {
-			v.Spec.Replicas = 3
-			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		{"with-metrics", func(v *vkov1.Valkey) {
+			v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true, Port: 9999}
 		}},
-		{"with-tls", func(v *vkov1.Valkey) {
-			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
-		}},
-		{"sentinel-and-tls", func(v *vkov1.Valkey) {
-			v.Spec.Replicas = 3
-			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
-			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
-		}},
+		{"everything", allFeatures},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			v := newTestValkey("test", tc.mutator)
-			np := BuildValkeyNetworkPolicy(v, "")
-
-			// The last ingress rule is always the health port.
-			last := np.Spec.Ingress[len(np.Spec.Ingress)-1]
-			require.Len(t, last.Ports, 1)
-			assert.Equal(t, intstr.FromInt32(SidecarHealthPort), *last.Ports[0].Port)
-			assert.Equal(t, corev1.ProtocolTCP, *last.Ports[0].Protocol)
-			assert.Empty(t, last.From, "sidecar health port must be reachable from all sources (kubelet)")
+			np := BuildValkeyNetworkPolicy(newTestValkey("test", tc.mutator), testOperator)
+			assertOnlyComponentRules(t, np, ValkeyPort, ValkeyPort+10000)
 		})
 	}
+}
+
+func TestBuildSentinelNetworkPolicy_NoRuleOutsideTheSentinelPorts(t *testing.T) {
+	np := BuildSentinelNetworkPolicy(newTestValkey("test", allFeatures), testOperator)
+	assertOnlyComponentRules(t, np, SentinelPort, SentinelPort+10000)
+}
+
+// Enabling metrics does not change the data policy at all: nothing this
+// repository deploys reads the exporter port.
+func TestBuildValkeyNetworkPolicy_MetricsAddNoRule(t *testing.T) {
+	withMetrics := BuildValkeyNetworkPolicy(newTestValkey("test", func(v *vkov1.Valkey) {
+		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+	}), testOperator)
+	without := BuildValkeyNetworkPolicy(newTestValkey("test"), testOperator)
+
+	assert.Equal(t, without.Spec.Ingress, withMetrics.Spec.Ingress)
 }
 
 // --- BuildSentinelNetworkPolicy ---
@@ -220,7 +240,7 @@ func TestBuildSentinelNetworkPolicy(t *testing.T) {
 		}
 	})
 
-	np := BuildSentinelNetworkPolicy(v, "")
+	np := BuildSentinelNetworkPolicy(v, OperatorPeer{})
 
 	assert.Equal(t, "test-sentinel", np.Name)
 	assert.Equal(t, "default", np.Namespace)
@@ -253,7 +273,7 @@ func TestBuildSentinelNetworkPolicy_WithTLS(t *testing.T) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
 
-	np := BuildSentinelNetworkPolicy(v, "")
+	np := BuildSentinelNetworkPolicy(v, OperatorPeer{})
 
 	// 2 ingress rules: Sentinel port + Sentinel TLS port.
 	require.Len(t, np.Spec.Ingress, 2)
@@ -271,7 +291,7 @@ func TestBuildSentinelNetworkPolicy_NamePrefix(t *testing.T) {
 		}
 	})
 
-	np := BuildSentinelNetworkPolicy(v, "")
+	np := BuildSentinelNetworkPolicy(v, OperatorPeer{})
 	assert.Equal(t, "custom-test-sentinel", np.Name)
 }
 
@@ -279,8 +299,8 @@ func TestBuildSentinelNetworkPolicy_NamePrefix(t *testing.T) {
 
 func TestNetworkPolicyHasChanged_Identical(t *testing.T) {
 	v := newTestValkey("test")
-	a := BuildValkeyNetworkPolicy(v, "")
-	b := BuildValkeyNetworkPolicy(v, "")
+	a := BuildValkeyNetworkPolicy(v, OperatorPeer{})
+	b := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
 	assert.False(t, NetworkPolicyHasChanged(a, b))
 }
@@ -290,8 +310,8 @@ func TestNetworkPolicyHasChanged_DifferentIngressRuleCount(t *testing.T) {
 	v2 := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
-	a := BuildValkeyNetworkPolicy(v1, "")
-	b := BuildValkeyNetworkPolicy(v2, "")
+	a := BuildValkeyNetworkPolicy(v1, OperatorPeer{})
+	b := BuildValkeyNetworkPolicy(v2, OperatorPeer{})
 
 	assert.True(t, NetworkPolicyHasChanged(a, b))
 }
@@ -302,8 +322,8 @@ func TestNetworkPolicyHasChanged_DifferentPeerCount(t *testing.T) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
 	})
-	a := BuildValkeyNetworkPolicy(v1, "")
-	b := BuildValkeyNetworkPolicy(v2, "")
+	a := BuildValkeyNetworkPolicy(v1, OperatorPeer{})
+	b := BuildValkeyNetworkPolicy(v2, OperatorPeer{})
 
 	assert.True(t, NetworkPolicyHasChanged(a, b))
 }
@@ -315,7 +335,7 @@ func TestBuildValkeyNetworkPolicy_Namespace(t *testing.T) {
 		v.Namespace = "production"
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 	assert.Equal(t, "production", np.Namespace)
 }
 
@@ -324,79 +344,87 @@ func TestBuildSentinelNetworkPolicy_Namespace(t *testing.T) {
 		v.Namespace = "production"
 	})
 
-	np := BuildSentinelNetworkPolicy(v, "")
+	np := BuildSentinelNetworkPolicy(v, OperatorPeer{})
 	assert.Equal(t, "production", np.Namespace)
 }
 
-// --- OperatorNamespace ingress peer ---
+// --- The operator peer (ADR 0039 D2) ---
 
-// TestBuildValkeyNetworkPolicy_OperatorNamespace verifies that when an operator
-// namespace is provided, a NamespaceSelector-based ingress peer is appended so
-// the operator pod can connect to Valkey for health checks.
-func TestBuildValkeyNetworkPolicy_OperatorNamespace(t *testing.T) {
-	v := newTestValkey("test")
-	np := BuildValkeyNetworkPolicy(v, "database-operators")
-
-	// Valkey port rule should now have 2 peers: Valkey pods + operator namespace.
-	require.Len(t, np.Spec.Ingress[0].From, 2)
-
-	// Last peer on the Valkey port rule is the operator namespace selector.
-	opPeer := np.Spec.Ingress[0].From[1]
-	assert.Nil(t, opPeer.PodSelector)
-	require.NotNil(t, opPeer.NamespaceSelector)
-	assert.Equal(t, "database-operators", opPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"])
+// assertOperatorPeer checks that peer admits the operator pod alone: its
+// namespace AND its labels, in one peer.
+func assertOperatorPeer(t *testing.T, peer networkingv1.NetworkPolicyPeer) {
+	t.Helper()
+	require.NotNil(t, peer.NamespaceSelector)
+	assert.Equal(t, map[string]string{"kubernetes.io/metadata.name": "database-operators"},
+		peer.NamespaceSelector.MatchLabels)
+	require.NotNil(t, peer.PodSelector, "a namespace alone admits every pod in it")
+	assert.Equal(t, testOperator.PodLabels, peer.PodSelector.MatchLabels)
 }
 
-func TestBuildValkeyNetworkPolicy_OperatorNamespace_WithSentinelAndTLS(t *testing.T) {
+// TestBuildValkeyNetworkPolicy_OperatorPeer verifies that the operator is
+// admitted as its pod, never as its namespace, on both data ports.
+func TestBuildValkeyNetworkPolicy_OperatorPeer(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
 		v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
 	})
-	np := BuildValkeyNetworkPolicy(v, "ops-ns")
+	np := BuildValkeyNetworkPolicy(v, testOperator)
 
-	// 3 rules: plain port, TLS port, health port.
-	require.Len(t, np.Spec.Ingress, 3)
-
-	// Plain port rule: Valkey + Sentinel + operator namespace = 3 peers.
-	require.Len(t, np.Spec.Ingress[0].From, 3)
-	// TLS port rule: same 3 peers.
-	require.Len(t, np.Spec.Ingress[1].From, 3)
-
-	// Operator namespace peer is last on each port rule.
-	for _, ruleIdx := range []int{0, 1} {
-		opPeer := np.Spec.Ingress[ruleIdx].From[2]
-		assert.Nil(t, opPeer.PodSelector)
-		require.NotNil(t, opPeer.NamespaceSelector)
-		assert.Equal(t, "ops-ns", opPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"])
+	require.Len(t, np.Spec.Ingress, 2)
+	for _, rule := range np.Spec.Ingress {
+		// Valkey + Sentinel + operator; the operator is last.
+		require.Len(t, rule.From, 3)
+		assertOperatorPeer(t, rule.From[2])
 	}
 }
 
-// TestBuildValkeyNetworkPolicy_NoOperatorNamespace verifies that when the
-// operator namespace is empty, no NamespaceSelector peer is added.
-func TestBuildValkeyNetworkPolicy_NoOperatorNamespace(t *testing.T) {
-	v := newTestValkey("test")
-	np := BuildValkeyNetworkPolicy(v, "")
-
-	require.Len(t, np.Spec.Ingress[0].From, 1)
-	assert.NotNil(t, np.Spec.Ingress[0].From[0].PodSelector)
-	assert.Nil(t, np.Spec.Ingress[0].From[0].NamespaceSelector)
-}
-
-func TestBuildSentinelNetworkPolicy_OperatorNamespace(t *testing.T) {
+func TestBuildSentinelNetworkPolicy_OperatorPeer(t *testing.T) {
 	v := newTestValkey("test", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
 	})
-	np := BuildSentinelNetworkPolicy(v, "database-operators")
+	np := BuildSentinelNetworkPolicy(v, testOperator)
 
-	// Sentinel port rule: Sentinel + Valkey + operator namespace = 3 peers.
+	// Sentinel port rule: Sentinel + Valkey + operator = 3 peers.
 	require.Len(t, np.Spec.Ingress[0].From, 3)
+	assertOperatorPeer(t, np.Spec.Ingress[0].From[2])
+}
 
-	opPeer := np.Spec.Ingress[0].From[2]
-	assert.Nil(t, opPeer.PodSelector)
-	require.NotNil(t, opPeer.NamespaceSelector)
-	assert.Equal(t, "database-operators", opPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"])
+// Half an identity is no identity: a namespace alone would admit every pod in
+// it, labels alone would select pods in the Valkey namespace. Either way no
+// operator peer is written.
+func TestBuildNetworkPolicy_IncompleteOperatorPeerAdmitsNoOperator(t *testing.T) {
+	for name, peer := range map[string]OperatorPeer{
+		"nothing":        {},
+		"namespace only": {Namespace: "database-operators"},
+		"labels only":    {PodLabels: testOperator.PodLabels},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := newTestValkey("test", func(v *vkov1.Valkey) {
+				v.Spec.Replicas = 3
+				v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+			})
+			valkey := BuildValkeyNetworkPolicy(v, peer)
+			sentinel := BuildSentinelNetworkPolicy(v, peer)
+
+			assert.Len(t, valkey.Spec.Ingress[0].From, 2, "Valkey + Sentinel, no operator")
+			assert.Len(t, sentinel.Spec.Ingress[0].From, 2, "Sentinel + Valkey, no operator")
+			for _, p := range append(valkey.Spec.Ingress[0].From, sentinel.Spec.Ingress[0].From...) {
+				assert.Nil(t, p.NamespaceSelector)
+			}
+		})
+	}
+}
+
+// The peer's label map is the policy's own: the client decodes the server's
+// answer into the object it wrote, and the reconciler's map is shared by every
+// concurrent pass.
+func TestBuildValkeyNetworkPolicy_OperatorPeerLabelsAreCopied(t *testing.T) {
+	np := BuildValkeyNetworkPolicy(newTestValkey("test"), testOperator)
+	np.Spec.Ingress[0].From[1].PodSelector.MatchLabels["written"] = "by the decoder"
+
+	assert.NotContains(t, testOperator.PodLabels, "written")
 }
 
 // --- Observer NetworkPolicy Tests ---
@@ -437,12 +465,10 @@ func TestBuildObserverNetworkPolicy(t *testing.T) {
 	// PolicyTypes.
 	assert.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
 
-	// One ingress rule: health port open to all.
-	require.Len(t, np.Spec.Ingress, 1)
-	require.Len(t, np.Spec.Ingress[0].Ports, 1)
-	assert.Equal(t, intstr.FromInt32(ObserverHealthPort), *np.Spec.Ingress[0].Ports[0].Port)
-	assert.Equal(t, corev1.ProtocolTCP, *np.Spec.Ingress[0].Ports[0].Protocol)
-	assert.Empty(t, np.Spec.Ingress[0].From, "health port must be open to all sources for kubelet probes")
+	// No ingress rule: nothing deployed connects to the observer, kubelet comes
+	// from the node. Nil rather than empty, or the drift check would see the API
+	// server's answer (the field omitted) as a difference on every pass.
+	assert.Nil(t, np.Spec.Ingress)
 }
 
 func TestBuildValkeyNetworkPolicy_WithObserver(t *testing.T) {
@@ -450,7 +476,7 @@ func TestBuildValkeyNetworkPolicy_WithObserver(t *testing.T) {
 		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
 	})
 
-	np := BuildValkeyNetworkPolicy(v, "")
+	np := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
 	// Valkey port rule should have 2 peers: Valkey pods + observer pods.
 	require.Len(t, np.Spec.Ingress[0].From, 2)
@@ -465,7 +491,7 @@ func TestBuildSentinelNetworkPolicy_WithObserver(t *testing.T) {
 		v.Spec.Observer = &vkov1.ObserverSpec{Enabled: true}
 	})
 
-	np := BuildSentinelNetworkPolicy(v, "")
+	np := BuildSentinelNetworkPolicy(v, OperatorPeer{})
 
 	// Sentinel port rule: Sentinel + Valkey + Observer = 3 peers.
 	require.Len(t, np.Spec.Ingress[0].From, 3)
@@ -474,58 +500,15 @@ func TestBuildSentinelNetworkPolicy_WithObserver(t *testing.T) {
 	assert.Equal(t, ComponentObserver, np.Spec.Ingress[0].From[2].PodSelector.MatchLabels["app.kubernetes.io/component"])
 }
 
-// TestNetworkPolicyHasChanged_OperatorNamespaceDiffers verifies that adding or
-// removing the operator namespace peer is detected as a change.
-func TestNetworkPolicyHasChanged_OperatorNamespaceDiffers(t *testing.T) {
+// TestNetworkPolicyHasChanged_OperatorPeerDiffers verifies that adding or
+// removing the operator peer is detected as a change.
+func TestNetworkPolicyHasChanged_OperatorPeerDiffers(t *testing.T) {
 	v := newTestValkey("test")
-	withNS := BuildValkeyNetworkPolicy(v, "database-operators")
-	withoutNS := BuildValkeyNetworkPolicy(v, "")
+	withPeer := BuildValkeyNetworkPolicy(v, testOperator)
+	withoutPeer := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 
-	assert.True(t, NetworkPolicyHasChanged(withNS, withoutNS))
-	assert.True(t, NetworkPolicyHasChanged(withoutNS, withNS))
-}
-
-// --- BuildValkeyNetworkPolicy: metrics exporter port ---
-
-// With a NetworkPolicy in place the exporter port is closed unless the policy opens
-// it, so enabling spec.metrics without this rule produces a Prometheus target that
-// times out on every scrape. Like the health port the rule carries no From
-// restriction: the operator does not know where Prometheus runs.
-func TestBuildValkeyNetworkPolicy_MetricsPort(t *testing.T) {
-	const customPort int32 = 9999
-	v := newTestValkey("test", func(v *vkov1.Valkey) {
-		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true, Port: customPort}
-	})
-
-	np := BuildValkeyNetworkPolicy(v, "")
-
-	var opened *networkingv1.NetworkPolicyIngressRule
-	for i, rule := range np.Spec.Ingress {
-		if len(rule.Ports) == 1 && *rule.Ports[0].Port == intstr.FromInt32(customPort) {
-			opened = &np.Spec.Ingress[i]
-		}
-	}
-	require.NotNil(t, opened, "the configured exporter port must be opened for ingress")
-	assert.Equal(t, corev1.ProtocolTCP, *opened.Ports[0].Protocol)
-	assert.Empty(t, opened.From, "Prometheus runs where the operator cannot know, so no From restriction")
-}
-
-// The rule is gated on spec.metrics.enabled: a cluster without an exporter must not
-// have an extra port opened in its NetworkPolicy.
-func TestBuildValkeyNetworkPolicy_NoMetricsPortWhenDisabled(t *testing.T) {
-	withMetrics := BuildValkeyNetworkPolicy(newTestValkey("test", func(v *vkov1.Valkey) {
-		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
-	}), "")
-	without := BuildValkeyNetworkPolicy(newTestValkey("test"), "")
-
-	assert.Len(t, without.Spec.Ingress, len(withMetrics.Spec.Ingress)-1,
-		"enabling metrics adds exactly one ingress rule")
-	for _, rule := range without.Spec.Ingress {
-		for _, p := range rule.Ports {
-			assert.NotEqual(t, intstr.FromInt32(vkov1.DefaultMetricsExporterPort), *p.Port,
-				"the exporter port must stay closed while metrics are disabled")
-		}
-	}
+	assert.True(t, NetworkPolicyHasChanged(withPeer, withoutPeer))
+	assert.True(t, NetworkPolicyHasChanged(withoutPeer, withPeer))
 }
 
 // NetworkPolicyHasChanged decides whether the live policy is rewritten. The pod
@@ -533,7 +516,7 @@ func TestBuildValkeyNetworkPolicy_NoMetricsPortWhenDisabled(t *testing.T) {
 // outdated selector would leave the real pods unprotected while looking correct.
 func TestNetworkPolicyHasChanged_DifferentPodSelector(t *testing.T) {
 	v := newTestValkey("test")
-	desired := BuildValkeyNetworkPolicy(v, "")
+	desired := BuildValkeyNetworkPolicy(v, OperatorPeer{})
 	current := desired.DeepCopy()
 	current.Spec.PodSelector.MatchLabels["app.kubernetes.io/instance"] = "some-other-cluster"
 

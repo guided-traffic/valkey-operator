@@ -94,7 +94,8 @@ now returns the tag of `repo:tag@sha256:…`, an empty value for a digest-only r
 the digest; every case of `TestExtractVersionFromImage` is checked with `IsValidLabelValue`. The
 exporter default
 `DefaultMetricsExporterImage` is pinned to the digest of the multi-arch image index behind
-`v1.66.0`, read with `docker buildx imagetools inspect` on 2026-09-26, so a re-pushed tag cannot
+`v1.92.1`, read with `docker buildx imagetools inspect` on 2026-09-29 (it was `v1.66.0` until
+then, [ADR 0018](../adr/0018-metrics-and-the-exporter-sidecar.md) D11), so a re-pushed tag cannot
 change what runs next to the password. The sidecar and the observer run the operator image,
 pinned when the chart's `image.digest` is set ([operator pod posture](operator-pod-posture.md#the-pod-and-container-fields)). Nothing requires a digest: a tag in
 `spec.image` or `spec.metrics.image` is pulled by tag as before.
@@ -209,7 +210,7 @@ legs, the user-namespace skip).
 A digest in `spec.image` is
 deployable since 2026-09-26 (`repo:tag@sha256:…` keeps the tag as the version label; a
 digest-only reference yields an empty one). The exporter default is already pinned to
-`v1.66.0`'s index digest; Renovate does not track
+`v1.92.1`'s index digest; Renovate does not track
 `DefaultMetricsExporterImage`, so that pin ages until someone moves it by hand.
 
 <a id="h-18"></a>

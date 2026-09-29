@@ -356,9 +356,11 @@ func TestSinglePodDeferral(t *testing.T) {
 				pod.Annotations = map[string]string{builder.AnnotationConfigHash: "old-config"}
 			}
 			root, sidecar := singlePodDeferral(v, sts, pod)
-			assert.Equal(t, tc.wantRoot, root == pod.Name, "root deferral")
+			assert.Equal(t, tc.wantRoot, root.pod == pod.Name, "root deferral")
 			assert.Equal(t, tc.wantSidecarPodSet, sidecar == pod.Name, "sidecar deferral")
-			if !tc.wantRoot {
+			if tc.wantRoot {
+				assert.Equal(t, vkov1.ReasonPodRunsAsRoot, root.reason)
+			} else {
 				assert.Empty(t, root)
 			}
 			if !tc.wantSidecarPodSet {
@@ -366,6 +368,84 @@ func TestSinglePodDeferral(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A rootless single pod whose exporter an earlier operator configured carries the
+// exporter repair of ADR 0018 D11. On the Helm path its sidecar image moves with
+// it, and the image-only isSidecarOnlyChange deferred the whole update -- the
+// exporter included -- on every such cluster. It is decided by persistence now,
+// like the root posture.
+//
+// Mutation check: returning the sidecar verdict before the exporter check in
+// singlePodDeferral turns the "persistent, sidecar bump" row into a deferral.
+func TestSinglePodDeferral_ExporterDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		persistent               bool
+		sidecar, exporterImage   bool
+		exporterEnv              bool
+		otherDrift               string
+		wantHeld, wantSidecarSet bool
+	}{
+		{"persistent, sidecar bump and exporter image: replaced", true, true, true, false, "", false, false},
+		{"persistent, exporter env only: replaced", true, false, false, true, "", false, false},
+		{"not persistent, sidecar bump and exporter image: held, sidecar reported", false, true, true, false, "", true, true},
+		{"not persistent, exporter env only: held", false, false, false, true, "", true, false},
+		{"not persistent, changed configuration: replaced", false, true, true, false, "config", false, false},
+		{"not persistent, no exporter drift: the sidecar deferral as before", false, true, false, false, "", false, true},
+		{"persistent, no exporter drift: the sidecar deferral as before", true, true, false, false, "", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newTestValkey("one", "default", func(v *vkov1.Valkey) {
+				v.Spec.Replicas = 1
+				v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+				if tc.persistent {
+					v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true}
+				}
+			})
+			sts := singlePodSts(v)
+			pod := singlePod(true, tc.sidecar, false)
+			exporter := *containerNamed(sts.Spec.Template.Spec.Containers, builder.ExporterContainerName)
+			exporter.Env = append([]corev1.EnvVar(nil), exporter.Env...)
+			if tc.exporterImage {
+				exporter.Image = "oliver006/redis_exporter:v1.66.0"
+			}
+			if tc.exporterEnv {
+				exporter.Env = exporter.Env[:len(exporter.Env)-1]
+			}
+			pod.Spec.Containers = append(pod.Spec.Containers, exporter)
+			if tc.otherDrift == "config" {
+				pod.Annotations = map[string]string{builder.AnnotationConfigHash: "old-config"}
+			}
+
+			held, sidecar := singlePodDeferral(v, sts, pod)
+
+			if tc.wantHeld {
+				assert.Equal(t, podSecurityPending{pod: pod.Name, reason: vkov1.ReasonExporterOutdated}, held)
+			} else {
+				assert.Empty(t, held)
+			}
+			assert.Equal(t, tc.wantSidecarSet, sidecar == pod.Name, "sidecar deferral")
+			if !tc.wantSidecarSet {
+				assert.Empty(t, sidecar)
+			}
+		})
+	}
+}
+
+// The same exporter repair on a rootless pod whose exporter is current is no
+// drift: the template and the pod carry the same container.
+func TestExporterDrifted_CurrentExporterIsNoDrift(t *testing.T) {
+	v := newTestValkey("one", "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+	})
+	sts := singlePodSts(v)
+	pod := &corev1.Pod{Spec: *sts.Spec.Template.Spec.DeepCopy()}
+	assert.False(t, exporterDrifted(pod, sts))
+
+	withoutExporter := singlePod(true, false, false)
+	assert.False(t, exporterDrifted(withoutExporter, sts), "adding the exporter is the CR author's change")
 }
 
 // singlePodSts is the persisted StatefulSet singlePodDeferral reads, with the
@@ -399,7 +479,7 @@ func TestSinglePodDeferral_ReadsPersistenceOffThePersistedStatefulSet(t *testing
 	pod := singlePod(false, false, false)
 
 	root, _ := singlePodDeferral(toggled, sts, pod)
-	assert.Equal(t, pod.Name, root, "the pods were built without a volume: still deferred")
+	assert.Equal(t, pod.Name, root.pod, "the pods were built without a volume: still deferred")
 }
 
 // singlePodCluster is a spec.replicas: 1 cluster whose only pod an earlier operator
@@ -443,7 +523,7 @@ func TestHandleStandaloneRollingUpdate_ReplacesAPersistentRootPod(t *testing.T) 
 
 	require.NoError(t, result.Error)
 	assert.False(t, podExists(t, c, "persist-0"), "a persistent root pod is replaced at the upgrade")
-	assert.Empty(t, result.rootDeferredPod)
+	assert.Empty(t, result.securityDeferred.pod)
 }
 
 // A non-persistent single pod is never discarded by an operator upgrade: it keeps
@@ -482,6 +562,63 @@ func TestCheckAndHandleRollingUpdate_DefersANonPersistentRootPodAndReportsIt(t *
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 	assert.Equal(t, vkov1.ReasonPodSecurityUpdateApplied, cond.Reason)
+}
+
+// exporterUpgradeCluster is a rootless spec.replicas: 1 cluster with metrics whose
+// only pod an earlier operator built: an older sidecar image and an older exporter
+// image, the shape of the Helm path at the first reconcile after the upgrade that
+// brings ADR 0018 D11.
+func exporterUpgradeCluster(t *testing.T, name string, persistent bool) (*ValkeyReconciler, client.Client, *vkov1.Valkey) {
+	t.Helper()
+	v := newTestValkey(name, "default", func(v *vkov1.Valkey) {
+		v.Spec.Replicas = 1
+		v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+		if persistent {
+			v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true}
+		}
+	})
+	sts := stsForValkey(v)
+	pod := rootless(podFromStsTemplate(v, sts, 0))
+	for i := range pod.Spec.Containers {
+		switch pod.Spec.Containers[i].Name {
+		case builder.SidecarContainerName:
+			pod.Spec.Containers[i].Image = olderSidecarImage
+		case builder.ExporterContainerName:
+			pod.Spec.Containers[i].Image = "oliver006/redis_exporter:v1.66.0"
+		}
+	}
+	pod.Annotations[builder.AnnotationPodSpecHash] = "previous-release"
+	r, c := newTestReconciler(v, sts, pod)
+	return r, c, crGet(t, c, name)
+}
+
+// On a persistent single pod the exporter update costs one restart, the data on
+// its volume, instead of waiting behind the sidecar deferral.
+func TestHandleStandaloneRollingUpdate_ReplacesAPersistentPodWithAnOutdatedExporter(t *testing.T) {
+	r, c, v := exporterUpgradeCluster(t, "exp-persist", true)
+
+	result := r.handleStandaloneRollingUpdate(context.Background(), v, getSts(t, c, "exp-persist"))
+
+	require.NoError(t, result.Error)
+	assert.False(t, podExists(t, c, "exp-persist-0"), "the exporter update replaces a persistent single pod")
+	assert.Empty(t, result.securityDeferred)
+}
+
+// On a non-persistent one it is held, never at the cost of the dataset, and the
+// condition names the pod and the repair.
+func TestCheckAndHandleRollingUpdate_DefersAnOutdatedExporterOnANonPersistentPodAndReportsIt(t *testing.T) {
+	r, c, v := exporterUpgradeCluster(t, "exp-ephemeral", false)
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), v)
+
+	require.NoError(t, result.Error)
+	assert.True(t, podExists(t, c, "exp-ephemeral-0"), "replacing it would discard the dataset")
+	cond := podSecurityPendingCondition(t, c, "exp-ephemeral")
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, vkov1.ReasonExporterOutdated, cond.Reason)
+	assert.Contains(t, cond.Message, "exp-ephemeral-0")
+	assert.Contains(t, cond.Message, "the exporter update")
 }
 
 // Upgrade neutrality of the condition: a cluster with nothing deferred never gains it.

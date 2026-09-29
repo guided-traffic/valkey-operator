@@ -113,6 +113,34 @@ func TestBuildExporterContainer_TLS(t *testing.T) {
 	assert.True(t, mounted, "exporter must mount the TLS volume when TLS enabled")
 }
 
+// The two exporter routes the operator does not use are off on every cluster, no
+// switch, and as environment variables: an unknown flag stops an older image set
+// through spec.metrics.image, an unknown variable does not. The routes themselves
+// are exercised against the real image in test/imagetools.
+func TestBuildExporterContainer_DisablesScrapeAndKeyValues(t *testing.T) {
+	for name, mutate := range map[string]func(*vkov1.Valkey){
+		"plain": func(*vkov1.Valkey) {},
+		"auth and tls": func(v *vkov1.Valkey) {
+			v.Spec.Auth = &vkov1.AuthSpec{SecretName: "s", SecretPasswordKey: "p"}
+			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true}
+		},
+		"own image":      func(v *vkov1.Valkey) { v.Spec.Metrics.Image = "my/exporter:9.9" },
+		"with extraArgs": func(v *vkov1.Valkey) { v.Spec.Metrics.ExtraArgs = []string{"--check-keys=*"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := newTestValkey("test", func(v *vkov1.Valkey) {
+				v.Spec.Metrics = &vkov1.MetricsSpec{Enabled: true}
+			}, mutate)
+			c := buildExporterContainer(v)
+			assert.Equal(t, "true", envValue(&c, "REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT"))
+			assert.Equal(t, "true", envValue(&c, "REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES"))
+			for _, a := range c.Args {
+				assert.NotContains(t, a, "disable-scrape-endpoint", "a flag would stop an image that predates it")
+			}
+		})
+	}
+}
+
 // --- metrics Service ---
 
 func TestBuildMetricsService(t *testing.T) {

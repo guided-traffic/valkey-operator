@@ -91,7 +91,7 @@ earlier steps by name only
 | 6 | StatefulSet | always | the data StatefulSet (`reconcileStatefulSet`) |
 | 7 | Sentinel resources | Sentinel enabled | Sentinel ConfigMap, headless Service, StatefulSet |
 | 8 | PodDisruptionBudgets | always (opt-in is decided inside) | both budgets, or their cleanup ([`pdb.go`](../../internal/controller/pdb.go)) |
-| 9 | NetworkPolicies | `spec.networkPolicy.enabled` | Valkey, Sentinel and observer policies |
+| 9 | NetworkPolicies | always, deliberately ungated | Valkey, Sentinel and observer policies while `spec.networkPolicy.enabled`; deletes every policy this Valkey controls that the spec no longer asks for — all of them once the flag is off (`cleanupNetworkPolicies`, [ADR 0039](../adr/0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D6) |
 | 10 | monitoring | always | the observer ServiceAccount and Deployment or their cleanup; the metrics Service and ServiceMonitor or their cleanup |
 | 11 | TLS material | always, deliberately ungated | nothing — it reports `TLSMaterialStale` by measuring the pods against the fingerprints steps 6 and 7 just stamped ([`tls_material.go`](../../internal/controller/tls_material.go)) |
 | 12 | pod name collision | always, deliberately ungated | nothing — it reports `ReconcileBlocked=True/ForeignObject` when a pod at a generated ordinal name is not controlled by its StatefulSet, so the roll's own hold on that pod ([ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) D9) reaches the critical alert ([`reportPodNameCollision`](../../internal/controller/foreign_object.go), [ADR 0002](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md) D13) |

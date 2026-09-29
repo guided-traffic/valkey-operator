@@ -144,6 +144,44 @@ kubectl label --overwrite ns <ns> pod-security.kubernetes.io/enforce=restricted
 Not covered: OpenShift, whose `restricted-v2` SCC refuses a fixed `runAsUser` outside
 the namespace's UID range. Nothing in this repository targets it.
 
+## The exporter update and the narrower NetworkPolicies
+
+The release that pins the metrics exporter to v1.92.1 changes two things on running clusters.
+Both apply at the upgrade, with no switch to keep the old behaviour.
+
+**The exporter.** The default `spec.metrics.image` moves from v1.66.0 to v1.92.1, and the
+exporter gets two variables that switch off its `/scrape` route and the export of key values
+([monitoring.md](monitoring.md#the-exporter-sidecar)). Both are part of the pod spec:
+
+| Cluster with `spec.metrics.enabled` | What the upgrade does |
+|---|---|
+| Multi-replica data tier | Rolls once through the failover-aware rolling update, together with the sidecar image every operator upgrade moves ([below](#what-an-upgrade-does-to-running-clusters)). |
+| Single replica without Sentinel, persistent | The only pod is replaced once — a short downtime, the data kept on its volume. |
+| Single replica without Sentinel, not persistent | **Not restarted**, because that would discard the dataset. The pod keeps the old exporter, `/scrape` included, and the CR carries `PodSecurityUpdatePending=True` with reason `ExporterOutdated` naming it until the pod restarts for another reason. `kubectl delete pod <name>-0` applies the update now and discards the dataset. |
+| Own `spec.metrics.image` | Used as given. An image older than v1.83.0 starts but keeps `/scrape`; move it to v1.83.0 or later. |
+
+Upstream v1.90.0 changed the keyspace metrics; check dashboards and alerts built on the
+exporter's `redis_*` series after the upgrade.
+
+**The NetworkPolicies** (only on clusters with `spec.networkPolicy.enabled`). The first reconcile
+rewrites the generated policies to admit only the operator's own components
+([network-policy.md](network-policy.md)):
+
+- **A scraper that reached the exporter (`9121`) or the observer (`8084`) through the old
+  any-source rule loses that access.** Write the policy that admits it
+  ([example](network-policy.md#admitting-a-scraper)) before upgrading, and it keeps scraping.
+- Pods in the operator's namespace other than the operator lose access to the data and
+  Sentinel ports.
+- The operator is admitted as its pod. The chart upgrade brings the label and the flag that
+  requires; an operator installed without the chart must set `POD_NAMESPACE` and
+  `--operator-pod-selector` ([how the operator pod is recognised](network-policy.md#how-the-operator-pod-is-recognised)),
+  or it cannot reach the pods wherever the policies are enforced.
+- **Policies that an earlier release left behind are deleted.** Turning
+  `spec.networkPolicy.enabled` off used to leave the last written policies in place; the
+  first reconcile after the upgrade deletes the ones the resource owns on every cluster whose
+  spec no longer asks for them — the policy is off, Sentinel or the observer is off, or the
+  `namePrefix` changed.
+
 ## What an upgrade does to running clusters
 
 **Before the new operator starts.** The chart runs a `pre-upgrade` hook Job

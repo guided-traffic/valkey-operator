@@ -1057,6 +1057,14 @@ func buildPodContainers(v *vkov1.Valkey, operatorImage string) []corev1.Containe
 // configured port. The exporter deliberately carries NO readiness probe: a failing
 // exporter must never remove the Valkey pod from the -rw/-r Services or stall a
 // rolling update, so its health is decoupled from pod readiness.
+//
+// Its listener takes no credentials, so everything it serves is served to anyone
+// who reaches the port. Two routes the operator does not use are switched off:
+// /scrape, which dials a target named in the request with the exporter's options,
+// password included, and the export of string key values. Both are environment
+// variables rather than flags: an older image set through spec.metrics.image
+// ignores an unknown variable and starts, where an unknown flag stops it and, with
+// it, the pod's readiness (ADR 0018 D1).
 func buildExporterContainer(v *vkov1.Valkey) corev1.Container {
 	port := v.MetricsPort()
 
@@ -1070,6 +1078,8 @@ func buildExporterContainer(v *vkov1.Valkey) corev1.Container {
 	env := []corev1.EnvVar{
 		{Name: "REDIS_ADDR", Value: fmt.Sprintf("%s://localhost:%d", scheme, valkeyPort)},
 		{Name: "REDIS_EXPORTER_WEB_LISTEN_ADDRESS", Value: fmt.Sprintf(":%d", port)},
+		{Name: "REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT", Value: stringTrue},
+		{Name: "REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES", Value: stringTrue},
 	}
 
 	// Inject the auth password so the exporter can authenticate against Valkey.

@@ -1936,7 +1936,7 @@ func TestHandleStandaloneRollingUpdate_SidecarOnlyChange_DeferredNoPodDelete(t *
 	result := r.handleStandaloneRollingUpdate(context.Background(), v, sts)
 
 	// Deferred: no requeue, not completed (pending).
-	assert.Empty(t, result.rootDeferredPod, "a rootless pod is not deferred on account of the posture")
+	assert.Empty(t, result.securityDeferred.pod, "a rootless pod is not deferred on account of the posture")
 	assert.False(t, result.NeedsRequeue, "Sidecar-only change must not trigger requeue")
 	assert.False(t, result.Completed, "Not completed while sidecar update is pending")
 	assert.Nil(t, result.Error)

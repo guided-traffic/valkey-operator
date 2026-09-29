@@ -15,12 +15,20 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: valkey-operator
+        # Tells the operator pod apart in the generated NetworkPolicies (ADR 0039 D2).
+        app.kubernetes.io/component: operator
     spec:
       containers:
         - name: manager
           image: controller:latest
           args:
             - --leader-elect
+            - --operator-pod-selector=app.kubernetes.io/name=valkey-operator,app.kubernetes.io/component=operator
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - containerPort: 8080
               name: metrics

@@ -29,6 +29,12 @@ wrong object for that decision. [ADR 0020](0020-write-only-what-the-operator-own
 the pod itself two-hop and routes all six through `deleteOwnedPod`, which sends the D8 UID
 precondition and treats Conflict as "already gone" rather than as a failure.
 
+Amended 2026-09-29 ([ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md)
+D6): the NetworkPolicy half of `cleanupObserverDeployment` is gone. `cleanupNetworkPolicies`
+deletes every generated policy the spec no longer asks for — the observer's included — by
+listing the policies of the resource's namespace, skipping every one this Valkey does not
+control, and deleting the rest through `deleteIfOwned`, with the D8 UID precondition.
+
 **One item stays open**: `deleteLegacyServices`, which scans ownerReferences but takes its
 Delete without a UID precondition and accepts any ownerReference rather than the controller
 one — see Residual risks.
@@ -377,6 +383,7 @@ Rejected. The RBAC fix was not in question; the missing guard on the delete was.
 ## References
 
 * [`internal/controller/pdb.go`](../../internal/controller/pdb.go) — `cleanupPodDisruptionBudget`, `reconcilePodDisruptionBudget`
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `cleanupNetworkPolicies` (ADR 0039 D6)
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `deleteLegacySentinelCertificate`, `deleteLegacySentinelSecret`, `legacySentinelSecretIsOurs`, `sentinelRolloutComplete`, `warnLegacySentinelTLSNotOwned`
 * [`internal/builder/certificate.go`](../../internal/builder/certificate.go) — `SentinelCertificateName`, `SentinelTLSSecretName`, `CertificateOwnerRef`
 * [ADR 0004](0004-opt-in-poddisruptionbudgets.md) — the PDB feature this guard protects

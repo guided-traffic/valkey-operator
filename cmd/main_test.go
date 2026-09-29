@@ -207,6 +207,7 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 		"--operator-image=repo/img:tag",
 		"--max-concurrent-reconciles=9",
 		"--allowed-seccomp-localhost-profiles=profiles/a.json, profiles/b.json,",
+		"--operator-pod-selector=app.kubernetes.io/name=valkey-operator,app.kubernetes.io/component=operator",
 	}
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse: %v", err)
@@ -229,6 +230,9 @@ func TestBindOperatorFlags_AllFlagsParsed(t *testing.T) {
 	}
 	if got := profileList(f.allowedSeccompLocalhostProfiles); !reflect.DeepEqual(got, []string{"profiles/a.json", "profiles/b.json"}) {
 		t.Errorf("allowed seccomp profiles = %q, want the two listed, trimmed, without the empty tail", got)
+	}
+	if f.operatorPodSelector != "app.kubernetes.io/name=valkey-operator,app.kubernetes.io/component=operator" {
+		t.Errorf("operatorPodSelector = %q, want the --operator-pod-selector value", f.operatorPodSelector)
 	}
 }
 
@@ -318,7 +322,8 @@ func TestNewReconciler(t *testing.T) {
 
 	f := &operatorFlags{operatorImage: "guidedtraffic/valkey-operator:v9", maxConcurrentReconciles: 6,
 		allowedSeccompLocalhostProfiles: "profiles/valkey.json"}
-	r := newReconciler(mgr, f, "valkey-system")
+	podLabels := map[string]string{"app.kubernetes.io/component": "operator"}
+	r := newReconciler(mgr, f, "valkey-system", podLabels)
 
 	if r.Client == nil {
 		t.Error("Client is nil, the reconciler cannot read or write objects")
@@ -336,6 +341,11 @@ func TestNewReconciler(t *testing.T) {
 	}
 	if r.OperatorNamespace != "valkey-system" {
 		t.Errorf("OperatorNamespace = %q, want valkey-system", r.OperatorNamespace)
+	}
+	// Half of the operator's NetworkPolicy peer (ADR 0039 D2); without it the
+	// generated policies admit no operator.
+	if !reflect.DeepEqual(r.OperatorPodLabels, podLabels) {
+		t.Errorf("OperatorPodLabels = %v, want the --operator-pod-selector labels", r.OperatorPodLabels)
 	}
 	if !reflect.DeepEqual(r.AllowedSeccompLocalhostProfiles, []string{"profiles/valkey.json"}) {
 		t.Errorf("AllowedSeccompLocalhostProfiles = %q, want the --allowed-seccomp-localhost-profiles value",

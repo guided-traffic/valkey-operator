@@ -186,11 +186,13 @@ type RollingUpdateResult struct {
 	// Error holds any error encountered during the rolling update step.
 	Error error
 
-	// rootDeferredPod names the only data pod of a non-persistent spec.replicas: 1
-	// cluster that still runs as root and whose replacement is deferred, empty
-	// otherwise. checkAndHandleRollingUpdate turns it into PodSecurityUpdatePending
-	// (docs/adr/0032-generated-pods-run-rootless.md, D3).
-	rootDeferredPod string
+	// securityDeferred names the only data pod of a non-persistent spec.replicas: 1
+	// cluster whose replacement is deferred although it carries a security repair --
+	// it runs as root, or runs an outdated exporter -- and which one; zero otherwise.
+	// checkAndHandleRollingUpdate turns it into PodSecurityUpdatePending
+	// (docs/adr/0032-generated-pods-run-rootless.md, D3;
+	// docs/adr/0018-metrics-and-the-exporter-sidecar.md, D11).
+	securityDeferred podSecurityPending
 
 	// availabilityStall names the pod an availability wait outlived its budget on,
 	// nil otherwise. availabilityWait sets it and writes nothing; the tier's
@@ -247,7 +249,7 @@ func (r *ValkeyReconciler) checkAndHandleRollingUpdate(ctx context.Context, v *v
 		// calling it here would flap the level -- it is the one skipped on the hold
 		// (ADR 0026 D11, ADR 0032 D3).
 		if !result.heldByPodCollision {
-			r.reportPodSecurityUpdatePending(ctx, v, result.rootDeferredPod)
+			r.reportPodSecurityUpdatePending(ctx, v, result.securityDeferred)
 		}
 	}
 	return result
@@ -3963,9 +3965,9 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 	// rather than a flag is what lets the condition message say which pod it means
 	// (setSidecarUpdatePendingCondition).
 	sidecarPendingPod := ""
-	// The pod that keeps running as root on a deferred update, empty when none does
-	// (docs/adr/0032-generated-pods-run-rootless.md, D3).
-	rootPendingPod := ""
+	// The pod that keeps a security repair on a deferred update, zero when none does
+	// (docs/adr/0032-generated-pods-run-rootless.md, D3; ADR 0018 D11).
+	var securityPending podSecurityPending
 
 	for i := int32(0); i < *currentSts.Spec.Replicas; i++ {
 		podName := fmt.Sprintf("%s-%d", stsName, i)
@@ -3986,12 +3988,13 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		if podOutdated(pod, currentSts) {
 			// In true standalone mode (a single replica) some changes are deferred to
 			// the next natural pod restart rather than applied by deleting the only
-			// instance: a sidecar-only change, and the rootless posture on a pod whose
-			// restart would discard the dataset. singlePodDeferral draws the line.
-			if root, sidecar := singlePodDeferral(v, currentSts, pod); root != "" || sidecar != "" {
+			// instance: a sidecar-only change, and the rootless posture or the exporter
+			// update on a pod whose restart would discard the dataset.
+			// singlePodDeferral draws the line.
+			if security, sidecar := singlePodDeferral(v, currentSts, pod); security.pod != "" || sidecar != "" {
 				logger.Info("Standalone pod update deferred to next pod restart",
-					"pod", podName, "runsAsRoot", root != "", "outdatedSidecar", sidecar != "")
-				rootPendingPod, sidecarPendingPod = root, sidecar
+					"pod", podName, "heldRepair", security.reason, "outdatedSidecar", sidecar != "")
+				securityPending, sidecarPendingPod = security, sidecar
 				continue
 			}
 
@@ -4027,11 +4030,11 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 	// Reflect sidecar-pending state in the CR status conditions.
 	r.setSidecarUpdatePendingCondition(ctx, v, sidecarPendingPod)
 
-	if sidecarPendingPod != "" || rootPendingPod != "" {
+	if sidecarPendingPod != "" || securityPending.pod != "" {
 		// The update is deferred — no active rolling update in progress. Return no
 		// requeue; the conditions remain set until the next natural pod restart
 		// clears them.
-		return RollingUpdateResult{rootDeferredPod: rootPendingPod}
+		return RollingUpdateResult{securityDeferred: securityPending}
 	}
 
 	// All pods updated and ready.
