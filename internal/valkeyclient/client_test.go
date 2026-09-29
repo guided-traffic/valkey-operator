@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -1126,4 +1127,59 @@ func TestSentinelReplicas_ConnectionError(t *testing.T) {
 	replicas, err := c.SentinelReplicas("test")
 	assert.Error(t, err)
 	assert.Nil(t, replicas)
+}
+
+// An error reply is typed, so a caller that has to act on what the server refused
+// can read its code through any number of wraps, and the text stays the one every
+// caller has always logged.
+func TestReadFullResponse_ErrorReplyIsTyped(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "-INPROG Failover already in progress\r\n")
+	defer cleanup()
+
+	err := New(addr).SentinelFailover("mymaster")
+
+	var reply *ReplyError
+	require.ErrorAs(t, err, &reply)
+	assert.Equal(t, "INPROG", reply.Code())
+	assert.Equal(t, "INPROG Failover already in progress", reply.Message)
+	assert.Contains(t, err.Error(), "valkey error: INPROG Failover already in progress")
+}
+
+// A failure to reach the server is not a reply.
+func TestConnectionError_IsNotAReplyError(t *testing.T) {
+	c := New("127.0.0.1:1")
+	c.SetTimeout(500 * time.Millisecond)
+
+	var reply *ReplyError
+	assert.False(t, errors.As(c.SentinelFailover("mymaster"), &reply))
+}
+
+func TestSentinelFailoverCoordinated_SendsTheOption(t *testing.T) {
+	addr, cleanup, cmds := recordingRESPServer(t)
+	defer cleanup()
+
+	require.NoError(t, New(addr).SentinelFailoverCoordinated("mymaster"))
+	assert.Equal(t, []string{"SENTINEL FAILOVER mymaster COORDINATED"}, collectCommands(cmds, 200*time.Millisecond))
+}
+
+func TestSentinelFailoverCoordinated_ReturnsTheTypedRefusal(t *testing.T) {
+	addr, cleanup := fakeRESPServerCustom(t, "-ERR wrong number of arguments for 'sentinel|failover' command\r\n")
+	defer cleanup()
+
+	err := New(addr).SentinelFailoverCoordinated("mymaster")
+
+	var reply *ReplyError
+	require.ErrorAs(t, err, &reply)
+	assert.Equal(t, "ERR", reply.Code())
+	assert.Contains(t, err.Error(), "sentinel failover mymaster coordinated on")
+}
+
+// The plain command is the forced failover the retrigger and the sidecar's drain
+// handler send; it must carry no option (ADR 0037 D1).
+func TestSentinelFailover_SendsThePlainCommand(t *testing.T) {
+	addr, cleanup, cmds := recordingRESPServer(t)
+	defer cleanup()
+
+	require.NoError(t, New(addr).SentinelFailover("mymaster"))
+	assert.Equal(t, []string{"SENTINEL FAILOVER mymaster"}, collectCommands(cmds, 200*time.Millisecond))
 }

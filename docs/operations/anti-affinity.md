@@ -12,8 +12,13 @@ renders no term at all, so upgrading the operator never changes how existing
 clusters are scheduled. The flip side is that without an opt-in all pods of a
 cluster may land on one node — a single drain then takes the whole data plane
 down at once. **Multi-replica clusters should set `mode: soft` (or `hard`)**;
-enabling it on a running cluster triggers one failover-aware rolling update
-(lossless for multi-replica clusters).
+enabling it on a running cluster triggers one failover-aware rolling update. On a
+multi-replica cluster the pre-roll dataset survives it; on a Sentinel cluster whose
+Sentinels cannot run a coordinated failover (before Valkey 9.0, the 8 to 9 upgrade roll
+included) and on any roll whose coordinated failover fell back to forced, the writes the
+outgoing master acknowledges during the roll's failover are lost
+([the master handover](rolling-updates.md#the-master-handover-on-a-sentinel-cluster)).
+*(corrected 2026-09-28: this said "lossless for multi-replica clusters")*
 
 - **`off`** (default) renders nothing. Scheduling is exactly what it was before
   the operator supported anti-affinity.
@@ -36,8 +41,10 @@ enabling it on a running cluster triggers one failover-aware rolling update
   peer to repel, and injecting an empty term would change the pod-spec hash and
   restart the pod for nothing.
 - Changing `mode` or `topologyKey` changes the pod-spec hash and therefore triggers
-  the operator's failover-aware rolling update — lossless for a multi-replica
-  cluster.
+  the operator's failover-aware rolling update — on a multi-replica cluster the pre-roll
+  dataset survives it, and the writes of its failover are lost where that failover is
+  forced, as above. *(corrected 2026-09-28: this said "lossless for a multi-replica
+  cluster")*
 
 ## Examples
 

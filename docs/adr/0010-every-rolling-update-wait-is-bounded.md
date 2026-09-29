@@ -769,12 +769,15 @@ too — it would give `DeferredRequeueAfter` two meanings depending on which wai
   rolling update" (`handleRollingUpdate` and `dispatchMultiReplicaState`), and "No ready
   updated replica available for promotion" and a failing `promoteAndRedirect` in
   `handleManualFailover`. T32's analysis lists further sites of the same class —
-  `waitForWriteSync` on a `WAIT` or TLS error, the waits inside `verifyNewMasterReady`, the
+  `waitForWriteSync` on a `WAIT` or TLS error, the waits inside `verifyNewMasterReady` *(bounded
+  since 2026-09-28 except the requeue while no current pod answers master: every other refusal of
+  the handover gate is held and reported past `syncTimeout`, ADR 0037 D6)*, the
   `deleteNextPendingPod` fall-through — which were not re-read for this entry. None is filed.
   D17 bounds the waits on a pod that does not come up, not on a pod that does not answer.
 * **The Sentinel failover's reset-and-retrigger cycle has no cap** *(added 2026-09-26, read)*.
   Each step is bounded — `failover-triggered` hands over to `failover-reset` after
-  `failoverRetryTimeout` (30 s), `handleFailoverRetrigger` fires again after
+  `failoverRetryTimeout` (30 s; since 2026-09-28 30 s of the trigger's stamp **and** 30 s with no
+  pass finding a master, `noMasterTimedOut`, ADR 0037 D6), `handleFailoverRetrigger` fires again after
   `failoverResetMinWait` (20 s) — but nothing counts the cycles; ~~`maxReconnectResets` caps only
   the no-replica branch~~ *(corrected 2026-09-26, read: `maxReconnectResets` counts only the
   no-replica branch's resets, and caps no branch overall — the pass that reaches it clears the

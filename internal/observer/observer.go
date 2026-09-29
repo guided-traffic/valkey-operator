@@ -109,6 +109,10 @@ type Observer struct {
 	mu             sync.RWMutex
 	result         CheckResult
 	metrics        *observerMetrics
+
+	// dataPodAddrFn replaces dataPodAddr's headless-Service address when set. Tests
+	// set it to put a RESP listener behind each ordinal; production leaves it nil.
+	dataPodAddrFn func(ordinal int) string
 }
 
 // New creates a new Observer with the given configuration.
@@ -279,7 +283,7 @@ func (o *Observer) runCoreChecks(_ context.Context, logger logr.Logger, masterAd
 	if o.cfg.Replicas > 1 {
 		firstFailMsg = runCheck(logger, checks, "replica_sync", "replicaSyncFailure",
 			firstFailMsg, uw.ReplicaSyncFailure, func() error {
-				return o.checkReplicaSync(masterAddr)
+				return o.checkReplicaSync()
 			})
 	}
 

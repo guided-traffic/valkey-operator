@@ -45,74 +45,117 @@ func TestPingHost(t *testing.T) {
 	})
 }
 
+// checkReplicaSync asks every data pod for its own replication state. Each row
+// starts from a three-pod cluster - test-0 the master, test-1 and test-2 replicas
+// holding the dataset - and changes one pod before the endpoints start; a nil pod
+// has no listener behind its ordinal.
 func TestCheckReplicaSync(t *testing.T) {
 	tests := []struct {
-		name            string
-		replicas        int
-		connectedSlaves int
-		syncInProgress  bool
-		infoReply       string
-		wantErr         string
+		name    string
+		arrange func(pods []*fakeValkeyNode)
+		wantErr []string
 	}{
 		{
-			name:            "all replicas connected",
-			replicas:        3,
-			connectedSlaves: 2,
+			name: "every replica synced",
 		},
 		{
-			name:            "more replicas than expected is accepted",
-			replicas:        3,
-			connectedSlaves: 5,
+			name:    "a replica in full sync is not synced",
+			arrange: func(pods []*fakeValkeyNode) { inFullSync(pods[2]) },
+			wantErr: []string{
+				"expected 2 synced replicas, got 1",
+				"test-2: replication not established (role=slave, linkStatus=down, syncInProgress=true)",
+			},
 		},
 		{
-			name:            "one replica missing",
-			replicas:        3,
-			connectedSlaves: 1,
-			wantErr:         "expected 2 connected replicas, got 1",
+			// Right after REPLICAOF the link is down and no transfer has started yet.
+			name:    "a replica still connecting is not synced",
+			arrange: func(pods []*fakeValkeyNode) { pods[2].linkStatus = "down" },
+			wantErr: []string{
+				"expected 2 synced replicas, got 1",
+				"test-2: replication not established (role=slave, linkStatus=down, syncInProgress=false)",
+			},
 		},
 		{
-			name:            "full resync still running",
-			replicas:        2,
-			connectedSlaves: 1,
-			syncInProgress:  true,
-			wantErr:         "master sync in progress",
+			name:    "an unreachable replica is not synced",
+			arrange: func(pods []*fakeValkeyNode) { pods[2] = nil },
+			wantErr: []string{"expected 2 synced replicas, got 1", "test-2: INFO REPLICATION"},
 		},
 		{
-			name:      "master rejects INFO",
-			replicas:  2,
-			infoReply: respError("LOADING Valkey is loading the dataset in memory"),
-			wantErr:   "INFO REPLICATION",
+			// The master counts a replica from its sync request on, so its count
+			// says nothing about whether the replica holds the dataset yet.
+			name: "the master's replica count is not read",
+			arrange: func(pods []*fakeValkeyNode) {
+				pods[0].connectedSlaves = 5
+				inFullSync(pods[2])
+			},
+			wantErr: []string{"expected 2 synced replicas, got 1"},
+		},
+		{
+			name:    "a second master is not a synced replica",
+			arrange: func(pods []*fakeValkeyNode) { pods[2] = newFakeValkeyNode() },
+			wantErr: []string{"expected 2 synced replicas, got 1", "2 pods answer role:master (test-0, test-2)"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := newFakeValkeyNode()
-			node.connectedSlaves = tt.connectedSlaves
-			node.syncInProgress = tt.syncInProgress
-			node.infoReply = tt.infoReply
-			ep := startFakeRESP(t, node.handle)
+			master := newFakeValkeyNode()
+			master.connectedSlaves = 2
+			pods := []*fakeValkeyNode{master, newFakeReplicaNode(), newFakeReplicaNode()}
+			if tt.arrange != nil {
+				tt.arrange(pods)
+			}
+			addrs := make([]string, len(pods))
+			var endpoints []*fakeRESP
+			for i, pod := range pods {
+				if pod == nil {
+					addrs[i] = closedAddr(t)
+					continue
+				}
+				ep := startFakeRESP(t, pod.handle)
+				addrs[i] = ep.addr
+				endpoints = append(endpoints, ep)
+			}
 
-			obs := &Observer{cfg: Config{Replicas: tt.replicas}}
-			err := obs.checkReplicaSync(ep.addr)
+			obs := &Observer{
+				cfg:           Config{ClusterName: "test", Replicas: len(pods)},
+				dataPodAddrFn: func(ordinal int) string { return addrs[ordinal] },
+			}
+			err := obs.checkReplicaSync()
 
-			if tt.wantErr == "" {
+			// Every pod is asked for its own answer, once per check.
+			for _, ep := range endpoints {
+				assert.Len(t, ep.commands(), 1, "commands received by %s", ep.addr)
+				assert.True(t, ep.sawCommand("INFO", "replication"))
+			}
+			if len(tt.wantErr) == 0 {
 				require.NoError(t, err)
 				return
 			}
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErr)
+			for _, want := range tt.wantErr {
+				assert.Contains(t, err.Error(), want)
+			}
+			assert.NotContains(t, err.Error(), "test-0:",
+				"the master is not a replica out of sync and must not be reported as one")
 		})
 	}
 }
 
-func TestCheckReplicaSync_UnreachableMaster(t *testing.T) {
-	obs := &Observer{cfg: Config{Replicas: 3}}
+func TestCheckReplicaSync_NoDataPodAnswers(t *testing.T) {
+	dead := closedAddr(t)
+	obs := &Observer{
+		cfg:           Config{ClusterName: "test", Replicas: 3},
+		dataPodAddrFn: func(int) string { return dead },
+	}
 
-	err := obs.checkReplicaSync(closedAddr(t))
+	err := obs.checkReplicaSync()
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "INFO REPLICATION")
+	assert.Contains(t, err.Error(), "expected 2 synced replicas, got 0")
+	for _, pod := range []string{"test-0", "test-1", "test-2"} {
+		assert.Contains(t, err.Error(), pod+": INFO REPLICATION")
+	}
 }
 
 // The write check must land in the configured observer DB and must carry a TTL,

@@ -912,7 +912,8 @@ func (r *ValkeyReconciler) resolveSplitBrainUnlessFailingOver(ctx context.Contex
 // out of: stateFailoverTriggered with a failover timestamp younger than
 // replicaReconnectTimeout. The window carries its own clock rather than trusting
 // the post-failover handler to leave the state, because one branch of that handler
-// waits without a bound (verifyNewMasterReady's plain requeues). Sentinel normally
+// waits without a bound (the handover gate's requeue while no current pod answers
+// master). Sentinel normally
 // moves its master pointer within seconds of the promotion (measured on Kind); its
 // failover-timeout bounds the promotion and the reconfiguration of the other
 // replicas separately, so a failover still reconfiguring after 90 s is possible and
@@ -986,7 +987,9 @@ func (r *ValkeyReconciler) handleFailoverRetrigger(ctx context.Context, v *vkov1
 		return RollingUpdateResult{Error: err}
 	}
 
-	if err := r.triggerSentinelFailover(ctx, v); err != nil {
+	// Forced, not coordinated: a coordinated failover that lost its election is
+	// what brought the roll here, and asking for another could lose it again (ADR 0037 D1).
+	if err := r.triggerSentinelFailover(ctx, v, false); err != nil {
 		logger.Info("Sentinel failover retry failed, will retry", "error", err)
 	}
 
@@ -1079,7 +1082,8 @@ func (r *ValkeyReconciler) checkFinalizationTopology(ctx context.Context, v *vko
 			continue
 		}
 		// When finalization is stalled, break any cascaded replication chains by
-		// sending SLAVEOF directly to all non-master pods. After a failover, a
+		// sending REPLICAOF directly to every Ready pod but the master -- unless that
+		// would discard the only dataset (ADR 0037 D4). After a failover, a
 		// replica can end up connected to the old master (now itself a replica)
 		// instead of the new master — a cascaded chain: new-master → old-master-pod
 		// → replica. The cascaded replica does not appear in the new master's INFO
@@ -1231,7 +1235,21 @@ const (
 	boundSentinelAwareness = "sentinel-awareness"
 	boundSyncWait          = "sync-wait"
 	boundRecreationWait    = "recreation-wait"
+	boundHandoverHold      = "handover-hold"
+	// boundNoMaster has no persisted half: it is the absence clock of
+	// noMasterTimedOut, and a restart that re-arms it delays a reset, never hastens one.
+	boundNoMaster = "no-master"
 )
+
+// annotationHandoverHoldStarted is the persisted half of the handover hold's bound:
+// when the gate in front of the outgoing master's delete first held it
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D6).
+// It gets its own key rather than the sync-wait bound it was first given, for the
+// reason annotationTopologyRestoreStarted states: verifyReplacedReplicasSynced clears
+// the sync-wait bound whenever every replaced replica is synced, and on a pass that
+// finds no replica left to replace and then reaches the gate that clear ran on every
+// pass, so the hold was re-armed each time and never reported.
+const annotationHandoverHoldStarted = "vko.gtrfc.com/handover-hold-started"
 
 // annotationRecreationWaitStarted is the persisted half of the recreation-wait
 // bound: when the rolling update first found the pod it is waiting for absent.
@@ -1338,7 +1356,7 @@ func (r *ValkeyReconciler) forgetWaitBounds(namespace, name string) {
 	for _, bound := range []string{
 		boundTopologyRestore, boundFinalization, boundManualFailover,
 		boundSentinelAwareness, boundSyncWait, boundMultipleMasters,
-		boundRecreationWait,
+		boundRecreationWait, boundHandoverHold, boundNoMaster,
 	} {
 		r.nudges.forget(waitBoundKey(namespace, name, bound))
 	}
@@ -2855,7 +2873,9 @@ func (r *ValkeyReconciler) handleMasterFailover(ctx context.Context, v *vkov1.Va
 	r.recordEvent(v, corev1.EventTypeNormal, "FailoverTriggered",
 		"Triggering Sentinel failover before updating master pod")
 
-	if err := r.triggerSentinelFailover(ctx, v); err != nil {
+	// Coordinated, so the outgoing master stops acknowledging writes before the
+	// replica is promoted (ADR 0037 D1).
+	if err := r.triggerSentinelFailover(ctx, v, true); err != nil {
 		logger.Info("Sentinel failover command failed, will retry via post-failover handler", "error", err)
 	} else {
 		logger.Info("Sentinel failover triggered, waiting for completion")
@@ -3084,10 +3104,11 @@ func (r *ValkeyReconciler) waitForWriteSync(ctx context.Context, v *vkov1.Valkey
 }
 
 // replaceRemainingPods finds and replaces any remaining pods with the old image.
-// Before deleting the former master on the Sentinel path, verifyNewMasterReady
-// requires a new master on the current template with replicas attached and no sync
-// in progress. It reads that master's DBSIZE but does not refuse on it -- a gap
-// that predates ADR 0026 D11 and is recorded with T32.
+// Before deleting the former master on the Sentinel path, the handover gate
+// (gateOutgoingPodDelete) requires a new master on the current template with every
+// current replica synced from it and attached to it, a delete that discards no
+// dataset, and an outgoing pod that no longer answers master
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D3, D5).
 func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Valkey, pods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 	checker := r.getInstanceChecker()
@@ -3104,22 +3125,22 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 
 		// Outdated, so replaced rather than waited for unless it is already going
 		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11). What gates
-		// the delete here is verifyNewMasterReady below, which asks for a current,
-		// available master with replicas attached -- not the availability of the pod
-		// about to be deleted. It reads the new master's DBSIZE but does not refuse
-		// on it; that gap predates D11 and is recorded in the T32 ticket.
+		// the delete here is the handover gate below, which asks the new master, the
+		// current replicas and the pod about to be deleted -- not whether that pod is
+		// available.
 		if ps.terminating {
 			return *r.terminationWait(ctx, v, common.ComponentValkey,
 				terminatingPod{name: ps.name, since: ps.terminatingSince},
 				"Waiting for the pod to finish terminating")
 		}
 
-		// Before deleting the former master (now a replica after failover),
-		// verify that a new-image master exists and has all replicas synced.
+		// The former master is deleted only once it is a replica after the failover,
+		// every current replica holds the dataset and is on the new master, and the
+		// delete discards no dataset (ADR 0037 D3, D5). A refusal is a bounded hold
+		// that keeps the rolling-update state (D6).
 		if v.IsSentinelEnabled() {
-			verified, result := r.verifyNewMasterReady(ctx, v, pods, checker)
-			if !verified {
-				return result
+			if result := r.gateOutgoingPodDelete(ctx, v, pods, ps, checker); result != nil {
+				return *result
 			}
 		}
 
@@ -3131,6 +3152,10 @@ func (r *ValkeyReconciler) replaceRemainingPods(ctx context.Context, v *vkov1.Va
 			firstTerminatingPod(pods)); result != nil {
 			return *result
 		}
+
+		// The delete goes through, so the handover gate's wait is over: its bound is
+		// dropped and a standing MasterHandoverStalled retracted (ADR 0037 D6).
+		r.endHandoverHold(ctx, v)
 
 		// Mark state as replacing-master.
 		if err := r.setRollingUpdateState(ctx, v, stateReplacingMaster); err != nil {
@@ -3212,6 +3237,8 @@ func (r *ValkeyReconciler) handlePostFailover(ctx context.Context, v *vkov1.Valk
 			continue
 		}
 		if info.Role == common.RoleMaster {
+			// A master was found, so any absence the no-master clock was counting is over.
+			r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundNoMaster))
 			return r.handleNewMasterFound(ctx, v, ps, info, freshPods)
 		}
 	}
@@ -3241,14 +3268,17 @@ func (r *ValkeyReconciler) handleNewMasterFound(ctx context.Context, v *vkov1.Va
 // may not have properly reconfigured replicas.
 //
 // On each timeout it:
-//  1. Directly commands all non-master pods to REPLICAOF the new master, bypassing
-//     sentinel's potentially-delayed reconfiguration.
+//  1. Directly commands every Ready pod but the new master -- the outgoing master
+//     and terminating pods included -- to REPLICAOF the new master, bypassing
+//     sentinel's potentially-delayed reconfiguration, unless the new master holds no
+//     keys while another pod holds some (ADR 0037 D4).
 //  2. Resets sentinel state so it rediscovers the topology.
 //  3. Tracks how many resets have occurred via annotationReconnectResetCount.
 //
 // After maxReconnectResets attempts the function proceeds with the rolling update
-// regardless, breaking the infinite retry loop. verifyNewMasterReady will still
-// gate the old-master deletion until replication is confirmed.
+// regardless, breaking the infinite retry loop. The handover gate still holds the
+// old master's deletion until every current replica is synced from and attached to
+// the new master and the delete discards no dataset (ADR 0037 D3, D5).
 func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vkov1.Valkey, ps podState, allPods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
@@ -3261,8 +3291,9 @@ func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vk
 		headlessName := common.HeadlessServiceName(v, common.ComponentValkey)
 		masterAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local", ps.name, headlessName, v.Namespace)
 
-		// Directly tell every non-master pod to replicate from the new master.
-		// This bypasses the sentinel reconfiguration delay that causes the stall.
+		// Directly tell every Ready pod but the new master to replicate from it,
+		// unless the dataset veto refuses (ADR 0037 D4). This bypasses the sentinel
+		// reconfiguration delay that causes the stall.
 		r.forceReplicaConnections(ctx, v, ps.name, allPods)
 
 		r.resetSentinelState(ctx, v, masterAddr)
@@ -3270,8 +3301,8 @@ func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vk
 		if resetCount >= maxReconnectResets {
 			// We have sent REPLICAOF and reset sentinel multiple times.
 			// The replicas should connect imminently. Proceed with the rolling
-			// update — verifyNewMasterReady will block the final deletion until
-			// replication is confirmed, so this is safe.
+			// update — the handover gate holds the final deletion until replication
+			// is confirmed and the delete discards no dataset (ADR 0037 D3, D5).
 			logger.Info("Max reconnect resets reached, proceeding with rolling update",
 				"newMaster", ps.name)
 			if err := r.clearReconnectResetCount(ctx, v); err != nil {
@@ -3293,15 +3324,32 @@ func (r *ValkeyReconciler) handleMasterWithNoReplicas(ctx context.Context, v *vk
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
 
-// forceReplicaConnections sends a direct REPLICAOF command to every ready non-master
-// pod, instructing it to replicate from masterPodName. This is a best-effort
+// forceReplicaConnections sends a direct REPLICAOF command to every existing, Ready
+// pod other than masterPodName -- terminating pods included, whatever role they
+// answer -- instructing it to replicate from masterPodName. This is a best-effort
 // operation used when sentinel has failed to reconfigure replicas on its own.
+//
+// A REPLICAOF discards the receiving pod's dataset, so the ADR 0028 veto binds here as
+// at the resolver, for the whole call: while masterPodName holds no keys or cannot be
+// counted, and any other existing pod -- non-Ready included -- holds some or cannot be
+// counted, nothing is sent at all
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D4).
+// A per-target veto lost: an empty target attaching to the master would satisfy every
+// gate behind it and unlock the delete of the pod holding the data. No Event: the two
+// masters this leaves are what MultipleMasters and SplitBrainDetected report
+// (docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md, D6).
 func (r *ValkeyReconciler) forceReplicaConnections(ctx context.Context, v *vkov1.Valkey, masterPodName string, pods []podState) {
 	logger := log.FromContext(ctx)
 
 	tlsConfig, err := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if err != nil {
 		logger.Info("Could not build TLS config for REPLICAOF, skipping forced replica connections", "error", err)
+		return
+	}
+
+	if refusal := replicaOfRefusal(keyCountsOnce(r.dbSizeReader(ctx, v)), masterPodName, pods); refusal != "" {
+		logger.Info("Not re-pointing any pod at the master: a REPLICAOF would discard the only dataset",
+			common.RoleMaster, masterPodName, "reason", refusal)
 		return
 	}
 
@@ -3394,12 +3442,16 @@ func (r *ValkeyReconciler) clearSentinelAwarenessTimestamp(v *vkov1.Valkey) {
 func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Valkey, freshPods []podState) RollingUpdateResult {
 	logger := log.FromContext(ctx)
 
-	if !r.isFailoverTimedOut(v) {
+	if !r.noMasterTimedOut(v) {
 		logger.Info("Waiting for failover to complete, no new master detected yet")
 		return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 	}
 
 	logger.Info("Failover timed out, resetting sentinel state and scheduling retry")
+	// A new failover gets a new absence clock and a new handover budget: a hold after
+	// the retrigger measures its own wait, not the wait of the failover it replaces.
+	r.nudges.forget(waitBoundKey(v.Namespace, v.Name, boundNoMaster))
+	r.endHandoverHold(ctx, v)
 
 	// Determine the correct master address from the pods we already know about.
 	masterAddr := ""
@@ -3430,77 +3482,6 @@ func (r *ValkeyReconciler) handleNoMasterFound(ctx context.Context, v *vkov1.Val
 	}
 
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: 15 * time.Second}
-}
-
-// verifyNewMasterReady verifies that a new-image master exists and has
-// connected replicas before we delete the old master pod.
-// Returns (true, _) if verified, (false, result) if we need to wait.
-func (r *ValkeyReconciler) verifyNewMasterReady(ctx context.Context, v *vkov1.Valkey, pods []podState, checker InstanceChecker) (bool, RollingUpdateResult) {
-	logger := log.FromContext(ctx)
-	var skippedTerminating terminatingPod
-	for _, other := range pods {
-		// available(): this is the gate in front of the old master's delete, so a
-		// pod that is itself being deleted must not be accepted as the new master
-		// (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1).
-		if other.needsUpdate || !other.available() {
-			if other.terminating && skippedTerminating.name == "" {
-				skippedTerminating = terminatingPod{name: other.name, since: other.terminatingSince}
-			}
-			continue
-		}
-		info, err := checker.GetReplicationInfo(ctx, v, other.name)
-		if err != nil {
-			continue
-		}
-		if info.Role == common.RoleMaster {
-			// Verify the new master has replicas connected.
-			if info.ConnectedSlaves == 0 {
-				logger.Info("New master has no connected replicas, waiting for sync",
-					"newMaster", other.name)
-				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-			if info.MasterSyncInProgress {
-				logger.Info("New master sync in progress, waiting",
-					"newMaster", other.name)
-				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-
-			// Read the new master's key count before the old master is deleted. It is
-			// logged, not enforced: an empty new master next to an old master that
-			// held data -- a failover that promoted an empty replica -- is NOT refused
-			// here, although this comment used to call it a critical safety check.
-			// The gap predates ADR 0026 D11 and is recorded with T32; the non-Sentinel
-			// path does refuse, before its promotion (verifyPromotionCandidateHoldsData).
-			addr := health.PodAddressForComponent(v, other.name, common.ComponentValkey, int(builder.ServicePort(v)))
-			tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
-			if tlsErr != nil {
-				logger.Info("Could not build TLS config for DBSIZE check", "error", tlsErr)
-				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-			vc := r.newValkeyClient(addr, r.readValkeyPassword(ctx, v), tlsConfig)
-			dbsize, err := vc.DBSize()
-			if err != nil {
-				logger.Info("Cannot check DBSIZE on new master, waiting",
-					"newMaster", other.name, "error", err)
-				return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
-			}
-
-			logger.Info("New master verified with data",
-				"newMaster", other.name, "dbsize", dbsize, "connectedSlaves", info.ConnectedSlaves)
-			return true, RollingUpdateResult{}
-		}
-	}
-
-	if skippedTerminating.name != "" {
-		// The only candidate was on its way out. Report it through the same bounded
-		// observation as every other termination wait rather than adding one more
-		// member to this function's unbounded requeue below (ADR 0026 D5).
-		return false, *r.terminationWait(ctx, v, common.ComponentValkey, skippedTerminating,
-			"Waiting for a terminating pod before verifying the new master")
-	}
-
-	logger.Info("No new-image master found yet, waiting for failover to complete")
-	return false, RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
 }
 
 // getRollingUpdateState returns the current rolling update state from annotations.
@@ -3547,6 +3528,9 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	// And for the recreation wait (T10), whose last episode can end the same way:
 	// the pod returns as the final replacement and no wait site runs again.
 	r.clearPodRecreationStalled(ctx, v)
+	// And for the handover hold (ADR 0037 D6), whose other clear is the delete that
+	// goes through; a state cleared any other way ends the hold too.
+	r.clearMasterHandoverStalled(ctx, v)
 
 	if v.Annotations == nil {
 		return nil
@@ -3561,8 +3545,10 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	_, hasTopologyRestore := v.Annotations[annotationTopologyRestoreStarted]
 	_, hasManualFailover := v.Annotations[annotationManualFailoverStarted]
 	_, hasRecreationWait := v.Annotations[annotationRecreationWaitStarted]
+	_, hasHandoverHold := v.Annotations[annotationHandoverHoldStarted]
 	if !hasState && !hasTimestamp && !hasCount && !hasFinalization && !hasSentinelAwareness &&
-		!hasPromoted && !hasSyncWait && !hasTopologyRestore && !hasManualFailover && !hasRecreationWait {
+		!hasPromoted && !hasSyncWait && !hasTopologyRestore && !hasManualFailover && !hasRecreationWait &&
+		!hasHandoverHold {
 		return nil
 	}
 	delete(v.Annotations, annotationRollingUpdateState)
@@ -3575,6 +3561,7 @@ func (r *ValkeyReconciler) clearRollingUpdateState(ctx context.Context, v *vkov1
 	delete(v.Annotations, annotationRecreationWaitStarted)
 	delete(v.Annotations, annotationTopologyRestoreStarted)
 	delete(v.Annotations, annotationManualFailoverStarted)
+	delete(v.Annotations, annotationHandoverHoldStarted)
 	if err := r.Update(ctx, v); err != nil {
 		return err
 	}
@@ -3629,6 +3616,25 @@ func (r *ValkeyReconciler) setFailoverTimestamp(ctx context.Context, v *vkov1.Va
 	}
 	v.Annotations[annotationFailoverTimestamp] = time.Now().UTC().Format(time.RFC3339)
 	return r.Update(ctx, v)
+}
+
+// noMasterTimedOut reports whether the failover has had failoverRetryTimeout to
+// produce a master on the current template, and no pass has found one for that long
+// either.
+//
+// The failover timestamp alone is not enough. It is the trigger's stamp, and the
+// handover gate can hold the roll in failover-triggered for minutes with a master
+// that answers on every pass (ADR 0037 D6). One pass in which that master is not
+// Ready, or its INFO times out, then found "no master" with a stamp long expired and
+// reset Sentinel and forced a failover of a healthy master, the hazard
+// docs/adr/0026-a-pod-being-deleted-is-not-available.md D4 names for a minutes-old
+// stamp. The absence carries its own first-seen, in memory like every nudge: an
+// operator restart re-arms it, which delays a reset by one window and never hastens
+// one.
+func (r *ValkeyReconciler) noMasterTimedOut(v *vkov1.Valkey) bool {
+	key := waitBoundKey(v.Namespace, v.Name, boundNoMaster)
+	absentSince := r.nudges.observe(key, time.Now())
+	return r.isFailoverTimedOut(v) && time.Since(absentSince) > failoverRetryTimeout
 }
 
 // isFailoverTimedOut checks whether the failover was triggered more than
@@ -3803,8 +3809,36 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 	}
 }
 
-// triggerSentinelFailover sends SENTINEL FAILOVER to a Sentinel instance.
-func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1.Valkey) error {
+// The two failover commands, as the trigger logs them under the stable key
+// failoverMode (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D1).
+const (
+	failoverModeCoordinated = "coordinated"
+	failoverModeForced      = "forced"
+)
+
+// triggerSentinelFailover asks the Sentinels, in ordinal order, for a failover until
+// one accepts it.
+//
+// With coordinated set it sends SENTINEL FAILOVER <name> COORDINATED, the roll's first
+// trigger (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D1).
+// A plain SENTINEL FAILOVER is forced: Sentinel promotes a replica and tells the
+// outgoing master nothing, so that master keeps acknowledging writes until Sentinel
+// converts it about 16 s later, and a full resync then discards every one of them.
+// The coordinated command has the master pause writes, wait for the replica to catch
+// up and hand over itself, so nothing it acknowledged is lost.
+//
+// A Sentinel that refuses the option itself (coordinatedFallbackReason) is asked the
+// same moment with the forced command -- today's command, so the fallback costs
+// nothing a Valkey 8 Sentinel did not already cost -- and so is every Sentinel after
+// it in this pass: the tier shares one image, and asking the next one COORDINATED
+// again would buy the same refusal. Every other failure is a failed attempt at that
+// Sentinel and the next one is asked in the same mode, as before. An OK whose election
+// is lost promotes nothing; failoverRetryTimeout then resets Sentinel and the
+// retrigger fires forced.
+//
+// Without coordinated the command is the forced one. The retrigger uses it, because
+// a coordinated failover that keeps losing its election would otherwise loop.
+func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1.Valkey, coordinated bool) error {
 	logger := log.FromContext(ctx)
 	monitorName := builder.SentinelMonitorName(v)
 	sentinelStsName := common.StatefulSetName(v, common.ComponentSentinel)
@@ -3814,6 +3848,12 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
 	password := r.sentinelPassword(ctx, v)
+
+	mode := failoverModeForced
+	if coordinated {
+		mode = failoverModeCoordinated
+	}
+	fallbackReason := ""
 
 	// Try each sentinel until one successfully triggers failover.
 	var lastErr error
@@ -3833,17 +3873,70 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
 		c := r.newValkeyClient(addr, password, tlsConfig)
-		if err := c.SentinelFailover(monitorName); err != nil {
+		err := sendSentinelFailover(c, monitorName, mode)
+		if reason := coordinatedFallbackReason(mode, err); reason != "" {
+			logger.Info("Sentinel cannot run a coordinated failover; asking it for a forced one",
+				"sentinel", podName, "fallbackReason", reason)
+			mode, fallbackReason = failoverModeForced, reason
+			err = c.SentinelFailover(monitorName)
+		}
+		if err != nil {
 			lastErr = err
-			logger.V(1).Info("Sentinel failover attempt failed", "sentinel", podName, "error", err)
+			logger.V(1).Info("Sentinel failover attempt failed", "sentinel", podName,
+				"failoverMode", mode, "error", err)
 			continue
 		}
 
-		logger.Info("Sentinel failover triggered successfully", "sentinel", podName)
+		logger.Info("Sentinel failover triggered successfully", "sentinel", podName,
+			"failoverMode", mode, "fallbackReason", fallbackReason)
 		return nil
 	}
 
 	return fmt.Errorf("all sentinel failover attempts failed, last error: %w", lastErr)
+}
+
+// sendSentinelFailover sends the failover command of the given mode.
+func sendSentinelFailover(c *valkeyclient.Client, monitorName, mode string) error {
+	if mode == failoverModeCoordinated {
+		return c.SentinelFailoverCoordinated(monitorName)
+	}
+	return c.SentinelFailover(monitorName)
+}
+
+// coordinatedFallbackReason returns the reply of a Sentinel that refused the
+// COORDINATED option itself, or "" when err is anything else.
+//
+// Two replies refuse the option, both from sentinel.c 9.1.1 and the first measured on
+// 8.1.9: a Sentinel before Valkey 9.0 does not know the fourth argument ("ERR wrong
+// number of arguments for 'sentinel|failover' command"; a 9.x Sentinel given an
+// option it does not know answers "ERR Unknown failover option specified", treated
+// alike), and a Sentinel whose master reports no master_failover_state answers
+// "NOGOODPRIMARY Primary does not support FAILOVER command". Only those fall back.
+// An ERR is matched on its text, not on its code alone: ERR also answers a monitor
+// name the Sentinel does not know, and falling back on that would send the rest of
+// the pass forced on a Sentinel tier that can coordinate. INPROG and NOGOODSLAVE
+// refuse the failover, not the option, and stay a failed attempt.
+//
+// The code is read from the typed reply, so it does not matter whether a client kept
+// the leading '-' or how deep the error is wrapped.
+func coordinatedFallbackReason(mode string, err error) string {
+	if mode != failoverModeCoordinated || err == nil {
+		return ""
+	}
+	var reply *valkeyclient.ReplyError
+	if !errors.As(err, &reply) {
+		return ""
+	}
+	switch reply.Code() {
+	case "NOGOODPRIMARY":
+		return reply.Message
+	case "ERR":
+		if strings.Contains(reply.Message, "wrong number of arguments") ||
+			strings.Contains(reply.Message, "Unknown failover option") {
+			return reply.Message
+		}
+	}
+	return ""
 }
 
 // handleStandaloneRollingUpdate handles rolling update for non-HA (no Sentinel) mode.
@@ -4130,10 +4223,11 @@ func (r *ValkeyReconciler) handleManualFailover(ctx context.Context, v *vkov1.Va
 
 	promotedPod := pods[promotedIdx]
 
-	// The last look before the irreversible step. The Sentinel path reads the same
-	// counts after its failover (verifyNewMasterReady) but only logs them; here the
-	// outgoing master is deleted seconds after the promotion, so the check has to
-	// happen before it, and it refuses.
+	// The last look before the irreversible step. The Sentinel path reads one count
+	// before its delete -- the new master's, and the outgoing pod's only when the new
+	// master is empty (gateOutgoingPodDelete, ADR 0037 D5); here the outgoing master
+	// is deleted seconds after the promotion, so the check reads both counts before
+	// the promotion, and it refuses.
 	if result := r.verifyPromotionCandidateHoldsData(ctx, v, pods[masterIdx], promotedPod); result != nil {
 		return *result
 	}
@@ -4557,27 +4651,17 @@ func (r *ValkeyReconciler) pod0SyncWaitReason(ctx context.Context, v *vkov1.Valk
 
 // replicationNotEstablishedReason answers the question every gate that is about to
 // act on a replica asks -- has this pod actually received its master dataset? --
-// and returns the reason it has not, or "" when it has.
+// and returns the reason it has not, prefixed with the pod's name, or "" when it has.
 //
-// The three fields are one answer, not three:
-//   - role=master means a REPLICAOF has not taken effect yet.
-//   - master_link_status != "up" means the handshake is still running. Right after
-//     REPLICAOF the link sits in CONNECT/CONNECTING, where master_sync_in_progress
-//     is 0 while no byte has moved.
-//   - master_sync_in_progress means the transfer itself is not finished.
-//
-// Checking only the last one accepts a replica that never started syncing. Phase 1
-// has reasoned this way since it was written; the gates in front of the failover
-// did not, which let a promotion take a replica with no dataset and the delete of
-// the outgoing master then take the last copy. The sidecar answers the same
-// question the same way (isSyncedReplica, internal/sidecar/drain.go).
+// The predicate is ReplicationInfo.NotEstablishedReason, the one answer every site
+// that says "synced" gives (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2):
+// this file's gates, the health check behind the Syncing phase, the observer and the
+// sidecar's drain. Checking the sync flag alone accepts a replica that never started
+// syncing, and asking it of the master accepts every replica, because a master never
+// carries the flag.
 func replicationNotEstablishedReason(podName string, info *valkeyclient.ReplicationInfo) string {
-	if info.Role == common.RoleMaster || info.MasterLinkStatus != "up" {
-		return fmt.Sprintf("replication not established on %s (role=%s, linkStatus=%s)",
-			podName, info.Role, info.MasterLinkStatus)
-	}
-	if info.MasterSyncInProgress {
-		return fmt.Sprintf("%s is still syncing from its master", podName)
+	if reason := info.NotEstablishedReason(); reason != "" {
+		return podName + ": " + reason
 	}
 	return ""
 }

@@ -235,8 +235,12 @@ type fakeValkeyNode struct {
 	mu    sync.Mutex
 	store map[string]string
 
+	// Replication state, rendered by replicationInfo in the shape Valkey gives
+	// for the role. linkStatus and syncInProgress describe a replica's link to
+	// its master; a master's reply carries neither.
 	role            string
 	connectedSlaves int
+	linkStatus      string
 	syncInProgress  bool
 
 	// Failure injection. Each holds a raw RESP reply that replaces the normal one.
@@ -253,6 +257,12 @@ type fakeValkeyNode struct {
 
 func newFakeValkeyNode() *fakeValkeyNode {
 	return &fakeValkeyNode{store: make(map[string]string), role: roleMaster}
+}
+
+// newFakeReplicaNode is a replica that holds its master's dataset: link up, no
+// sync in progress.
+func newFakeReplicaNode() *fakeValkeyNode {
+	return &fakeValkeyNode{store: make(map[string]string), role: "slave", linkStatus: "up"}
 }
 
 func (n *fakeValkeyNode) handle(args []string) string {
@@ -298,13 +308,33 @@ func (n *fakeValkeyNode) handle(args []string) string {
 	}
 }
 
+// inFullSync puts a replica into the state Valkey reports while the RDB transfer
+// runs: link down, sync in progress. Pass it to configure.
+func inFullSync(n *fakeValkeyNode) {
+	n.linkStatus = "down"
+	n.syncInProgress = true
+}
+
+// replicationInfo renders INFO replication the way Valkey does (measured on 9.1.1
+// and 8.1.9): master_link_status only where a link exists, and
+// master_sync_in_progress only in a replica's reply - a master never carries it,
+// whatever its replicas are doing. A replica in full sync reports its link down
+// with the sync flag at 1.
 func (n *fakeValkeyNode) replicationInfo() string {
-	sync := "0"
-	if n.syncInProgress {
-		sync = "1"
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "# Replication\r\nrole:%s\r\n", n.role)
+	if n.linkStatus != "" {
+		fmt.Fprintf(&sb, "master_link_status:%s\r\n", n.linkStatus)
 	}
-	return fmt.Sprintf("# Replication\r\nrole:%s\r\nconnected_slaves:%d\r\nmaster_sync_in_progress:%s\r\n",
-		n.role, n.connectedSlaves, sync)
+	if n.role != roleMaster {
+		sync := "0"
+		if n.syncInProgress {
+			sync = "1"
+		}
+		fmt.Fprintf(&sb, "master_sync_in_progress:%s\r\n", sync)
+	}
+	fmt.Fprintf(&sb, "connected_slaves:%d\r\n", n.connectedSlaves)
+	return sb.String()
 }
 
 // configure mutates the node under its own lock so a test can inject a failure

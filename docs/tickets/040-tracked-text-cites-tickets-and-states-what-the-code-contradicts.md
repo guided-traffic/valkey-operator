@@ -82,7 +82,7 @@ hook checks it.
   (`:198-205`, `:119`) decides it, so every future gap breaks D7. The only gap is the `Ready` row
   ([`condition_registry.go:102`](../../internal/controller/condition_registry.go#L102), "T18: ...
   (ADR 0001 D4 decides this; re-decision open)"); it suppresses no failing assertion.
-- **Open-ticket citations** (T12, T18, T23, T34): 25 label lines and one path (ADR 0025 `:444`);
+- **Open-ticket citations** (T18, T23, T34): 21 lines (`git grep -n '\bT18\b\|\bT23\b\|\bT34\b' -- ':!docs/tickets'`);
   some ADR homes cite the ticket themselves (ADR 0010 `:812`, ADR 0026 `:791`).
 - **Measured-false statements about tickets** (archive/037 is tracked, ADR 0034's change is
   committed): [ADR 0003](../adr/0003-nudge-a-short-of-pods-statefulset.md) `:111-113`, `:228-229`
@@ -248,8 +248,7 @@ overstates the RBAC footprint; (g) sends the next gate-job author to an endpoint
 5. Before the sweep, add to this ticket a mapping table for every sub-label above, and settle
    T24(a), (b), (d).
 6. Open-ticket citations are part of the sweep; whichever of this ticket and the owning ticket
-   lands first rewrites the line, the other verifies it: T12 -> residual risks of ADR 0025
-   (`:441-444`) and ADR 0028 (`:123`, `:230`); T18 -> ADR 0001 D4; T23 -> ADR 0010 `:808-813`; the
+   lands first rewrites the line, the other verifies it: T18 -> ADR 0001 D4; T23 -> ADR 0010 `:808-813`; the
    `verifyNewMasterReady` gap -> ADR 0026 `:787-791`; the T34 lines of ADR 0017 are tags (Q2).
 7. [`docs/tickets/README.md`](README.md#naming-and-numbering) `:29-30`: archive/037 defines its
    own T1-T5 (test scenarios) and WP1-WP6.
@@ -408,11 +407,11 @@ B is cheap, rides an already required context and turns the residual risk into a
 
 ## Related
 
-- T12, T23, T34: their citations are part of the sweep (change 6).
+- T23, T34: their citations are part of the sweep (change 6).
 - T18: its citations are part of the sweep; it meets Q1 on `condition_registry.go:102`.
 - T43: its close grep for `S1` would hit `pod_termination_test.go:408`, an archive/039 label; it
   also edits ADR 0020.
 - T43: `make lint` skips build-tagged files.
 - T60: edits ADR 0020 near `:477-479` and `:570-571`; coordinate with the ADR 0020 rewrite.
-- T12: owns the Sentinel-path loss after `WAIT` and its "lossless" statements.
+- [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done): reworded the Sentinel-path "lossless" statements (ADR 0037 D8); (b) is the non-Sentinel counterpart.
 - T29: edits the same ADR 0013 D3 paragraph as (d).

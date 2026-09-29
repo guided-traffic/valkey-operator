@@ -4,7 +4,7 @@
 
 Accepted. Date: 2026-08-21.
 
-Amended 2026-09-28: **D1's controlled failover is coordinated where Sentinel supports it, and D10's predicate binds the delete of the outgoing master.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1 sends `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback; its D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the delete in `replaceRemainingPods`, held past `syncTimeout` rather than paused (D6). The residual risk below that named the missing key check is closed by decision and open until built. Marked in place.
+Amended 2026-09-28: **D1's controlled failover is coordinated where Sentinel supports it, and D10's predicate binds the delete of the outgoing master.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1 sends `SENTINEL FAILOVER <name> COORDINATED` on the first trigger, the forced command as the fallback; its D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the delete in `replaceRemainingPods`, held past `syncTimeout` rather than paused (D6). The residual risk below that named the missing key check is closed by decision ~~and open until built~~ *(and implemented 2026-09-28: `triggerSentinelFailover` with the coordinated option on the first trigger, and the handover gate `gateOutgoingPodDelete` in [`master_handover.go`](../../internal/controller/master_handover.go); unit-tested in [`coordinated_failover_test.go`](../../internal/controller/coordinated_failover_test.go), [`master_handover_test.go`](../../internal/controller/master_handover_test.go) and [`sentinel_failover_test.go`](../../internal/controller/sentinel_failover_test.go); no run of the built code on Kubernetes is recorded here)*. Marked in place.
 
 The strategy itself predates this ADR set; the template-source and freshness-guard
 decisions below landed on branch `feat/support-pdb`.
@@ -184,7 +184,7 @@ and no maximum). Failing over only once every replica already runs the new spec
 guarantees the promotion target is up to date and synced, so the failover cannot promote
 a pod that would then have to full-resync. Replacing the master last means the pod
 holding the authoritative dataset is disturbed exactly once, at the end, when a synced
-successor already exists. *(Amended 2026-09-28: the controlled failover is `SENTINEL FAILOVER <name> COORDINATED` where the Sentinel supports it and the forced command otherwise — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1.)*
+successor already exists. *(Amended 2026-09-28: the controlled failover is `SENTINEL FAILOVER <name> COORDINATED` where the Sentinel supports it and the forced command otherwise — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1.)* *(Implemented 2026-09-28: the Sentinel roll's first trigger, `handleMasterFailover`, sends the coordinated command; a Sentinel that refuses the option itself — `NOGOODPRIMARY`, or the `ERR` a Sentinel before Valkey 9.0 answers — is asked the forced command at once, and so is every later Sentinel of that pass (`coordinatedFallbackReason`). The retrigger after a failover that did not complete, `handleFailoverRetrigger`, and the sidecar's drain failover stay forced. The non-Sentinel roll's promotion is unchanged.)*
 
 **D2 — Every "desired" input comes from the live StatefulSet, never from the CR.** Five
 are named values: `valkeyImageFromSts(sts)`, `sidecarImageFromSts(sts)`,
@@ -398,8 +398,11 @@ delete is refused unless `readyCount-cost >= total-1` since 2026-09-26 —
 `sentinelDeleteKeepsVotes`, [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md)
 D10.)* The delete gate serialises those deletes. The delete spends nothing the
 roll was not about to spend: masters are never replica candidates, `replaceRemainingPods`
-deletes the former master only behind `verifyNewMasterReady` (a replication gate, not a key
-count — see Residual risks), the PVC survives a pod delete, a replica re-syncs from its
+deletes the former master only behind `verifyNewMasterReady` ~~(a replication gate, not a key
+count — see Residual risks)~~ *(since 2026-09-28 the handover gate of
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5,
+`gateOutgoingPodDelete`: the replica-side predicate on every current replica, a count on the new
+master, the key-count veto and the role; the Sentinel path only — Residual risks)*, the PVC survives a pod delete, a replica re-syncs from its
 master, and a single pod without persistence loses nothing the same roll would not take
 from it the moment it turned Ready. `deleteNextPendingPod` (a leftover outdated
 second master) keeps `available()`, and a pod on the current template is never deleted — for
@@ -443,7 +446,11 @@ when it is unreadable — it never reads the outgoing master's count and compare
 comment calls that a critical safety check; the check does not exist. See Residual risks.)*
 *(Amended 2026-09-28: [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5 put the same replica-side predicate, a count on the
 new master, the key-count veto and the role in front of that delete, held past `syncTimeout` as
-`MasterHandoverStalled` rather than paused — decided, not built.)*
+`MasterHandoverStalled` rather than paused — ~~decided, not built~~ implemented 2026-09-28 in
+`gateOutgoingPodDelete`, on the Sentinel path, where `replaceRemainingPods` is the only caller.
+The predicate itself moved onto `valkeyclient.ReplicationInfo.NotEstablishedReason`, which
+`replicationNotEstablishedReason` wraps with the pod's name, so every gate above asks the same
+answer as the health check, the observer and the sidecar drain — ADR 0037 D2.)*
 On the manual path the delete follows the promotion within seconds, so the check has to come
 before it. An empty master returns early
 -- a cluster that holds no data yet must still be able to roll -- and an unreadable count
@@ -567,8 +574,18 @@ readiness a second, partial source of truth about replication.
   no-data-loss guarantee silently degrades the day another pod-spec field starts changing
   on upgrade. Since 2026-09-26 that is true of rootless pods; a root pod is decided by
   `singlePodDeferral` (D6 amendment), which is the one change that was caught.
-* **The Sentinel path deletes the former master with no key-count gate.** Before the
-  `replaceRemainingPods` delete, `verifyNewMasterReady` requires a current, available master
+* ~~**The Sentinel path deletes the former master with no key-count gate.**~~ **Closed
+  2026-09-28: the handover gate asks the key counts before that delete**
+  ([ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3, D5, D6;
+  `gateOutgoingPodDelete`). Every other pod on the current template that exists and is not
+  terminating must answer as a synced replica and the new master must count at least that many
+  attached replicas, at least one; the new master's `DBSIZE` must be readable; the ADR 0028 veto
+  (`demotionRefusalReason`) must let the delete through — a new master holding keys, or both
+  empty; and the pod about to be deleted must not answer `role:master` (no answer passes). A
+  refusal requeues inside `spec.rollingUpdate.syncTimeout` and is reported as
+  `MasterHandoverStalled` past it, the rolling-update state kept. Unit-tested
+  (`TestReplaceRemainingPods_DeletesTheOutgoingPodOnlyWhenNothingIsLost`,
+  `TestHandleRollingUpdate_TheRefusalShapeKeepsTheDataset`); the full e2e suite and the writer harness of ADR 0037 ran green on the built code on Kind, both Valkey lines, the refusal shape itself not driven on a cluster. As recorded until then: Before the `replaceRemainingPods` delete, `verifyNewMasterReady` requires a current, available master
   with at least one connected replica (its "no sync in progress" term reads
   `master_sync_in_progress`, a field a master never reports, and never fires), and reads its
   `DBSIZE` — but compares it with nothing and never reads the outgoing master's count, so a
@@ -578,9 +595,13 @@ readiness a second, partial source of truth about replication.
   code comments still describe the check as present~~ *(corrected 2026-09-28: the header of
   `replaceRemainingPods` and the inline comment in `verifyNewMasterReady` say since 2026-09-26
   that the count is logged and not enforced; the comment above the pre-promotion check on the
-  manual path still says the Sentinel path "reads the same counts", where it reads one)*.
+  manual path still says the Sentinel path "reads the same counts", where it reads one)* *(all
+  three rewritten 2026-09-28 with the gate: the manual-path comment now says the Sentinel path
+  reads the new master's count before its delete, and the outgoing pod's only when the new master
+  is empty)*.
   *(Closed by decision 2026-09-28, [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5: the replica-side predicate, a count
-  on the new master, the key-count veto and the role in front of that delete; open until built.)*
+  on the new master, the key-count veto and the role in front of that delete; ~~open until
+  built~~ built the same day, above.)*
 * ~~**A Sentinel tier of one or two Sentinels never replaces a Ready outdated Sentinel — open,
   awaiting a decision.**~~ **Closed 2026-09-26: such a tier rolls serially**
   ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10, `sentinelDeleteKeepsVotes`;
@@ -598,7 +619,9 @@ readiness a second, partial source of truth about replication.
 
 ## References
 
-* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `verifyNewMasterReady`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`; for the 2026-09-28 amendment `handleMasterFailover`, `triggerSentinelFailover`, `coordinatedFallbackReason`, `handleFailoverRetrigger`, `replicationNotEstablishedReason`
+* [`internal/controller/master_handover.go`](../../internal/controller/master_handover.go) — `gateOutgoingPodDelete`, `verifyNewMasterReady` (moved here from `rolling_update.go` on 2026-09-28), `replicasNotOnNewMaster`, `datasetRefusal`, `holdHandover`
+* [`internal/valkeyclient/client.go`](../../internal/valkeyclient/client.go) — `ReplicationInfo.NotEstablishedReason` (D10's predicate), `SentinelFailoverCoordinated`
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `runSentinelRollingUpdate` (the Sentinel-tier residual risk)
 * [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26)
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `ComputePodSpecHash`, the readiness probe
@@ -611,3 +634,4 @@ readiness a second, partial source of truth about replication.
 * [ADR 0032](0032-generated-pods-run-rootless.md) — D3, the single-pod rule for a pod that runs as root (D6, D7)
 * [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a tier of one or two Sentinels (the closed residual risk)
 * [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — D9, the Sentinel-path counterpart of D8: no resolution while the roll's own Sentinel failover is in flight
+* [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) — D1, the coordinated failover of D1 here; D2, the predicate of D10 at every site that says "synced"; D3, D5 and D6, the handover gate in front of the former master's delete (the closed residual risk)

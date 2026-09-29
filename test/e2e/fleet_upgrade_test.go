@@ -19,8 +19,11 @@
 //     pre-upgrade hook Job, the new CRD schema and the three ClusterRole grants
 //     the new operator needs (secrets:delete, events.k8s.io, policy PDBs).
 //   - Every cluster converges back to OK without a human touching it.
-//   - No data is lost while the failover-aware rolling update replaces every
-//     data pod, on both cluster shapes.
+//   - The dataset written before the upgrade survives the failover-aware
+//     rolling update that replaces every data pod, on both cluster shapes:
+//     every data pod ends with the pre-upgrade DBSIZE. Nothing is written
+//     during the roll, so this does not measure the writes an outgoing master
+//     acknowledges during a forced failover, which are lost (ADR 0037 D8).
 //   - The Sentinel StatefulSet rolls too, and exactly once. Its pod-spec hash
 //     changes whenever a release changes buildSentinelPodSpec -- the explicit
 //     terminationGracePeriodSeconds of v1.11.0 and the rootless posture of

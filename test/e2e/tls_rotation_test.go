@@ -216,8 +216,11 @@ func TestE2E_TLS_CertificateRotation_RollsTheFleet(t *testing.T) {
 	})
 
 	t.Run("the dataset survived the roll", func(t *testing.T) {
-		// A failover-aware roll is lossless by design; a rotation is the one trigger
-		// nobody asked for, so it is the one where that claim is worth measuring.
+		// A failover-aware roll keeps the pre-roll dataset (ADR 0037 D8), and that is
+		// what this asserts: the canary written before the rotation is on the master
+		// after it. Nothing is written during the roll, so no write acknowledged during
+		// its failover is measured here. A rotation is the one trigger nobody asked
+		// for, so it is the one where that claim is worth measuring.
 		got := tc.valkeyTLSExec(t, ns, tc.masterPodName(t, ns, name), tlsValkeyPort, "GET", "rotation-canary")
 		assert.Equal(t, "before", got, "the canary written before the rotation must still be there")
 	})
