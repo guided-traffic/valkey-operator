@@ -43,7 +43,7 @@ GOVULNCHECK ?= $(LOCALBIN)/govulncheck-$(GOVULNCHECK_VERSION)
 
 ## Tool Versions
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
-KUSTOMIZE_VERSION ?= v5.8.1
+KUSTOMIZE_VERSION ?= v5.8.2
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
 CONTROLLER_GEN_VERSION ?= v0.22.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
