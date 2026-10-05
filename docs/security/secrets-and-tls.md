@@ -45,7 +45,7 @@ the export of key values off on every cluster
 ([ADR 0018](../adr/0018-metrics-and-the-exporter-sidecar.md) D11), and the generated
 NetworkPolicy no longer admits every source on the port. It stays open where the switch does
 not reach: an image set through `spec.metrics.image` older than v1.83.0, and the pod of a
-non-persistent single-replica cluster until it restarts
+non-persistent single-replica cluster, with or without Sentinel, until it restarts
 (`PodSecurityUpdatePending=True/ExporterOutdated` names it).
 
 ## TLS material

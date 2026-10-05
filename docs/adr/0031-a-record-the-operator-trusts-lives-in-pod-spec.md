@@ -14,6 +14,12 @@ written before this date.
 Not done, deliberately: `config-hash` and `pod-spec-hash` are forgeable by the identical
 mechanism and stay in pod metadata. Consequences names why, and it is not "we forgot".
 
+Applied 2026-10-05 to a second record: the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2 (`VKO_POD_METADATA_HASH`, a digest of the
+pod labels and annotations the CR author sets) is carried on the same two carrier containers and
+stamped after the builder, per D1 to D3. D4 holds for it on the data tier only: a Sentinel pod
+without the record is outdated (ADR 0007 D2, amended 2026-10-05).
+
 Amends [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
 D4, which named the annotation as the carrier, and closes the second half of the gap
 [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 opened the

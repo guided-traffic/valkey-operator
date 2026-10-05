@@ -4,6 +4,11 @@
 
 Accepted. Date: 2026-08-25.
 
+Amended 2026-09-29 ([ADR 0007](0007-failover-aware-rolling-update.md) D11): **the only data pod
+of a Sentinel cluster is rolled by `handleStandaloneRollingUpdate`, and its recorded replacement
+is what holds the Sentinel roll** through D11's waits; the residual risk that a single pod which
+never starts is not reported is narrowed accordingly. Both marked in place.
+
 Amended 2026-09-28: **D11's *Replacement* argument gains the gate it leaned on.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D3 and D5 put the replica-side predicate, a count on the new master, the key-count veto and the role in front of the former master's delete in `replaceRemainingPods`, held past `syncTimeout` as `MasterHandoverStalled` (D6) in the shape of this record's D5. The residual risk below that named the missing key check is closed by decision ~~and open until built~~ *(and implemented 2026-09-28: `gateOutgoingPodDelete` in [`master_handover.go`](../../internal/controller/master_handover.go), called by `replaceRemainingPods` on the Sentinel path, which is the only path that reaches that function; a held delete requeues inside `spec.rollingUpdate.syncTimeout` and past it returns `DeferredRequeueAfter` with `MasterHandoverStalled` set, so the pass continues and the Sentinel roll stays held, as this record's D5 does. Unit-tested in [`master_handover_test.go`](../../internal/controller/master_handover_test.go); the full e2e suite and the writer harness of ADR 0037 ran green on the built code on Kind, both Valkey lines, the refusal shape itself not driven on a cluster)*. Marked in place.
 
 Amended 2026-08-27: **adopting a pod as the master authority is a site that spends it, and
@@ -59,7 +64,9 @@ an adversarial review of the implementation, and is stated as it landed: the Sen
 guard applies only to a delete that spends a vote (D8), `PodAvailabilityStalled` is retracted on
 evidence only, a `Ready=False` stamped at kubelet's first status sync is not a transition, the
 Sentinel scan names the longest-unavailable current pod (D6), and the Sentinel-after-data ordering
-has one known exception, a paused data roll.
+has one known exception, a paused data roll *(and, by design since 2026-09-29, a Sentinel
+cluster's single data pod that defers its change — [ADR 0007](0007-failover-aware-rolling-update.md)
+D11)*.
 
 Implemented: the `available()` / `reachable()` split on `podState` with the per-site answers of
 D1–D4, the delete gate of D5, the tier definition of D7, the bounded stall observation and the
@@ -274,7 +281,9 @@ has cleared the reconnect counter. The gated deletes are `replaceNextReplica`,
 branch, and both go through `standaloneWait`.~~ *(superseded 2026-09-26, see D11)* The
 standalone handler is a single-pod tier: its gate is the pod's own `DeletionTimestamp`, checked
 in front of the delete and routed to `terminationWait`, and `standaloneWait` is left with the
-wait on a current pod, which D11 shows is reachable only on a tier larger than one pod.
+wait on a current pod, which D11 shows is reachable only on a tier larger than one pod *(or,
+since 2026-09-29, on a Sentinel cluster's single data pod while its replacement is recorded —
+[ADR 0007](0007-failover-aware-rolling-update.md) D11)*.
 
 Every wait on a terminating pod — the gate and the `!available()` waits alike — goes through
 `terminationWait`, which reports it in one of two shapes:
@@ -531,6 +540,10 @@ which used to requeue with no pod named and now waits on `firstUnavailableExisti
 than `spec.replicas: 1` (`TestHandleStandaloneRollingUpdate_BoundsTheWaitOnACurrentPod`): the
 standalone handler records no rolling-update state, so a single current pod takes the "no
 rolling update needed" return of `dispatchDataRollingUpdate` before any wait (*Residual risks*).
+*(Amended 2026-09-29: and on a Sentinel cluster's single data pod while the replacement the
+operator made is recorded as `replacing-replicas` —
+[ADR 0007](0007-failover-aware-rolling-update.md) D11,
+`TestReconcileWorkload_SentinelSinglePodReplacementHoldsTheSentinelRoll`.)*
 `waitForReplicasReady` is split: `!available()` goes to this wait,
 while an available but outdated pod — a second master `replaceNextReplica` does not take —
 keeps the plain requeue. A stall returns through its caller like any other result, so
@@ -569,7 +582,19 @@ environmental; bounding the availability wait would have made it the common case
 image. [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D1 — the Sentinel tier
 rolls after the data tier — holds again, with one known exception: `pauseRollingUpdate` returns
 an empty result, neither a requeue nor a `DeferredRequeueAfter`, so the pass that pauses the data
-roll is not holding and runs the Sentinel roll (*Residual risks*). What the stall shape buys
+roll is not holding and runs the Sentinel roll (*Residual risks*). *(Amended 2026-09-29.)* The
+single data pod of a Sentinel cluster, rolled by `handleStandaloneRollingUpdate` since
+[ADR 0007](0007-failover-aware-rolling-update.md) D11, reaches these waits only because its
+replacement is recorded: `recordSinglePodReplacement` writes `replacing-replicas` before the
+delete, and `finishDataRoll` — or, for a replacement a deferral interrupts,
+`settleDeferredReplacement` once the pod is available — clears it. Without a state the dispatch skips a missing pod and a
+current one and sees no roll, so the Sentinel roll would start while the data tier had no pod. A
+single pod without Sentinel records nothing, as before — no second tier waits on it. A deferral
+of that pod with no replacement recorded — a sidecar-only delta, or a held repair — holds nothing
+and releases the Sentinel roll in the same pass, by design: the pod is up, and no deferral holds
+the Valkey image, the TLS material or the configuration (ADR 0007 D6, amended 2026-09-29), so
+what this rule holds against, a Sentinel taken onto a data spec that does not come up, cannot
+arise. What the stall shape buys
 back is the status write, `checkAndRecoverNoMaster` and `checkSteadyStateSplitBrain`; the latter
 two are gated on `IsMultiReplicaWithoutSentinel` — the first at its call site in
 `handlePostRollingUpdateChecks`, the second inside itself — so on a Sentinel cluster it is the
@@ -632,7 +657,8 @@ alert was added for it.
   roll immediately; the same roll replaces it either way, and the Event says the pod was not
   available.
 * A pod that never comes up is named on the CR — on any topology but a single pod (*Residual
-  risks*) — after `syncTimeout` (default 5 min) measured on its own clock, from the instant it
+  risks*; a Sentinel cluster's single data pod is named for a replacement the operator made,
+  since 2026-09-29, [ADR 0007](0007-failover-aware-rolling-update.md) D11) — after `syncTimeout` (default 5 min) measured on its own clock, from the instant it
   stopped being Ready or from its creation if it never was; not after the 2 min of
   `podTerminationOverrun`, and not relative to the delete. Measured once
   on Kind: about 64 s after the image change with `syncTimeout` 60 s (Status). Inside the budget
@@ -792,7 +818,12 @@ spare vote. Rejected.
   shows only as phase `Provisioning` through `updateStandaloneStatus`. After a spec fix the pod is
   outdated and D11's replacement rule deletes it, so the roll is not stuck; only the report is
   missing. Pre-existing in shape, and the scope limit
-  [ADR 0032](0032-generated-pods-run-rootless.md) D7 states. Traced by reading.
+  [ADR 0032](0032-generated-pods-run-rootless.md) D7 states. Traced by reading. *(Narrowed
+  2026-09-29: the only data pod of a Sentinel cluster is rolled by the same handler since
+  [ADR 0007](0007-failover-aware-rolling-update.md) D11 and records `replacing-replicas` for a
+  replacement the operator makes, so its replacement is waited on and reported until
+  `finishDataRoll`; a single pod without Sentinel, and a Sentinel one recreated for any other
+  reason, still are not.)*
 * ~~**`verifyNewMasterReady` reads the new master's `DBSIZE` and does not refuse on it.**~~
   **Closed 2026-09-28: the handover gate refuses on the key counts** (below). As recorded until
   then: Its

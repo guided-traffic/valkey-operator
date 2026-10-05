@@ -10,7 +10,27 @@ are explained in [status.md](status.md). The decisions are
 [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
 (the master handover).
 
-## What `syncTimeout` bounds
+## What starts a roll
+
+The data and Sentinel StatefulSets use `updateStrategy: OnDelete`, so a changed pod template
+reaches no running pod by itself: the operator replaces each pod whose spec or records differ
+from the template it wrote ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2). That
+covers:
+
+- an image of any container or init container (`spec.image`, the exporter image);
+- the generated configuration (`valkey.conf`, `sentinel.conf`);
+- the pod spec — resources, probes, volumes, affinity, the security context;
+- the TLS material a pod mounts, when cert-manager renews it ([TLS](tls.md));
+- the pod labels and annotations of a tier — `spec.podLabels`, `spec.podAnnotations`,
+  `spec.sentinel.podLabels`, `spec.sentinel.podAnnotations`. Adding, changing or removing an
+  entry replaces the pods of that tier, so the new metadata is on every pod afterwards. Before
+  the operator release that records them, such a change rewrote the templates and replaced no
+  pod.
+
+A single-replica cluster applies some of these only when the pod restarts for another reason
+([upgrading.md](upgrading.md#a-single-replica-cluster)). A pod label or annotation change is not
+one of them: it replaces the only pod, and without persistence that pod comes back empty.
+
 
 `syncTimeout` bounds the two points in a rolling update where the operator waits
 for a full dataset transfer, one wait that has nothing to do with a transfer —
@@ -53,7 +73,14 @@ report.
 ## The master handover on a Sentinel cluster
 
 A Sentinel cluster's roll hands the master over once, when every replica runs the
-current spec: it waits until every replica answers that it holds the dataset and a
+current spec — unless the cluster has one data pod: with no replica to hand over to, that pod
+follows the rules of a single-replica cluster without Sentinel
+([upgrading.md](upgrading.md#a-single-replica-cluster)) — a new sidecar image is held back, and
+a pod-spec change with it; a new image, configuration or certificate replaces the pod with no
+failover and a short downtime, and without persistence the replacement loses its data
+([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D6, D11).
+Otherwise it waits until every
+replica answers that it holds the dataset and a
 `WAIT` on the master has been acknowledged, asks Sentinel for a failover, waits for the
 promoted pod and then deletes the former master.
 

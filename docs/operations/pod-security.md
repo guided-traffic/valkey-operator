@@ -49,8 +49,9 @@ rolls. Changing the profile (to one the [allow-list](#localhost-profiles-need-th
 admits) or `userNamespaces` changes the pod-spec hash of both
 StatefulSets: the data tier rolls failover-aware and the Sentinel tier rolls as for any
 template change; the observer Deployment, where
-enabled, is rewritten and restarts. As with every pod-spec change, the only pod of a single-replica
-cluster without Sentinel is restarted, and without persistence it comes back empty.
+enabled, is rewritten and restarts. As with every pod-spec change, the only data pod of a
+single-replica cluster, with or without Sentinel, is restarted, and without persistence it comes
+back empty.
 Turning `userNamespaces` off again rolls the pods back out of their user namespace.
 `hostUsers` is compared exactly, not as a subset: when a mutating admission policy adds
 `hostUsers: false` to the template of a resource without the opt-in, the operator writes

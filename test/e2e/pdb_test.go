@@ -432,6 +432,30 @@ func (tc *testClients) waitForValkeyEvent(t *testing.T, namespace, name, reason 
 	require.NoError(t, err, append([]interface{}{failureMsg}, msgArgs...)...)
 }
 
+// countValkeyEventsSince counts the Events with the given reason about a Valkey CR
+// since a point in time, summing an aggregated series.
+func (tc *testClients) countValkeyEventsSince(t *testing.T, namespace, name, reason string, since metav1.Time) int {
+	t.Helper()
+	events, err := tc.kube.EventsV1().Events(namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	count := 0
+	for i := range events.Items {
+		ev := &events.Items[i]
+		if ev.Regarding.Kind != "Valkey" || ev.Regarding.Name != name || ev.Reason != reason {
+			continue
+		}
+		if ev.EventTime.Time.Before(since.Time) && ev.DeprecatedLastTimestamp.Time.Before(since.Time) {
+			continue
+		}
+		if ev.Series != nil && ev.Series.Count > 0 {
+			count += int(ev.Series.Count)
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 // requireNoWarningEvents asserts the CR collected no Warning Event at all.
 //
 // It is the assertion whose absence let a Warning per controlled failover ship:

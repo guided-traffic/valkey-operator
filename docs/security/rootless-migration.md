@@ -102,7 +102,8 @@ migration runs (ADR 0032 D2, D4).
   handler and the manual-failover master check,
   [`rolling_update.go`](../../internal/controller/rolling_update.go)). The ordinary failover-aware
   roll replaces it: every persistent multi-replica data tier rolls twice at the upgrade, and a
-  persistent single pod restarts twice — two short downtimes, data kept. The comparison, not the
+  persistent single pod — with or without Sentinel, by the single-pod roll, no failover —
+  restarts twice: two short downtimes, data kept. The comparison, not the
   hash, starts that roll, and only once the repair has left the template, which it does only
   when every ordinal holds a migrated pod and the first roll has finalized (the ordering fix
   above); a pod missing during the second roll is no evidence,
@@ -188,6 +189,13 @@ for another reason (a node drain, say — a container restart keeps the pod spec
 dataset. How the condition is written and cleared is
 [`PodSecurityUpdatePending`](../operations/status.md#podsecurityupdatepending).
 
+The only data pod of a Sentinel cluster is decided the same way, and the Sentinel pods beside it
+roll whether that pod is replaced or held
+([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11). Operators from before that
+decision never finished either roll of such a cluster: its data pod and every Sentinel pod kept
+running as root with no condition naming them, and a persistent tier kept the repair in its
+template. The first reconcile after upgrading to an operator that carries D11 moves them.
+
 ## What this does not cover
 
 <a id="h-21"></a>
@@ -200,7 +208,10 @@ the server side — no pod can re-own it, and the first replacement never starts
 it, three kinds of pod still run as root: a non-persistent single pod
 (`PodSecurityUpdatePending` names it; deleting it discards its data), a pod so old that
 it carries no `pod-spec-hash` annotation (delete it), and the pods of a tier whose
-roll holds on a replacement that never became available (`PodAvailabilityStalled`).
+roll holds on a replacement that never became available (`PodAvailabilityStalled`). On an
+operator from before [ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11 add a fourth,
+named by nothing: the data pod and every Sentinel pod of a Sentinel cluster with one data pod —
+upgrade the operator.
 
 <a id="h-22"></a>
 

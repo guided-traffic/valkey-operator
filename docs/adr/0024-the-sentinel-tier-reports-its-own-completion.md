@@ -2,9 +2,11 @@
 
 ## Status
 
-Accepted, amended 2026-08-25 (D3, see D8) and 2026-09-26 (D1, D5, D6 and the
+Accepted, amended 2026-08-25 (D3, see D8), 2026-09-26 (D1, D5, D6 and the
 Consequences, see D9; D9's quorum guard for a tier of one or two Sentinels, see
-D10). Date: 2026-08-23.
+D10) and 2026-09-29 (D1: a second source of `RollingUpdateComplete`, the
+single-pod route of [ADR 0007](0007-failover-aware-rolling-update.md) D11).
+Date: 2026-08-23.
 
 Implemented: the `SentinelUpdatePending` condition, the `SentinelUpdateComplete`
 event, the `Sentinel Rolling Update i/n` phase, the reworded
@@ -26,11 +28,18 @@ terminating Sentinel pod in either wait goes through `terminationWait`, and
 `PodTerminationStalled` is cleared by those waits and at the Sentinel
 completion. A holding data tier now holds the Sentinel roll, which restores
 D1's ordering with one known exception, the pass in which a data roll pauses
+*(and, by design since 2026-09-29, a single data pod that defers its change —
+[ADR 0007](0007-failover-aware-rolling-update.md) D11)*
 (D9). Implemented. The hold of the Sentinel roll passed its e2e on 2026-09-26;
 the Sentinel-tier waits have unit coverage only, for the reason under *Residual
 risks*. *(Superseded 2026-09-26 by D10; until that decision, the same day, this
 read: "Open, awaiting a decision: a tier of one or two Sentinels can never
 replace a Ready outdated pod (pre-existing, Residual risks).")*
+
+Amended 2026-10-05 (correction, no decision changes): two Context sentences are
+corrected in place — a Sentinel podLabels change never rolled the tier before the
+pod metadata record of [ADR 0007](0007-failover-aware-rolling-update.md) D2, and the
+revision trap below now excludes the metadata a CR author sets.
 
 Decided 2026-09-26 by Hans (D10): **a tier of one or two Sentinels rolls
 serially** — one Sentinel at a time, and only while every other one is
@@ -49,7 +58,10 @@ tier neither errored nor requeued — nor, since 2026-09-26, held a wait past it
 bound (D9). Both emission sites of the `RollingUpdateComplete` event —
 `finalizeRollingUpdate` and `verifyTopologyRestored` — belong to the data tier,
 and both clear the
-rolling-update state annotation in the same breath. That clearing is load-bearing:
+rolling-update state annotation in the same breath. *(Since 2026-09-29 there is a
+third, `handleSentinelSinglePodRollingUpdate` — a Sentinel cluster with one data
+pod, [ADR 0007](0007-failover-aware-rolling-update.md) D11 — whose state
+`finishDataRoll` clears in the same pass.)* That clearing is load-bearing:
 the absence of the state annotation is what means "no data-tier update in
 flight" (ADR 0010 — once it is gone, nothing calls `detectAndResolveSplitBrain`).
 
@@ -68,8 +80,12 @@ Sentinel-tier completion from the log at all — only from live cluster state.
 Anything sequencing on "Completed" (a human, a pipeline) acts too early. The
 status surface was wrong during that window too: while Sentinel pods roll, the
 pass ends before `updateStatus`, so the phase kept showing the last data-tier
-value — and on a Sentinel-only spec change (Sentinel podLabels, resources) it
-showed `OK` for the whole roll, violating the status contract ("OK when
+value — and on a Sentinel-only spec change ~~(Sentinel podLabels, resources)~~
+*(resources; corrected 2026-10-05: a `spec.sentinel.podLabels` change rolled no
+Sentinel pod at all until the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2, amended 2026-10-05 — the
+parenthesis was written with this ADR and `sentinelPodNeedsUpdate` never read
+labels)* it showed `OK` for the whole roll, violating the status contract ("OK when
 healthy, otherwise the current task").
 
 One trap constrained the design: a second convergence predicate already exists.
@@ -77,7 +93,13 @@ One trap constrained the design: a second convergence predicate already exists.
 revision-based, while the roll driver is image/hash-based. The two can disagree —
 a template change covered by no hash bumps the controller revision but rolls
 nothing — so a completion marker on the revision predicate could wait forever
-for pods the driver will never replace.
+for pods the driver will never replace. *(Narrowed 2026-10-05: the pod labels and
+annotations a CR author sets are covered since the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2, which on this tier also
+replaces a pod without a record, so a `spec.sentinel` metadata change no longer
+leaves `sentinelRolloutComplete` false. Template metadata the operator owns is still
+covered by no record — a release that changes such a label or annotation moves the
+revision and rolls nothing — so the trap stands and D3 is unchanged.)*
 
 ## Decision
 
@@ -90,7 +112,13 @@ for pods the driver will never replace.
   2026-08-25, when a data-tier wait past its bound began to continue the pass
   into the Sentinel roll. A holding data tier now holds the Sentinel roll, which
   restores the ordering except in the pass in which a data roll pauses — see
-  D9.)*
+  D9.)* *(Amended 2026-09-29: the data-tier event has two sources —
+  `finalizeRollingUpdate` on the failover roll, and
+  `handleSentinelSinglePodRollingUpdate` for a Sentinel cluster with one data
+  pod, which is rolled as a single pod since
+  [ADR 0007](0007-failover-aware-rolling-update.md) D11 and emits it in the pass
+  whose Sentinel roll starts. Until then that topology never completed a data
+  roll, so neither event ever fired on it.)*
 - **D2 — The `SentinelUpdatePending` condition is the level, and its previous
   value is the memory.** `checkAndHandleSentinelRollingUpdate` sets it to True
   (reason `SentinelPodsOutdated`, message carrying the progress count) whenever
@@ -233,7 +261,13 @@ for pods the driver will never replace.
   (`PodTerminationStalled`, `PodRecreationStalled`, `PodAvailabilityStalled`).
   The exception left is the pause: `pauseRollingUpdate` returns an empty result
   — no requeue, no deferral — so the pass in which a data roll pauses runs the
-  Sentinel roll (*Residual risks*). What keeps the two evaluators of
+  Sentinel roll (*Residual risks*). *(Since 2026-09-29 a second case is by design:
+  the single data pod of a Sentinel cluster that defers its change holds nothing
+  either, and no `RollingUpdateComplete` fires. A deferral that interrupts a
+  recorded replacement is waited out until the pod is available, and no deferral
+  holds the Valkey image, the TLS material or the configuration, so no Sentinel is
+  taken onto a data spec that does not come up or a protocol the data pod does not
+  serve — [ADR 0007](0007-failover-aware-rolling-update.md) D11.)* What keeps the two evaluators of
   `PodAvailabilityStalled` from contending within a pass is narrower than the
   ordering and has no exception: a data stall result always carries
   `DeferredRequeueAfter`, so a pass that reports a data stall never runs the
@@ -549,7 +583,8 @@ for pods the driver will never replace.
   `checkAndHandleSentinelRollingUpdate`, `dispatchSentinelRollingUpdate`,
   `finishSentinelRollingUpdate`, `sentinelWait`, `sentinelScan` (`observe`,
   `deleteTarget`), `recordSentinelUpdateProgress`, `sentinelUpdatePending`,
-  `finalizeRollingUpdate`; D9: `availabilityWait`, `podNotReadySince`,
+  `finalizeRollingUpdate`, `handleSentinelSinglePodRollingUpdate` (D1's second
+  source); D9: `availabilityWait`, `podNotReadySince`,
   `stampedAtFirstSync`, `firstSyncSlack`, `reportAvailabilityStall`,
   `expiredUnavailablePod`, `terminationWait`, `pauseRollingUpdate` (the
   exception to the hold); D10: `sentinelDeleteKeepsVotes` and its call in

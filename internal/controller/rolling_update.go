@@ -38,7 +38,7 @@ const (
 	annotationFailoverTimestamp = "vko.gtrfc.com/failover-timestamp"
 
 	// Rolling update states:
-	stateReplacingReplicas = "replacing-replicas" // Replacing replica pods one by one.
+	stateReplacingReplicas = "replacing-replicas" // Replacing replica pods one by one, or the only data pod of a Sentinel cluster (ADR 0007 D11).
 	stateFailoverTriggered = "failover-triggered" // Sentinel failover has been triggered.
 	stateFailoverReset     = "failover-reset"     // Sentinel was reset after a timed-out failover; waiting to retrigger.
 	stateReplacingMaster   = "replacing-master"   // Replacing the former master pod.
@@ -194,6 +194,13 @@ type RollingUpdateResult struct {
 	// docs/adr/0018-metrics-and-the-exporter-sidecar.md, D11).
 	securityDeferred podSecurityPending
 
+	// updateDeferred reports that the single-pod handler held an outdated pod back
+	// (singlePodDeferral) instead of replacing it. The pass ends on nothing, so the
+	// Sentinel roll is not held by it -- except while a replacement of that pod is
+	// recorded, which handleSentinelSinglePodRollingUpdate settles first
+	// (docs/adr/0007-failover-aware-rolling-update.md, D11).
+	updateDeferred bool
+
 	// availabilityStall names the pod an availability wait outlived its budget on,
 	// nil otherwise. availabilityWait sets it and writes nothing; the tier's
 	// evaluator turns it into PodAvailabilityStalled, so the condition has exactly
@@ -219,6 +226,11 @@ type RollingUpdateResult struct {
 
 // rollingUpdateRequeueDelay is the default delay between rolling update steps.
 const rollingUpdateRequeueDelay = 10 * time.Second
+
+// dataRollCompleteMessage is the message of the RollingUpdateComplete Event. The event
+// covers the data tier only: the Sentinel tier rolls afterwards and reports its own
+// SentinelUpdateComplete (docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
+const dataRollCompleteMessage = "Rolling update of the data pods completed successfully; any outdated Sentinel pods are rolled next"
 
 // checkAndHandleRollingUpdate checks if any pods need updating and orchestrates the
 // rolling update of the data tier, and it is that tier's evaluator of
@@ -351,15 +363,7 @@ func (r *ValkeyReconciler) dispatchDataRollingUpdate(ctx context.Context, v *vko
 		logger.Info("Rolling update detected", "desiredImage", desiredImage)
 	}
 
-	var result RollingUpdateResult
-	switch {
-	case v.IsSentinelEnabled():
-		result = r.handleRollingUpdate(ctx, v, currentSts)
-	case v.IsMultiReplicaWithoutSentinel():
-		result = r.handleMultiReplicaRollingUpdate(ctx, v, currentSts)
-	default:
-		result = r.handleStandaloneRollingUpdate(ctx, v, currentSts)
-	}
+	result := r.rollDataTier(ctx, v, currentSts)
 
 	if result.Completed {
 		if err := r.finishDataRoll(ctx, v, currentSts); err != nil {
@@ -369,6 +373,118 @@ func (r *ValkeyReconciler) dispatchDataRollingUpdate(ctx context.Context, v *vko
 	return result
 }
 
+// rollDataTier hands the data-tier roll to the handler of the topology. It is its own
+// function because the dispatch above sits at the cyclomatic ceiling.
+func (r *ValkeyReconciler) rollDataTier(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet) RollingUpdateResult {
+	switch {
+	case singleDataPodBehindSentinel(v, currentSts):
+		return r.handleSentinelSinglePodRollingUpdate(ctx, v, currentSts)
+	case v.IsSentinelEnabled():
+		return r.handleRollingUpdate(ctx, v, currentSts)
+	case v.IsMultiReplicaWithoutSentinel():
+		return r.handleMultiReplicaRollingUpdate(ctx, v, currentSts)
+	default:
+		return r.handleStandaloneRollingUpdate(ctx, v, currentSts)
+	}
+}
+
+// singleDataPodBehindSentinel reports a Sentinel cluster whose data tier is one pod,
+// by the CR and by the persisted StatefulSet alike
+// (docs/adr/0007-failover-aware-rolling-update.md, D11). Either count alone sends a
+// scale in flight down the wrong path: a scale-down the StatefulSet does not carry yet
+// (CR 1, StatefulSet 3) would reach a handler that deletes the master without a
+// failover, and a scale-up it does not carry yet (CR 3, StatefulSet 1) would restart
+// the only pod one pass before the replicas it can fail over to exist.
+func singleDataPodBehindSentinel(v *vkov1.Valkey, sts *appsv1.StatefulSet) bool {
+	return v.IsSentinelEnabled() && v.Spec.Replicas == 1 &&
+		sts.Spec.Replicas != nil && *sts.Spec.Replicas == 1
+}
+
+// handleSentinelSinglePodRollingUpdate rolls the data tier of a Sentinel cluster with
+// one data pod the way a single pod without Sentinel is rolled
+// (docs/adr/0007-failover-aware-rolling-update.md, D11). The failover roll has nothing
+// to promote there: Sentinel refused every failover, clearStaleRollingUpdateState
+// discarded the state recorded for it, and the next pass asked again -- the only pod
+// was never replaced, and the Sentinel roll behind it never ran.
+//
+// Around handleStandaloneRollingUpdate the route keeps one state, stateReplacingReplicas,
+// meaning "a replacement of the pod may be in flight": recordSinglePodReplacement writes
+// it before a delete, and while it stands every pass re-enters the dispatch, whose waits
+// hold the Sentinel roll (ADR 0026 D11). Three things keep it honest:
+//
+//   - a state the failover roll left is restated as ours, never dropped: a scale-down
+//     in the middle of that roll can leave the only pod missing or booting, and a
+//     dropped state would release the Sentinel roll onto a data tier without a pod;
+//   - a deferral while the state stands is settled here (settleDeferredReplacement): the
+//     pod is waited on until it is available, then the state is cleared;
+//   - the completion is announced as RollingUpdateComplete (ADR 0024 D1), and
+//     finishDataRoll clears the state in the same pass, whose Sentinel roll follows.
+func (r *ValkeyReconciler) handleSentinelSinglePodRollingUpdate(ctx context.Context, v *vkov1.Valkey,
+	currentSts *appsv1.StatefulSet) RollingUpdateResult {
+	if state := r.getRollingUpdateState(v); state != "" && state != stateReplacingReplicas {
+		if err := r.restateAsSinglePodReplacement(ctx, v, state); err != nil {
+			return RollingUpdateResult{Error: err}
+		}
+	}
+	result := r.handleStandaloneRollingUpdate(ctx, v, currentSts)
+	switch {
+	case result.Completed:
+		r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete", dataRollCompleteMessage)
+	case result.updateDeferred && r.getRollingUpdateState(v) != "":
+		return r.settleDeferredReplacement(ctx, v, currentSts, result)
+	}
+	return result
+}
+
+// restateAsSinglePodReplacement replaces a state the failover roll left on the CR with
+// stateReplacingReplicas. clearRollingUpdateState drops the failover's annotations and
+// the in-memory wait bounds with it, so the replacement starts on fresh budgets.
+func (r *ValkeyReconciler) restateAsSinglePodReplacement(ctx context.Context, v *vkov1.Valkey, state string) error {
+	log.FromContext(ctx).Info("Restating a failover rolling-update state as a single-pod replacement",
+		"staleState", state)
+	if err := r.clearRollingUpdateState(ctx, v); err != nil {
+		return err
+	}
+	return r.setRollingUpdateState(ctx, v, stateReplacingReplicas)
+}
+
+// settleDeferredReplacement ends a recorded replacement whose pod the handler now
+// defers -- an operator upgrade moved the sidecar while the replacement was on its way,
+// or the state was left by an earlier roll. A deferral holds nothing, so releasing it
+// while the pod has not come up would take the Sentinel roll onto a data spec that
+// may never start (ADR 0026 D11). The pod is therefore waited on like any
+// replacement, the deferral's report carried along, and the state is cleared once
+// the pod is available: nothing is being replaced any more.
+func (r *ValkeyReconciler) settleDeferredReplacement(ctx context.Context, v *vkov1.Valkey,
+	currentSts *appsv1.StatefulSet, deferred RollingUpdateResult) RollingUpdateResult {
+	podName := fmt.Sprintf("%s-0", currentSts.Name)
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+		return RollingUpdateResult{Error: fmt.Errorf("getting pod %s: %w", podName, err)}
+	}
+	if wait := standaloneWait(ctx, r, v, pod, "Waiting for the replaced pod before its deferred update"); wait != nil {
+		wait.securityDeferred = deferred.securityDeferred
+		return *wait
+	}
+	if err := r.clearRollingUpdateState(ctx, v); err != nil {
+		return RollingUpdateResult{Error: err}
+	}
+	return deferred
+}
+
+// recordSinglePodReplacement records stateReplacingReplicas before the only data pod
+// of a Sentinel cluster is deleted (docs/adr/0007-failover-aware-rolling-update.md,
+// D11). Without a state the passes until the replacement is available never reach the
+// handler -- the dispatch skips a missing pod and a current one, and sees no roll -- so
+// the Sentinel roll would start while the data tier is down. A single pod without
+// Sentinel records nothing, as before: no second tier waits on it.
+func (r *ValkeyReconciler) recordSinglePodReplacement(ctx context.Context, v *vkov1.Valkey) error {
+	if !v.IsSentinelEnabled() || r.getRollingUpdateState(v) != "" {
+		return nil
+	}
+	return r.setRollingUpdateState(ctx, v, stateReplacingReplicas)
+}
+
 // finishDataRoll is the completion of a data-tier roll. It runs here, at the single
 // point every dispatch target reports Completed, rather than inside each of them.
 // handleStandaloneRollingUpdate reported Completed without clearing anything, and it
@@ -376,7 +492,9 @@ func (r *ValkeyReconciler) dispatchDataRollingUpdate(ctx context.Context, v *vko
 // mid-restoration flips IsMultiReplicaWithoutSentinel and re-routes the very next
 // pass there. The rolling-update state, the promoted pod and the wait bounds then
 // stayed on the CR forever, and the in-memory bounds pre-expired the budget of the
-// next update (ADR 0010 D10 again).
+// next update (ADR 0010 D10 again). It is also where a Sentinel cluster with one data
+// pod completes, carrying the replacing-replicas state its route recorded
+// (docs/adr/0007-failover-aware-rolling-update.md, D11).
 //
 // The state clear is idempotent: clearRollingUpdateState returns without an API call
 // when no annotation is left, so the targets that already cleared their own state
@@ -510,14 +628,42 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 }
 
 // podOutdated is podNeedsUpdate against every input of the persisted data
-// StatefulSet, plus the image of every other container and init container and the
-// retired ownership repair. It is what every site of the data tier asks, so the
-// inputs cannot drift apart between them.
+// StatefulSet, plus the image of every other container and init container, the
+// pod metadata record and the retired ownership repair. It is what every site of
+// the data tier asks, so the inputs cannot drift apart between them.
 func podOutdated(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return podNeedsUpdate(pod, valkeyImageFromSts(sts), sidecarImageFromSts(sts), configHashFromSts(sts),
 		podSpecHashFromSts(sts), tlsMaterialHashFromSts(sts), sts.Spec.Template.Spec.Containers) ||
 		podImagesDrifted(pod, &sts.Spec.Template.Spec) ||
+		podMetadataHashChanged(pod, podMetadataHashFromSts(sts)) ||
 		podCarriesRetiredRepair(pod, sts)
+}
+
+// podMetadataHashChanged returns true when a data pod carries a pod metadata
+// record (builder.PodMetadataHashEnvName) that differs from desiredHash. A pod
+// without the record, or an empty desired value, is not outdated: the data tier
+// keeps the presence rule of the TLS record, because a pod an operator before the
+// record built would otherwise be replaced by the upgrade alone -- the only data
+// pod of a non-persistent single-replica cluster together with its dataset
+// (docs/adr/0007-failover-aware-rolling-update.md, D2, D6). Every multi-replica
+// data pod takes the record in the roll each release causes with its new sidecar
+// image (docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md, D11). The
+// record is env, which no pod update can remove, so the presence rule is no way
+// out of the comparison for a pod that has one (ADR 0031). The Sentinel tier holds
+// no dataset and drops the presence rule (sentinelPodMetadataOutdated).
+func podMetadataHashChanged(pod *corev1.Pod, desiredHash string) bool {
+	if desiredHash == "" {
+		return false
+	}
+	podHash := builder.RecordedPodMetadataHash(&pod.Spec)
+	return podHash != "" && podHash != desiredHash
+}
+
+// podMetadataHashFromSts returns the pod metadata record of a StatefulSet's pod
+// template, or empty string when no container carries one. Read off the persisted
+// template for the reason valkeyImageFromSts gives.
+func podMetadataHashFromSts(sts *appsv1.StatefulSet) string {
+	return builder.RecordedPodMetadataHash(&sts.Spec.Template.Spec)
 }
 
 // podCarriesRetiredRepair reports a pod created while the data template carried the
@@ -861,6 +1007,15 @@ func (r *ValkeyReconciler) handleRollingUpdate(ctx context.Context, v *vkov1.Val
 		return *result
 	}
 
+	// A tier of one has no replica to fail over to, and Sentinel refuses every failover
+	// it is asked for. The single-pod route takes that tier when the CR asks for one pod
+	// as well; a CR that asks for more waits here, the pass continuing, until the
+	// StatefulSet carries the scale-up (docs/adr/0007-failover-aware-rolling-update.md,
+	// D11).
+	if totalPods == 1 {
+		return RollingUpdateResult{DeferredRequeueAfter: rollingUpdateRequeueDelay}
+	}
+
 	// Step 2: All replicas are updated. Now handle the master failover and replacement.
 	if result := r.handleMasterFailover(ctx, v, pods, masterIdx); result != nil {
 		return *result
@@ -1033,11 +1188,7 @@ func (r *ValkeyReconciler) finalizeRollingUpdate(ctx context.Context, v *vkov1.V
 	}
 
 	logger.Info("Rolling update complete, all data pods running new image")
-	// This event covers the data tier only: the Sentinel tier rolls afterwards
-	// and reports its own SentinelUpdateComplete
-	// (docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md).
-	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete",
-		"Rolling update of the data pods completed successfully; any outdated Sentinel pods are rolled next")
+	r.recordEvent(v, corev1.EventTypeNormal, "RollingUpdateComplete", dataRollCompleteMessage)
 	// Clean up state annotation.
 	if err := r.clearRollingUpdateState(ctx, v); err != nil {
 		return RollingUpdateResult{Error: err}
@@ -3941,7 +4092,10 @@ func coordinatedFallbackReason(mode string, err error) string {
 	return ""
 }
 
-// handleStandaloneRollingUpdate handles rolling update for non-HA (no Sentinel) mode.
+// handleStandaloneRollingUpdate handles the rolling update of a single data pod: a
+// cluster without Sentinel, and a Sentinel cluster with one data pod, which
+// handleSentinelSinglePodRollingUpdate routes here because there is no replica to fail
+// over to (docs/adr/0007-failover-aware-rolling-update.md, D11).
 //
 // When the valkey image changes, the pod is deleted so the StatefulSet recreates it
 // with the new template. When only the sidecar image changed (operator upgrade)
@@ -3998,6 +4152,14 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 				continue
 			}
 
+			// Before the terminating check, so a replacement somebody else started (an
+			// eviction, a manual delete) is recorded and waited out like the operator's
+			// own; and before the phase write, which refreshes v from the cache, so the
+			// state update carries the resourceVersion of this pass's own last write.
+			if err := r.recordSinglePodReplacement(ctx, v); err != nil {
+				return RollingUpdateResult{Error: err}
+			}
+
 			// A single-pod tier: the delete gate is the terminating check. Deleting
 			// the only pod again while it terminates is the no-op this whole rule
 			// started from (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D1,
@@ -4034,7 +4196,7 @@ func (r *ValkeyReconciler) handleStandaloneRollingUpdate(ctx context.Context, v 
 		// The update is deferred — no active rolling update in progress. Return no
 		// requeue; the conditions remain set until the next natural pod restart
 		// clears them.
-		return RollingUpdateResult{securityDeferred: securityPending}
+		return RollingUpdateResult{securityDeferred: securityPending, updateDeferred: true}
 	}
 
 	// All pods updated and ready.
@@ -5029,12 +5191,15 @@ func (r *ValkeyReconciler) finalizeMultiReplicaRollingUpdate(ctx context.Context
 }
 
 // sentinelPodNeedsUpdate returns true if the Sentinel pod's images, pod-spec hash,
-// config hash or TLS material fingerprint differ from what the sentinel StatefulSet
-// template specifies.
+// config hash, pod metadata record or TLS material fingerprint differ from what the
+// sentinel StatefulSet template specifies.
 func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
 	// Check the images of every container and init container, by name -- the
 	// same rule as the data tier's (podImagesDrifted).
 	if podImagesDrifted(pod, &desiredTemplate.Spec) {
+		return true
+	}
+	if sentinelPodMetadataOutdated(pod, desiredTemplate) {
 		return true
 	}
 	// Check pod spec hash annotation: trigger update when the pod carries a hash
@@ -5062,6 +5227,20 @@ func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateS
 	// never been measured -- the tier is rolled.
 	return podTLSMaterialHashChanged(pod,
 		builder.RecordedTLSMaterialHash(&desiredTemplate.Spec, desiredTemplate.Annotations))
+}
+
+// sentinelPodMetadataOutdated reports a Sentinel pod whose pod metadata record
+// differs from the template's -- a missing record included. That is the one input
+// without the presence rule (docs/adr/0007-failover-aware-rolling-update.md, D2):
+// the template carries the record from the release that introduced it, and the
+// Sentinel tier does not otherwise roll on an operator upgrade (ADR 0005 D11), so
+// with the presence rule its StatefulSet would keep a revision no pod runs, and a
+// spec.sentinel metadata change would roll none of the pods from before the record.
+// The tier holds no dataset, so the one roll this costs replaces nothing that
+// carries data. An empty desired value is still "cannot tell" (ADR 0007 D3).
+func sentinelPodMetadataOutdated(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	desired := builder.RecordedPodMetadataHash(&desiredTemplate.Spec)
+	return desired != "" && builder.RecordedPodMetadataHash(&pod.Spec) != desired
 }
 
 // sentinelScan is one sweep over the Sentinel tier: everything
@@ -5273,8 +5452,9 @@ func (r *ValkeyReconciler) dispatchSentinelRollingUpdate(ctx context.Context, v 
 	// A roll is in flight. Record it before acting: the True condition is the
 	// memory whose flip back to False is the completion edge, and the phase is
 	// the status contract's "current task" — the data tier's RollingUpdateComplete
-	// has already fired at this point (or, on a Sentinel-only spec change, the
-	// data tier never rolled and the phase would otherwise keep reading OK).
+	// has already fired at this point (or, on a Sentinel-only spec change or beside
+	// a single data pod that defers its change (ADR 0007 D11), the data tier never
+	// rolled and the phase would otherwise keep reading OK).
 	r.recordSentinelUpdateProgress(ctx, v, scan.updatedReadyCount, totalSentinels)
 
 	target, cost := scan.deleteTarget()
@@ -5390,7 +5570,7 @@ func (r *ValkeyReconciler) recordSentinelUpdateProgress(ctx context.Context, v *
 // the pod deleted last is still booting, and "complete" would fire while it
 // does, which is the same too-early edge this marker exists to remove (the
 // data tier's RollingUpdateComplete already fires before the Sentinel tier
-// starts). The completion event is gated on the condition flip actually
+// starts, whenever the data tier rolls). The completion event is gated on the condition flip actually
 // landing, so it is emitted exactly once per roll; a failed flip requeues,
 // because with every pod Ready nothing else re-triggers the pass.
 //

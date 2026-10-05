@@ -80,24 +80,7 @@ func StampTLSMaterialHash(sts *appsv1.StatefulSet, containerName, hash string) {
 	if hash == "" {
 		return
 	}
-
-	containers := sts.Spec.Template.Spec.Containers
-	for i := range containers {
-		if containers[i].Name != containerName {
-			continue
-		}
-		for j := range containers[i].Env {
-			if containers[i].Env[j].Name == TLSMaterialHashEnvName {
-				containers[i].Env[j].Value = hash
-				return
-			}
-		}
-		containers[i].Env = append(containers[i].Env, corev1.EnvVar{
-			Name:  TLSMaterialHashEnvName,
-			Value: hash,
-		})
-		return
-	}
+	stampTemplateEnv(sts, containerName, TLSMaterialHashEnvName, hash)
 }
 
 // RecordedTLSMaterialHash returns the TLS material fingerprint recorded on a pod

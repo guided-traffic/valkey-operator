@@ -413,7 +413,10 @@ func (r *ValkeyReconciler) reconcileWorkload(ctx context.Context, valkey *vkov1.
 // pass, so the Sentinel tier rolls after the data tier
 // (docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11; ADR 0024 D1). One
 // exception is known and recorded there: a paused data roll (pauseRollingUpdate)
-// returns no requeue at all, so the pass that pauses does run the Sentinel roll.
+// returns no requeue at all, so the pass that pauses does run the Sentinel roll. A
+// Sentinel cluster whose single data pod defers its change is not holding either
+// (ADR 0007 D11): the deferral is honoured only once the pod is available, and it holds
+// no Valkey image, TLS material or configuration, so the Sentinel roll runs.
 func (r *ValkeyReconciler) handlePostRollingUpdateChecks(ctx context.Context, v *vkov1.Valkey,
 	dataTierHolding bool) (ctrl.Result, bool, error) {
 	sentinelDeferred, done, err := r.runSentinelRollingUpdate(ctx, v, dataTierHolding)
@@ -1292,6 +1295,9 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
+	// The pod metadata record goes onto the sidecar, after the builder, so the
+	// pod-spec hash never sees it (ADR 0031 D3; ADR 0007 D2).
+	builder.StampPodMetadataHash(desired, builder.SidecarContainerName, builder.DataPodMetadataHash(v))
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
@@ -1463,6 +1469,7 @@ func (r *ValkeyReconciler) reconcileSentinelHeadlessService(ctx context.Context,
 func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelStatefulSet(v)
+	builder.StampPodMetadataHash(desired, builder.SentinelContainerName, builder.SentinelPodMetadataHash(v))
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {

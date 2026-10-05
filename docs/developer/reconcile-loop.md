@@ -112,7 +112,11 @@ order is swapped.
    early while waiting for a recreated pod — exactly when a blocked recreation needs the nudge
    ([ADR 0003](../adr/0003-nudge-a-short-of-pods-statefulset.md) D7).
 2. **The data-tier rolling update**, `checkAndHandleRollingUpdate`
-   ([`rolling_update.go`](../../internal/controller/rolling_update.go)). An error writes phase
+   ([`rolling_update.go`](../../internal/controller/rolling_update.go)). `rollDataTier` picks the
+   handler by topology; a Sentinel cluster whose CR and data StatefulSet both ask for one pod
+   goes to the single-pod handler, which records `replacing-replicas` before its delete so the
+   passes until the replacement is available hold the Sentinel roll
+   ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11). An error writes phase
    `Error` and returns it; `NeedsRequeue` ends the pass with that delay; a
    `DeferredRequeueAfter` — a wait past its bound — is kept for the end of the pass and marks
    the data tier as holding. One such wait is the handover gate of a Sentinel roll
