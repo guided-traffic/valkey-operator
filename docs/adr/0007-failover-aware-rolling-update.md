@@ -15,6 +15,31 @@ metrics. Such a pod is decided by `singlePodDeferral` the way a root pod is, and
 `PodSecurityUpdatePending=True/ExporterOutdated` when it is held. The residual's sentence that
 the deferral "cannot be tightened" is marked in place.
 
+Amended 2026-09-29: **D11 is new — a Sentinel cluster with one data pod is rolled as a single
+pod — and D6 and D7 are amended with it.** D1's sequence needs a replica to promote, and the
+dispatch sent every Sentinel cluster to it whatever its size: with one data pod the roll asked
+Sentinel for a failover about every 15 s, Sentinel refused each one, and neither the data pod nor
+any Sentinel pod behind it ever took a change (*Context*). `rollDataTier` now routes that topology
+to `handleStandaloneRollingUpdate`, so D6 and its amendments decide it as they decide a single pod
+without Sentinel. The adversarial review of that change found that a sidecar-only deferral held
+certificate rotations and configuration changes on every rootless single pod, and on this route
+let the tiers diverge; Hans decided that a rotated TLS record or a changed config hash is never a
+sidecar-only delta (D6, amended), with a guard that makes a release changing the rendered
+configuration a decision (D7, amended). The review's other findings are closed in D11 itself:
+a deferral interrupting a recorded replacement is settled before it releases the Sentinel roll, a
+failover state left by a scale-down is restated rather than dropped, a replacement somebody else
+started is recorded, and a tier of one under a CR asking for more waits instead of asking
+Sentinel for a failover. D1 and D6 are marked in place. Implemented; unit-tested and
+mutation-checked (the D11 guard below). The e2e `TestE2E_RollingUpdate_SentinelSingleDataPod`
+([`sentinel_single_pod_test.go`](../../test/e2e/sentinel_single_pod_test.go)) passed three times
+in a row before the review fixes, three times after them and once on the final code, on
+2026-09-29 on a local Kind
+cluster (control plane + 3 workers, Kubernetes v1.36.1, an operator image built from this tree):
+the only data pod replaced from Valkey 8 to 9 with no `FailoverTriggered`, its saved key kept,
+Sentinel naming it as master again, every replaced Sentinel pod created after
+`RollingUpdateComplete`, no Warning Event. It ran alone, not in a full suite and not in CI; the
+configuration and rotation paths of the D6 amendment are unit-tested only.
+
 The strategy itself predates this ADR set; the template-source and freshness-guard
 decisions below landed on branch `feat/support-pdb`.
 
@@ -140,6 +165,25 @@ Guards, per decision:
   both full local suites the same day, 51/51 on Valkey 9 and on Valkey 8, and again inside both
   full suites on one operator image built from the final code of the branch, 53/53 on each line —
   Kind, Kubernetes 1.36.1, containerd 2.3.1, runc 1.4.2, Linux 6.10; locally, not in CI.)*
+* D11 — the twelve tests of
+  [`sentinel_single_pod_roll_test.go`](../../internal/controller/sentinel_single_pod_roll_test.go):
+  the replacement without a failover (an image change, and a persistent pod that runs as root),
+  a configuration change behind a stale sidecar replaced, a held non-persistent root pod
+  reported, a leftover failover state restated and settled, a replacement somebody else started
+  recorded, the pass-by-pass hold of the Sentinel roll up to the completion, a deferral that
+  releases it and one that interrupts a recorded replacement and does not, a tier of one under a
+  CR asking for more, a scale-down the StatefulSet does not carry yet, and the route predicate.
+  The D6 and D7 amendments of 2026-09-29: `TestSinglePodDeferral_ARotationOrAConfigChangeIsNotSidecarOnly`
+  ([`pod_security_migration_test.go`](../../internal/controller/pod_security_migration_test.go))
+  and `TestComputeConfigHash_PinnedForTheSinglePodRule`
+  ([`configmap_test.go`](../../internal/builder/configmap_test.go)). Mutation-checked on
+  2026-09-29, each mutation restored and `cmp`-verified: the old dispatch turns four red (it keeps
+  the pod, records `failover-triggered` and emits `FailoverTriggered` — the first step of the
+  loop, now reproduced in a unit test); dropping the `RollingUpdateComplete` Event, the
+  StatefulSet count of the route predicate, the settle, the restate, the early record, the
+  tier-of-one guard, the TLS or the configuration term of `sidecarOnlyDelta`, or letting a
+  deferral hold, each turns its own test red, and a changed rendered configuration turns the
+  pinned hashes red.
 
 Amended 2026-08-22: **D10 is new.** D1 and D9 both say the failover waits on replication
 state, and the code asked only `master_sync_in_progress`, which a replica that has not
@@ -180,6 +224,24 @@ holds is the fix and its guard — `TestReconcile_BlockedStatefulSetWriteDoesNot
 drives three passes against a rejected StatefulSet `Update` and asserts the pod survives
 every one of them.
 
+The failure that forced D11: a Sentinel cluster with one data pod — the default shape, since
+`spec.replicas` defaults to 1 and nothing refuses `sentinel.enabled` beside it — went to the
+failover roll like every Sentinel cluster. `replaceNextReplica` found no candidate, and
+`handleMasterFailover` passed every gate vacuously: `waitForReplicasReady` had no replica to
+ask, and `waitForWriteSync` returns at zero replicas. It recorded `failover-triggered`, emitted
+`FailoverTriggered` and asked every Sentinel for a failover, which each refused (`NOGOODSLAVE`,
+nothing to promote); on the next pass `clearStaleRollingUpdateState` discarded the state because
+no pod counted as replaced, and the same step ran again, about every 15 s. Every pass ended on
+that requeue, before the Sentinel roll and before the status write. The sidecar image is the
+operator image, so every operator upgrade entered the loop, and so did every change of the
+image, the configuration, the pod spec or the TLS material: the data pod and every Sentinel pod
+kept their old spec — the root posture of earlier releases
+([ADR 0032](0032-generated-pods-run-rootless.md)) and rotated-away TLS material
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md))
+included — with the status frozen and no condition saying why, until a human deleted the pod or
+scaled the cluster. Found by reading; the first step of the loop is reproduced by a unit test
+under the old dispatch (D11's guard), the loop itself was not run against a cluster.
+
 ## Decision
 
 **D1 — The rolling-update sequence is fixed.** Replace replica pods one by one; verify
@@ -193,7 +255,7 @@ and no maximum). Failing over only once every replica already runs the new spec
 guarantees the promotion target is up to date and synced, so the failover cannot promote
 a pod that would then have to full-resync. Replacing the master last means the pod
 holding the authoritative dataset is disturbed exactly once, at the end, when a synced
-successor already exists. *(Amended 2026-09-28: the controlled failover is `SENTINEL FAILOVER <name> COORDINATED` where the Sentinel supports it and the forced command otherwise — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1.)* *(Implemented 2026-09-28: the Sentinel roll's first trigger, `handleMasterFailover`, sends the coordinated command; a Sentinel that refuses the option itself — `NOGOODPRIMARY`, or the `ERR` a Sentinel before Valkey 9.0 answers — is asked the forced command at once, and so is every later Sentinel of that pass (`coordinatedFallbackReason`). The retrigger after a failover that did not complete, `handleFailoverRetrigger`, and the sidecar's drain failover stay forced. The non-Sentinel roll's promotion is unchanged.)*
+successor already exists. *(Amended 2026-09-29: a Sentinel cluster with one data pod has no replica to migrate or promote and is not rolled by this sequence; it is rolled as a single pod, D11.)* *(Amended 2026-09-28: the controlled failover is `SENTINEL FAILOVER <name> COORDINATED` where the Sentinel supports it and the forced command otherwise — [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D1.)* *(Implemented 2026-09-28: the Sentinel roll's first trigger, `handleMasterFailover`, sends the coordinated command; a Sentinel that refuses the option itself — `NOGOODPRIMARY`, or the `ERR` a Sentinel before Valkey 9.0 answers — is asked the forced command at once, and so is every later Sentinel of that pass (`coordinatedFallbackReason`). The retrigger after a failover that did not complete, `handleFailoverRetrigger`, and the sidecar's drain failover stay forced. The non-Sentinel roll's promotion is unchanged.)*
 
 **D2 — Every "desired" input comes from the live StatefulSet, never from the CR.** Five
 are named values: `valkeyImageFromSts(sts)`, `sidecarImageFromSts(sts)`,
@@ -272,9 +334,10 @@ to the previously recorded master, closing the window in which the cluster carri
 master the annotation does not name — the rule that owns it is
 [ADR 0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) D5.
 
-**D6 — A sidecar-only delta on a single-replica non-Sentinel cluster is deferred, never
+**D6 — A sidecar-only delta on a single-replica ~~non-Sentinel~~ cluster is deferred, never
 applied** *(for a pod that runs rootless; a root pod is decided by `singlePodDeferral` since
-2026-09-26, see the amendment below)*. `handleStandaloneRollingUpdate` detects a change
+2026-09-26, see the amendment below)* *(with or without Sentinel since 2026-09-29: a Sentinel
+cluster with one data pod reaches `handleStandaloneRollingUpdate` too, D11)*. `handleStandaloneRollingUpdate` detects a change
 affecting exclusively the sidecar image on a true standalone (`isSidecarOnlyChange`), sets
 `SidecarUpdatePending=True`, and leaves the pod running the old sidecar image. Restarting
 it would trade in-memory data for a sidecar bump. **Documentation must state that
@@ -283,9 +346,10 @@ pod "is restarted and its in-memory data is lost", which would have had an admin
 downtime for nothing while never learning the real behaviour. That draft was corrected
 before it was committed, so the wrong sentence is development history and is not
 recoverable from this repository; only the correction is, in the message of commit
-`a0ac61f`. [`docs/operations/upgrading.md`](../operations/upgrading.md#a-single-replica-cluster-without-sentinel)
+`a0ac61f`. [`docs/operations/upgrading.md`](../operations/upgrading.md#a-single-replica-cluster)
 (ADR 0035; this record wrote the committed README here) states the deferral ("A
-single-replica cluster without Sentinel is not restarted for this"). Do not read the same
+single-replica cluster — with or without Sentinel — is not restarted for this", reworded
+2026-09-29 for D11). Do not read the same
 phrase in the committed metrics note
 ([`docs/operations/monitoring.md`](../operations/monitoring.md#enabling-metrics-on-a-running-cluster))
 as the defect: there the pod really is restarted, which is D7's counter-case.
@@ -318,7 +382,8 @@ and delete the only pod together with its `emptyDir`. A rootless single pod goes
 `isSidecarOnlyChange` exactly as described above.
 
 *Residual (2026-09-28), the single-pod cost of the widened image comparison above:* on a
-non-persistent single-replica non-Sentinel cluster the deferral still reads the valkey and
+non-persistent single-replica ~~non-Sentinel~~ cluster *(with or without Sentinel since
+2026-09-29, D11)* the deferral still reads the valkey and
 sidecar images only. An image written onto that pod's `exporter` or an init container while
 the sidecar image also differs reads to `isSidecarOnlyChange` as sidecar-only and is
 deferred with it — reported as `SidecarUpdatePending`, not replaced. ~~The deferral cannot be
@@ -333,6 +398,22 @@ written onto an init container is still read as sidecar-only.)* The pod-spec-has
 an upgrade is writable by the same principal (`vko.gtrfc.com/pod-spec-hash`). On every other
 topology — multi-replica or persistent — the swap is replaced by the ordinary
 failover-aware roll.
+
+*Amended 2026-09-29* (Hans, on the adversarial review of D11): **a sidecar-only delta is one the
+records can tell apart.** `isSidecarOnlyChange` compares the Valkey and sidecar images only, so
+a rootless single pod running the sidecar of an earlier operator — which every operator upgrade
+leaves on it — deferred every certificate rotation and every configuration change with the
+sidecar, for as long as the pod lived: the rotated-away key stayed in use
+([ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)), TLS or
+auth switched on stayed off, and beside Sentinel the Sentinel tier took a configuration the data
+pod did not serve (D11). `sidecarOnlyDelta` adds the two records outside the pod-spec hash: a pod
+whose TLS material record or config hash differs from the template is replaced — without
+persistence with its dataset, the cost a rotation (ADR 0030) and a configuration change of the
+CR author always carried, and the rule a root pod already had. A change of the pod spec alone
+still waits with the sidecar (D7). Holding the configuration change and, beside Sentinel, the
+Sentinel roll with it was the alternative and lost: a requested TLS or auth switch that silently
+does not arrive is the worse failure. The images, hashes and persistence still come from the
+persisted StatefulSet (D2).
 
 **D7 — The sidecar image must remain the only pod-spec delta an operator upgrade
 introduces for single-replica pods.** The D6 deferral compares **images only** *(for a
@@ -358,6 +439,14 @@ root pod enabling metrics is a pod-spec-hash change and waits with the posture u
 `PodSecurityUpdatePending`, whose message says that every other pending change of the pod
 spec applies on the next restart. Verified by reading `singlePodDeferral` and
 `ComputeConfigHash`, which metrics does not enter.
+
+*Amended 2026-09-29:* the rendered configuration is under the same rule. A changed config hash
+replaces a single pod whatever its sidecar does (D6, amended 2026-09-29), so a release that
+changes what `ComputeConfigHash` renders restarts every non-persistent single data pod at the
+operator upgrade, with its dataset. `TestComputeConfigHash_PinnedForTheSinglePodRule`
+([`configmap_test.go`](../../internal/builder/configmap_test.go)) pins the hash of four shapes and
+fails such a release first; the decision it asks for is this rule's. It sees only what the four
+shapes render. The TLS record needs no guard: it is Secret content, and no release moves it.
 
 **D8 — During an in-flight manual failover the split-brain resolver is told which pod
 was promoted.** `handleMultiReplicaRollingUpdate` passes `annotationPromotedPod` to
@@ -472,6 +561,63 @@ waits rather than assuming a yes (D3). The two counts are also logged on the way
 because after the delete of the outgoing master nothing can be asked about what the
 promotion was based on.
 
+**D11 — A Sentinel cluster with one data pod is rolled as a single pod.** When the CR and the
+persisted data StatefulSet both ask for one data pod (`singleDataPodBehindSentinel`),
+`rollDataTier` hands the data-tier roll to `handleStandaloneRollingUpdate`, not to D1's
+sequence: there is no replica to promote, so no failover precedes the delete. Every single-pod
+rule applies as it does without Sentinel — D6 and its amendments (a sidecar-only delta deferred
+under `SidecarUpdatePending`; a pod that runs as root or carries an outdated exporter replaced
+when persistent, held and reported as `PodSecurityUpdatePending` when not), the terminating
+gate, and the bounded waits of [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11.
+
+The route keeps one roll state, `replacing-replicas`, meaning "a replacement of the only pod may
+be in flight" (`handleSentinelSinglePodRollingUpdate`). While it stands every pass re-enters the
+dispatch — without a state the dispatch skips a missing pod and a current one and sees no roll —
+and the handler's waits hold the Sentinel roll (ADR 0026 D11):
+
+* it is recorded before the pod is deleted, and before the terminating check, so a replacement
+  somebody else started — an eviction, a manual delete of the outdated pod — is waited out like
+  the operator's own (`recordSinglePodReplacement`);
+* a state the failover roll left — a scale-down to one pod in the middle of that roll — is
+  restated as `replacing-replicas`, never dropped, since the only pod may then be missing or
+  booting (`restateAsSinglePodReplacement`). `replacing-replicas` is also the one state
+  `clearStaleRollingUpdateState` never discards, so a route that flips back to D1's sequence in
+  the middle of a replacement starts it normally;
+* a deferral while the state stands — an operator upgrade moved the sidecar while a replacement
+  was on its way — is settled first: the pod is waited on until it is available, the deferral's
+  report carried along, and then the state is cleared (`settleDeferredReplacement`);
+* the completion emits `RollingUpdateComplete`
+  ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D1), `finishDataRoll` clears
+  the state, and the Sentinel roll starts in the same pass.
+
+A deferral with no replacement recorded holds nothing: the handler returns neither a requeue nor
+a `DeferredRequeueAfter`, so the Sentinel roll runs in the same pass beside the held data pod and
+no `RollingUpdateComplete` fires, because the data tier did not roll. That is safe because of
+what a deferral can hold. The pod is up — a deferral that interrupts a replacement is settled
+first. And it holds the sidecar image with whatever the pod-spec hash carries (D7), never the
+Valkey image, the TLS material or the configuration: a new image replaces a held repair
+(`singlePodReplaceable`), and a rotated TLS record or a changed config hash is never a
+sidecar-only delta (D6, amended with this decision). So no Sentinel is taken onto a data spec that
+does not come up, nor onto a protocol — a TLS port, a password — the data pod does not serve.
+It is also what lets the Sentinel pods beside a held root data pod become rootless.
+
+Both counts decide the route, because either one alone sends a scale in flight down the wrong
+path: a scale-down the StatefulSet does not carry yet (CR 1, StatefulSet 3) would reach a handler
+that deletes the master without a failover, and a scale-up it does not carry yet (CR 3,
+StatefulSet 1) would restart the only pod before the replicas it can fail over to exist. That
+scale-up stays on D1's sequence, which holds a tier of one — the pass continuing, with a
+`DeferredRequeueAfter` — instead of asking Sentinel for a failover it can only refuse; it lasts as
+long as the StatefulSet does not carry the scale-up, one pass on a stale cache, or as long as a
+refused StatefulSet write, which its own step reports.
+
+While the pod restarts, Sentinel marks the master `o_down`, aborts its own failover for want of a
+replica (`-failover-abort-no-good-slave`) and keeps naming the pod to
+`get-master-addr-by-name`; within 15 s of the pod's return it reports `flags master` again —
+measured on docker with `valkey/valkey:9.1.1` and `8.1.9`, three Sentinels with the operator's
+settings, no operator, TLS, auth or persistence. The replacement's init container asks Sentinel
+for the master, gets its own hostname (`announce-hostnames yes`) and boots as master
+(`init-config-selector` in [`statefulset.go`](../../internal/builder/statefulset.go)) — by reading.
+
 ## Consequences
 
 * Behaviour change on the normal path from D2 is free: the operator watches
@@ -521,6 +667,22 @@ promotion was based on.
   included — until it is recreated for another reason or an administrator deletes it, and
   `PodSecurityUpdatePending` is the only signal. A persistent root single pod pays one
   restart at the operator upgrade instead: downtime, not data loss.
+* D11 charges a Sentinel cluster with one data pod what a single pod without Sentinel already
+  pays: every applied change is one restart of its only master — downtime until the replacement
+  is Ready, Sentinel reporting the master down meanwhile — and, without persistence, the dataset
+  on a replacement. What is deferred without Sentinel is deferred here, reported by the same
+  conditions: a sidecar-only delta, and without persistence the rootless posture and the exporter
+  update. The first pass after the operator upgrade that carries D11 takes what the loop had
+  held by these rules: the data pod is replaced when its Valkey image, TLS material or
+  configuration changed meanwhile, or when it is persistent and still runs as root; a
+  non-persistent root pod is held and named; anything else waits with the upgrade's sidecar. The
+  Sentinel tier rolls in every case.
+* The D6 amendment of 2026-09-29 makes a certificate rotation and a configuration change replace
+  every single data pod, with or without Sentinel, even while it runs an earlier operator's
+  sidecar — without persistence with its dataset, where the image-only test used to hold both
+  for the pod's lifetime. A release that changes the rendered configuration now restarts every
+  non-persistent single pod at the upgrade; the pinned hashes of D7's amendment make that a
+  decision the release has to take.
 * Serving stale data from a disconnected replica is the accepted trade of D9: the `-r`
   Service keeps such a pod in rotation. Any future desire to fail readiness on a broken
   master link changes the availability profile of the read Service.
@@ -571,6 +733,33 @@ not reproducible from this repository). The tie itself is verified by reading
 
 Would remove disconnected replicas from the read Service. Not adopted; it would also make
 readiness a second, partial source of truth about replication.
+
+### Keep the failover roll for a Sentinel cluster with one data pod (D11)
+
+Three variants, decided against on 2026-09-29:
+
+* **Refuse the topology by a CEL rule** (`replicas >= 2` while Sentinel is enabled). Cheap, but
+  CEL judges writes only: stored CRs keep looping, and since the rule reads two fields it sits on
+  `spec`, so every spec edit of such a CR is refused until the same edit fixes the topology. It
+  also refuses the default shape and a legitimate setup — one pod behind a Sentinel endpoint,
+  for example a development cluster using the client configuration of production.
+* **Stop retrying and report** a level condition, the Sentinel roll held. The loop ends and is
+  visible, but every operator upgrade becomes a manual pod delete per cluster, which bypasses
+  D6's deferrals, and the root posture and stale TLS material stay until somebody acts.
+* **Surge a second data pod**, fail over to it, replace the first and scale back. The only
+  variant without downtime and without data loss on a pod without persistence, but a new state
+  machine with failure modes of its own — a surge pod held Pending by a ResourceQuota or `hard`
+  anti-affinity, a claim left behind, a StatefulSet replica count that differs from the CR — for
+  a guarantee a single pod without Sentinel does not have either.
+
+### Hold a configuration change behind the stale sidecar (D6, amended 2026-09-29)
+
+Keep the image-only sidecar test for the configuration, and beside Sentinel hold the Sentinel
+roll while the data pod's config hash differs, so the tiers cannot diverge. Upgrade-neutral with
+no new restart, and lost: TLS or auth switched on for a single-pod cluster after any operator
+upgrade stays off — on both tiers beside Sentinel — until somebody deletes the pod, reported only
+as an outdated sidecar, and a pending configuration change would hold the Sentinel tier's own
+changes as well.
 
 ## Residual risks
 
@@ -630,14 +819,28 @@ readiness a second, partial source of truth about replication.
   operator upgrade. wds18 runs only three-Sentinel tiers (checked read-only on 2026-09-26);
   other clusters were not checked. Verified by reading `dispatchSentinelRollingUpdate`,
   `sentinelWait` and `runSentinelRollingUpdate`; not reproduced against a cluster.
+* **D11 rests on Sentinel's behaviour while the only data pod restarts**, measured without the
+  operator and without TLS or auth (Decision). The route itself is unit-tested and covered end to
+  end by `TestE2E_RollingUpdate_SentinelSingleDataPod`, whose runs are recorded in Status.
+* **`RollingUpdateComplete` is emitted before `finishDataRoll` clears the state** on D11's
+  route, so a clear that fails emits it once more on the next pass. `finalizeRollingUpdate` has
+  the same shape on the failover roll. Accepted: a duplicate Normal Event.
+* **A tier of one under a CR that asks for more reports nothing of its own** while it waits (D11):
+  the refused StatefulSet write that can keep it there is reported by the StatefulSet step, and a
+  stale cache lasts a pass. The pod keeps its old spec meanwhile.
+* **A Sentinel cluster scaled down to one data pod while its master was a higher ordinal** was
+  not traced — the known-master record and the Sentinel monitor address. D1's sequence deletes
+  pod-0 in that window as well, since it is an outdated replica there, so D11 does not add the
+  case.
 
 ## References
 
-* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`; for the 2026-09-28 amendment `handleMasterFailover`, `triggerSentinelFailover`, `coordinatedFallbackReason`, `handleFailoverRetrigger`, `replicationNotEstablishedReason`
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — for D11 `rollDataTier`, `singleDataPodBehindSentinel`, `handleSentinelSinglePodRollingUpdate`, `restateAsSinglePodReplacement`, `settleDeferredReplacement`, `recordSinglePodReplacement`, the tier-of-one guard in `handleRollingUpdate`; `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`; for the 2026-09-28 amendment `handleMasterFailover`, `triggerSentinelFailover`, `coordinatedFallbackReason`, `handleFailoverRetrigger`, `replicationNotEstablishedReason`
 * [`internal/controller/master_handover.go`](../../internal/controller/master_handover.go) — `gateOutgoingPodDelete`, `verifyNewMasterReady` (moved here from `rolling_update.go` on 2026-09-28), `replicasNotOnNewMaster`, `datasetRefusal`, `holdHandover`
 * [`internal/valkeyclient/client.go`](../../internal/valkeyclient/client.go) — `ReplicationInfo.NotEstablishedReason` (D10's predicate), `SentinelFailoverCoordinated`
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `runSentinelRollingUpdate` (the Sentinel-tier residual risk)
-* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26)
+* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26); `sidecarOnlyDelta` (D6 as amended 2026-09-29)
+* [`internal/builder/configmap_test.go`](../../internal/builder/configmap_test.go) — `TestComputeConfigHash_PinnedForTheSinglePodRule` (D7 as amended 2026-09-29)
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `ComputePodSpecHash`, the readiness probe
 * [`internal/builder/configmap.go`](../../internal/builder/configmap.go) — `replica-serve-stale-data yes`
 * [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) — why the rolling update must survive its own rejected write
@@ -646,6 +849,7 @@ readiness a second, partial source of truth about replication.
 * [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — the bounds on every wait this sequence introduces
 * [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — D1 on what a spending site asks of a pod, D11 on the replacement of an outdated pod and the availability wait (D9, D10)
 * [ADR 0032](0032-generated-pods-run-rootless.md) — D3, the single-pod rule for a pod that runs as root (D6, D7)
-* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a tier of one or two Sentinels (the closed residual risk)
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) — D10, the serial roll of a tier of one or two Sentinels (the closed residual risk); D1, the data-tier completion marker D11's route emits
+* [`internal/controller/sentinel_single_pod_roll_test.go`](../../internal/controller/sentinel_single_pod_roll_test.go) — D11's unit guard
 * [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — D9, the Sentinel-path counterpart of D8: no resolution while the roll's own Sentinel failover is in flight
 * [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) — D1, the coordinated failover of D1 here; D2, the predicate of D10 at every site that says "synced"; D3, D5 and D6, the handover gate in front of the former master's delete (the closed residual risk)

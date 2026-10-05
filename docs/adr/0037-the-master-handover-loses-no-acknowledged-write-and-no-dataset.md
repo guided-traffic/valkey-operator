@@ -72,7 +72,9 @@ companion refusal: no write fence.
 
 ## Context
 
-A Sentinel data-tier roll hands the master over once. With every replica on the new template it
+A Sentinel data-tier roll hands the master over once *(a roll with a replica: the single data
+pod of a Sentinel cluster is replaced without a handover,
+[ADR 0007](0007-failover-aware-rolling-update.md) D11)*. With every replica on the new template it
 forces a Sentinel failover, waits for the promoted pod (X) to have a replica, and deletes the
 former master (O). Each step could lose writes a client had already been acknowledged, or the
 dataset of the only pod holding it, and fifteen tracked texts called the roll lossless. Measured

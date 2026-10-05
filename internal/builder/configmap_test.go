@@ -359,6 +359,44 @@ func TestComputeConfigHash_IncludesSentinelConfig(t *testing.T) {
 	assert.NotEqual(t, ComputeConfigHash(vStandalone), ComputeConfigHash(vHA))
 }
 
+// TestComputeConfigHash_PinnedForTheSinglePodRule pins the config hash of four fixed
+// shapes. A changed config hash replaces the only data pod of a single-replica cluster,
+// whatever else it defers (docs/adr/0007-failover-aware-rolling-update.md, D6, D7): a
+// pod without persistence is replaced with its dataset. A release that changes the
+// rendered configuration therefore restarts every such pod at the operator upgrade, and
+// an operator upgrade must not discard a dataset without its own decision. When this
+// test fails, that is the decision to take -- then pin the new values.
+func TestComputeConfigHash_PinnedForTheSinglePodRule(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		v    *vkov1.Valkey
+		want string
+	}{
+		{"standalone", newTestValkey("pin"), "71d42459"},
+		{"Sentinel with one data pod", newTestValkey("pin", func(v *vkov1.Valkey) {
+			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+		}), "ce69cce4"},
+		{"Sentinel, TLS, auth, RDB", newTestValkey("pin", func(v *vkov1.Valkey) {
+			v.Spec.Replicas = 3
+			v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
+			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, SecretName: "pin-tls"}
+			v.Spec.Auth = &vkov1.AuthSpec{SecretName: "pin-auth", SecretPasswordKey: "password"}
+			v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true, Mode: vkov1.PersistenceModeRDB}
+		}), "de43e393"},
+		{"no Sentinel, TLS alongside plaintext, AOF", newTestValkey("pin", func(v *vkov1.Valkey) {
+			v.Spec.Replicas = 3
+			v.Spec.TLS = &vkov1.TLSSpec{Enabled: true, SecretName: "pin-tls", AllowUnencrypted: true}
+			v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true, Mode: vkov1.PersistenceModeAOF}
+		}), "ef453b5d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ComputeConfigHash(tc.v),
+				"the rendered configuration changed; decide whether this release may restart "+
+					"single-replica pods at the upgrade (ADR 0007 D7), then pin the new value")
+		})
+	}
+}
+
 // TestComputeConfigHash_StableWhenKnownMasterChanges verifies that the config
 // hash does NOT change when the AnnotationKnownMaster annotation is updated.
 // This annotation is set by persistKnownMaster after a rolling-update failover.

@@ -46,10 +46,11 @@ const (
 	// roll pauses do reach it, unless a post-update check ends the pass.
 	ConditionTypeReady ConditionType = "Ready"
 
-	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
-	// the sidecar container image has drifted from the desired version.
-	// Standalone pods are not automatically restarted for sidecar-only changes;
-	// the update will occur on the next pod restart (manual delete or image change).
+	// ConditionTypeSidecarUpdatePending is set on a single-replica Valkey instance,
+	// with or without Sentinel, when the sidecar container image has drifted from the
+	// desired version. Its only data pod is not automatically restarted for a
+	// sidecar-only change; the update will occur on the next pod restart (manual
+	// delete or image change).
 	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
 
 	// ConditionTypeRollingUpdatePaused is set when a rolling update stopped waiting
@@ -123,8 +124,9 @@ const (
 	// ConditionTypeSentinelUpdatePending reports that the Sentinel tier is being
 	// rolled: at least one Sentinel pod runs a spec older than the Sentinel
 	// StatefulSet template, or a replacement pod is not Ready yet. The data tier
-	// always finishes first — its RollingUpdateComplete event fires before the
-	// first Sentinel pod is touched — so this condition, and the
+	// finishes first — its RollingUpdateComplete event fires before the first
+	// Sentinel pod is touched, except in the pass in which a data roll pauses and
+	// beside a single data pod that defers its change — so this condition, and the
 	// SentinelUpdateComplete event emitted exactly when it flips back to False,
 	// are the signal that the update as a whole is finished. The condition's own
 	// previous value is the memory that a roll was in flight; there is no
@@ -503,7 +505,8 @@ const (
 	ValkeyPhaseRollingUpdate ValkeyPhase = "Rolling Update"
 	// ValkeyPhaseSentinelRollingUpdate indicates the Sentinel tier is being
 	// rolled. It follows the data tier's "Rolling Update" phase (the data tier
-	// always converges first) and appears alone on Sentinel-only spec changes.
+	// converges first) and appears alone on Sentinel-only spec changes and beside
+	// a single data pod that defers its change.
 	ValkeyPhaseSentinelRollingUpdate ValkeyPhase = "Sentinel Rolling Update"
 	// ValkeyPhaseFailover indicates a failover is in progress.
 	ValkeyPhaseFailover ValkeyPhase = "Failover in progress"

@@ -4,6 +4,15 @@
 
 Accepted. Date: 2026-08-26.
 
+Corrected 2026-09-29: **a rotation did not reach a rootless single data pod that ran the sidecar
+of an earlier operator** — which every operator upgrade leaves on it until it restarts. The
+single-pod deferral's image-only test read the rotation as part of a sidecar-only delta and held
+it for as long as the pod lived: the rotated-away key stayed in use, and, if `valkey-server` does
+not reload, the pod would have kept serving the old certificate past its expiry. Neither tier of a
+Sentinel cluster with one data pod took a rotation at all. Both are fixed by
+[ADR 0007](0007-failover-aware-rolling-update.md) D6 (amended 2026-09-29: a rotated record is
+never a sidecar-only delta) and D11; D4 is marked in place.
+
 Implemented in `0aaf79d`, ahead of this document: the ADR was **deliberately deferred**
 (`ADR spaeter, erst Code`) with the debt written down in
 [`CLAUDE.md`](../../CLAUDE.md) rather than silently carried, and this file pays it. That
@@ -164,7 +173,11 @@ not by a builder, because a builder never sees Secret content
 ([`internal/controller/tls_material.go`](../../internal/controller/tls_material.go)). A changed
 fingerprint is pod-template drift like any other and is replaced by the rolling update of
 [ADR 0007](0007-failover-aware-rolling-update.md), with its failover, its sync waits and its
-bounds. **No new replacement mechanism was introduced, and none may be.**
+bounds. **No new replacement mechanism was introduced, and none may be.** *(A single data pod has
+no failover target and is replaced by the single-pod roll of ADR 0007 — even beside an earlier
+operator's sidecar only since 2026-09-29, ADR 0007 D6 as amended; since 2026-09-29 also
+beside Sentinel, ADR 0007 D11; until then neither tier of a Sentinel cluster with one data pod
+ever took a rotation.)*
 
 > **Amended 2026-08-27 — the carrier changed, the mechanism did not.** This decision
 > originally named the ~~`vko.gtrfc.com/tls-material-hash` pod annotation~~ as the carrier.

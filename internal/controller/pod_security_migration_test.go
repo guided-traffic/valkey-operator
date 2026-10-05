@@ -463,6 +463,59 @@ func singlePodSts(v *vkov1.Valkey) *appsv1.StatefulSet {
 	return sts
 }
 
+// A certificate rotation or a configuration change that lands while a rootless single
+// pod still runs an old sidecar is not a sidecar-only delta (sidecarOnlyDelta, ADR 0007
+// D6). The image-only test held both behind the stale sidecar -- which every operator
+// upgrade leaves on such a pod -- for as long as the pod lived: the rotated-away key in
+// use (ADR 0030), TLS or auth switched on and still off. The last row is the control.
+//
+// Mutation check: dropping the podTLSMaterialHashChanged term of sidecarOnlyDelta defers
+// the rotated rows, dropping the podAnnotationHashChanged term the configuration rows.
+func TestSinglePodDeferral_ARotationOrAConfigChangeIsNotSidecarOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		persistent  bool
+		podRecord   string
+		podConfig   string
+		wantSidecar bool
+	}{
+		{"rotated, not persistent: replaced", false, "old", "", false},
+		{"rotated, persistent: replaced", true, "old", "", false},
+		{"configuration changed, not persistent: replaced", false, "new", "00000000", false},
+		{"configuration changed, persistent: replaced", true, "new", "00000000", false},
+		{"record and configuration unchanged: the sidecar-only deferral stands", false, "new", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newTestValkey("tlsrot", "default", func(v *vkov1.Valkey) {
+				if tc.persistent {
+					v.Spec.Persistence = &vkov1.PersistenceSpec{Enabled: true}
+				}
+			})
+			sts := stsForValkey(v)
+			builder.StampTLSMaterialHash(sts, builder.SidecarContainerName, "new")
+			pod := podFromStsTemplate(v, sts, 0)
+			for i := range pod.Spec.Containers {
+				if pod.Spec.Containers[i].Name == builder.SidecarContainerName {
+					pod.Spec.Containers[i].Image = "ghcr.io/guided-traffic/valkey-operator:previous"
+					pod.Spec.Containers[i].Env = []corev1.EnvVar{{Name: builder.TLSMaterialHashEnvName, Value: tc.podRecord}}
+				}
+			}
+			if tc.podConfig != "" {
+				pod.Annotations[builder.AnnotationConfigHash] = tc.podConfig
+			}
+
+			security, sidecar := singlePodDeferral(v, sts, pod)
+
+			assert.Empty(t, security.pod, "a rootless pod holds no security repair")
+			if tc.wantSidecar {
+				assert.Equal(t, pod.Name, sidecar)
+			} else {
+				assert.Empty(t, sidecar, "the pod is replaced")
+			}
+		})
+	}
+}
+
 // The CR asks for persistence, the operator refused to write it (volumeClaimTemplates
 // are immutable, ADR 0023), and the pod still runs on an emptyDir. Reading the CR
 // here deleted the only pod together with its dataset.

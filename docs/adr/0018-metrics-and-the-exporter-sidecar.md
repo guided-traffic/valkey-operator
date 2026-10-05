@@ -194,7 +194,9 @@ The rules:
   repository reads an exporter series.
 - **The exporter's env is in the pod-spec hash**, so this change rolls every metrics-enabled
   multi-replica data tier once through the failover-aware rolling update (D7).
-- **A single data pod (`spec.replicas: 1`, no Sentinel) is decided by persistence.** The same
+- **A single data pod (`spec.replicas: 1`, no Sentinel *(with or without Sentinel since
+  2026-09-29, [ADR 0007](0007-failover-aware-rolling-update.md) D11)*) is decided by
+  persistence.** The same
   release moves the sidecar image, and `isSidecarOnlyChange` compares only the Valkey and sidecar
   images, so the exporter update read as sidecar-only and was deferred on every such cluster
   until its next restart ([ADR 0007](0007-failover-aware-rolling-update.md) D6, D7).

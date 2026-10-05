@@ -35,7 +35,8 @@ field and rolls nothing (`TestPodHardening_OptInsMoveThePodSpecHashes`). Three l
   values list the missing one on purpose — measured again with the allow-list in the final run of
   2026-09-26, green on both Valkey lines); a multi-replica or
   Sentinel roll holds on that pod and reports `PodAvailabilityStalled` after
-  `spec.rollingUpdate.syncTimeout` (ADR 0026 D11), a single pod is not reported (ADR 0032 D7).
+  `spec.rollingUpdate.syncTimeout` (ADR 0026 D11), a single pod is not reported (ADR 0032 D7)
+  unless it is the data pod of a Sentinel cluster (ADR 0007 D11).
   Too strict, a container fails at a syscall. It must allow every generated container, the
   `chown` of `fix-data-ownership` included.
 - It is **only as strict as the file it names**, and every CR author may name ~~any file in that

@@ -457,7 +457,8 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
 - A digest-only `spec.image` gets an empty `app.kubernetes.io/version` label.
 - Setting `image.digest` on an installed operator changes `--operator-image`, and with it the
   sidecar image of every data pod and the observer's image: the data tiers roll as for any
-  operator image change (a rootless single standalone pod defers it, ADR 0007 D6) and the
+  operator image change (a rootless single data pod defers it, ADR 0007 D6 — with or without
+  Sentinel since 2026-09-29, ADR 0007 D11) and the
   observer Deployment is rewritten. Set in the same upgrade that moves the tag, it costs nothing
   extra.
 - The observer's uid/gid/fsGroup 65532, `privileged: false` and `enableServiceLinks: false` are

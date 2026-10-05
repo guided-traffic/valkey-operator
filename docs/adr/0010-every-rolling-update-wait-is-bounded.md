@@ -451,7 +451,10 @@ cluster. The ordering
 rolls after the data tier — holds again for every data-tier stall, **but not without
 exception**: `pauseRollingUpdate` returns an empty `RollingUpdateResult`, no `NeedsRequeue` and
 no `DeferredRequeueAfter`, so the pass in which a data roll pauses is not holding and runs the
-Sentinel roll (Residual risks).
+Sentinel roll (Residual risks). *(Since 2026-09-29 a Sentinel cluster's single data pod that
+defers its change releases the Sentinel roll the same way, by design: the pod is up and no
+deferral holds the Valkey image, the TLS material or the configuration —
+[ADR 0007](0007-failover-aware-rolling-update.md) D6, D11.)*
 
 **D17 — The wait on a pod that exists, is not being deleted and is not available is a bounded
 observation on the pod's own clock; an outdated pod is not waited on at all.** Added
@@ -490,7 +493,9 @@ mistake. Two halves:
   `countUpdatedPods` below the total; the standalone wait on the current pod (`standaloneWait`),
   reached only while rolling-update state is recorded — the standalone handler writes none, so a
   current single pod that never starts takes the converged early return in
-  `dispatchDataRollingUpdate` and shows as phase `Provisioning`, not as this condition;
+  `dispatchDataRollingUpdate` and shows as phase `Provisioning`, not as this condition *(except,
+  since 2026-09-29, a Sentinel cluster's single data pod, whose replacement records
+  `replacing-replicas` — [ADR 0007](0007-failover-aware-rolling-update.md) D11)*;
   and the Sentinel quorum wait and completion hold through `sentinelWait`. Within
   `spec.rollingUpdate.syncTimeout` (`GetSyncTimeout()`, default 5 m) the plain requeue is
   unchanged. Past it the pass returns `DeferredRequeueAfter`, and the tier's evaluator —
@@ -582,7 +587,8 @@ write. No Event (ADR 0025 D7).
   the same roll replaces it either way, so what changes is only when.
 * A stuck replacement is reported only once `syncTimeout` has passed on its own clock: 5 min by
   default, and longer wherever a user raised the budget for a slow full sync — the two cannot be
-  tuned apart. A current single pod is not reported at all (D17). `ValkeyPhaseNotOK` is the
+  tuned apart. A current single pod is not reported at all (D17) *(but for a replacement the
+  operator made on a Sentinel cluster, since 2026-09-29)*. `ValkeyPhaseNotOK` is the
   fallback after 30 min, but whether it survives the alternating phase of the next bullet is not
   checked.
 * On a Sentinel cluster every data-tier stall — terminating, absent or unavailable — now also

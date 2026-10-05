@@ -76,7 +76,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 
 | ADR | Decision | State |
 |---|---|---|
-| [0007](0007-failover-aware-rolling-update.md) | Failover-aware rolling update against the persisted template | Implemented |
+| [0007](0007-failover-aware-rolling-update.md) | Failover-aware rolling update against the persisted template; a Sentinel cluster with one data pod rolls as a single pod (D11) | Implemented |
 | [0008](0008-known-master-annotation-is-the-recorded-authority.md) | The known-master annotation is the operator's recorded master authority | Implemented |
 | [0009](0009-an-unrecorded-promotion-is-not-a-promotion.md) | A promotion the operator could not record is not a completed promotion | Implemented |
 | [0010](0010-every-rolling-update-wait-is-bounded.md) | Every rolling-update wait is bounded and has a named exit | Implemented, except the plain requeues on a master or a promotion step that does not answer, and on a Sentinel pod that is missing |

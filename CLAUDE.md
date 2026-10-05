@@ -476,6 +476,21 @@ itself — every rule, what it permits, and the hardening items it leaves open �
    synced from and attached to the new master, and the delete discards no dataset; otherwise held
    and, past `syncTimeout`, reported as `MasterHandoverStalled` (ADR 0037 D3, D5, D6)
 
+**A Sentinel cluster with one data pod does not take these steps** — nothing to promote. When
+the CR and the data StatefulSet both ask for one pod (`singleDataPodBehindSentinel`),
+`rollDataTier` hands it to the single-pod handler (`handleSentinelSinglePodRollingUpdate` around
+`handleStandaloneRollingUpdate`), so the single-pod rules and deferrals apply as without
+Sentinel. The route keeps one state, `replacing-replicas` ("a replacement may be in flight"):
+recorded before the delete and before the terminating check, restated from a failover state a
+scale-down left, cleared by `finishDataRoll` (with `RollingUpdateComplete`) or, when a deferral
+interrupts it, by `settleDeferredReplacement` once the pod is available — while it stands the
+Sentinel roll waits. A deferral with no replacement recorded holds nothing and the Sentinel roll
+runs: the pod is up, and no deferral holds the Valkey image, TLS material or configuration. A tier
+of one under a CR asking for more (a scale-up the StatefulSet does not carry yet) waits in
+`handleRollingUpdate` instead of asking Sentinel for a failover. Before this the topology — the
+default shape of a Sentinel CR — asked Sentinel for a refused failover every ~15 s and never
+rolled either tier. → [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D11
+
 The data StatefulSet uses `updateStrategy: OnDelete` and `podManagementPolicy: Parallel`, so
 pod replacement is the operator's job, not the StatefulSet controller's — which is also why a
 PodDisruptionBudget never constrains it. The rolling update compares pods against the
@@ -498,7 +513,8 @@ promoting.
 **Completion is reported per tier.** `RollingUpdateComplete` means the data tier and fires
 before the first Sentinel pod is replaced — except in the pass where a data roll *pauses*
 (`pauseRollingUpdate` returns no requeue), which releases the Sentinel roll; a known exception,
-ADR 0026 D11. The Sentinel tier rolls afterwards, carries the
+ADR 0026 D11 — and beside a single data pod whose change is deferred, where the Sentinel tier
+rolls with no `RollingUpdateComplete` at all (by design, ADR 0007 D11). The Sentinel tier rolls afterwards, carries the
 `SentinelUpdatePending` condition while it does (phase `Sentinel Rolling Update i/n`), and
 emits `SentinelUpdateComplete` exactly when that condition flips back to False. Anything
 sequencing on "the update is finished" on a sentinel-enabled cluster waits for the Sentinel
@@ -623,7 +639,8 @@ not among them: a holding data tier holds it**, for all three stall conditions
 share `spec.image` and a released Sentinel roll takes a healthy Sentinel onto the spec the data
 tier is stuck on and spends the spare vote. One known exception, a residual risk and not a rule:
 a data roll that *pauses* (`pauseRollingUpdate` returns no requeue) is not holding, so the pass
-that pauses runs the Sentinel roll. **No Event on any of it** — ADR 0025 D7 still
+that pauses runs the Sentinel roll. A single data pod beside Sentinel is held for by its recorded
+`replacing-replicas` state, and its deferral releases the Sentinel roll by design (ADR 0007 D11). **No Event on any of it** — ADR 0025 D7 still
 promises zero Warnings on a clean roll. `countUpdatedPods` deliberately still counts a
 terminating pod; the completion hold lives in `finalizeRollingUpdate`, Sentinel path only.
 
@@ -944,8 +961,8 @@ overwritten.
   check), and the replacement is the ordinary failover-aware roll. A pod missing mid-roll is no
   evidence, so the repair does not come back. Leaving the pods to their next replacement was the
   alternative, and lost. After the second roll no generated pod carries a root container.
-- **The single data pod of a `spec.replicas: 1` cluster without Sentinel that still runs as root
-  is decided by persistence** (`singlePodDeferral`, read off the persisted StatefulSet), not by
+- **The single data pod of a `spec.replicas: 1` cluster, with or without Sentinel (ADR 0007 D11),
+  that still runs as root is decided by persistence** (`singlePodDeferral`, read off the persisted StatefulSet), not by
   `isSidecarOnlyChange` (which still decides a rootless one): persistent is replaced at once, the
   repair running on its way up; non-persistent is deferred and reported as
   `PodSecurityUpdatePending=True/PodRunsAsRoot`, because an operator upgrade never discards a
@@ -953,7 +970,13 @@ overwritten.
   author or a rotation caused and which replace it as they always did. *(2026-09-29, ADR 0018
   D11)* A rootless single pod whose **exporter image or env** differs from the template takes
   the same line (`exporterDrifted`, reason `ExporterOutdated`): the release's new sidecar image
-  otherwise made `isSidecarOnlyChange` defer the exporter fix on every such cluster.
+  otherwise made `isSidecarOnlyChange` defer the exporter fix on every such cluster. *(2026-09-29,
+  ADR 0007 D6, D7)* A rootless single pod is deferred only for a **sidecar-only delta**
+  (`sidecarOnlyDelta`): a rotated TLS record or a changed config hash replaces it, with or without
+  its sidecar current — the image-only test had held rotations and TLS/auth switches for the
+  pod's lifetime. A release that changes the rendered configuration therefore restarts every
+  non-persistent single pod at the upgrade; `TestComputeConfigHash_PinnedForTheSinglePodRule`
+  fails it first, and that is a decision, not a value to update.
 - **The drift comparisons treat `securityContext` as a subset** (`podSpecChanged`,
   `containerChanged`, `ObserverDeploymentHasChanged`): a field the operator does not set is not
   compared, so a mutating admission policy is not fought over — **except `capabilities.add`**,
@@ -962,8 +985,9 @@ overwritten.
 
 The posture is in the pod-spec hash, so this release rolls every multi-replica data tier and
 every Sentinel tier once, and every persistent data tier a second time (above) — a persistent
-single data pod without Sentinel therefore restarts twice, two short downtimes with the data
-kept. A tier of one or two Sentinels, recorded here as open until 2026-09-26 because its roll
+single data pod, with or without Sentinel, therefore restarts twice, two short downtimes with the
+data kept (beside Sentinel only since ADR 0007 D11, 2026-09-29: before it neither tier of such a
+cluster ever rolled). A tier of one or two Sentinels, recorded here as open until 2026-09-26 because its roll
 could never delete a Ready Sentinel, now rolls serially
 ([ADR 0024](docs/adr/0024-the-sentinel-tier-reports-its-own-completion.md) D10). A
 replacement that never comes up (NFS `root_squash` refusing the `chown`, so the pre-flight fails)
@@ -1104,8 +1128,8 @@ proves both against the pinned image, with a negative control. The `<name>-metri
 marker label `vko.gtrfc.com/metrics=true` so the ServiceMonitor selects only it; the
 ServiceMonitor is `unstructured` (`monitoring.coreos.com/v1`) and skipped when the CRD is
 absent. Enabling metrics changes the pod-spec hash and therefore rides the failover-aware
-rolling update — the pre-roll dataset survives except on a single standalone pod without
-persistence; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before
+rolling update — the pre-roll dataset survives except on a single data pod without
+persistence, with or without Sentinel; on a Sentinel cluster whose Sentinels cannot run a coordinated failover (before
 Valkey 9.0) and on any roll whose coordinated failover fell back to forced, the writes the
 outgoing master acknowledges during the roll's failover are lost (ADR 0037 D8).
 → [ADR 0018](docs/adr/0018-metrics-and-the-exporter-sidecar.md)
