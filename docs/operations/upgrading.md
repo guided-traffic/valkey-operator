@@ -182,7 +182,28 @@ rewrites the generated policies to admit only the operator's own components
   spec no longer asks for them — the policy is off, Sentinel or the observer is off, or the
   `namePrefix` changed.
 
-## What an upgrade does to running clusters
+## Pod labels and annotations reach running pods
+
+From the release that records pod metadata on, a change of `spec.podLabels`,
+`spec.podAnnotations`, `spec.sentinel.podLabels` or `spec.sentinel.podAnnotations` replaces the
+pods of that tier through the ordinary roll ([what starts a roll](rolling-updates.md#what-starts-a-roll)).
+Before it, the change rewrote the StatefulSet templates and replaced no pod, and the
+StatefulSets reported a revision their pods did not run, which kube-prometheus alerts on as
+`KubeStatefulSetUpdateNotRolledOut`. The record is the environment variable
+`VKO_POD_METADATA_HASH` on the sidecar and on the sentinel container; nothing reads it inside the
+pod ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D2).
+
+| Cluster | What the upgrade does |
+|---|---|
+| Sentinel tier | **Rolls once**, behind the quorum guard; a tier of one or two Sentinels rolls serially. A Sentinel pod without the record is replaced, whatever else the release changes. |
+| Multi-replica data tier | Nothing extra: it rolls for the sidecar image anyway, and the new pods carry the record. |
+| Single replica (with or without Sentinel) | **Not restarted** for it. Its pod carries no record until it is replaced for another reason, and until then a pod label or annotation change does not replace it either. |
+
+A data tier on the kustomize path or a floating `image.tag` does not roll on an upgrade (below),
+so its pods carry no record until they are replaced, and the StatefulSet shows a revision they do
+not run. A change to the tier's pod labels or annotations does not replace them; deleting the
+pods one at a time, replicas first, does.
+
 
 **Before the new operator starts.** The chart runs a `pre-upgrade` hook Job
 (`valkey-operator-pre-upgrade`) that executes `manager migrate` and writes the
@@ -232,8 +253,10 @@ deliberately does not apply it: it sets the `SidecarUpdatePending` condition on 
 `Valkey` CR and leaves the pod running the **old** sidecar image. There is no
 downtime and nothing to schedule — but there is also no automatic convergence: the
 pod keeps the old sidecar until something restarts it, which means a manual
-`kubectl delete pod`, an eviction, a new `spec.image`, a configuration change or a
-certificate rotation — those three replace the pod even while its sidecar is old. A change
+`kubectl delete pod`, an eviction, a new `spec.image`, a configuration change, a
+certificate rotation or a pod label or annotation change — those four replace the pod even
+while its sidecar is old (the last one only on a pod created by an operator that records pod
+metadata, [below](#pod-labels-and-annotations-reach-running-pods)). A change
 of the pod spec alone (resources, affinity, the exporter) does not: it waits with the
 sidecar, and the condition stands for both. Force it when you want it — but the restart is
 not free on the only pod of the cluster: it has no failover target, so an instance

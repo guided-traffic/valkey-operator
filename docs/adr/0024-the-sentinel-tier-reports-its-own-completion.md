@@ -36,6 +36,11 @@ risks*. *(Superseded 2026-09-26 by D10; until that decision, the same day, this
 read: "Open, awaiting a decision: a tier of one or two Sentinels can never
 replace a Ready outdated pod (pre-existing, Residual risks).")*
 
+Amended 2026-10-05 (correction, no decision changes): two Context sentences are
+corrected in place — a Sentinel podLabels change never rolled the tier before the
+pod metadata record of [ADR 0007](0007-failover-aware-rolling-update.md) D2, and the
+revision trap below now excludes the metadata a CR author sets.
+
 Decided 2026-09-26 by Hans (D10): **a tier of one or two Sentinels rolls
 serially** — one Sentinel at a time, and only while every other one is
 available (`sentinelDeleteKeepsVotes`). Implemented; unit-tested and
@@ -75,8 +80,12 @@ Sentinel-tier completion from the log at all — only from live cluster state.
 Anything sequencing on "Completed" (a human, a pipeline) acts too early. The
 status surface was wrong during that window too: while Sentinel pods roll, the
 pass ends before `updateStatus`, so the phase kept showing the last data-tier
-value — and on a Sentinel-only spec change (Sentinel podLabels, resources) it
-showed `OK` for the whole roll, violating the status contract ("OK when
+value — and on a Sentinel-only spec change ~~(Sentinel podLabels, resources)~~
+*(resources; corrected 2026-10-05: a `spec.sentinel.podLabels` change rolled no
+Sentinel pod at all until the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2, amended 2026-10-05 — the
+parenthesis was written with this ADR and `sentinelPodNeedsUpdate` never read
+labels)* it showed `OK` for the whole roll, violating the status contract ("OK when
 healthy, otherwise the current task").
 
 One trap constrained the design: a second convergence predicate already exists.
@@ -84,7 +93,13 @@ One trap constrained the design: a second convergence predicate already exists.
 revision-based, while the roll driver is image/hash-based. The two can disagree —
 a template change covered by no hash bumps the controller revision but rolls
 nothing — so a completion marker on the revision predicate could wait forever
-for pods the driver will never replace.
+for pods the driver will never replace. *(Narrowed 2026-10-05: the pod labels and
+annotations a CR author sets are covered since the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2, which on this tier also
+replaces a pod without a record, so a `spec.sentinel` metadata change no longer
+leaves `sentinelRolloutComplete` false. Template metadata the operator owns is still
+covered by no record — a release that changes such a label or annotation moves the
+revision and rolls nothing — so the trap stands and D3 is unchanged.)*
 
 ## Decision
 

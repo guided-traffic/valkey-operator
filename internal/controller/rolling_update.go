@@ -628,14 +628,42 @@ func podNeedsUpdate(pod *corev1.Pod, desiredValkeyImage, desiredSidecarImage, de
 }
 
 // podOutdated is podNeedsUpdate against every input of the persisted data
-// StatefulSet, plus the image of every other container and init container and the
-// retired ownership repair. It is what every site of the data tier asks, so the
-// inputs cannot drift apart between them.
+// StatefulSet, plus the image of every other container and init container, the
+// pod metadata record and the retired ownership repair. It is what every site of
+// the data tier asks, so the inputs cannot drift apart between them.
 func podOutdated(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return podNeedsUpdate(pod, valkeyImageFromSts(sts), sidecarImageFromSts(sts), configHashFromSts(sts),
 		podSpecHashFromSts(sts), tlsMaterialHashFromSts(sts), sts.Spec.Template.Spec.Containers) ||
 		podImagesDrifted(pod, &sts.Spec.Template.Spec) ||
+		podMetadataHashChanged(pod, podMetadataHashFromSts(sts)) ||
 		podCarriesRetiredRepair(pod, sts)
+}
+
+// podMetadataHashChanged returns true when a data pod carries a pod metadata
+// record (builder.PodMetadataHashEnvName) that differs from desiredHash. A pod
+// without the record, or an empty desired value, is not outdated: the data tier
+// keeps the presence rule of the TLS record, because a pod an operator before the
+// record built would otherwise be replaced by the upgrade alone -- the only data
+// pod of a non-persistent single-replica cluster together with its dataset
+// (docs/adr/0007-failover-aware-rolling-update.md, D2, D6). Every multi-replica
+// data pod takes the record in the roll each release causes with its new sidecar
+// image (docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md, D11). The
+// record is env, which no pod update can remove, so the presence rule is no way
+// out of the comparison for a pod that has one (ADR 0031). The Sentinel tier holds
+// no dataset and drops the presence rule (sentinelPodMetadataOutdated).
+func podMetadataHashChanged(pod *corev1.Pod, desiredHash string) bool {
+	if desiredHash == "" {
+		return false
+	}
+	podHash := builder.RecordedPodMetadataHash(&pod.Spec)
+	return podHash != "" && podHash != desiredHash
+}
+
+// podMetadataHashFromSts returns the pod metadata record of a StatefulSet's pod
+// template, or empty string when no container carries one. Read off the persisted
+// template for the reason valkeyImageFromSts gives.
+func podMetadataHashFromSts(sts *appsv1.StatefulSet) string {
+	return builder.RecordedPodMetadataHash(&sts.Spec.Template.Spec)
 }
 
 // podCarriesRetiredRepair reports a pod created while the data template carried the
@@ -5163,12 +5191,15 @@ func (r *ValkeyReconciler) finalizeMultiReplicaRollingUpdate(ctx context.Context
 }
 
 // sentinelPodNeedsUpdate returns true if the Sentinel pod's images, pod-spec hash,
-// config hash or TLS material fingerprint differ from what the sentinel StatefulSet
-// template specifies.
+// config hash, pod metadata record or TLS material fingerprint differ from what the
+// sentinel StatefulSet template specifies.
 func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
 	// Check the images of every container and init container, by name -- the
 	// same rule as the data tier's (podImagesDrifted).
 	if podImagesDrifted(pod, &desiredTemplate.Spec) {
+		return true
+	}
+	if sentinelPodMetadataOutdated(pod, desiredTemplate) {
 		return true
 	}
 	// Check pod spec hash annotation: trigger update when the pod carries a hash
@@ -5196,6 +5227,20 @@ func sentinelPodNeedsUpdate(pod *corev1.Pod, desiredTemplate corev1.PodTemplateS
 	// never been measured -- the tier is rolled.
 	return podTLSMaterialHashChanged(pod,
 		builder.RecordedTLSMaterialHash(&desiredTemplate.Spec, desiredTemplate.Annotations))
+}
+
+// sentinelPodMetadataOutdated reports a Sentinel pod whose pod metadata record
+// differs from the template's -- a missing record included. That is the one input
+// without the presence rule (docs/adr/0007-failover-aware-rolling-update.md, D2):
+// the template carries the record from the release that introduced it, and the
+// Sentinel tier does not otherwise roll on an operator upgrade (ADR 0005 D11), so
+// with the presence rule its StatefulSet would keep a revision no pod runs, and a
+// spec.sentinel metadata change would roll none of the pods from before the record.
+// The tier holds no dataset, so the one roll this costs replaces nothing that
+// carries data. An empty desired value is still "cannot tell" (ADR 0007 D3).
+func sentinelPodMetadataOutdated(pod *corev1.Pod, desiredTemplate corev1.PodTemplateSpec) bool {
+	desired := builder.RecordedPodMetadataHash(&desiredTemplate.Spec)
+	return desired != "" && builder.RecordedPodMetadataHash(&pod.Spec) != desired
 }
 
 // sentinelScan is one sweep over the Sentinel tier: everything

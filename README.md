@@ -308,8 +308,8 @@ the page named under its table.
 | `antiAffinity` | `AntiAffinitySpec` | *(off)* | Opt-in pod anti-affinity for the data and Sentinel StatefulSets |
 | `podSecurity` | `PodSecuritySpec` | *(`RuntimeDefault`, no user namespace)* | Seccomp profile and opt-in user namespace of the data, Sentinel and observer pods — see [`spec.podSecurity`](#specpodsecurity) |
 | `rollingUpdate` | `RollingUpdateSpec` | — | Rolling update timing |
-| `podLabels` | `map[string]string` | — | Additional labels for Valkey pods |
-| `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods |
+| `podLabels` | `map[string]string` | — | Additional labels for Valkey pods; a change replaces the pods ([what starts a roll](docs/operations/rolling-updates.md#what-starts-a-roll)) |
+| `podAnnotations` | `map[string]string` | — | Additional annotations for Valkey pods; a change replaces the pods |
 | `resources` | `ResourceRequirements` | — | CPU/memory requests and limits |
 
 Examples for every common shape: [examples.md](docs/operations/examples.md).
@@ -322,8 +322,8 @@ Examples for every common shape: [examples.md](docs/operations/examples.md).
 | `replicas` | `int32` | `3` | Number of Sentinel instances |
 | `allowUnencrypted` | `bool` | `false` | Keep plaintext Sentinel port (`26379`) open alongside TLS port (`36379`). Only effective when `spec.tls.enabled: true`. |
 | `disableAuth` | `bool` | `false` | Disable password authentication for Sentinel client connections. Sentinel still uses `auth-pass` to connect to Valkey nodes. Only effective when `spec.auth` is configured. |
-| `podLabels` | `map[string]string` | — | Additional labels for Sentinel pods |
-| `podAnnotations` | `map[string]string` | — | Additional annotations for Sentinel pods |
+| `podLabels` | `map[string]string` | — | Additional labels for Sentinel pods; a change replaces the pods ([what starts a roll](docs/operations/rolling-updates.md#what-starts-a-roll)) |
+| `podAnnotations` | `map[string]string` | — | Additional annotations for Sentinel pods; a change replaces the pods |
 | `resources` | `ResourceRequirements` | — *(no default: no requests, no limits)* | CPU/memory for **every** container of a Sentinel pod — the `sentinel` container and the `init-sentinel-config` init container get the same values, so a cpu/memory `ResourceQuota` admits the pod once the values that quota tracks are set here. Changing it rolls the Sentinel tier. |
 
 Explained in: [compute-resources.md](docs/operations/compute-resources.md) (`resources`), [tls.md](docs/operations/tls.md#dual-port-mode-allowunencrypted) (`allowUnencrypted`), [examples.md](docs/operations/examples.md#ha--with-authentication-sentinel-unauthenticated) (`disableAuth`).

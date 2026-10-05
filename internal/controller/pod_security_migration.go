@@ -169,30 +169,36 @@ func singlePodDeferral(v *vkov1.Valkey, sts *appsv1.StatefulSet, pod *corev1.Pod
 
 // sidecarOnlyDelta reports whether the sidecar image is the only change a replacement
 // would bring the pod, as far as the records can tell (ADR 0007 D6). isSidecarOnlyChange
-// compares the images; the TLS material record and the config hash, the two records
-// outside the pod-spec hash, must match as well. Without them the stale sidecar every
+// compares the images; the TLS material record, the config hash and the pod metadata
+// record, the three records outside the pod-spec hash, must match as well. A changed
+// metadata record is the CR author's label or annotation change, and a label a
+// NetworkPolicy keys on has to reach the pod. Without them the stale sidecar every
 // operator upgrade leaves on a single pod held back, for as long as the pod lived, a
 // certificate rotation -- the rotated-away key in use (ADR 0030) -- and a configuration
 // change: TLS or auth switched on stayed off, and beside Sentinel the Sentinel tier took
 // the new configuration the data pod did not serve. Neither record moves on an operator
 // upgrade: the TLS record is Secret content, and a release that changes the rendered
 // configuration fails TestComputeConfigHash_PinnedForTheSinglePodRule first (ADR 0007
-// D7). A pod-spec change cannot be told apart from the sidecar bump and stays deferred
-// with it (ADR 0007 D7).
+// D7), and the metadata record moves only with the CR's maps -- a pod without one, built
+// before the record existed, is not measured, and TestComputePodMetadataHash_Pinned keeps
+// the recipe. A pod-spec change cannot be told apart from the sidecar bump and stays
+// deferred with it (ADR 0007 D7).
 func sidecarOnlyDelta(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return isSidecarOnlyChange(pod, valkeyImageFromSts(sts), sidecarImageFromSts(sts)) &&
 		!podTLSMaterialHashChanged(pod, tlsMaterialHashFromSts(sts)) &&
-		!podAnnotationHashChanged(pod, configHashFromSts(sts))
+		!podAnnotationHashChanged(pod, configHashFromSts(sts)) &&
+		!podMetadataHashChanged(pod, podMetadataHashFromSts(sts))
 }
 
 // singlePodReplaceable reports whether the only data pod is replaced although it
 // carries a held repair: its StatefulSet keeps a volume, or a change the operator
 // upgrade alone never makes -- the Valkey image, the TLS material record, the
-// configuration -- replaces it anyway.
+// configuration, the pod metadata -- replaces it anyway.
 func singlePodReplaceable(pod *corev1.Pod, sts *appsv1.StatefulSet, desiredImage string) bool {
 	return stsIsPersistent(sts) || podImageChanged(pod, desiredImage, "") ||
 		podTLSMaterialHashChanged(pod, tlsMaterialHashFromSts(sts)) ||
-		podAnnotationHashChanged(pod, configHashFromSts(sts))
+		podAnnotationHashChanged(pod, configHashFromSts(sts)) ||
+		podMetadataHashChanged(pod, podMetadataHashFromSts(sts))
 }
 
 // exporterDrifted reports whether the pod runs an exporter container whose image

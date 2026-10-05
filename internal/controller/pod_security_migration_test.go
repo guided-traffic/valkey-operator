@@ -337,6 +337,7 @@ func TestSinglePodDeferral(t *testing.T) {
 		{"root, not persistent, the CR author changed the image: replaced", 1, false, false, true, true, "", false, false},
 		{"root, not persistent, rotated TLS material: replaced (ADR 0030)", 1, false, false, false, false, "tls", false, false},
 		{"root, not persistent, changed configuration: replaced", 1, false, false, false, false, "config", false, false},
+		{"root, not persistent, changed pod metadata: replaced", 1, false, false, false, false, "metadata", false, false},
 		{"multi-replica: never deferred, the roll is failover-aware", 3, false, false, true, false, "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -354,6 +355,9 @@ func TestSinglePodDeferral(t *testing.T) {
 				pod.Annotations = map[string]string{builder.AnnotationTLSMaterialHash: "old-material"}
 			case "config":
 				pod.Annotations = map[string]string{builder.AnnotationConfigHash: "old-config"}
+			case "metadata":
+				builder.StampPodMetadataHash(sts, builder.SidecarContainerName, "new-metadata")
+				setPodMetadataRecord(pod, builder.SidecarContainerName, "old-metadata")
 			}
 			root, sidecar := singlePodDeferral(v, sts, pod)
 			assert.Equal(t, tc.wantRoot, root.pod == pod.Name, "root deferral")

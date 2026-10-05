@@ -105,6 +105,13 @@ the rolling update that enabling anti-affinity costs loses nothing on a multi-re
 [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8 says what a
 multi-replica roll keeps and what it loses; the claim is struck and corrected in place.
 
+**Amended 2026-10-05** by [ADR 0007](0007-failover-aware-rolling-update.md) D2 (the pod metadata
+record): **D11 gains a third exception** — the release that introduces the record rolls every
+Sentinel tier once, because a Sentinel pod without the record is outdated. D1 is not bent: the
+record repairs a defect (a pod label or annotation change reached no running pod) and is no
+feature to opt into. The data tier keeps the presence rule, so no single data pod is restarted
+by that upgrade.
+
 ## Context
 
 Two separate pressures produced the same rule.
@@ -355,6 +362,18 @@ released images are amd64-only), and from there it could not have attributed the
 posture anyway, because v1.11.0 lies on that path. From 1.12.8, v1.11.0 is off the path;
 whether nothing else between 1.12.8 and this branch moves the Sentinel hash was not checked, so
 the run shows that the tier rolled once, not why.
+
+*Amended 2026-10-05* ([ADR 0007](0007-failover-aware-rolling-update.md) D2): **the release that
+introduces the pod metadata record rolls every Sentinel tier once.** The record
+(`VKO_POD_METADATA_HASH`, a digest of the CR author's pod labels and annotations) is stamped on
+every Sentinel template, and a Sentinel pod without it is outdated, so each Sentinel tier rolls
+once at that upgrade — serially and quorum-guarded, holding no dataset — whatever the release does
+to the Sentinel pod spec or configuration. The data tier keeps the presence rule: a multi-replica
+data tier takes the record in the roll its sidecar image already causes, and a single data pod is
+not restarted for it. This is a third exception beside the two bullets above, decided by Hans:
+leaving the Sentinel pods unmeasured would leave every Sentinel StatefulSet on a revision no pod
+runs. **Not verified:** that release has not run against a fleet; the rule is unit-tested and the
+e2e covers a cluster this operator built, not an upgrade.
 
 ## Consequences
 
