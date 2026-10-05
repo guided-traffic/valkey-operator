@@ -1295,6 +1295,9 @@ func (r *ValkeyReconciler) reconcileService(ctx context.Context, v *vkov1.Valkey
 func (r *ValkeyReconciler) reconcileStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildStatefulSet(v, r.OperatorImage)
+	// The pod metadata record goes onto the sidecar, after the builder, so the
+	// pod-spec hash never sees it (ADR 0031 D3; ADR 0007 D2).
+	builder.StampPodMetadataHash(desired, builder.SidecarContainerName, builder.DataPodMetadataHash(v))
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {
@@ -1466,6 +1469,7 @@ func (r *ValkeyReconciler) reconcileSentinelHeadlessService(ctx context.Context,
 func (r *ValkeyReconciler) reconcileSentinelStatefulSet(ctx context.Context, v *vkov1.Valkey) error {
 	logger := log.FromContext(ctx)
 	desired := builder.BuildSentinelStatefulSet(v)
+	builder.StampPodMetadataHash(desired, builder.SentinelContainerName, builder.SentinelPodMetadataHash(v))
 	builder.ApplyOperatorVersion(desired, r.OperatorVersion)
 
 	if err := controllerutil.SetControllerReference(v, desired, r.Scheme); err != nil {

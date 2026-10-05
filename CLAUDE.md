@@ -497,6 +497,20 @@ PodDisruptionBudget never constrains it. The rolling update compares pods agains
 **persisted StatefulSet template**, never against the CR, so a rejected StatefulSet write
 cannot turn an image change into a pod-delete loop.
 
+**A pod label or annotation change rolls the pods** (decided 2026-10-05). `spec.podLabels`,
+`spec.podAnnotations` and the `spec.sentinel` pair reach only the template metadata, which
+`OnDelete` applies to no running pod, so a change used to move both revisions and replace
+nothing. The seventh outdated input is a digest of the tier's *user* maps,
+`VKO_POD_METADATA_HASH` on the carrier container — env, not an annotation, because a pod may
+patch its own metadata (ADR 0031) — stamped on every write, empty maps included. **The data
+tier keeps the presence rule** (the upgrade must not replace a non-persistent single pod);
+**the Sentinel tier does not**, so the introducing release rolls every Sentinel tier once. A
+changed record is not a sidecar-only delta. `TestComputePodMetadataHash_Pinned` guards the
+recipe like the config hash. `status.currentRevision` is no signal on these StatefulSets:
+`OnDelete` never advances it; read `updatedReplicas` and each pod's revision label.
+→ [ADR 0007](docs/adr/0007-failover-aware-rolling-update.md) D2, D6, D7;
+[ADR 0005](docs/adr/0005-upgrade-neutral-defaults-and-anti-affinity.md) D11
+
 **"Synced" in step 3 and 4 is the full replication answer** — role, `master_link_status:up`
 and no sync in progress (`replicationNotEstablishedReason`), never the sync flag alone: a
 replica whose link is still connecting reports `master_sync_in_progress:0` while holding

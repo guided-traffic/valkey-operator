@@ -40,6 +40,30 @@ Sentinel naming it as master again, every replaced Sentinel pod created after
 `RollingUpdateComplete`, no Warning Event. It ran alone, not in a full suite and not in CI; the
 configuration and rotation paths of the D6 amendment are unit-tested only.
 
+Amended 2026-10-05: **D2 gains a seventh input, the pod metadata record, and D6 and D7 a third
+record outside the pod-spec hash.** `spec.podLabels`, `spec.podAnnotations` and their
+`spec.sentinel` counterparts reach only the template metadata, and the statefulset-controller
+applies template metadata to no running pod under `OnDelete`. A change therefore rewrote both
+templates, moved both controller revisions and replaced no pod: measured on 2026-10-05 on
+wds18-k8s-main, where a label added to eight clusters reached none of the 21 data pods
+chaos-mesh had not happened to kill, a label-keyed scrape stayed down, and
+`KubeStatefulSetUpdateNotRolledOut` fired on every data StatefulSet with a pod left on the old
+revision. The record (`VKO_POD_METADATA_HASH`, D2) makes the change ride the failover-aware
+roll. The data tier keeps the presence rule; the Sentinel tier does not, so the release that
+introduces the record rolls every Sentinel tier once (decided by Hans the same day;
+[ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11). The record is carried in
+the pod spec as [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) D1 requires,
+not in a template annotation. Implemented; unit-tested, 11 of 11 mutations of the new code
+killed. The e2e `TestE2E_PodMetadataChangeRollsBothTiers`
+([`pod_metadata_test.go`](../../test/e2e/pod_metadata_test.go)) — add a label to both tiers,
+then remove it — passed twice on 2026-10-05 on a local Kind cluster (control plane + 3 workers,
+an operator image built from this tree, Valkey 9): every data and Sentinel pod replaced and
+carrying the label, then none carrying it, every pod on `updateRevision`, both completion Events,
+no Warning Event; during the second run the record was read on the `sidecar` and `sentinel`
+containers of the persisted templates. A third time inside one full e2e suite on the same image
+(Valkey 9, 56 of 56 tests green); not on Valkey 8, not in CI, and the fleet upgrade that adds the
+Sentinel roll has not run.
+
 The strategy itself predates this ADR set; the template-source and freshness-guard
 decisions below landed on branch `feat/support-pdb`.
 
@@ -308,6 +332,33 @@ than newly introduced, and it is accepted, not fixed: a pod-image-mutating webho
 the template untouched is unsupported. Closing it would mean reading the pod image back with
 mirror-aware tolerance, which the operator has no registry map to do.
 
+*Amended 2026-10-05:* **the seventh input is the pod metadata record**,
+`podMetadataHashFromSts(sts)`. It is a digest of the pod labels and annotations the CR author
+gives the tier (`ComputePodMetadataHash` over `spec.podLabels` and `spec.podAnnotations`, or
+the `spec.sentinel` pair — the user maps, never the merged ones, so an operator-owned label a
+release changes does not move it), carried as `VKO_POD_METADATA_HASH` on the tier's carrier
+container — the sidecar, the sentinel container — and stamped onto the built StatefulSet in
+`reconcileStatefulSet` and `reconcileSentinelStatefulSet`, so the pod-spec hash never moves with
+it ([ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) D1–D3). Both tiers stamp
+it on every write, empty maps included: an empty desired value means "cannot tell" (D3), so a
+record written only for non-empty maps would make the removal of the last entry roll nothing.
+`podOutdated` ORs `podMetadataHashChanged` in; `sentinelPodNeedsUpdate` asks
+`sentinelPodMetadataOutdated`.
+
+**The two tiers read a pod without the record differently.** The data tier keeps the presence
+rule of the TLS record: such a pod is not outdated for it, because otherwise the upgrade that
+introduces the record would replace the only pod of a non-persistent single-replica cluster
+together with its dataset (D6, D7); every multi-replica data pod takes the record in the roll
+its new sidecar image causes anyway
+([ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D11). The Sentinel tier drops
+it: a Sentinel pod without the record is outdated. That tier rolls on an operator upgrade only
+when its pod spec or configuration changes (ADR 0005 D11), so with the presence rule every
+Sentinel StatefulSet would run on a revision no pod carries from the upgrade on —
+`KubeStatefulSetUpdateNotRolledOut` on each of them, the symptom the record exists to end — and
+a `spec.sentinel` metadata change would roll none of the pods from before the record. The tier
+holds no dataset, so the one roll this costs replaces nothing that carries data. Decided by
+Hans, 2026-10-05.
+
 **D3 — An empty desired value means "cannot tell" and degrades toward not replacing
 pods.** `valkeyImageFromSts` and `configHashFromSts` return the empty string when the
 container or annotation is absent, and every comparison treats that as "skip the check".
@@ -415,6 +466,16 @@ Sentinel roll with it was the alternative and lost: a requested TLS or auth swit
 does not arrive is the worse failure. The images, hashes and persistence still come from the
 persisted StatefulSet (D2).
 
+*Amended 2026-10-05:* **the pod metadata record (D2) is the third record a sidecar-only delta
+requires unchanged.** `sidecarOnlyDelta` asks `podMetadataHashChanged` beside the TLS record and
+the config hash, and `singlePodReplaceable` replaces on it: a label or annotation change of the
+CR author replaces a single pod whose sidecar is outdated — without persistence with its
+dataset, the cost a configuration change already carries — and so it does a pod held for a
+security repair. A label selectors and policies key on has to reach the pod, and on a single
+pod the stale sidecar every operator upgrade leaves would otherwise hold it for the pod's
+lifetime. A pod built before the record carries none and is not measured (D2), so the upgrade
+that introduces the record defers exactly what it deferred before.
+
 **D7 — The sidecar image must remain the only pod-spec delta an operator upgrade
 introduces for single-replica pods.** The D6 deferral compares **images only** *(for a
 rootless pod; a root pod is decided by `singlePodDeferral` since 2026-09-26)*, so the
@@ -447,6 +508,13 @@ operator upgrade, with its dataset. `TestComputeConfigHash_PinnedForTheSinglePod
 ([`configmap_test.go`](../../internal/builder/configmap_test.go)) pins the hash of four shapes and
 fails such a release first; the decision it asks for is this rule's. It sees only what the four
 shapes render. The TLS record needs no guard: it is Secret content, and no release moves it.
+
+*Amended 2026-10-05:* the pod metadata recipe is under the same rule. A changed record replaces
+a single pod whatever its sidecar does (D6, amended 2026-10-05), so a release that changes what
+`ComputePodMetadataHash` computes for the same maps restarts every non-persistent single data
+pod at the upgrade, with its dataset. `TestComputePodMetadataHash_Pinned`
+([`pod_metadata_test.go`](../../internal/builder/pod_metadata_test.go)) pins three shapes and
+fails such a release first.
 
 **D8 — During an in-flight manual failover the split-brain resolver is told which pod
 was promoted.** `handleMultiReplicaRollingUpdate` passes `annotationPromotedPod` to
@@ -761,6 +829,49 @@ upgrade stays off — on both tiers beside Sentinel — until somebody deletes t
 as an outdated sidecar, and a pending configuration change would hold the Sentinel tier's own
 changes as well.
 
+### Pod metadata: fold it into `vko.gtrfc.com/pod-spec-hash` (D2, amended 2026-10-05)
+
+No new record, the user maps digested together with the built spec. Lost: on a single data pod a
+pod-spec change cannot be told apart from the sidecar bump and waits with it (D7), and every
+single pod carries a deferred sidecar after its first operator upgrade, so a label change would
+wait on those clusters until something else replaced the pod.
+
+### Pod metadata: compare the pod's labels and annotations with the template directly
+
+No record at all. Lost: it sees an added or changed entry but never a removed one, because a pod
+carries labels from others too (the sidecar's `instanceRole`, the statefulset-controller's, a
+human's); and a mutating admission policy that rewrites a label value at pod create would make
+every pod outdated forever.
+
+### Pod metadata: roll on `controller-revision-hash != status.updateRevision`
+
+Lost: it rolls on every template delta, including the ones the operator defers on purpose (D6,
+the retired repair's timing), and it makes the revision the driver, which
+[ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D3 keeps out of the decision.
+
+### Pod metadata: patch the template metadata onto the running pods
+
+No restart. Lost: the pods keep the old revision, so the revision gap and its alert never close
+and `sentinelRolloutComplete` never completes; and it is a pod-metadata write the operator does
+not make today ([ADR 0020](0020-write-only-what-the-operator-owns.md)).
+
+### Pod metadata: carry the record in a pod template annotation
+
+The first design of this amendment. Lost to [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)
+D1: the sidecar may patch its own pod's metadata, and with the data tier's presence rule a pod
+whose record was deleted is unmeasured, so it would opt out of every later metadata roll.
+
+### Pod metadata: the presence rule on the Sentinel tier too
+
+No extra roll at the upgrade. Lost (Hans, 2026-10-05): every Sentinel StatefulSet runs on a
+revision no pod carries from that upgrade on, the alert fires on each, and a `spec.sentinel`
+metadata change rolls none of the pods from before the record until chance replaces them.
+
+### Pod metadata: no presence rule on either tier
+
+Lost: the upgrade that introduces the record replaces the only pod of every non-persistent
+single-replica cluster, with its dataset.
+
 ## Residual risks
 
 * `podNeedsUpdate` skips the config-hash comparison when a pod lacks
@@ -833,15 +944,31 @@ changes as well.
   pod-0 in that window as well, since it is an outdated replica there, so D11 does not add the
   case.
 
+* **The introducing release leaves a revision gap the presence rule does not close (D2, amended
+  2026-10-05).** On the kustomize or floating-tag path the data tier does not roll on an operator
+  upgrade (ADR 0005 D11), and a deferred single data pod is not replaced: both keep a revision
+  their template no longer has, and the alert fires on those StatefulSets until the pods are
+  replaced. A `spec.podLabels` change does not reach such a pod either, because it carries no
+  record, and nothing reports that beyond the standing `SidecarUpdatePending`.
+* **Template metadata the operator owns is still covered by no record.** A release that changes a
+  base label or a template annotation outside the hashes moves the revision and rolls nothing.
+  Today the only such label that changes, `app.kubernetes.io/version`, moves with `spec.image`,
+  which rolls anyway.
+* **The record makes the CR's metadata reach every pod; it compares no live label.** What a
+  pod's own sidecar writes onto its pod after it started is not undone by this mechanism
+  ([isolation and tenancy](../security/isolation-and-tenancy.md#what-does-not-hold)).
+
 ## References
 
-* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — for D11 `rollDataTier`, `singleDataPodBehindSentinel`, `handleSentinelSinglePodRollingUpdate`, `restateAsSinglePodReplacement`, `settleDeferredReplacement`, `recordSinglePodReplacement`, the tier-of-one guard in `handleRollingUpdate`; `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`; for the 2026-09-28 amendment `handleMasterFailover`, `triggerSentinelFailover`, `coordinatedFallbackReason`, `handleFailoverRetrigger`, `replicationNotEstablishedReason`
+* [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) — for D11 `rollDataTier`, `singleDataPodBehindSentinel`, `handleSentinelSinglePodRollingUpdate`, `restateAsSinglePodReplacement`, `settleDeferredReplacement`, `recordSinglePodReplacement`, the tier-of-one guard in `handleRollingUpdate`; `checkAndHandleRollingUpdate`, `collectPodStates`, `handleStandaloneRollingUpdate`, `handleMultiReplicaRollingUpdate`, `handlePostManualFailover`, `promotePod0AndRedirect`, `isSidecarOnlyChange`, `podNeedsUpdate`, `replaceNextReplica`, `replaceRemainingPods`, `availabilityWait`, `dispatchSentinelRollingUpdate`, `sentinelScan.deleteTarget`, `sentinelWait`; for the 2026-09-28 amendment `handleMasterFailover`, `triggerSentinelFailover`, `coordinatedFallbackReason`, `handleFailoverRetrigger`, `replicationNotEstablishedReason`; for the 2026-10-05 amendment `podOutdated`, `podMetadataHashChanged`, `podMetadataHashFromSts`, `sentinelPodNeedsUpdate`, `sentinelPodMetadataOutdated`
 * [`internal/controller/master_handover.go`](../../internal/controller/master_handover.go) — `gateOutgoingPodDelete`, `verifyNewMasterReady` (moved here from `rolling_update.go` on 2026-09-28), `replicasNotOnNewMaster`, `datasetRefusal`, `holdHandover`
 * [`internal/valkeyclient/client.go`](../../internal/valkeyclient/client.go) — `ReplicationInfo.NotEstablishedReason` (D10's predicate), `SentinelFailoverCoordinated`
-* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `runSentinelRollingUpdate` (the Sentinel-tier residual risk)
-* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26); `sidecarOnlyDelta` (D6 as amended 2026-09-29)
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `runSentinelRollingUpdate` (the Sentinel-tier residual risk); `reconcileStatefulSet` and `reconcileSentinelStatefulSet` stamp the pod metadata record (D2 as amended 2026-10-05)
+* [`internal/controller/pod_security_migration.go`](../../internal/controller/pod_security_migration.go) — `singlePodDeferral`, `reportPodSecurityUpdatePending` (D6, D7 as amended 2026-09-26); `sidecarOnlyDelta` (D6 as amended 2026-09-29 and 2026-10-05), `singlePodReplaceable` (D6 as amended 2026-10-05)
 * [`internal/builder/configmap_test.go`](../../internal/builder/configmap_test.go) — `TestComputeConfigHash_PinnedForTheSinglePodRule` (D7 as amended 2026-09-29)
 * [`internal/builder/statefulset.go`](../../internal/builder/statefulset.go) — `ComputePodSpecHash`, the readiness probe
+* [`internal/builder/pod_metadata.go`](../../internal/builder/pod_metadata.go) — `ComputePodMetadataHash`, `StampPodMetadataHash`, `RecordedPodMetadataHash` (D2 as amended 2026-10-05); `TestComputePodMetadataHash_Pinned` in its test (D7 as amended 2026-10-05)
+* [`internal/controller/pod_metadata_test.go`](../../internal/controller/pod_metadata_test.go) and [`test/e2e/pod_metadata_test.go`](../../test/e2e/pod_metadata_test.go) — the pod metadata record's unit guard and e2e
 * [`internal/builder/configmap.go`](../../internal/builder/configmap.go) — `replica-serve-stale-data yes`
 * [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) — why the rolling update must survive its own rejected write
 * [ADR 0008](0008-known-master-annotation-is-the-recorded-authority.md) — how the promotion decision reaches the pods

@@ -68,6 +68,7 @@ hashes, and the drift comparisons. They make no API calls.
 | [`rbac.go`](../../internal/builder/rbac.go) | The per-cluster sidecar ServiceAccount, Role and RoleBinding |
 | [`observer.go`](../../internal/builder/observer.go) | The observer Deployment and ServiceAccount, and the Deployment's drift comparison |
 | [`pod_security.go`](../../internal/builder/pod_security.go) | The rootless posture applied by one walk over every container, the `check-data-writable` pre-flight, the `fix-data-ownership` repair, and the securityContext comparisons |
+| [`pod_metadata.go`](../../internal/builder/pod_metadata.go) | The pod metadata record: a digest of a tier's user pod labels and annotations, its stamping onto the carrier container, and reading it back |
 | [`tls_material.go`](../../internal/builder/tls_material.go) | The TLS material fingerprint, its stamping onto a pod template, and reading it back |
 | [`annotations.go`](../../internal/builder/annotations.go) | The operator-version, config-hash, pod-spec-hash, nudge and TLS-material annotation keys and their helpers |
 | [`volumeclaim_conflict.go`](../../internal/builder/volumeclaim_conflict.go) | The comparison of desired against persisted `volumeClaimTemplates` |
