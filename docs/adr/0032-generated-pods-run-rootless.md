@@ -39,7 +39,8 @@ questions it had left open.
   correction marked with its date. The option that lost is under *Alternatives Considered*.
 - **A tier of one or two Sentinels rolls serially** — decided in
   [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10 and recorded here for its
-  reach: this ADR rolls every Sentinel tier once, and such a tier, whose quorum equals its size,
+  reach: this ADR rolls every Sentinel tier once *(the tier behind a single data pod only since
+2026-09-29, [ADR 0007](0007-failover-aware-rolling-update.md) D11)*, and such a tier, whose quorum equals its size,
   refused the delete of every Ready Sentinel and never finished that roll
   ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md), *Residual risks*).
 
@@ -115,6 +116,21 @@ under `fsGroup`); [ADR 0017](0017-test-and-ci-policy.md) (the new guards). Super
 Amended 2026-09-28 (correction, no decision changes): the first Consequence said every roll
 loses nothing. [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D8
 says what a multi-replica roll keeps and what it loses; the claim is struck and corrected in place.
+
+Amended 2026-09-29 (correction; D3 gains a topology, no rule of this ADR changes): **a Sentinel
+cluster with one data pod never took this release's rolls, on either tier, until
+[ADR 0007](0007-failover-aware-rolling-update.md) D11.** The failover roll it went through has
+no replica to promote: it asked Sentinel for a failover about every 15 s, Sentinel refused each
+one, and every pass ended before the Sentinel roll. Its data pod and every one of its Sentinel
+pods kept running as root, reported by nothing — `PodSecurityUpdatePending` is written only on
+the single-pod route — and on a persistent tier the repair stayed in the template, because the
+loop kept a roll state recorded (D4). The statements that this release rolls every Sentinel tier
+once, that after the second roll the only generated pods with a root container are D3's deferred
+single pods and very old pods, and the residual risk that described such a cluster's pod as
+"replaced like on every other spec change of that shape" were false for that topology until this
+date. Since ADR 0007 D11 its data pod is decided by D3 like any single pod, its replacement is
+recorded while it runs (D4, D7), and its Sentinel tier rolls once the data tier completes or
+defers. Marked in place.
 
 ## Context
 
@@ -245,13 +261,16 @@ asks for the pass that removes it)* — a data pod that still carries it is outd
 `podOutdated` is `podNeedsUpdate` against the persisted StatefulSet or `podCarriesRetiredRepair`
 (the pod spec carries `fix-data-ownership`, the persisted template does not), and it is what
 every data-tier site asks — the dispatch loop, `collectPodStates`, the standalone handler and
-the manual-failover master check. The ordinary failover-aware roll then replaces those pods
+the manual-failover master check. The ordinary failover-aware roll — for a single data pod the
+single-pod roll — then replaces those pods
 from the clean template. The comparison is one-directional: while the template carries the
 repair no pod is outdated for lacking it, so the write that adds it stays a non-roll. A pod
 missing during the second roll is no evidence for the repair — D4 keeps only a repair the
 template already carries — so it does not come back. After the second roll the only generated
 pods with a root container are the deferred non-persistent single pods of D3 and a pod too old
-to carry a `pod-spec-hash` (*Residual risks*). In a persistent tier such an old pod is itself
+to carry a `pod-spec-hash` (*Residual risks*) *(for a Sentinel cluster with one data pod only
+since 2026-09-29: until [ADR 0007](0007-failover-aware-rolling-update.md) D11 its data pod and
+its Sentinel pods never rolled and all stayed root)*. In a persistent tier such an old pod is itself
 migration evidence (D4): it keeps the repair in the template, so that tier's second roll waits
 for the same restart that migrates it.
 
@@ -262,7 +281,9 @@ make (Consequences).~~ *(Superseded 2026-09-26 by the paragraph above; the optio
 under Alternatives.)*
 
 **D3 — Single-pod clusters are decided by persistence.** On a `spec.replicas: 1` data cluster
-whose pod runs without `runAsNonRoot` (`singlePodDeferral`):
+whose pod runs without `runAsNonRoot` (`singlePodDeferral`) — with or without Sentinel *(since
+2026-09-29, [ADR 0007](0007-failover-aware-rolling-update.md) D11; until then a Sentinel
+cluster's single pod went to the failover roll, which never replaced it)*:
 
 - persistent: replaced at once, with the repair running on its way up, and once more when the
   repair has left the template (D2) — ~~one restart~~ two restarts *(corrected 2026-09-26)*,
@@ -285,7 +306,8 @@ a persistence toggle the operator refused to write (ADR 0023) would otherwise re
 "persistent" and delete the only pod together with its `emptyDir`.
 
 `isSidecarOnlyChange` no longer decides a root pod; it still decides a rootless one (ADR 0007
-D6). `PodSecurityUpdatePending` is a level with one evaluator in `checkAndHandleRollingUpdate`
+D6) — since 2026-09-29 through `sidecarOnlyDelta`, which replaces a rootless pod on a rotated TLS
+record or a changed configuration as this rule replaces a root one (ADR 0007 D6, amended). `PodSecurityUpdatePending` is a level with one evaluator in `checkAndHandleRollingUpdate`
 (the deferral is decided one dispatch target down, which most passes never reach), written
 `False/PodSecurityUpdateApplied` only over a standing True, Event-free (ADR 0025 D7), with a
 row in `conditionRegistry` (ADR 0027).
@@ -312,8 +334,10 @@ before that roll's finalization — topology check, state clear, `RollingUpdateC
 `clearStaleRollingUpdateState` then discards its state as stale, on the non-Sentinel path in the
 middle of the topology restoration. The repair therefore stays while
 `annotationRollingUpdateState` is set, and a migrated pod is one that is Ready, not one past its
-pre-flight: a single pod records no roll state, and Ready is what keeps its second restart behind
-the first having served. The state is a gate on *keeping* the repair, never evidence for adding
+pre-flight: a single pod records no roll state *(without Sentinel; the single data pod of a
+Sentinel cluster records `replacing-replicas` while it is replaced since 2026-09-29,
+[ADR 0007](0007-failover-aware-rolling-update.md) D11, and both gates order its second
+restart)*, and Ready is what keeps its second restart behind the first having served. The state is a gate on *keeping* the repair, never evidence for adding
 it (`TestDataOwnershipRepairNeeded_StaysWhileARollIsRecorded`). *(Added 2026-09-26, measured.)*
 The gate moves the removal into the pass **after** the one that completes the first roll, and
 nothing schedules that pass: the CR watch is generation-gated (`GenerationChangedPredicate`),
@@ -348,7 +372,9 @@ can be set on it;
 lists the violators first. While the migration runs it also lists the persistent data pods that
 carry the repair (D2), until the second roll has replaced them from the clean template. After
 it the generated pods the dry-run can still name are the non-persistent single pods deferred
-under D3 and a pod too old to carry a `pod-spec-hash` (*Residual risks*); both run as root until
+under D3 and a pod too old to carry a `pod-spec-hash` (*Residual risks*) *(until 2026-09-29 also
+the data pod and every Sentinel pod of a Sentinel cluster with one data pod, which never rolled;
+[ADR 0007](0007-failover-aware-rolling-update.md) D11)*; both run as root until
 they restart, and in a persistent tier the old pod also holds the repair in the template, so
 that tier's pods keep carrying it until then (D2). ~~It also lists the persistent data pods created
 during the migration, which still carry the repair (D2); enforcement does not evict running
@@ -361,7 +387,9 @@ case — is reported as `PodAvailabilityStalled` instead of stalling silently, a
 operator replaces the stuck pod itself. A **single pod** is not covered: its roll records no
 state, so a current pod that does not start takes the converged early return and shows only as
 phase `Provisioning` (ADR 0026, residual risk "A single pod that never starts is not
-reported").
+reported"). *(Narrowed 2026-09-29: the single data pod of a Sentinel cluster records its
+replacement, [ADR 0007](0007-failover-aware-rolling-update.md) D11, so a replacement the operator
+made that never comes up is reported as `PodAvailabilityStalled`.)*
 
 ## Consequences
 
@@ -382,9 +410,12 @@ reported").
   2026-09-26: they roll serially, one Sentinel at a time and only while every other one is
   available, and lose automatic failover for the seconds a Sentinel restarts
   ([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D10); before that decision
-  such a tier never finished this roll.
+  such a tier never finished this roll. *(Corrected 2026-09-29: the Sentinel tier behind a single
+  data pod rolls since [ADR 0007](0007-failover-aware-rolling-update.md) D11; until then it never
+  did, because that cluster's data roll never completed.)*
 - **Persistent single-pod clusters restart twice at the upgrade** — for the posture, then for
-  the retired repair (D2); downtime, not data loss. ~~restart once~~ *(corrected 2026-09-26)*.
+  the retired repair (D2); downtime, not data loss. *(With or without Sentinel since 2026-09-29,
+  [ADR 0007](0007-failover-aware-rolling-update.md) D11.)* ~~restart once~~ *(corrected 2026-09-26)*.
   ~~The second restart does not wait for the first to have served: D4 counts the pod as migrated
   once its pre-flight exited 0, and the standalone handler replaces an outdated single pod
   without asking readiness (ADR 0026 D11), so the two can run into one longer outage.~~
@@ -392,7 +423,9 @@ reported").
   the two restarts.)*
 - **Non-persistent single-pod clusters keep running as root** until their next restart for any
   other reason, and say so in `PodSecurityUpdatePending`. That is the price of never discarding
-  a dataset for an operator upgrade.
+  a dataset for an operator upgrade. *(With or without Sentinel since 2026-09-29,
+  [ADR 0007](0007-failover-aware-rolling-update.md) D11; the Sentinel pods beside such a data pod
+  roll regardless.)*
 - Root still runs once per persistent data pod during the migration, for a fraction of a second
   — also on storage where `fsGroup` alone would have sufficed. The repair cannot tell the two
   apart without a failed start first (Alternatives, M2).
@@ -550,11 +583,16 @@ reported").
   How often the Sentinel path takes which order was not measured, and the non-Sentinel path was
   not traced past the state clear. *(Corrected 2026-09-26: this item called the order timing on
   both paths and said the e2e counted two Events.)*
-- A **Sentinel** cluster with `spec.replicas: 1` is not covered by D3: it goes through the
+- ~~A **Sentinel** cluster with `spec.replicas: 1` is not covered by D3: it goes through the
   Sentinel rolling update (`handleRollingUpdate`), not `singlePodDeferral`, and its only data pod
   is replaced like on every other spec change of that shape — without persistence, with its
   data. That predates this ADR; this release is one more trigger for it. With persistence its
-  pod is outdated a second time by the retired repair, like every persistent data pod (D2).
+  pod is outdated a second time by the retired repair, like every persistent data pod (D2).~~
+  **Closed 2026-09-29 by [ADR 0007](0007-failover-aware-rolling-update.md) D11**, and the text
+  above was wrong: the Sentinel rolling update never replaced that pod. With no replica to
+  promote it asked Sentinel for a failover about every 15 s and discarded its own state on the
+  next pass, so the data pod and every Sentinel pod of that cluster kept running as root,
+  unreported (Status). Such a cluster is decided by D3 now, like any single pod.
 - A pod created by an operator so old that it carries no `pod-spec-hash` annotation is not
   recognised as outdated by the posture change (`podSpecHashChanged` falls back to comparing
   resources), so it is not migrated by the roll; a restart for any other reason migrates it.
@@ -596,7 +634,7 @@ reported").
   stays the one gate: a repair that achieves nothing leaves the pod failing at
   `check-data-writable` rather than serving a silent `MISCONF`; on a multi-replica tier that is
   reported as `PodAvailabilityStalled` after `syncTimeout`, while a single pod shows only as phase
-  `Provisioning` (D7).
+  `Provisioning` (D7; the data pod of a Sentinel cluster is reported since 2026-09-29).
 
 ## References
 
@@ -606,7 +644,9 @@ reported").
   — the migration evidence, the single-pod rule, the condition's evaluator
 - [`internal/controller/rolling_update.go`](../../internal/controller/rolling_update.go) —
   `podOutdated` and `podCarriesRetiredRepair` (the second roll), `finishDataRoll` (the recheck
-  that lets the repair leave, D4), `sentinelDeleteKeepsVotes` (ADR 0024 D10)
+  that lets the repair leave, D4), `sentinelDeleteKeepsVotes` (ADR 0024 D10),
+  `singleDataPodBehindSentinel` and `handleSentinelSinglePodRollingUpdate` (the Sentinel cluster
+  with one data pod, ADR 0007 D11)
 - [`internal/builder/image_requirements.go`](../../internal/builder/image_requirements.go) —
   `find` and `chown`
 - Tests: [`internal/builder/pod_security_test.go`](../../internal/builder/pod_security_test.go)

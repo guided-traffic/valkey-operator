@@ -26,8 +26,8 @@ not a supported upgrade path.
 > **One-time migration: the release that makes generated pods rootless.** Upgrading
 > from an operator that still ran Valkey as root rolls **every Sentinel tier** once —
 > tiers of one or two Sentinels serially — and every multi-replica data tier once, a
-> persistent one **twice**; restarts persistent single-pod clusters without Sentinel
-> twice; and re-owns data an older operator wrote as root. On NFS with `root_squash`, act
+> persistent one **twice**; restarts the only data pod of a persistent single-replica
+> cluster — with or without Sentinel — twice; and re-owns data an older operator wrote as root. On NFS with `root_squash`, act
 > **before** the upgrade. Details below and in
 > [ADR 0032](../adr/0032-generated-pods-run-rootless.md); the security view of the migration
 > is [docs/security/rootless-migration.md](../security/rootless-migration.md).
@@ -45,15 +45,15 @@ field to switch it off and no opt-out. The same release sets `enableServiceLinks
 every generated pod and pins the default exporter image by digest; those changes are part
 of the same pod-spec change and add no roll of their own.
 The posture is part of the pod spec, so the upgrade moves each cluster once, a persistent
-data tier a second time for the repair container below, and one kind of cluster not at all:
+data tier a second time for the repair container below, and one kind of data pod not at all:
 
 | Cluster | What the upgrade does |
 |---|---|
 | Multi-replica data tier | Rolls through the failover-aware rolling update, like every roll: the pre-roll dataset survives, and where the roll's failover is forced — Sentinels before Valkey 9.0, or a coordinated failover that fell back — the writes the outgoing master acknowledges during that failover are lost ([below](#writes-during-the-rolls-failover)). Once without persistence; **twice** with it: the second roll replaces the pods created while the template carried the repair container below, once that container has left it — which it does only after the first roll has finalized (its `RollingUpdateComplete`) and every data pod is Ready, so the two rolls run one after the other and report two completions. |
 | Sentinel tier | Rolls once, behind the quorum guard; a tier of one or two Sentinels rolls serially (below). Sentinel pods carry no sidecar, so an operator upgrade rolls them only when the release changes their pod spec or configuration — this one does. |
 | Observer Deployment | Restarts once; it holds no data. |
-| Single replica without Sentinel, persistent | The only pod is replaced at the upgrade, and once more when the repair container below has left the template — **two short downtimes**, data kept (it reloads its RDB/AOF each time). The second restart waits until the first replacement is Ready, so the pod serves between the two. The sidecar-only deferral described further down holds back neither. |
-| Single replica without Sentinel, not persistent | **Not restarted**, because that would discard the dataset. The pod keeps running as root and the CR carries `PodSecurityUpdatePending=True` (reason `PodRunsAsRoot`) naming it until the pod restarts for any other reason. `kubectl delete pod <name>-0` applies the posture now and discards the dataset. A new `spec.image`, a certificate rotation or a configuration change still replaces the pod, as it always did. |
+| Single replica, persistent (with or without Sentinel) | The only data pod is replaced at the upgrade, and once more when the repair container below has left the template — **two short downtimes**, data kept (it reloads its RDB/AOF each time). The second restart waits until the first replacement is Ready, so the pod serves between the two. The sidecar-only deferral described further down holds back neither. |
+| Single replica, not persistent (with or without Sentinel) | **Not restarted**, because that would discard the dataset. The pod keeps running as root and the CR carries `PodSecurityUpdatePending=True` (reason `PodRunsAsRoot`) naming it until the pod restarts for any other reason. `kubectl delete pod <name>-0` applies the posture now and discards the dataset. A new `spec.image`, a certificate rotation or a configuration change still replaces the pod, as it always did. A Sentinel tier beside it rolls regardless. |
 
 "Persistent" is what the data StatefulSet was created with, not what `spec.persistence`
 says now: a toggle the operator refused to apply (see
@@ -156,8 +156,8 @@ exporter gets two variables that switch off its `/scrape` route and the export o
 | Cluster with `spec.metrics.enabled` | What the upgrade does |
 |---|---|
 | Multi-replica data tier | Rolls once through the failover-aware rolling update, together with the sidecar image every operator upgrade moves ([below](#what-an-upgrade-does-to-running-clusters)). |
-| Single replica without Sentinel, persistent | The only pod is replaced once — a short downtime, the data kept on its volume. |
-| Single replica without Sentinel, not persistent | **Not restarted**, because that would discard the dataset. The pod keeps the old exporter, `/scrape` included, and the CR carries `PodSecurityUpdatePending=True` with reason `ExporterOutdated` naming it until the pod restarts for another reason. `kubectl delete pod <name>-0` applies the update now and discards the dataset. |
+| Single replica, persistent (with or without Sentinel) | The only data pod is replaced once — a short downtime, the data kept on its volume. |
+| Single replica, not persistent (with or without Sentinel) | **Not restarted**, because that would discard the dataset. The pod keeps the old exporter, `/scrape` included, and the CR carries `PodSecurityUpdatePending=True` with reason `ExporterOutdated` naming it until the pod restarts for another reason. `kubectl delete pod <name>-0` applies the update now and discards the dataset. |
 | Own `spec.metrics.image` | Used as given. An image older than v1.83.0 starts but keeps `/scrape`; move it to v1.83.0 or later. |
 
 Upstream v1.90.0 changed the keyspace metrics; check dashboards and alerts built on the
@@ -205,7 +205,8 @@ said "without data loss")*
 ### Writes during the roll's failover
 
 **A Sentinel cluster's roll asks for a coordinated failover, and falls back to the forced
-one where the Sentinels cannot run it** ([the master handover](rolling-updates.md#the-master-handover-on-a-sentinel-cluster),
+one where the Sentinels cannot run it** — unless it has one data pod, which has nothing to fail
+over to and asks for none ([below](#a-single-replica-cluster)) ([the master handover](rolling-updates.md#the-master-handover-on-a-sentinel-cluster),
 [ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
 D1). The operator that runs the roll sends the command, so the roll an operator upgrade
 starts already asks for the coordinated failover (read from the code). Two things follow
@@ -223,16 +224,18 @@ for an upgrade:
   aborts: clients see a hang and a disconnect, not an error. The roll then falls back to its
   forced retrigger, which loses that failover's window of writes.
 
-### A single-replica cluster without Sentinel
+### A single-replica cluster
 
-**A single-replica cluster without Sentinel is not restarted for this.** A
-sidecar-only delta on the only pod has no failover target, so the operator
+**A single-replica cluster — with or without Sentinel — is not restarted for this.** A
+sidecar-only delta on the only data pod has no failover target, so the operator
 deliberately does not apply it: it sets the `SidecarUpdatePending` condition on the
 `Valkey` CR and leaves the pod running the **old** sidecar image. There is no
 downtime and nothing to schedule — but there is also no automatic convergence: the
 pod keeps the old sidecar until something restarts it, which means a manual
-`kubectl delete pod`, an eviction, or a spec change that alters the pod template
-(a new `spec.image`, for example). Force it when you want it — but the restart is
+`kubectl delete pod`, an eviction, a new `spec.image`, a configuration change or a
+certificate rotation — those three replace the pod even while its sidecar is old. A change
+of the pod spec alone (resources, affinity, the exporter) does not: it waits with the
+sidecar, and the condition stands for both. Force it when you want it — but the restart is
 not free on the only pod of the cluster: it has no failover target, so an instance
 without `persistence.enabled` comes back empty (with persistence it reloads its
 RDB/AOF). This is the same exception as the
@@ -240,6 +243,20 @@ RDB/AOF). This is the same exception as the
 rootless release does restart a persistent single-replica cluster**: a pod that still
 runs as root is decided by persistence, not by the sidecar image — see the one-time
 migration above.
+
+**A Sentinel cluster with one data pod** — what `sentinel.enabled: true` gives without
+`spec.replicas` — follows these single-pod rules too, and its Sentinel tier rolls after the
+data pod, or in the same pass when the data pod's change is held back
+([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11). Releases before this one sent it
+through the failover roll, which has no replica to promote: the operator asked Sentinel for a
+failover about every 15 s, never replaced the pod and never rolled the Sentinel tier, and every
+change of either tier — the rootless posture and rotated TLS material included — stayed
+unapplied. The first reconcile after upgrading takes what that held by the rules above: the data
+pod is replaced when its image, its configuration or its TLS certificate changed in the meantime
+— without persistence its dataset is gone — or when it is persistent and still runs as root
+(twice); a non-persistent pod still running as root is held and named by
+`PodSecurityUpdatePending`; anything else waits with the upgrade's sidecar. The Sentinel tier
+rolls in every case.
 
 ```bash
 kubectl get valkey <name> -o jsonpath='{range .status.conditions[?(@.type=="SidecarUpdatePending")]}{.status}{"\n"}{end}'

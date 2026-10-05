@@ -681,30 +681,6 @@ func kubectlExec(t *testing.T, namespace, pod, container string, args ...string)
 	return stdout.String()
 }
 
-// countValkeyEventsSince counts the Events with the given reason about a Valkey CR
-// since a point in time, summing an aggregated series.
-func (tc *testClients) countValkeyEventsSince(t *testing.T, namespace, name, reason string, since metav1.Time) int {
-	t.Helper()
-	events, err := tc.kube.EventsV1().Events(namespace).List(context.Background(), metav1.ListOptions{})
-	require.NoError(t, err)
-	count := 0
-	for i := range events.Items {
-		ev := &events.Items[i]
-		if ev.Regarding.Kind != "Valkey" || ev.Regarding.Name != name || ev.Reason != reason {
-			continue
-		}
-		if ev.EventTime.Time.Before(since.Time) && ev.DeprecatedLastTimestamp.Time.Before(since.Time) {
-			continue
-		}
-		if ev.Series != nil && ev.Series.Count > 0 {
-			count += int(ev.Series.Count)
-			continue
-		}
-		count++
-	}
-	return count
-}
-
 // requireHostPathVolume asserts that the PV bound to the claim is a hostPath one.
 func (tc *testClients) requireHostPathVolume(t *testing.T, namespace, claim string) {
 	t.Helper()

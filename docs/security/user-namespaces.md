@@ -101,7 +101,8 @@ measurement is in [pod security](../operations/pod-security.md#seccomp-profile-a
 API server that drops the field shows `ReconcileBlocked=True/UserNamespacesUnsupported`
 and phase `Error` (the pods keep running without the namespace); a node that cannot
 honour it holds the roll on a replacement that never starts (`PodAvailabilityStalled`),
-and a single pod is not reported. For the operator and the hook no Valkey resource
+and a single pod is not reported — except the data pod of a Sentinel cluster with one, whose
+replacement is reported like a roll's ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11). For the operator and the hook no Valkey resource
 reports either case: a dropped field is silent, and a pod a node cannot start shows
 it only in its own status and events — on `helm upgrade` the hook runs first, so the
 upgrade fails there (read from the chart, not run). ~~Not yet measured on any

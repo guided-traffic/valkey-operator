@@ -338,7 +338,10 @@ the template, one more controlled failover per persistent multi-replica cluster,
 persistent single pod without Sentinel restarts twice, for the posture and then for the retired
 repair, each a short downtime with its data kept.)*
 Non-persistent single pods without Sentinel are deferred while their Valkey image is unchanged,
-and reported by `PodSecurityUpdatePending`. **Not verified:** that the posture alone moves the
+and reported by `PodSecurityUpdatePending`. *(Since 2026-09-29 the single data pod of a Sentinel
+cluster is decided the same way, with or without persistence, and its Sentinel tier rolls;
+until then neither tier of such a cluster ever took this release —
+[ADR 0007](0007-failover-aware-rolling-update.md) D11.)* **Not verified:** that the posture alone moves the
 Sentinel hash rests on reading `podSpecDigest` (the JSON of the whole built spec); no unit test
 pins it for the Sentinel spec. `TestE2E_FleetUpgrade` passed locally on 2026-09-26 (Kind, not
 CI) from the released chart 1.12.8: the Sentinel tier completed exactly one roll — one

@@ -195,7 +195,9 @@ measured). No pod template changes.
   `:789-792` is accurate. `:90-94`, `:1369-1373`, `:2721-2725` call the cycle the `NOGOODSLAVE`
   recovery. The test pins only the cap pass.
 - Measured: `replica-priority 0` on every replica, or no replica at all, makes every forced
-  failover answer `NOGOODSLAVE`, again 20 s later (the operator never sets the priority).
+  failover answer `NOGOODSLAVE`, again 20 s later (the operator never sets the priority). No
+  replica at all is not a driver: a Sentinel cluster with one data pod is rolled as a single pod
+  and asks for no failover ([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D11).
 - Drivers (by reading): an old master unreachable on a NotReady node is marked master by its label
   and `:3308` resets the tier toward it, which is measured scenario A and sustains the cycle until
   the node returns; also a current master that is not `available()`, or replicas that cannot

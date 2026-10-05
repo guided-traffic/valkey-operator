@@ -53,7 +53,14 @@ report.
 ## The master handover on a Sentinel cluster
 
 A Sentinel cluster's roll hands the master over once, when every replica runs the
-current spec: it waits until every replica answers that it holds the dataset and a
+current spec — unless the cluster has one data pod: with no replica to hand over to, that pod
+follows the rules of a single-replica cluster without Sentinel
+([upgrading.md](upgrading.md#a-single-replica-cluster)) — a new sidecar image is held back, and
+a pod-spec change with it; a new image, configuration or certificate replaces the pod with no
+failover and a short downtime, and without persistence the replacement loses its data
+([ADR 0007](../adr/0007-failover-aware-rolling-update.md) D6, D11).
+Otherwise it waits until every
+replica answers that it holds the dataset and a
 `WAIT` on the master has been acknowledged, asks Sentinel for a failover, waits for the
 promoted pod and then deletes the former master.
 

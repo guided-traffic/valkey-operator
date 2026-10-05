@@ -180,7 +180,11 @@ more-than-one-master predicate and therefore calls the bare resolver, not
 succeeded. A clean rolling update reads `RollingUpdate` ×n →
 `FailoverTriggered` / `ManualFailover` → `RollingUpdateComplete` →
 `SentinelUpdateComplete`, all Normal, on both topologies, and that is asserted by
-an e2e subtest per topology rather than left as a property nobody checks.
+an e2e subtest per topology rather than left as a property nobody checks. *(A
+Sentinel cluster with one data pod reads `RollingUpdateComplete` →
+`SentinelUpdateComplete` alone since 2026-09-29 — no replica step, no failover —
+and asserts it in `TestE2E_RollingUpdate_SentinelSingleDataPod`;
+[ADR 0007](0007-failover-aware-rolling-update.md) D11.)*
 
 **D8. Every test reconciler records Events.** `newTestReconciler` installs a
 `fakeEventRecorder` by default, so a newly added Event can fail an assertion

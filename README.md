@@ -530,7 +530,7 @@ A **level** is re-measured on every pass, an **edge** records something and is c
 | `Provisioning` | Initial setup in progress |
 | `Syncing` | Replication sync in progress |
 | `Rolling Update X/Y` | Data-tier rolling update progress |
-| `Sentinel Rolling Update X/Y` | Sentinel-tier rolling update progress (runs after the data tier — except in the pass in which a data roll pauses on its sync timeout — or alone on Sentinel-only spec changes) |
+| `Sentinel Rolling Update X/Y` | Sentinel-tier rolling update progress (runs after the data tier — except in the pass in which a data roll pauses on its sync timeout — or alone on Sentinel-only spec changes and beside a single data pod whose change is held back) |
 | `Failover in progress` | Sentinel-triggered leader switch |
 | `Error` | Error state (see `message` for details) — what it covers: [status.md](docs/operations/status.md#error) |
 
