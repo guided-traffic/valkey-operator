@@ -38,3 +38,9 @@ main
 tmp/
 .claude/
 graphify-out/
+
+# Embargoed tickets: a live|boundary security finding stays untracked while
+# local_-prefixed, independent of anyone's global excludes file (ADR 0034). The **
+# covers archive/ as well, where a ticket that closes while still embargoed (dropped,
+# or done with the risk accepted) keeps its prefix until the owner accepts publishing it.
+docs/tickets/**/local_*

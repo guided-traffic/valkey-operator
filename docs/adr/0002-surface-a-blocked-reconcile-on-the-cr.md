@@ -38,6 +38,26 @@ condition is a one-shot record with no later pass to recompute it uses that func
 directly and decides for itself
 ([ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D15).
 
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
+
+Amended again 2026-09-27 (correction, no decision changes): the reason D5's amendment and its
+residual risk give for leaving `readyReplicas` where it is — every phase message is a
+function of the ready count — is imprecise. Five phase messages name no count, and on a
+blocked pass `persistStatus` puts the previous phase and message back, so there only the
+`Ready` condition moves with the count. Both places are struck and restated in place, and
+Residual risks gains an entry with the verified facts. D5 and the choice to leave the
+assignment where it is are unchanged.
+
+Corrected 2026-09-27 (no decision changes), two sentences found false by code reading. D11
+said that with Sentinel `status.masterPod` comes from Sentinel; it is the data pod `findMaster`
+finds answering `role:master` to `INFO replication`, and no Sentinel is asked. The residual
+risk on `Ready` during a rolling update missed the two kinds of pass that reach `updateStatus`
+mid-roll (the correction of [ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) D4
+of the same day). Both are struck and corrected in place; D11 and D5a are unchanged as rules.
+Verified by reading `CheckCluster` and `findMaster` in
+[`checker.go`](../../internal/health/checker.go), `updateHAStatus`, `reconcileWorkload` and
+`pauseRollingUpdate`; nothing was run.
+
 ## Context
 
 During the 2026-08-19 infra-d incident (context in
@@ -118,8 +138,13 @@ it became `Available` at `07:05:10Z`, and the field still read `false` fourteen 
 later. Three seconds of real lag became a permanently wrong value, because a field with no
 proxy in phase, message or conditions has no passenger seat: nothing else changes when only
 it changes. `readyReplicas` carries the identical defect and is masked rather than fixed —
-every branch's phase message is a function of the ready count, so it always rides along.
-That masking is a property of the current message strings, not an invariant.
+~~every branch's phase message is a function of the ready count, so it always rides along.~~
+*(corrected 2026-09-27, Residual risks)* every branch either names the ready count or fixes
+it, and a change of it moves the phase message or the `Ready` condition with it — on a
+blocked pass only the `Ready` condition, because `persistStatus` puts the previous phase and
+message back.
+That masking is a property of the current ~~message strings~~ phase and `Ready` condition
+strings, not an invariant.
 
 The fix keeps D5's wording and moves the assignment: `observerReady` is now computed in
 `persistStatus`, next to `v.Status.OperatorVersion`, which is the side of the capture this
@@ -139,8 +164,9 @@ blocked. `Ready` carries only the first. The contract now lives on
 `vkov1.ConditionTypeReady`, which moved out of `internal/controller` (where it was an
 unexported string constant, and therefore the one condition every CR carries with no
 declared type and no entry in any table built from `api/v1`) into
-[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go). It is stated in the README
-condition table and pinned by `TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked` and
+[`api/v1/valkey_types.go`](../../api/v1/valkey_types.go). It is stated in
+[docs/operations/status.md](../operations/status.md#ready) (ADR 0035; this record wrote the
+README condition table here) and pinned by `TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked` and
 `TestUpdateHAStatus_KeepsReadyTrueWhileBlocked` — the second because no test at any tier
 reached the `HAClusterReady` shape the finding was actually reported on.
 
@@ -313,7 +339,11 @@ anything. **Two labeled masters deliberately picks no winner** — that state be
 `checkSteadyStateSplitBrain`
 ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md)). With Sentinel
 the field has a different source and `currentMasterPod` is never called: `updateHAStatus`
-writes `clusterState.MasterPod` — the master as Sentinel reports it.
+writes `clusterState.MasterPod` — ~~the master as Sentinel reports it~~ *(corrected
+2026-09-27: the running data pod that answers `role:master` to `INFO replication`, found by
+`findMaster` ([`checker.go`](../../internal/health/checker.go)) probing every data pod; when
+several answer, the one with the most connected replicas, ties to the lowest ordinal. No
+Sentinel is asked)*.
 
 **D12 — The status reports a per-instance current task.** `OK` when the instance is
 healthy, otherwise a short description of what the operator is doing
@@ -328,6 +358,20 @@ statefulset-controller under `updateStrategy: OnDelete`, and that failure mode i
 covered by the nudge ([ADR 0003](0003-nudge-a-short-of-pods-statefulset.md)) instead.
 Naming the boundary prevents the recurring expectation that the condition explains
 every stall.
+
+*Amended 2026-09-28:* one operator refusal that is not a write of its own is now covered —
+a pod under a generated ordinal name (`<cr>-N`, `<cr>-sentinel-N`) that the StatefulSet did
+not create. The rolling update refuses to touch it and holds
+([ADR 0020](0020-write-only-what-the-operator-owns.md) D9,
+[ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11), and a report-only resource
+step, `reportPodNameCollision`, carries the collision to `ReconcileBlocked=True/ForeignObject`
+through the single evaluator (`setReconcileBlockedCondition` over the joined
+`reconcileResources` error), so the critical `ValkeyReconcileBlocked` alert sees it. The step
+reads the ordinal range of each applicable tier, treats a foreign or absent StatefulSet as
+absent, and returns a read error other than NotFound so the evaluator cannot clear a standing
+report on a pass that measured nothing (ADR 0027). This is a report the operator produces from
+its own reconcile, not a claim that the pod's *creation* is the operator's write; the boundary
+D13 draws around StatefulSet-owned pod creation is unchanged.
 
 **D14 — Condition messages are truncated at 1024 runes, keeping the front.**
 `truncateConditionMessage` appends a literal `...` to the cut, so a truncated message is
@@ -457,21 +501,60 @@ after that.
   `ReconcileBlocked` condition; the operator cannot write through an admission block,
   so no guard would change the outcome.
 * A user reading only `ReconcileBlocked` cannot see a blocked **pod** creation (D13);
-  that path is visible as a short-of-pods StatefulSet plus the nudge.
+  that path is visible as a short-of-pods StatefulSet plus the nudge. Since 2026-09-28 one
+  pod-related refusal *is* on the condition — a pod under a generated ordinal name the
+  StatefulSet did not create, reported by `reportPodNameCollision` (D13 amendment) — but that
+  is the operator refusing to touch a colliding pod, not a rejected pod creation.
 * **`readyReplicas` still cannot trigger a status write on its own** (D5, amended).
-  Deliberately not fixed with `observerReady`: the field is masked by the fact that every
+  Deliberately not fixed with `observerReady`: the field is masked by the fact that ~~every
   branch's phase message is a function of the ready count, so it rides along on every pass
-  that changes it, and no case could be constructed by reading in which it goes stale. The
-  accepted cost is that the masking is a property of the message strings — anyone who makes
-  a phase message stop naming the count reopens the defect, and nothing tests for that.
+  that changes it~~ *(corrected 2026-09-27, next entry)* a change of the ready count moves the
+  phase message or the `Ready` condition with it, and no case could be constructed by reading
+  in which it goes stale. The accepted cost is that the masking is a property of the message
+  strings — ~~anyone who makes a phase message stop naming the count reopens the defect~~
+  *(corrected 2026-09-27, next entry)* the phase and `Ready` condition strings, and nothing
+  tests for that.
   Moving the assignment next to `observerReady` closes it and is a two-line change if the
   coupling is ever judged too fragile to keep.
+* **The masking of `readyReplicas` is narrower than D5's amendment and the entry above first
+  said** (added 2026-09-27). Verified by reading `updateStandaloneStatus`, `updateHAStatus`,
+  `persistStatus` and `statusUnchanged` in
+  [`valkey_controller.go`](../../internal/controller/valkey_controller.go):
+  - Not every phase message names the count. Five name none: the standalone OK message
+    `All replicas are ready`, the standalone Error `Instance unreachable: …`, the HA Error
+    `Cluster health check failed: …`, and the two no-pod-ready messages. The HA Syncing
+    message names the synced counts of the health check, not the StatefulSet's ready count.
+    In those branches the count is only implied by the branch: it equals `spec.replicas` in
+    the all-ready branches and is 0 in the no-pod-ready ones. The `Ready` condition follows
+    the same shape: its message names the count in the partly-ready branches, and its reason
+    changes with the branch.
+  - On a blocked pass `persistStatus` restores `prevStatus.Phase` and `prevStatus.Message`
+    before `statusUnchanged` runs, so the phase message carries nothing there. Of the other
+    fields `statusUnchanged` compares — the conditions, `masterPod`, `observerReady`,
+    `operatorVersion` — the one that moves with the count is the `Ready` condition.
+
+  It follows from these two facts that the coupling is wider than the entry above said: a
+  change to the `Ready` condition's messages or reasons, not only to a phase message, can
+  reopen the defect on a blocked pass. **Not verified:** that the count can never go stale
+  today. That no such case was found rests on reading the code, not on a measurement. The two
+  blocked-pass status tests in
+  [`status_phase_test.go`](../../internal/controller/status_phase_test.go)
+  (`TestUpdateStatus_KeepsNonPhaseFieldsWhileBlocked`,
+  `TestUpdateHAStatus_KeepsReadyTrueWhileBlocked`) mark the StatefulSets ready after the first
+  pass and assert the `Ready` condition along with the count, so neither isolates the count.
+  The fix named above, moving the assignment into `persistStatus`, still closes it and is
+  still not taken.
 * **The `Ready` contract is documented, not enforced** (D5a). Nothing prevents a future
   writer from setting `Ready` off something that is not the data plane, and nothing prevents
   a consumer from reading it as "the operator is healthy". The condition registry
   ([ADR 0027](0027-conditions-are-levels-edges-or-history.md)) records that `Ready` is a
   level with one evaluator, which catches a second evaluator appearing but not a wrong one.
-* **`Ready` keeps its pre-roll value for the whole rolling update**, because a pass with a
+* **`Ready` keeps its pre-roll value ~~for the whole rolling update~~** *(corrected 2026-09-27:
+  on every pass that ends on a rolling-update exit; a pass whose wait has outlived its bound
+  ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5, D11;
+  [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D16, D17) and the pass in which the
+  data roll pauses on its sync timeout reach `updateStatus` and recompute it, unless a
+  post-update check ends that pass)*, because a pass with a
   roll in flight returns before `updateStatus`
   ([ADR 0001](0001-continue-reconciling-past-a-rejected-write.md) D4). That is decided
   behaviour, and D5a states it, but it means "Ready" and "serving right now" come apart for

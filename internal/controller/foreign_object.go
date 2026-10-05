@@ -290,6 +290,73 @@ func (r *ValkeyReconciler) podUnderNameIsOurs(
 	return podIsOurs(pod, sts)
 }
 
+// reportPodNameCollision is the report-only resource step that brings a pod-name
+// collision the rolling update refuses to the ReconcileBlocked condition and the
+// critical alert.
+//
+// The rolling update refuses a pod under a generated name its StatefulSet did not
+// create (dispatchDataRollingUpdate, scanSentinelPods, ADR 0020 D9), but that
+// refusal fails the workload pass with phase Error only -- it never reaches
+// ReconcileBlocked, whose single evaluator runs on the joined error of
+// reconcileResources. This step is what puts the refusal there, through that one
+// evaluator: it returns foreignObjectError, the error joins resourceErr, and
+// setReconcileBlockedCondition writes True/ForeignObject; the registry stays at one
+// evaluator (docs/adr/0002-surface-a-blocked-reconcile-on-the-cr.md, D13).
+//
+// It is a report, not a write: it deletes nothing and commands nothing. It mirrors
+// scanTierTLSMaterial -- cache-served reads over the persisted StatefulSet's ordinal
+// range, per tier, a foreign or absent StatefulSet treated as absent because its own
+// step is the one reporter for it (ADR 0020 D8). It emits no Event: the condition
+// message names the pod, and the sidecar-Role step is the one Event emitter for the
+// pod family (filterOwnedPods).
+//
+// A read error other than NotFound is returned rather than swallowed, so a pass that
+// could not measure the tier does not let the single evaluator clear a standing
+// ForeignObject on silence (ADR 0027).
+func (r *ValkeyReconciler) reportPodNameCollision(ctx context.Context, v *vkov1.Valkey) error {
+	components := []string{common.ComponentValkey}
+	if v.IsSentinelEnabled() {
+		components = append(components, common.ComponentSentinel)
+	}
+	for _, component := range components {
+		if err := r.reportTierPodNameCollision(ctx, v, component); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reportTierPodNameCollision is reportPodNameCollision for one tier: it reads the
+// StatefulSet, skips one that is absent or foreign, and returns the first pod under
+// a generated name that the StatefulSet did not create.
+func (r *ValkeyReconciler) reportTierPodNameCollision(ctx context.Context, v *vkov1.Valkey, component string) error {
+	sts := &appsv1.StatefulSet{}
+	name := types.NamespacedName{Name: common.StatefulSetName(v, component), Namespace: v.Namespace}
+	if err := r.Get(ctx, name, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !metav1.IsControlledBy(sts, v) || sts.Spec.Replicas == nil {
+		return nil
+	}
+	for i := int32(0); i < *sts.Spec.Replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", sts.Name, i)
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		if !podIsOurs(pod, sts) {
+			return foreignObjectError("Pod", podName)
+		}
+	}
+	return nil
+}
+
 // deleteOwnedPod deletes a pod the caller has already proven this cluster's
 // StatefulSet created, and keeps the delete on that very object.
 //

@@ -4,15 +4,18 @@
 
 Accepted. Date: 2026-08-21.
 
-Implemented and documented in [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md)
-sections 2 and 6. ~~Four~~ **Three** items stay open — see Residual risks; two of them carry an
-unchecked entry on that document's hardening checklist (section 9).
+Implemented and documented in [`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md)
+and [`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md).
+~~Four~~ **Three** items stay open — see Residual risks; two of them carry an open gap in
+`docs/security/`: [H-5](../security/secrets-and-tls.md#h-5) and [H-8](../security/secrets-and-tls.md#h-8).
 
 Amended 2026-08-26 by [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md):
 **D12 no longer holds for TLS material.** The cert-manager residual risk fired — measured on a
 live fleet, on the client side — and is rewritten rather than ticked off: the half about
 `valkey-server` is still unmeasured and is now covered by replacement instead of by
 verification.
+
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
 
 ## Context
 
@@ -165,7 +168,9 @@ operator publishes.~~
 > password is a brute-forceable oracle **at any digest strength**. This sentence used to say
 > "32-bit" on both halves, which read as though a wider hash would make the password case safe;
 > corrected 2026-08-27.
-> The password rotation gap of section 6 therefore stays open.
+> The password rotation gap of
+> [`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md#the-password-rotation-gap)
+> (ADR 0036; this record wrote section 6 of `SECURITY_ARCHITECTURE.md` here) therefore stays open.
 
 **D13 — Password rotation is a documented manual procedure, stated precisely rather than
 glossed.** The Secret **is** watched and a change does enqueue a reconcile, so:
@@ -260,9 +265,11 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
 ## Residual risks
 
 * **`tls-auth-clients optional` (open)** — TLS authenticates the server only. "Require client
-  certificates where the deployment can" is on the hardening checklist.
+  certificates where the deployment can" is the open gap
+  [H-5](../security/secrets-and-tls.md#h-5).
 * **Nothing in the operator expires or warns about a downgrade switch left enabled (open).**
-  Enforcement of D9 is a documented human checklist item only.
+  Enforcement of D9 is a documented human checklist item only
+  ([H-8](../security/secrets-and-tls.md#h-8)).
 * ~~**cert-manager renewal is only partially covered:** the Secret content changes and the mount
   follows it, but **whether the running `valkey-server` reloads the new material is not
   verified in this repository.**~~ **Fired 2026-08-26, and rewritten rather than closed.** The
@@ -284,7 +291,7 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
 * [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — the `%VALKEY_PASSWORD%` placeholder and `init-sentinel-config`
 * [`internal/builder/certificate.go`](../../internal/builder/certificate.go) — the `unstructured` cert-manager `Certificate`
 * [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `readValkeyPassword`, `findValkeyForSecret`, the legacy-material cleanup
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — sections 2 and 6, and the hardening checklist
+* [`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md) and [`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md) — the posture, its propagation, and each page's open gaps ("What this does not cover")
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) — why none of these defaults is the secure one
 * [ADR 0006](0006-delete-only-what-the-operator-owns.md) — the provenance gate on the legacy cleanup
 * [ADR 0013](0013-operator-is-cluster-wide-privileged.md) — the surrounding trust model

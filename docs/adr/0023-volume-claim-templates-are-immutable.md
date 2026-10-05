@@ -10,6 +10,8 @@ the data tier's report on every pass of every Sentinel cluster that had a confli
 D4's "costs nothing" is marked superseded in place. Implemented and unit-verified; not
 run against a cluster.
 
+Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
+
 Implemented: `VolumeClaimTemplatesConflict` in the builder, `guardVolumeClaimTemplates`
 in both StatefulSet reconcilers, the `RecreateRequired` `ReconcileBlocked` reason, the
 `StorageSpecNotApplied` condition, and the two Warning Event reasons.
@@ -194,7 +196,9 @@ does not work in the enabling direction, twice over — see the two measurements
 Until those are fixed the Event says that the change needs a hand-recreated
 StatefulSet, that **the operator does not carry the dataset across it**, and that
 reverting `spec.persistence` clears the block for free. The procedure and its cost
-live in the README, where they can be stated at length and kept honest.
+live in [`docs/operations/persistence.md`](../operations/persistence.md#changing-storage-on-an-existing-cluster)
+(ADR 0035; this record wrote the README here), where they can be stated at length and kept
+honest.
 
 **Measurement 0 — the recovery works, losslessly, in the disabling direction.** The
 pods survive the orphan delete, the operator recreates the StatefulSet without claim

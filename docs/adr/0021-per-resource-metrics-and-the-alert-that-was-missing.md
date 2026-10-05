@@ -150,8 +150,9 @@ is the supported way to opt out.
   the cluster. No Secret material, no spec contents — no password, no image, no host, no TLS
   material. The chart Service does not change reachability: the container port is declared with
   or without it and anything that can route to the operator pod already reads `:8080`. This is
-  recorded as a residual risk here, in ADR 0018 and in
-  [`SECURITY_ARCHITECTURE.md`](../../SECURITY_ARCHITECTURE.md), and the mitigations are the ones
+  recorded as a residual risk here, in ADR 0018 and as gap
+  [H-13](../security/operator-pod-posture.md#h-13) in `docs/security/operator-pod-posture.md`,
+  and the mitigations are the ones
   ADR 0018 already names: a NetworkPolicy for the operator namespace, moving the endpoint with
   `--metrics-bind-address`, or the D10 authentication filter.
 * **Cardinality is bounded by resource count.** About eleven series per Valkey resource plus two

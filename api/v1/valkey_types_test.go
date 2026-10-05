@@ -1335,3 +1335,34 @@ func TestGetSyncTimeout(t *testing.T) {
 		})
 	}
 }
+
+// TestPodSecurityAccessors pins the defaults of spec.podSecurity (ADR 0033 D1, D2):
+// RuntimeDefault and no user namespace whenever the block or a field is missing.
+func TestPodSecurityAccessors(t *testing.T) {
+	runtimeDefault := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	v := newValkey("ps")
+	assert.Equal(t, runtimeDefault, v.GetSeccompProfile())
+	assert.False(t, v.UsesUserNamespaces())
+
+	v.Spec.PodSecurity = &PodSecuritySpec{}
+	assert.Equal(t, runtimeDefault, v.GetSeccompProfile())
+	assert.False(t, v.UsesUserNamespaces())
+
+	v.Spec.PodSecurity.SeccompProfile = &SeccompProfileSpec{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	assert.Equal(t, runtimeDefault, v.GetSeccompProfile())
+
+	v.Spec.PodSecurity.SeccompProfile = &SeccompProfileSpec{
+		Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: stringPtr("profiles/v.json"),
+	}
+	v.Spec.PodSecurity.UserNamespaces = true
+	assert.Equal(t, &corev1.SeccompProfile{
+		Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: stringPtr("profiles/v.json"),
+	}, v.GetSeccompProfile())
+	assert.True(t, v.UsesUserNamespaces())
+}
+
+// TestDefaultMetricsExporterImage_IsPinnedByDigest: a tag alone can be re-pushed
+// under the pods (ADR 0033 D5).
+func TestDefaultMetricsExporterImage_IsPinnedByDigest(t *testing.T) {
+	assert.Regexp(t, `^oliver006/redis_exporter:v[0-9.]+@sha256:[0-9a-f]{64}$`, DefaultMetricsExporterImage)
+}

@@ -37,7 +37,8 @@ rules:
       - list
       - patch
       - update
-  # Update the CRD to the latest schema before migrating existing CRs
+  # Granted but unused: the hook lists and patches Valkey CRs only and never reads
+  # or writes a CRD (docs/security/privilege-footprint.md, H-3).
   - apiGroups:
       - apiextensions.k8s.io
     resources:

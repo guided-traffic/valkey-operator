@@ -315,7 +315,7 @@ func TestRequestRecheck_IsANoOpWithoutPassState(t *testing.T) {
 	assert.NotPanics(t, func() { requestRecheck(context.Background(), time.Second) })
 }
 
-// --- StatefulSets and observer Deployment: the NA61 half of ADR 0020 ---
+// --- StatefulSets and observer Deployment: ADR 0020 D1 and D8, amended 2026-08-22 ---
 
 // foreignStatefulSet returns a StatefulSet under name that no Valkey controls,
 // with its own selector and workload — the shape of a pre-existing application
@@ -728,7 +728,7 @@ func TestReconcileNetworkPolicy_RefusesAForeignNetworkPolicy(t *testing.T) {
 	// a CR reporting OK while the policy it names belongs to somebody else is a
 	// security statement that is not true.
 	v := networkPolicyValkey()
-	desired := builder.BuildValkeyNetworkPolicy(v, "valkey-system")
+	desired := builder.BuildValkeyNetworkPolicy(v, testOperatorPeer)
 	foreign := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      desired.Name,
@@ -744,7 +744,7 @@ func TestReconcileNetworkPolicy_RefusesAForeignNetworkPolicy(t *testing.T) {
 	r.Recorder = rec
 
 	err := r.reconcileNetworkPolicy(context.Background(), v,
-		builder.BuildValkeyNetworkPolicy(v, "valkey-system"))
+		builder.BuildValkeyNetworkPolicy(v, testOperatorPeer))
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errForeignObject)
@@ -910,7 +910,7 @@ func TestDeleteIfOwned_ToleratesAReplacementUnderTheName(t *testing.T) {
 	assert.NoError(t, r.deleteIfOwned(context.Background(), v, owned, "metrics Service"))
 }
 
-// --- pods: the NA63 half of ADR 0020 ---
+// --- pods: ADR 0020 D9 ---
 //
 // A pod is the only managed object whose controller is not the CR, so the proof runs
 // pod -> StatefulSet -> CR (D9). The three doors these tests cover are deliberately
@@ -1058,25 +1058,48 @@ func TestCollectPodStates_RefusesAForeignPod(t *testing.T) {
 	assert.ErrorIs(t, err, errForeignObject)
 }
 
-func TestCheckAndHandleRollingUpdate_RefusesAForeignPod(t *testing.T) {
-	// The NA61 StatefulSet guard proves the wrong object for this decision: a foreign
-	// pod differs from the persisted template by construction, so the very next step
-	// would classify it as outdated and schedule it for deletion.
+// A foreign pod at an in-range data ordinal holds the roll: the pass does not end on
+// an error, nothing on the pod is touched, and the collision is reported to the CR by
+// the resource step, not here (ADR 0020 D9, ADR 0026 D11). The hold carries
+// DeferredRequeueAfter, which is what holds the Sentinel roll and lets the pass reach
+// the status write.
+//
+// Mutation check: restoring the Error return in dispatchDataRollingUpdate fails the
+// heldByPodCollision assertion and the "no error" assertion.
+func TestCheckAndHandleRollingUpdate_HoldsForAForeignPod(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
 	sts := stsForValkey(v)
 	r, c := newTestReconciler(v, sts, foreignPod(v, "test-0"), podFromStsTemplate(v, sts, 1))
 
 	result := r.checkAndHandleRollingUpdate(context.Background(), v)
 
-	require.Error(t, result.Error)
-	assert.ErrorIs(t, result.Error, errForeignObject)
+	require.NoError(t, result.Error, "the roll holds, it does not fail the pass")
+	assert.True(t, result.heldByPodCollision)
+	assert.Positive(t, result.DeferredRequeueAfter, "the hold carries a recheck cadence and holds the Sentinel roll")
+	assert.False(t, result.NeedsRequeue)
 
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Name: "test-0", Namespace: "default"}, &corev1.Pod{}),
 		"the foreign pod must survive the pass")
 }
 
-func TestCheckAndHandleSentinelRollingUpdate_RefusesAForeignPod(t *testing.T) {
+// A foreign pod without any controller reference is the same hold; only a genuine
+// read failure ends the pass. This is the "no controller reference" shape the hold
+// distinguishes in its log from the "controlled by another object" shape above.
+func TestCheckAndHandleRollingUpdate_HoldsForAPodWithoutAController(t *testing.T) {
+	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 2 })
+	sts := stsForValkey(v)
+	stray := foreignPod(v, "test-0")
+	stray.OwnerReferences = nil
+	r, _ := newTestReconciler(v, sts, stray, podFromStsTemplate(v, sts, 1))
+
+	result := r.checkAndHandleRollingUpdate(context.Background(), v)
+
+	require.NoError(t, result.Error)
+	assert.True(t, result.heldByPodCollision)
+}
+
+func TestCheckAndHandleSentinelRollingUpdate_HoldsForAForeignPod(t *testing.T) {
 	v := newTestValkey("ha", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{Enabled: true, Replicas: 3}
@@ -1089,8 +1112,9 @@ func TestCheckAndHandleSentinelRollingUpdate_RefusesAForeignPod(t *testing.T) {
 
 	result := r.checkAndHandleSentinelRollingUpdate(context.Background(), v)
 
-	require.Error(t, result.Error)
-	assert.ErrorIs(t, result.Error, errForeignObject)
+	require.NoError(t, result.Error, "the Sentinel roll holds, it does not fail the pass")
+	assert.True(t, result.heldByPodCollision)
+	assert.Positive(t, result.DeferredRequeueAfter)
 
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Name: stray.Name, Namespace: "default"}, &corev1.Pod{}))

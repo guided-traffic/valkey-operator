@@ -39,15 +39,18 @@ const (
 	// and the operator cannot write something. Read status.message and ReconcileBlocked to
 	// find out what.
 	//
-	// It is a level, not an edge, with one carve-out: a pass with a rolling update in
-	// flight returns before updateStatus and writes its own phase, so during a roll Ready
-	// keeps its pre-roll value (ADR 0001 D4).
+	// It is a level, not an edge, with one carve-out: a pass that ends on a rolling-update
+	// exit returns before updateStatus and writes its own phase, so during a roll Ready
+	// keeps the value of the last pass that reached updateStatus (ADR 0001 D4). A pass
+	// whose wait has outlived its bound (ADR 0026 D5, D11) and the pass in which a data
+	// roll pauses do reach it, unless a post-update check ends the pass.
 	ConditionTypeReady ConditionType = "Ready"
 
-	// ConditionTypeSidecarUpdatePending is set on standalone Valkey instances when
-	// the sidecar container image has drifted from the desired version.
-	// Standalone pods are not automatically restarted for sidecar-only changes;
-	// the update will occur on the next pod restart (manual delete or image change).
+	// ConditionTypeSidecarUpdatePending is set on a single-replica Valkey instance,
+	// with or without Sentinel, when the sidecar container image has drifted from the
+	// desired version. Its only data pod is not automatically restarted for a
+	// sidecar-only change; the update will occur on the next pod restart (manual
+	// delete or image change).
 	ConditionTypeSidecarUpdatePending ConditionType = "SidecarUpdatePending"
 
 	// ConditionTypeRollingUpdatePaused is set when a rolling update stopped waiting
@@ -121,8 +124,9 @@ const (
 	// ConditionTypeSentinelUpdatePending reports that the Sentinel tier is being
 	// rolled: at least one Sentinel pod runs a spec older than the Sentinel
 	// StatefulSet template, or a replacement pod is not Ready yet. The data tier
-	// always finishes first — its RollingUpdateComplete event fires before the
-	// first Sentinel pod is touched — so this condition, and the
+	// finishes first — its RollingUpdateComplete event fires before the first
+	// Sentinel pod is touched, except in the pass in which a data roll pauses and
+	// beside a single data pod that defers its change — so this condition, and the
 	// SentinelUpdateComplete event emitted exactly when it flips back to False,
 	// are the signal that the update as a whole is finished. The condition's own
 	// previous value is the memory that a roll was in flight; there is no
@@ -152,13 +156,18 @@ const (
 	// The refusal itself is never lifted -- deleting a second pod while the first
 	// is wedged is the failure the refusal exists to prevent. What the condition
 	// marks is the moment the operator stops ending the reconcile pass on the
-	// wait, so the rest of the pass (the Sentinel roll, no-master recovery, the
-	// steady-state split-brain check and the status write) runs again while the
-	// stall lasts. It clears by itself once the pod is gone.
+	// wait, so the rest of the pass (no-master recovery, the steady-state
+	// split-brain check and the status write) runs again while the stall lasts.
+	// It clears by itself once the pod is gone.
 	//
 	// There is no Event: a clean rolling update must emit zero Warnings
 	// (docs/adr/0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md).
 	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D5.
+	//
+	// Until 2026-09-26 the list above also named the Sentinel roll. A stalled data
+	// tier no longer releases it (ADR 0026 D11): the Sentinel update waits until
+	// the data tier has converged, as ADR 0024 D1 says -- with one known exception,
+	// the pass in which a data roll pauses (RollingUpdatePaused).
 	ConditionTypePodTerminationStalled ConditionType = "PodTerminationStalled"
 
 	// ConditionTypePodRecreationStalled reports that the rolling update deleted a
@@ -167,10 +176,51 @@ const (
 	// it at all: the measured cause is an immutable-field sync error wedging pod
 	// creation on the lowest mismatching ordinal (T10). The roll of that tier
 	// holds; the rest of the pass -- the status write, the steady-state
-	// split-brain check, the Sentinel roll -- keeps running, the ADR 0026 D5
-	// shape applied to the absent pod instead of the terminating one. Cleared
-	// the moment the pod exists again.
+	// split-brain check and the no-master recovery -- keeps running, the ADR 0026
+	// D5 shape applied to the absent pod instead of the terminating one. The
+	// Sentinel roll is not among them: it waits for the data tier (ADR 0026 D11).
+	// Cleared the moment the pod exists again.
 	ConditionTypePodRecreationStalled ConditionType = "PodRecreationStalled"
+
+	// ConditionTypePodAvailabilityStalled reports that the rolling update of a tier
+	// is waiting on a pod that exists, is not being deleted and has not been
+	// available for longer than spec.rollingUpdate.syncTimeout -- a replacement on
+	// an unpullable image, a container that crashes at boot, a request no node can
+	// schedule. The clock is the pod's own: the lastTransitionTime of its Ready
+	// condition, or its creationTimestamp while it has none.
+	//
+	// The wait itself is not lifted: a pod on the current template comes back
+	// identical when deleted, so only the observation is bounded. What the condition
+	// marks is the moment the operator stops ending the reconcile pass on the wait,
+	// so the status write, the no-master recovery and the steady-state split-brain
+	// check run again while the stall lasts. The Sentinel roll does not: a holding
+	// data tier holds it too, because both tiers share spec.image. An outdated pod
+	// is never waited on at all -- it is replaced whether it is available or not --
+	// which is what lets a spec fix move a stalled roll on by itself.
+	//
+	// The reason names the tier: ValkeyPodNotAvailable for a data pod,
+	// SentinelPodNotAvailable for a Sentinel pod. It is a level: each tier's roll
+	// re-measures it on every pass that reaches it and retracts only its own
+	// report. The False reason PodAvailable is written only over a standing True,
+	// never onto a cluster that did not carry the condition. There is no Event.
+	// See docs/adr/0026-a-pod-being-deleted-is-not-available.md, D11.
+	ConditionTypePodAvailabilityStalled ConditionType = "PodAvailabilityStalled"
+
+	// ConditionTypePodSecurityUpdatePending reports that the only data pod of a
+	// spec.replicas: 1 cluster without persistence still runs as root -- it was
+	// built by an operator before every generated pod became rootless -- and that
+	// the operator deliberately does not replace it: there is no replica to fail
+	// over to and no volume to keep the data, so the restart would discard the
+	// dataset. The rootless posture applies on the pod's next restart for any other
+	// reason; deleting the pod applies it at once, with the data.
+	//
+	// A persistent single pod is not deferred -- it is replaced at the upgrade, with
+	// a restart but with its data -- and a multi-replica cluster is migrated by the
+	// ordinary failover-aware rolling update, so neither ever carries the condition.
+	// It is a level re-measured on every pass; the False reason
+	// PodSecurityUpdateApplied is written only over a standing True. There is no
+	// Event. See docs/adr/0032-generated-pods-run-rootless.md, D3.
+	ConditionTypePodSecurityUpdatePending ConditionType = "PodSecurityUpdatePending"
 
 	// ConditionTypeTLSMaterialStale reports that at least one pod is still running
 	// with TLS material older than the one in the TLS Secret it mounts.
@@ -185,9 +235,9 @@ const (
 	// unrelated reason, and the pods then keep the material they pinned at start
 	// until it expires and their long-lived processes go silent.
 	//
-	// It is written only on TLS clusters, and only for pods that already carry the
-	// fingerprint annotation; a pod created before the operator wrote fingerprints
-	// is not stale, it is unmeasured.
+	// It is written only on TLS clusters, and only for pods that already carry a
+	// recorded fingerprint (VKO_TLS_MATERIAL_HASH, or the legacy annotation); a pod
+	// created before the operator wrote fingerprints is not stale, it is unmeasured.
 	ConditionTypeTLSMaterialStale ConditionType = "TLSMaterialStale"
 
 	// ConditionTypeRWServiceEmpty reports that no data pod carries the
@@ -210,6 +260,28 @@ const (
 	// state never gains the condition -- the False is only ever written over an
 	// existing condition, never stamped onto the fleet.
 	ConditionTypeRWServiceEmpty ConditionType = "RWServiceEmpty"
+
+	// ConditionTypeMasterHandoverStalled reports that the Sentinel rolling update
+	// has held the delete of the outgoing master for longer than
+	// spec.rollingUpdate.syncTimeout. Before that delete the handover asks three
+	// things, and the reason names the one that is not yet true:
+	// ReplicaNotSynced (a replica on the current spec has not completed its sync
+	// from the new master, or the new master has fewer replicas attached than
+	// there are), DatasetWouldBeDiscarded (the new master holds no keys while the
+	// pod about to be deleted holds some, or a key count cannot be read) and
+	// FormerMasterStillMaster (the pod about to be deleted still answers
+	// role:master). The message names both pods, the counts or the sync reason, and
+	// the repair.
+	//
+	// The hold itself is never lifted by a timeout: deleting the pod is the one step
+	// that cannot be undone. What the condition marks is the moment the operator
+	// stops ending the reconcile pass on it, so the status write and the split-brain
+	// check run again; the rolling-update state is kept and the Sentinel roll waits.
+	// It is an edge: set once the wait outlived the timeout, with one Warning Event,
+	// and cleared -- only over an existing condition -- when the delete goes through
+	// or the rolling-update state is cleared.
+	// See docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D6.
+	ConditionTypeMasterHandoverStalled ConditionType = "MasterHandoverStalled"
 )
 
 const (
@@ -240,6 +312,24 @@ const (
 	// disagreeing. It clears only when the StatefulSet is recreated or the spec is
 	// put back (docs/adr/0023-volume-claim-templates-are-immutable.md).
 	ReasonRecreateRequired = "RecreateRequired"
+
+	// ReasonUserNamespacesUnsupported is the ReconcileBlocked reason for
+	// spec.podSecurity.userNamespaces on a cluster whose API server drops hostUsers
+	// from a pod template: its UserNamespacesSupport feature gate is off, the default
+	// before Kubernetes 1.33. The write succeeds and the field is silently gone, so
+	// the pods run without the user namespace the spec asks for. It clears when the
+	// gate is on or the field is set back to false
+	// (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md).
+	ReasonUserNamespacesUnsupported = "UserNamespacesUnsupported"
+
+	// ReasonSeccompProfileNotAllowed is the ReconcileBlocked reason for a
+	// spec.podSecurity.seccompProfile naming a Localhost profile the operator was not
+	// started with (--allowed-seccomp-localhost-profiles, empty by default). Nothing
+	// failed: the operator refuses to write the data StatefulSet, the Sentinel
+	// StatefulSet and the observer, and the running pods keep their template. It
+	// clears when an administrator allows the profile or the spec names another
+	// (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md, D9).
+	ReasonSeccompProfileNotAllowed = "SeccompProfileNotAllowed"
 
 	// ReasonVolumeClaimTemplatesImmutable is the StorageSpecNotApplied reason for a
 	// size, storage class or access mode that differs from the live claims while the
@@ -341,6 +431,37 @@ const (
 	// again. Only written over an existing condition.
 	ReasonPodRecreated = "PodRecreated"
 
+	// ReasonValkeyPodNotAvailable is the PodAvailabilityStalled reason while the
+	// data tier's roll waits on a data pod that has not been available for longer
+	// than spec.rollingUpdate.syncTimeout. The message names the pod and the moment
+	// it stopped being available.
+	ReasonValkeyPodNotAvailable = "ValkeyPodNotAvailable"
+
+	// ReasonSentinelPodNotAvailable is the same report for the Sentinel tier's roll.
+	// The tier is in the reason because the two tiers evaluate the condition
+	// independently and each retracts only its own report.
+	ReasonSentinelPodNotAvailable = "SentinelPodNotAvailable"
+
+	// ReasonPodAvailable clears PodAvailabilityStalled once the tier that reported
+	// it no longer waits on an unavailable pod. Only written over a standing True.
+	ReasonPodAvailable = "PodAvailable"
+
+	// ReasonPodRunsAsRoot is the PodSecurityUpdatePending reason while the only data
+	// pod of a non-persistent single-pod cluster runs as root and its replacement is
+	// deferred. The message names the pod.
+	ReasonPodRunsAsRoot = "PodRunsAsRoot"
+
+	// ReasonExporterOutdated is the PodSecurityUpdatePending reason while the only data
+	// pod of a non-persistent single-pod cluster runs an exporter whose image or
+	// environment an earlier operator version set, and its replacement is deferred.
+	// The message names the pod.
+	ReasonExporterOutdated = "ExporterOutdated"
+
+	// ReasonPodSecurityUpdateApplied clears PodSecurityUpdatePending once no data pod
+	// update is deferred on account of the rootless migration or the exporter update
+	// any more. Only written over a standing True.
+	ReasonPodSecurityUpdateApplied = "PodSecurityUpdateApplied"
+
 	// ReasonNoPodLabeledMaster is the RWServiceEmpty reason while a settled
 	// cluster has no data pod carrying the instanceRole=master label, so the -rw
 	// Service selects nothing.
@@ -349,6 +470,25 @@ const (
 	// ReasonMasterLabeled clears RWServiceEmpty once a data pod carries the
 	// master label again. Only written over an existing condition.
 	ReasonMasterLabeled = "MasterLabeled"
+
+	// ReasonReplicaNotSynced is the MasterHandoverStalled reason while a replica on
+	// the current spec has not completed its sync from the new master, or the new
+	// master has fewer replicas attached than there are.
+	ReasonReplicaNotSynced = "ReplicaNotSynced"
+
+	// ReasonDatasetWouldBeDiscarded is the MasterHandoverStalled reason while the
+	// new master holds no keys and the pod about to be deleted holds some, or while
+	// either key count cannot be read.
+	ReasonDatasetWouldBeDiscarded = "DatasetWouldBeDiscarded"
+
+	// ReasonFormerMasterStillMaster is the MasterHandoverStalled reason while the pod
+	// about to be deleted still answers role:master.
+	ReasonFormerMasterStillMaster = "FormerMasterStillMaster"
+
+	// ReasonMasterHandoverNotHeld clears MasterHandoverStalled once the delete went
+	// through or the rolling-update state was cleared. Only written over an existing
+	// condition.
+	ReasonMasterHandoverNotHeld = "MasterHandoverNotHeld"
 )
 
 // ValkeyPhase describes the current phase of the Valkey instance.
@@ -365,7 +505,8 @@ const (
 	ValkeyPhaseRollingUpdate ValkeyPhase = "Rolling Update"
 	// ValkeyPhaseSentinelRollingUpdate indicates the Sentinel tier is being
 	// rolled. It follows the data tier's "Rolling Update" phase (the data tier
-	// always converges first) and appears alone on Sentinel-only spec changes.
+	// converges first) and appears alone on Sentinel-only spec changes and beside
+	// a single data pod that defers its change.
 	ValkeyPhaseSentinelRollingUpdate ValkeyPhase = "Sentinel Rolling Update"
 	// ValkeyPhaseFailover indicates a failover is in progress.
 	ValkeyPhaseFailover ValkeyPhase = "Failover in progress"
@@ -412,6 +553,61 @@ type SentinelSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	DisableAuth bool `json:"disableAuth,omitempty"`
+
+	// Resources defines the compute resource requirements of every container in a
+	// Sentinel pod: the sentinel container and its init container. Both get the same
+	// values, so a namespace with a cpu/memory ResourceQuota admits the pod. No
+	// default: omitted means no requests and no limits, as before the field existed.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// PodSecuritySpec configures hardening of every pod the operator generates for a
+// Valkey resource beyond the fixed rootless posture: the data pods, the Sentinel
+// pods and the observer. Omitted means RuntimeDefault seccomp and no user
+// namespace (docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md).
+type PodSecuritySpec struct {
+	// SeccompProfile is the seccomp profile of every generated pod. Omitted means
+	// RuntimeDefault. Unconfined is not accepted: the pods always run under a
+	// seccomp filter, and Pod Security "restricted" stays satisfiable.
+	// +optional
+	SeccompProfile *SeccompProfileSpec `json:"seccompProfile,omitempty"`
+
+	// UserNamespaces runs every generated pod in a user namespace of its own
+	// (hostUsers: false): the uid a container runs as (999 on the data and Sentinel
+	// pods, 65532 on the observer) maps to an unprivileged uid on the node. It needs node support - Kubernetes 1.33 or later (1.30 with the
+	// UserNamespacesSupport feature gate), a container runtime with user-namespace
+	// support (containerd 2.0 or later, CRI-O 1.25 or later), and idmap-mount support
+	// in the kernel for tmpfs (Linux 6.3), in the file system of every data volume
+	// (NFS has none) and in the runtime's snapshotter (overlayfs has it, containerd's
+	// native snapshotter does not). A pod on a node without it does not start.
+	// Changing it rolls every data and Sentinel pod.
+	// +kubebuilder:default=false
+	// +optional
+	UserNamespaces bool `json:"userNamespaces,omitempty"`
+}
+
+// SeccompProfileSpec selects the seccomp profile of the generated pods.
+// +kubebuilder:validation:XValidation:rule="self.type == 'Localhost' ? (has(self.localhostProfile) && size(self.localhostProfile) > 0) : !has(self.localhostProfile)",message="localhostProfile is required when type is Localhost and must not be set otherwise"
+// +kubebuilder:validation:XValidation:rule="!has(self.localhostProfile) || (!self.localhostProfile.startsWith('/') && !self.localhostProfile.matches('(^|/)[.][.](/|$)'))",message="localhostProfile must be a relative path below the kubelet's seccomp directory, without '..'"
+type SeccompProfileSpec struct {
+	// Type is RuntimeDefault, the container runtime's default filter, or Localhost,
+	// a profile file installed on every node below the kubelet's seccomp directory.
+	// A Localhost profile that is missing on a node keeps a pod scheduled there from
+	// starting; it has to allow what every generated container does - including the
+	// chown of the migration-only fix-data-ownership init container.
+	// +kubebuilder:validation:Enum=RuntimeDefault;Localhost
+	// +kubebuilder:default=RuntimeDefault
+	Type corev1.SeccompProfileType `json:"type"`
+
+	// LocalhostProfile is the path of the profile relative to the kubelet's seccomp
+	// directory (for example profiles/valkey.json): not absolute, no '..' element.
+	// Required for Localhost, forbidden otherwise. The operator writes it only when
+	// its --allowed-seccomp-localhost-profiles lists the path (empty by default, so
+	// every Localhost profile is refused until an administrator allows one): a profile
+	// that allows every syscall would be as good as no filter.
+	// +optional
+	LocalhostProfile *string `json:"localhostProfile,omitempty"`
 }
 
 // AuthSpec defines authentication configuration for Valkey.
@@ -493,7 +689,10 @@ type TLSSpec struct {
 const (
 	// DefaultMetricsExporterImage is the exporter image used when spec.metrics.image is empty.
 	// oliver006/redis_exporter supports Valkey and exposes standard Redis/Valkey metrics.
-	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.66.0"
+	// Pinned by the digest of the multi-arch image index behind the tag, so a re-pushed
+	// tag cannot change what runs in the pods (ADR 0033 D5); the tag stays for the
+	// reader and for the version it names.
+	DefaultMetricsExporterImage = "oliver006/redis_exporter:v1.92.1@sha256:7fbc93d30f0f91eed1b2fe6968a956259cc5d260a984dd9071f1d1e9c2692ecd"
 
 	// DefaultMetricsExporterPort is the default port the exporter serves /metrics on.
 	DefaultMetricsExporterPort int32 = 9121
@@ -865,6 +1064,9 @@ type PersistenceSpec struct {
 type RollingUpdateSpec struct {
 	// SyncTimeout is the maximum duration to wait for a replaced pod to
 	// complete replication sync before pausing the rolling update.
+	// The same budget bounds how long the rolling update waits on a pod that
+	// exists but never becomes available (an unpullable image, a crash at boot)
+	// before it reports the PodAvailabilityStalled condition naming that pod.
 	// Default: 5m.
 	// +optional
 	SyncTimeout *metav1.Duration `json:"syncTimeout,omitempty"`
@@ -936,6 +1138,11 @@ type ValkeySpec struct {
 	// two replicas across nodes.
 	// +optional
 	AntiAffinity *AntiAffinitySpec `json:"antiAffinity,omitempty"`
+
+	// PodSecurity configures the seccomp profile and an opt-in user namespace of
+	// every generated pod. Omitted means RuntimeDefault and no user namespace.
+	// +optional
+	PodSecurity *PodSecuritySpec `json:"podSecurity,omitempty"`
 }
 
 // ValkeyStatus defines the observed state of Valkey.
@@ -1258,6 +1465,34 @@ func (v *Valkey) GetObserverResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: resource.MustParse("64Mi"),
 		},
 	}
+}
+
+// GetSentinelResources returns the compute resources of every Sentinel pod
+// container; empty when spec.sentinel.resources is not set.
+func (v *Valkey) GetSentinelResources() corev1.ResourceRequirements {
+	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Resources != nil {
+		return *v.Spec.Sentinel.Resources
+	}
+	return corev1.ResourceRequirements{}
+}
+
+// GetSeccompProfile returns the seccomp profile of every generated pod:
+// spec.podSecurity.seccompProfile, RuntimeDefault when unset.
+func (v *Valkey) GetSeccompProfile() *corev1.SeccompProfile {
+	if v.Spec.PodSecurity == nil || v.Spec.PodSecurity.SeccompProfile == nil ||
+		v.Spec.PodSecurity.SeccompProfile.Type != corev1.SeccompProfileTypeLocalhost {
+		return &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	}
+	profile := ""
+	if p := v.Spec.PodSecurity.SeccompProfile.LocalhostProfile; p != nil {
+		profile = *p
+	}
+	return &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &profile}
+}
+
+// UsesUserNamespaces reports whether the generated pods run with hostUsers: false.
+func (v *Valkey) UsesUserNamespaces() bool {
+	return v.Spec.PodSecurity != nil && v.Spec.PodSecurity.UserNamespaces
 }
 
 // GetSyncTimeout returns the configured sync timeout for rolling updates,

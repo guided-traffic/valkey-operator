@@ -5,9 +5,11 @@
 Accepted. Date: 2026-08-21.
 
 The privilege model is implemented and documented rule by rule in
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md). **Several narrowing items in
-this ADR are open** and live as the hardening checklist there; they are listed under
-Residual risks.
+~~`SECURITY_ARCHITECTURE.md`~~ [docs/security/privilege-footprint.md](../security/privilege-footprint.md)
+*(since 2026-09-27, [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md))*.
+**Several narrowing items in this ADR are open** and live ~~as the hardening checklist there~~
+as open gaps `H-<n>` in the closing section of the security page whose mechanism has the gap
+*(ADR 0036 D3, D4)*; they are listed under Residual risks.
 
 The privilege footprint was verified by reading only: the repository at one commit, taken
 from `config/rbac/role.yaml`, the Helm ClusterRole, `internal/builder/rbac.go` and the
@@ -16,6 +18,117 @@ of that kind — cert-manager's ownerReference behaviour in the Consequences res
 reference cluster, recorded beside the code that depends on it
 (`deleteLegacySentinelSecret`, [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go)):
 measured on a cluster, not reproducible from this repository.
+
+Amended 2026-09-26: **D9 is superseded by [ADR 0032](0032-generated-pods-run-rootless.md)
+D1 — every generated pod runs rootless, with no option.** The asymmetry D9 stated as a
+decision is gone: the five `securityContext` controls D8 counts on the operator's own
+Deployment are now set on every data, Sentinel and observer pod, and data and Sentinel pods
+additionally run with a fixed uid, gid and `fsGroup` of 999. D9, the Consequence that a
+`restricted` namespace rejects the generated pods, the "Set a workload `securityContext`"
+alternative and the workload-`securityContext` residual risk are marked in place below; D8
+gains an addition. The operator's own privilege footprint — every other decision here — is
+unchanged. Verified by reading
+[`internal/builder/pod_security.go`](../../internal/builder/pod_security.go), its three call
+sites (`buildPodSpec`, `buildSentinelPodSpec`, `BuildObserverDeployment`), the repair's
+insertion in `reconcileStatefulSet`, the Pod Security evaluator matrix in
+[`pod_security_test.go`](../../internal/builder/pod_security_test.go), and — for what a
+namespace label change does to running pods — `ValidateNamespace` and `isSignificantPodUpdate`
+in `k8s.io/pod-security-admission` v0.37.0, the version `go.mod` pins; the evaluator matrix
+was read, not run, for this amendment. **Run on a node, locally and not in CI** (2026-09-26,
+Kind with a control plane and three workers, Kubernetes v1.36.1, containerd; ~~the branch has not
+been through the pipeline~~ *(corrected 2026-09-26: pushed as `e2ce8bb`, where
+`Generated Manifests Up To Date` and `Integration Tests (envtest)` failed — a stale local
+controller-gen and a cache read right after a Create, both fixed in the working tree; CI has not
+run on the fix)*): `make test-e2e` on both Valkey lines, 51/51 green each, including
+`TestE2E_PodSecurity_RestrictedNamespace`; and the fleet-upgrade migration e2e
+`TestE2E_FleetUpgrade`, green from released chart 1.12.8 — not from its default 1.10.48, whose
+amd64-only images could not be run on the arm64 host used.
+
+Amended again 2026-09-26, in the same unreleased release:
+[ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) D6
+extends D8 — the operator Deployment and the pre-upgrade hook Job share one pod and one container
+block with a fixed uid, gid and `fsGroup` of 65532, `privileged: false`,
+`enableServiceLinks: false`, a stated `automountServiceAccountToken: true`, a seccomp profile of
+`RuntimeDefault` or `Localhost` from `podSecurity.seccompProfile`, and an opt-in
+`hostUsers: false` — and D4 of that ADR supersedes D8's reason for the observer's identity. The
+D9 note, the restricted-namespace Consequence and the closed workload-`securityContext` residual
+risk are also brought up to the second roll of [ADR 0032](0032-generated-pods-run-rootless.md) D2
+and its ordering (D4), decided the same day: they still said that dropping the repair from the
+template rolls nothing. The privilege footprint (D1–D7, D10–D14) is unchanged. Verified by
+reading the chart templates, `_helpers.tpl`, `values.yaml` and
+[`pod_security.go`](../../internal/builder/pod_security.go); the chart variants were rendered by
+hand according to the T31 ticket, and CI renders only the default `podSecurity` and an empty
+`image.digest` (the e2e job's `helm install`); ~~the second roll has not yet passed on a node, and
+ADR 0033's e2e has not run yet~~ *(superseded 2026-09-26 by the runs below)*.
+
+Amended a third time 2026-09-26. **The residual risk "`automountServiceAccountToken` is never
+disabled on the data pods" is closed**, and has been since 2026-08-27: the data pod sets it
+`false` and projects the token into the `sidecar` container alone, the Sentinel pod sets it and
+projects nothing ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
+step 4, out of the adversarial review of ADR 0030 that also produced
+[ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md)); the item and the
+Consequence "where it can use the mounted sidecar token" are marked in place. D9's note gains [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+D9: a `Localhost` profile a Valkey resource names is written into its workloads only if the
+operator's `--allowed-seccomp-localhost-profiles` lists that exact path (chart `valkeyPodSecurity.allowedSeccompLocalhostProfiles`,
+default empty). That list bounds the CR authors, not the operator: its own pods take
+`podSecurity.seccompProfile` unchecked against it (D8). No grant changes. Verified by reading
+[`statefulset.go`](../../internal/builder/statefulset.go) (`AutomountServiceAccountToken`,
+`sidecarTokenVolume`), [`sentinel.go`](../../internal/builder/sentinel.go),
+[`pod_hardening.go`](../../internal/controller/pod_hardening.go), `cmd/main.go` and the chart's
+`deployment.yaml` and `_helpers.tpl`; `helm template` rendered the flag for a non-empty list,
+none for the default, and failed the render for each refused entry (2026-09-26). Runs on Kind
+(2026-09-26, Kubernetes 1.36.1, containerd 2.3.1, runc 1.4.2, Linux 6.10), all before the
+allow-list and ADR 0033's CEL path rule existed: the fleet-upgrade e2e from 1.12.8 green including the second roll (two
+`RollingUpdateComplete` per persistent tier), the full suite 53/53 on Valkey 8 and 52/53 on
+Valkey 9 with ADR 0033's hardening e2e failing once on its own `/data` owner assertion, since
+fixed and passed on Valkey 8 and, rerun alone, on Valkey 9 (ADR 0032 Status). ~~The allow-list's
+e2e subtest has not run, and no run of its integration test is recorded.~~ *(Corrected
+2026-09-27: [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+Status records later runs of the same day — the allow-list's refusal subtest green on every run of
+the hardening e2e, and its integration test green on envtest 1.29 on the tree before D9's gate
+moved to the write. Read in ADR 0033, not re-run for this correction.)*
+
+Amended 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md), which replaced
+`SECURITY_ARCHITECTURE.md` with one page per perspective under
+[docs/security/](../security/README.md) and moved vulnerability reporting to
+[SECURITY.md](../../SECURITY.md). **D12** (one document), **D13** (one checklist ordered by blast
+radius, completed items kept) and the first half of **D14** ("There is no `SECURITY.md`") are
+superseded, and so is the alternative "Drop completed items from the checklist". Each is
+struck through in place below, with the rule that replaced it. The residual
+"`DEVELOPER.md` does not exist yet" is closed by
+[ADR 0035](0035-the-readme-advertises-the-reference-lives-under-docs.md). Every link to the deleted
+document now names the page that holds the material: the footprint and gaps H-1 to H-3 are on
+[privilege-footprint.md](../security/privilege-footprint.md), the generated-name, egress and
+CR-author gaps H-9 to H-11 on [isolation-and-tenancy.md](../security/isolation-and-tenancy.md).
+D1–D11 are unchanged as rules. *(Amended 2026-09-29: D7's any-source rules and its
+namespace-wide operator peer are re-decided by [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md), implemented the same day.)* In the same change, a stale sentence in D8 was corrected: the chart has refused an
+absolute or `..` path for the operator's own `Localhost` profile since ADR 0033's amendment of
+2026-09-26. Verified by reading `docs/security/`, `SECURITY.md`, `DEVELOPER.md` and the
+`valkey-operator.podHardening` helper in
+[`_helpers.tpl`](../../deploy/helm/valkey-operator/templates/_helpers.tpl), on 2026-09-27.
+
+Amended again 2026-09-27 (correction, no decision changes): the residual risk "A generated
+name can be held by an object the operator did not create" still said that every managed kind
+but the two ServiceAccounts, the sidecar Role and its RoleBinding is written by generated name
+with no ownership check. [ADR 0020](0020-write-only-what-the-operator-owns.md) has guarded
+every managed kind since its amendments of 2026-08-22, and the code agrees. In
+`internal/controller` — the reconcile paths of
+[`valkey_controller.go`](../../internal/controller/valkey_controller.go), `pdb.go`, the nudge
+in `nudge.go`, `clearDrainStamps` in `steady_state_master.go`, and `writeWorkload`, which only
+those paths call — every `Update` and `Patch` of a managed object follows an ownership proof of
+the object read (`metav1.IsControlledBy`, or `podIsOurs` for a pod), and every `Create` runs on
+NotFound or after an owned object was deleted with its UID precondition. That covers StatefulSets, Services, ConfigMaps, NetworkPolicies, the observer
+Deployment, ServiceMonitors, Certificates, PodDisruptionBudgets, the ServiceAccounts, the Role
+and the RoleBinding. The sentence is struck and restated in place, and the entry stays partly
+open for H-9 and H-11. Verified by reading on 2026-09-27; no test was run for this correction.
+
+Corrected 2026-09-27 (no decision changes): the alternative "A namespaced Role per watched
+namespace" offered, as a second option, a cache filtered by label with the ClusterRole narrowed
+to match. An RBAC rule carries no label selector — `rbacv1.PolicyRule` in `k8s.io/api` v0.37.1,
+the version `go.mod` pins, has `Verbs`, `APIGroups`, `Resources`, `ResourceNames` and
+`NonResourceURLs` only — so that option does not exist; it is struck in place, here and in gap
+[H-1](../security/privilege-footprint.md#h-1). Verified by reading the type.
 
 ## Context
 
@@ -88,26 +201,102 @@ whatever `default` is bound to — nothing, in a stock cluster.
 to three policies, every one with `PolicyTypes: [Ingress]`: the Valkey policy always, the
 Sentinel and observer policies only when those components are enabled, so a standalone
 cluster gets exactly one. The data port accepts traffic from Valkey pods,
-Sentinel pods, observer pods and **the operator namespace** (matched on
-`kubernetes.io/metadata.name`, because the operator connects directly to the data plane). The
-sidecar health port and the exporter port are deliberately **open to everyone**: kubelet
-probes originate from the node, not from a pod a policy can select, and Prometheus is not
-locatable from the CR.
+Sentinel pods, observer pods and ~~**the operator namespace** (matched on
+`kubernetes.io/metadata.name`, because the operator connects directly to the data plane)~~
+*(re-decided 2026-09-29, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D2: the operator pod — its namespace and a pod selector matching
+it alone)*. ~~The sidecar health port and the exporter port are deliberately **open to
+everyone**: kubelet probes originate from the node, not from a pod a policy can select, and
+Prometheus is not locatable from the CR.~~ *(Re-decided 2026-09-29, [ADR 0039](0039-a-networkpolicy-admits-only-the-components-this-repository-deploys.md) D1–D3: a shipped
+policy admits only traffic between the components this repository deploys, so the sidecar
+health, exporter and observer ports get no rule — kubelet's traffic comes from the node, which
+the API admits anyway, and a scraper is the administrator's to admit. Implemented.)*
 
 **D8 — The operator process itself runs fully restricted.** Verified by reading the chart
 Deployment: five `securityContext` controls, split across the two levels the field exists
-at — pod-level `runAsNonRoot: true` and `seccompProfile: RuntimeDefault`, container-level
+at — pod-level `runAsNonRoot: true` and `seccompProfile: RuntimeDefault` *(since 2026-09-26 the
+chart default of `podSecurity.seccompProfile`, with `Localhost` selectable — the ADR 0033 D6
+amendment below)*, container-level
 `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` and
 `capabilities: drop [ALL]`. `terminationGracePeriodSeconds: 10` sits beside them in the same
 pod spec and is not a `securityContext` control. The operator holds the cluster's most
 privileged token, so hardening its own runtime is the highest-value posture control
 available — **and it is the existence proof for giving the workload pods the same
-treatment.**
+treatment.** *(Added 2026-09-26:)* They have it now:
+[ADR 0032](0032-generated-pods-run-rootless.md) D1 applies these five controls to every
+generated pod — ~~the observer with exactly these five, because its image user is numeric like
+this one~~ *(superseded 2026-09-26 by [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+D4: the observer is pinned to `runAsUser`, `runAsGroup` and `fsGroup` 65532, `OperatorUID`)*;
+data and Sentinel pods with `runAsUser`, `runAsGroup` and `fsGroup` 999 on top,
+because the Valkey image declares no `USER` and would otherwise start as root. The one
+container outside the posture is the migration-only `fix-data-ownership` repair (ADR 0032 D2).
 
-**D9 — The asymmetry between the operator and the workloads it creates is a stated decision,
-not an oversight.** No pod generated by `internal/builder` sets any `securityContext`
+*Amended 2026-09-26 by [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)
+D6:* the five controls are no longer the whole of it, and they are no longer the Deployment's
+alone. The chart's Deployment and its pre-upgrade hook Job — which carried the same five before,
+unnamed here — now render one shared pod block and one shared container block
+(`valkey-operator.podHardening`, `valkey-operator.containerSecurityContext` in
+[`_helpers.tpl`](../../deploy/helm/valkey-operator/templates/_helpers.tpl)): `runAsNonRoot` with
+`runAsUser`, `runAsGroup` and `fsGroup` 65532 — the image's distroless `nonroot` user, now named
+rather than inherited — `enableServiceLinks: false`, `automountServiceAccountToken: true`
+(stated: both pods call the API server), and `privileged: false` beside the three container
+fields. The seccomp profile is `podSecurity.seccompProfile`: `RuntimeDefault` by default, or
+`Localhost` with a path; any other type, a `Localhost` without a path, or a path without
+`Localhost` fails the render, so `Unconfined` cannot be installed through the chart. *(Added
+2026-09-26, ADR 0033 D9:)* the operator's own profile is the installer's choice and is not
+checked against `valkeyPodSecurity.allowedSeccompLocalhostProfiles`, which bounds only what a
+Valkey resource may name; ~~unlike that list and the CRD, the chart does not refuse an absolute
+path or a `..` element here (rendered by hand 2026-09-26; what the API server then does with the
+Deployment was not run)~~ *(corrected 2026-09-27: like the CRD, the chart refuses an absolute path
+or a `..` element at render — `valkey-operator.podHardening` fails on both, added with
+[ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)'s amendment
+of 2026-09-26; read in the template, not rendered for this correction)*.
+`hostUsers: false` is behind `podSecurity.userNamespaces`, default off, because a node without
+user-namespace support would not start the operator pod; an API server with the
+`UserNamespacesSupport` gate off drops the field from both pods without an error, and for the
+chart nothing reports that (ADR 0033 *Residual risks*). None of this narrows D1: the
+operator's power is its ServiceAccount token, and no pod-level control changes what that token
+may do at the API server. `image.digest`, when set (the default is empty, and nothing in the
+release pipeline fills it), pins the operator, the hook and, through `--operator-image`, the
+sidecar and observer images the operator generates (`valkey-operator.image`, ADR 0033 D5). Verified by reading the templates and `values.yaml`; `helm template`
+with each variant was run by hand (ADR 0033 *Residual risks*). In CI the chart is rendered
+only by the e2e job's `helm install` (`.github/workflows/release.yml`, with
+`test/e2e/helm-values.yaml`), which leaves `podSecurity` and `image.digest` at their defaults; no
+CI job renders the digest, user-namespace or `Localhost` variants or checks a refused value.
+
+**D9 — ~~The asymmetry between the operator and the workloads it creates is a stated decision,
+not an oversight.~~** ~~No pod generated by `internal/builder` sets any `securityContext`
 (verified by the absence of the field across the package). Generated clusters inherit whatever
-the namespace's Pod Security admission level allows.
+the namespace's Pod Security admission level allows.~~ *(**Superseded 2026-09-26 by
+[ADR 0032](0032-generated-pods-run-rootless.md) D1:** every generated pod runs rootless, with
+~~no CRD field~~ no CRD field that lowers it *(amended 2026-09-26: `spec.podSecurity` of ADR
+0033 chooses a seccomp profile and an opt-in user namespace, never root and never
+`Unconfined`)*, no `baseline` level and no opt-out. The stated decision was the wrong one: the
+upstream Valkey image declares no `USER` and drops to `valkey` in its own entrypoint, which
+every generated container on that image replaces with `command:` — so under this rule
+`valkey-server` ran as uid 0 with Docker's default set of fourteen capabilities and
+`NoNewPrivs: 0`, less isolation than the image itself intends (measured in Docker on both
+pinned lines, ADR 0032 Context). What holds now: one walk over the assembled `PodSpec`
+(`applyValkeyPodSecurity`, `applyObserverPodSecurity` in
+[`pod_security.go`](../../internal/builder/pod_security.go)) sets pod-level
+`runAsNonRoot: true` and `seccompProfile: RuntimeDefault` *(or a `Localhost` profile the CR
+names, never `Unconfined` — ADR 0033 D1, 2026-09-26 — and only one the operator's
+`--allowed-seccomp-localhost-profiles` lists; an unlisted one is never written, ADR 0033 D9,
+same day)* — plus `runAsUser`, `runAsGroup` and
+`fsGroup` 999 on data and Sentinel pods *(and 65532 on the observer, ADR 0033 D4)* — and
+`allowPrivilegeEscalation: false`,
+`readOnlyRootFilesystem: true` and `capabilities.drop: [ALL]` on every container and init
+container, the sidecar and the third-party exporter included *(plus `privileged: false` on every
+container, `enableServiceLinks: false` on every pod, and an opt-in `hostUsers: false` — ADR 0033
+D2, D4)*. The one root container the
+builders still generate is `fix-data-ownership` — uid 0, only `CAP_CHOWN` — carried by a
+persistent data template only during the migration (added while a data pod an earlier
+operator built exists, kept until every ordinal holds a ~~rootless pod proven ours~~ pod proven
+ours, rootless and Ready, and while a data-tier roll is recorded — *tightened 2026-09-26, ADR
+0032 D4*) and kept out
+of the pod-spec hash, so a pod created from that template keeps it in its spec after the
+template drops it — until the second roll replaces it *(decided 2026-09-26, ADR 0032 D2)* (ADR
+0032 D2, D4); a template carrying it passes `baseline`, not
+`restricted`. D8's addition records what replaced this rule.)*
 
 **D10 — The pre-upgrade hook's grant is bounded in time, not in scope.** `<release>-upgrade`
 gets `valkeys: get,list,patch,update` and `customresourcedefinitions: get,list,patch,update`
@@ -126,22 +315,39 @@ unused is auditable, and trimming it would put the generated role permanently ou
 what `make manifests` reproduces.
 
 **D12 — The privilege footprint is documented rule by rule, and updated in the same change
-as the code.** `SECURITY_ARCHITECTURE.md` covers roles and trust boundaries, data and secret
+as the code.** ~~`SECURITY_ARCHITECTURE.md` covers roles and trust boundaries, data and secret
 flow, isolation and what it does *not* defend against, the footprint rule by rule, the
-validation story, rotation, vulnerability reporting and the hardening checklist. Every rule is
-read out of the manifests, not out of intent, and unverified statements say so. Before it
-existed, the permission set lived only in the markers, the generated role and the chart
-ClusterRole, and the README documented no verbs at all.
+validation story, rotation, vulnerability reporting and the hardening checklist.~~
+*(Superseded 2026-09-27 by [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D1, D7, D8.)* The footprint rule by rule is
+[docs/security/privilege-footprint.md](../security/privilege-footprint.md); roles and trust
+boundaries, secret flow, isolation, the validation story and rotation are each a page of their
+own under [docs/security/](../security/README.md); vulnerability reporting is
+[SECURITY.md](../../SECURITY.md). Every rule is read out of the manifests, not out of intent,
+and unverified statements say so. Before the first security document existed, the permission set
+lived only in the markers, the generated role and the chart ClusterRole, and the README
+documented no verbs at all.
 
-**D13 — The hardening checklist is ordered by what a compromise buys an attacker, never by
-effort, and completed items stay in the list with what they did *not* close.**
-Effort-ordered lists get worked top-down and leave the expensive, highest-impact items
+**D13 — ~~The hardening checklist is ordered by what a compromise buys an attacker, never by
+effort, and completed items stay in the list with what they did *not* close.~~**
+~~Effort-ordered lists get worked top-down and leave the expensive, highest-impact items
 permanently last — here that would be exactly the two things that define the trust model.
 Keeping closed items visible with their residual prevents a checked box from being read as
-"this class of risk is gone".
+"this class of risk is gone".~~ *(**Superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D3–D5:** there is
+no single checklist. An open gap is `H-<n>` in the closing section `What this does not cover` of
+the page whose mechanism has the gap, its number never reused; a closed gap loses its entry,
+and keeps at most three sentences of past-tense prose inside its mechanism's section where it
+explains a current rule — which is where "what the fix did not cover" now stands, beside the rule
+it qualifies. The worry D13 answered, that effort ordering buries the trust-model items, has no
+list left to act on; the two gaps that define the trust model are H-1 and H-2, the first two on
+[privilege-footprint.md](../security/privilege-footprint.md).)*
 
-**D14 — Vulnerability intake states the gap rather than inventing a contact.** There is no
-`SECURITY.md` and no published address; reports are routed to GitHub private vulnerability
+**D14 — Vulnerability intake states the gap rather than inventing a contact.** ~~There is no
+`SECURITY.md` and no published address;~~ *(superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D7: the reporting
+policy is [SECURITY.md](../../SECURITY.md) at the root, which states that there is no published
+address;)* reports are routed to GitHub private vulnerability
 reporting, or to the maintainer organisation, and reporters are asked not to open a public
 issue for anything that reads a Secret, escalates RBAC or destroys data, and to include the
 operator version, the chart version and whether TLS and auth were enabled. An invented or
@@ -167,28 +373,65 @@ reads.
   Roles are indistinguishable, because none uses `resourceNames`
   ([ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8).
 * **No egress rule is written at all**, so a compromised Valkey pod may open connections
-  anywhere, including to the API server — where it can use the mounted sidecar token. The open
-  health and exporter ports are unauthenticated surfaces reachable from anywhere in the
-  cluster.
-* **A `restricted`-PSA namespace will reject the generated pods outright**, so the operator
+  anywhere, including to the API server — ~~where it can use the mounted sidecar token~~
+  *(corrected 2026-09-26: since ADR 0012 D8 step 4, 2026-08-27, only a compromised `sidecar`
+  container holds that token; the `valkey` and `exporter` containers and the init containers
+  mount none)*. The open health and exporter ports are unauthenticated surfaces reachable from
+  anywhere in the cluster.
+* ~~**A `restricted`-PSA namespace will reject the generated pods outright**, so the operator
   cannot be used in a hardened namespace today. Data pods run as root with full capabilities
-  unless the namespace forces otherwise.
+  unless the namespace forces otherwise.~~ *(Superseded 2026-09-26 by
+  [ADR 0032](0032-generated-pods-run-rootless.md) D1 and D6.)* Every template the builders
+  render passes Pod Security `restricted` until the migration repair is inserted — asserted,
+  with the positive control that the legacy shape is refused, by the evaluator matrix in
+  [`pod_security_test.go`](../../internal/builder/pod_security_test.go) (read, not run for this
+  amendment); admission by a real API server on a node is the job of
+  `TestE2E_PodSecurity_RestrictedNamespace`, which passed on both Valkey lines (locally on
+  Kind, 2026-09-26, not in CI): the namespace refused an unrestricted pod on a server-side dry
+  run, then admitted every generated pod of four topologies and saw it Ready, with `Uid` 999,
+  `CapEff` and `CapBnd` 0 and `NoNewPrivs` 1 in `/proc/1/status` of the `valkey` and
+  `sentinel` containers. "Full capabilities" was imprecise
+  as well: it was the runtime's default set — fourteen as measured under Docker, `NET_RAW`,
+  `DAC_OVERRIDE` and `SETUID` among them. When an existing namespace can be switched to
+  `enforce: restricted` is ADR 0032 D6's rule: once it holds no pod without `runAsNonRoot`.
+  What makes labelling earlier unsafe is pod *creation*, not the pods already running —
+  PodSecurity evicts nothing, a label change only returns warnings for existing violators
+  (`ValidateNamespace`), and a label patch the sidecar makes on such a pod is not re-evaluated
+  (`isSignificantPodUpdate`) — but a data pod the migration creates from a template that still
+  carries the repair passes `baseline` only and would be refused. A deferred non-persistent
+  single-pod cluster (`PodSecurityUpdatePending`, ADR 0032 D3) holds that precondition off
+  without being at risk: its template is already rootless, only the pod is not. And the
+  server-side dry-run D6 recommends lists more than the precondition names: every persistent
+  data pod the migration created keeps `fix-data-ownership` in its immutable spec after the
+  template drops it, and is reported until ~~it is replaced for another reason~~ the second roll
+  of ADR 0032 D2 replaces it *(corrected 2026-09-26: dropping the repair from the template makes
+  each such pod outdated, `podCarriesRetiredRepair`)*. The operator
+  never labels namespaces.
 * The documented blast radius includes creating `Valkey` CRs in any namespace on top of
   deleting them (D11).
-* The checklist has to carry unchecked high-severity items indefinitely without that reading
-  as neglect — scoping the `secrets` grant costs install-and-forget behaviour for new
-  namespaces, and may never be done.
+* ~~The checklist has~~ The security pages have *(since 2026-09-27, ADR 0036 D3)* to carry
+  open high-severity gaps indefinitely without that reading
+  as neglect — scoping the `secrets` grant ([H-1](../security/privilege-footprint.md#h-1))
+  costs install-and-forget behaviour for new namespaces, and may never be done.
 * Vulnerability intake depends on GitHub's private-reporting feature being enabled on the
-  repository. The missing `SECURITY.md` is an open documentation item, distinct from
+  repository. ~~The missing `SECURITY.md` is an open documentation item, distinct from
   `SECURITY_ARCHITECTURE.md`, which is the design document and deliberately **not** the
-  GitHub reporting convention file.
+  GitHub reporting convention file.~~ *(Superseded 2026-09-27 by
+  [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) D7:
+  [SECURITY.md](../../SECURITY.md) exists and is the reporting policy only; the design is
+  [docs/security/](../security/README.md).)* Whether private reporting is switched on is still
+  not verified, and `SECURITY.md` says so.
 
 ## Alternatives Considered
 
 ### A namespaced Role per watched namespace
 
-Or a cache filtered by label with the ClusterRole narrowed to match. Both are on the hardening
-checklist with the cost stated: **the operator stops being install-and-forget for new
+~~Or a cache filtered by label with the ClusterRole narrowed to match. Both are~~ *(corrected
+2026-09-27: there is no second option — `rbacv1.PolicyRule` has no label selector, so no
+ClusterRole can be narrowed to match a label-filtered cache; such a cache shrinks what the
+operator holds in memory, not what its token may read.)* It is ~~on the hardening checklist~~
+the option of the open gap [H-1](../security/privilege-footprint.md#h-1) *(since 2026-09-27,
+ADR 0036)* with the cost stated: **the operator stops being install-and-forget for new
 namespaces.**
 
 ### Drop `escalate` and `bind`, keeping the sidecar Role a strict subset of the operator's own grants
@@ -211,12 +454,22 @@ Rejected: more pods holding a namespace-wide pod-patch token for no functional g
 
 ### Add egress NetworkPolicies
 
-On the checklist, not implemented.
+~~On the checklist~~ An open gap, [H-10](../security/isolation-and-tenancy.md#h-10) *(since
+2026-09-27, ADR 0036)*, not implemented.
 
 ### Set a workload `securityContext`
 
-On the checklist, not implemented. `readOnlyRootFilesystem` in particular conflicts with the
-Valkey data path unless volumes are carved out.
+~~On the checklist, not implemented. `readOnlyRootFilesystem` in particular conflicts with the
+Valkey data path unless volumes are carved out.~~ *(Superseded 2026-09-26: taken by
+[ADR 0032](0032-generated-pods-run-rootless.md) D1, for every generated pod and with no
+opt-out.)* The feared conflict did not arise: every path a generated process writes was
+already a mounted volume — the data PVC or `emptyDir`, the Sentinel config `emptyDir` — so the
+read-only root needed no carve-out. The one thing added is `workingDir: /data` on the `valkey`
+container, which it used to inherit from the image. Measured under `--read-only` in Docker on
+both pinned lines (ADR 0032 Context) and kept as
+[`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go);
+on a node, `TestE2E_PodSecurity_RestrictedNamespace` completed an AOF rewrite and an RDB
+snapshot under the read-only root (locally on Kind, 2026-09-26, not in CI).
 
 ### Trim the `valkeys` marker to the verbs the code uses
 
@@ -225,11 +478,18 @@ and kept edited.
 
 ### Order the hardening checklist by effort or likelihood
 
-Rejected: it buries the items that define the trust model.
+Rejected: it buries the items that define the trust model. *(Moot since 2026-09-27: there is no
+single checklist left to order, [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D3.)*
 
 ### Drop completed items from the checklist
 
-Rejected: it loses the statement of what the fix did *not* cover.
+~~Rejected: it loses the statement of what the fix did *not* cover.~~ *(**Superseded
+2026-09-27 — taken by [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)
+D4, D5.**)* A closed gap loses its entry and its `H-<n>`. The statement of what its fix did not
+cover survives as at most three sentences of past-tense prose in the section of the mechanism
+it qualifies, which is where a reader of that rule finds it. Everything else about it is history
+in git.
 
 ### Publish a maintainer email, or omit the reporting section
 
@@ -237,57 +497,118 @@ The first is not established; the second leaves a reporter with no channel at al
 
 ## Residual risks
 
-Every item below except the last is on the hardening checklist in
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md), ordered there by blast radius.
+~~Every item below except the last is on the hardening checklist in
+`SECURITY_ARCHITECTURE.md`, ordered there by blast radius.~~ *(Superseded 2026-09-27 by
+[ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md):)* Every open item
+below is an open gap on the security page whose mechanism has it, named per item; the last item
+is closed.
 
-* **`secrets: get,list,watch` cluster-wide (open)** — the heaviest confidentiality exposure.
+* **`secrets: get,list,watch` cluster-wide (open,
+  [H-1](../security/privilege-footprint.md#h-1))** — the heaviest confidentiality exposure.
   `delete` exists for exactly one, provenance-gated caller; the guard bounds the reconcile
   path, not the grant.
-* **`roles: escalate` + `rolebindings` + `serviceaccounts: create` (open)** — namespaced
+* **`roles: escalate` + `rolebindings` + `serviceaccounts: create` (open,
+  [H-2](../security/privilege-footprint.md#h-2))** — namespaced
   admin everywhere. Reducing it requires verifying the subset claim and dropping both
   `escalate` and `bind`; the chart grants the pair, and holding all of a Role's permissions is
   what makes either one unnecessary.
-* **Workload pods have no `securityContext` (open)** while the operator's own Deployment sets
-  all five `securityContext` controls listed in D8.
-* **`automountServiceAccountToken` is never disabled on the data pods (open)** — the whole
+* ~~**Workload pods have no `securityContext` (open)** while the operator's own Deployment sets
+  all five `securityContext` controls listed in D8.~~
+
+  **(Closed 2026-09-26 by [ADR 0032](0032-generated-pods-run-rootless.md) D1 and D6.)** Every
+  generated pod carries the five D8 controls, data and Sentinel pods run as uid 999, and the
+  rendered templates pass the `restricted` evaluator the API server's PodSecurity admission
+  runs, and a namespace labelled `pod-security.kubernetes.io/enforce: restricted` admitted
+  every generated pod in `TestE2E_PodSecurity_RestrictedNamespace`. What it did **not** close: the migration-only repair runs as uid 0 with
+  `CAP_CHOWN` in every persistent data pod the migration creates (ADR 0032 D2), and ~~because
+  removing it from the template rolls nothing, it stays in each such pod's spec until the pod
+  is replaced for another reason~~ it stays in each such pod's spec until the second roll
+  replaces the pod once the repair has left the template *(corrected 2026-09-26, ADR 0032 D2 and
+  the ordering of D4; ~~that second roll has not yet passed on a node~~ it passed the same day in
+  the fleet-upgrade e2e from 1.12.8, two `RollingUpdateComplete` per persistent tier)* — until then raising the
+  namespace's `enforce` label to `restricted`, or
+  dry-running it, lists those pods as violators, and kubelet re-runs init containers when it
+  has to recreate a pod's sandbox, so the repair can run as root there again (Kubernetes
+  init-container semantics, not measured here); a non-persistent single-pod cluster keeps its
+  root pod until it restarts for another reason (D3); OpenShift's `restricted-v2` SCC refuses
+  the fixed `runAsUser: 999` outside a namespace's UID range, and nothing here targets it; and
+  **the node evidence is local, not CI** — the restricted-namespace e2e and the fleet-upgrade
+  migration e2e passed on 2026-09-26 on one Kind cluster (Kubernetes v1.36.1, containerd), ~~the
+  branch has not been through the pipeline~~ the branch's one pipeline run (`e2ce8bb`) failed two
+  gate jobs, fixed and not re-run *(corrected 2026-09-26)*, `TestE2E_FleetUpgrade` is not a CI job and started
+  from chart 1.12.8 rather than its default 1.10.48, and Kind's hostPath PV has a `0777` root
+  volume root, so the ownership repair was exercised against roots the test set to `0755 root`
+  beforehand (ADR 0032 Residual risks).
+* ~~**`automountServiceAccountToken` is never disabled on the data pods (open)** — the whole
   pod runs under `<cr-name>-sidecar`, so the `valkey`, `sidecar` and `exporter` containers
   all carry the token although only the sidecar uses it. A compromise of the `valkey` or
   `exporter` container — **including via an attacker-chosen `spec.metrics.image`** — yields
-  that token. Corrected 2026-08-21: the grant it carries is no longer namespace-wide
+  that token.~~ Corrected 2026-08-21: the grant it carries is no longer namespace-wide
   `pods get,list,patch`. Since [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
   D8 step 3 it is `pods: patch` restricted by `resourceNames` to this cluster's own data
   pods — still the ability to move the `instanceRole` label and to write drain stamps, but
   only on this cluster. The observer half of this bullet is **closed**: it has its own pod
   spec with `automountServiceAccountToken: false`.
+
+  **(Closed 2026-08-27 by [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md)
+  D8 step 4; marked here 2026-09-26.)** The data pod sets
+  `automountServiceAccountToken: false` and hands the token back to the `sidecar` container
+  alone through a projected volume (`sidecarTokenVolume`, `SidecarTokenVolumeName` in
+  [`statefulset.go`](../../internal/builder/statefulset.go)), so `valkey`, the exporter and every
+  init container — the migration-only root repair of ADR 0032 D2 included — hold no token; the
+  Sentinel pod sets the flag and projects nothing. What it did **not** close: the `sidecar`
+  container itself keeps the D8 step 3 grant and must, and a sidecar compromise still yields
+  it; the per-pod records it could forge are ADR 0031's subject.
 * **(Closed 2026-08-21) The observer shared the sidecar ServiceAccount** while making no API
   call at all. [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8
   step 2 shipped: the observer runs under `<cr-name>-observer`, bound to no Role, mounting
   no token. A pre-existing ServiceAccount under that derived name is refused rather than
   overwritten ([ADR 0020](0020-write-only-what-the-operator-owns.md) D1, D2).
-* **A generated name can be held by an object the operator did not create (partly open).**
+* **A generated name can be held by an object the operator did not create (partly open,
+  [H-9](../security/isolation-and-tenancy.md#h-9) and
+  [H-11](../security/isolation-and-tenancy.md#h-11)).**
   There is no admission webhook constraining CR names
   ([ADR 0015](0015-one-crd-validated-by-schema-only.md)), so whoever may `create valkeys`
   picks the names of every derived object. Deletes are guarded
-  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)); writes are guarded for the
+  ([ADR 0006](0006-delete-only-what-the-operator-owns.md)); ~~writes are guarded for the
   observer ServiceAccount and the sidecar ServiceAccount, Role and RoleBinding
   ([ADR 0020](0020-write-only-what-the-operator-owns.md)). Every other managed kind is
   still written by generated name with no ownership check — ADR 0020 D7 and its Residual
-  risks name what that leaves open.
-* **No egress NetworkPolicies (open).**
-* **The pre-upgrade hook's cluster-wide CRD write grant (open)** — taken on every upgrade
-  unless disabled.
-* **`DEVELOPER.md`, the third file of the documentation standard, does not exist yet
+  risks name what that leaves open.~~ *(corrected 2026-09-27: stale since ADR 0020's
+  amendments of 2026-08-22, Status)* writes are guarded for every managed kind
+  ([ADR 0020](0020-write-only-what-the-operator-owns.md)): a reconcile path updates or
+  patches an existing object only after `metav1.IsControlledBy` proves it is this Valkey's,
+  and refuses a foreign one; it creates only on NotFound; a pod is proven two-hop, through the
+  StatefulSet. What stays open is what the guards do not undo: an object an earlier release
+  already adopted (H-9), and the choices a CR author makes, the image among them (H-11).
+* **No egress NetworkPolicies (open, [H-10](../security/isolation-and-tenancy.md#h-10)).**
+* **The pre-upgrade hook's cluster-wide CRD write grant (open,
+  [H-3](../security/privilege-footprint.md#h-3))** — taken on every upgrade unless disabled.
+* ~~**`DEVELOPER.md`, the third file of the documentation standard, does not exist yet
   (open).** A documentation gap, not a hardening item: `SECURITY_ARCHITECTURE.md` records it
-  in its introduction, not on its checklist.
+  in its introduction, not on its checklist.~~ **(Closed 2026-09-27 by
+  [ADR 0035](0035-the-readme-advertises-the-reference-lives-under-docs.md).)**
+  [DEVELOPER.md](../../DEVELOPER.md) exists, together with
+  [docs/developer/](../developer/README.md); the same change replaced
+  `SECURITY_ARCHITECTURE.md` with [docs/security/](../security/README.md)
+  ([ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md)).
 
 ## References
 
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — the rule-by-rule footprint, trust boundaries and hardening checklist
+* [docs/security/privilege-footprint.md](../security/privilege-footprint.md) — the rule-by-rule footprint and its open gaps H-1 to H-3; trust boundaries are [trust-boundaries.md](../security/trust-boundaries.md), the other gaps sit on their own pages under [docs/security/](../security/README.md) *(until 2026-09-27 all of it was `SECURITY_ARCHITECTURE.md`)*
+* [ADR 0036](0036-the-security-architecture-is-one-page-per-perspective.md) — the security architecture as one page per perspective; supersedes D12, D13 and the first half of D14
+* [SECURITY.md](../../SECURITY.md) — vulnerability reporting (D14)
 * [`internal/builder/rbac.go`](../../internal/builder/rbac.go) — `BuildSidecarServiceAccount`, `BuildSidecarRole`, `BuildSidecarRoleBinding`
 * [`internal/builder/networkpolicy.go`](../../internal/builder/networkpolicy.go) — the three ingress-only policies
 * [`internal/builder/sentinel.go`](../../internal/builder/sentinel.go) — `DefaultServiceAccountName` for Sentinel pods
+* [`internal/builder/pod_security.go`](../../internal/builder/pod_security.go) — the rootless posture of every generated pod, which superseded D9
 * [`deploy/helm/valkey-operator/templates/`](../../deploy/helm/valkey-operator/templates/) — `clusterrole.yaml`, `clusterrolebinding.yaml`, `pre-upgrade-rbac.yaml`, `deployment.yaml`
 * [ADR 0006](0006-delete-only-what-the-operator-owns.md) — the call-site guard that pairs with the destructive verb
 * [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) — the sidecar half of the trust boundary
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — how the grant is kept in sync across three manifests
 * [ADR 0016](0016-authentication-and-tls-posture.md) — what the data plane authenticates and encrypts
+* [ADR 0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) — the per-pod records the sidecar's remaining grant could rewrite (the closed `automountServiceAccountToken` residual)
+* [`internal/controller/pod_hardening.go`](../../internal/controller/pod_hardening.go) — `seccompProfileAllowed`, the allow-list that bounds a Valkey resource's `Localhost` profile (ADR 0033 D9)
+* [ADR 0032](0032-generated-pods-run-rootless.md) — generated pods run rootless; supersedes D9
+* [ADR 0033](0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) — the seccomp choice, the opt-in user namespace and the operator pod's shared hardening block (D8 amendment)
+* [`deploy/helm/valkey-operator/templates/_helpers.tpl`](../../deploy/helm/valkey-operator/templates/_helpers.tpl) — `valkey-operator.podHardening`, `valkey-operator.containerSecurityContext`, `valkey-operator.image`

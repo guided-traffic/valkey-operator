@@ -34,12 +34,14 @@ func BuildSidecarServiceAccount(v *vkov1.Valkey) *corev1.ServiceAccount {
 // BuildSidecarRole builds the namespaced Role for the sidecar container.
 // The role grants patch access to this cluster's data pods so the sidecar can
 // update the instanceRole label on its own pod and the drain stamp on a peer pod.
+// It also grants get, so the drain handler can check whether a promotion candidate
+// is being deleted (ADR 0028 D5a).
 //
-// patch is the only verb the sidecar calls — patchMetadata in
-// internal/sidecar/labeler.go is the package's single clientset call site — so
-// nothing else is granted. Dropping the unused get/list was the precondition for
-// the resourceNames restriction below, which is incompatible with list
-// (SECURITY_ARCHITECTURE.md section 4.2, ADR 0012 D8).
+// get and patch are the only verbs the sidecar calls — IsTerminating and
+// patchMetadata in internal/sidecar/labeler.go are its two clientset call sites —
+// so nothing else is granted. list stays dropped: it is incompatible with the
+// resourceNames restriction below (docs/security/privilege-footprint.md, "The
+// per-instance sidecar Role"; ADR 0012 D8).
 //
 // livePodNames are the pods that currently carry this cluster's data-pod selector
 // labels; SidecarRolePodNames explains why the grant is not derived from
@@ -76,9 +78,9 @@ func BuildSidecarRole(v *vkov1.Valkey, livePodNames []string) *rbacv1.Role {
 	return role
 }
 
-// SidecarRolePodNames returns the data-pod names the sidecar Role grants patch on,
-// sorted by ordinal: the union of the pods spec.replicas asks for and the pods that
-// actually exist right now.
+// SidecarRolePodNames returns the data-pod names the sidecar Role grants get and
+// patch on, sorted by ordinal: the union of the pods spec.replicas asks for and the
+// pods that actually exist right now.
 //
 // Both halves are load-bearing. The desired half covers scale-up: the operator writes
 // the Role before the StatefulSet in the same pass (reconcileResources), so the new

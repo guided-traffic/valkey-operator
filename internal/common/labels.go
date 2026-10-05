@@ -45,12 +45,19 @@ const (
 	ManagedBy = "vko.gtrfc.com"
 )
 
-// ExtractVersionFromImage extracts the tag portion from a container image string.
-// Returns "latest" if no tag is present.
+// ExtractVersionFromImage extracts the tag portion from a container image string,
+// for the app.kubernetes.io/version label. Returns "latest" if neither a tag nor a
+// digest is present, and "" for a reference pinned by digest alone.
+//
+// A digest is never the result: "sha256:<64 hex>" is 71 characters with a colon,
+// and a label value allows 63 characters without one, so returning it made the API
+// server refuse every object carrying the label -- a digest-pinned spec.image could
+// never be deployed (ADR 0033 D5). "repo:tag@sha256:..." yields the tag.
 func ExtractVersionFromImage(image string) string {
-	// Handle images with digest (e.g., "image@sha256:...")
+	digestOnly := false
 	if idx := strings.LastIndex(image, "@"); idx != -1 {
-		return image[idx+1:]
+		image = image[:idx]
+		digestOnly = true
 	}
 
 	// Handle images with tag (e.g., "image:tag")
@@ -64,7 +71,9 @@ func ExtractVersionFromImage(image string) string {
 	if idx := strings.LastIndex(tagPart, ":"); idx != -1 {
 		return tagPart[idx+1:]
 	}
-
+	if digestOnly {
+		return ""
+	}
 	return "latest"
 }
 

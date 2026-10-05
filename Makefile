@@ -25,23 +25,31 @@ SHELL = /usr/bin/env bash -o pipefail
 
 LOCALBIN ?= $(shell pwd)/bin
 ## Tool Binaries
-KUSTOMIZE ?= $(LOCALBIN)/kustomize
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-ENVTEST ?= $(LOCALBIN)/setup-envtest
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
-GOCYCLO ?= $(LOCALBIN)/gocyclo
-GOSEC ?= $(LOCALBIN)/gosec
-GOVULNCHECK ?= $(LOCALBIN)/govulncheck
+# Each path carries its tool's version (defined below; these variables expand
+# lazily). go-install-tool installs only when its file is missing -- make may run
+# the recipe more often, because $(LOCALBIN) is a normal prerequisite and newer
+# than the tools, but the [ -f ] guard skips it -- so an unversioned
+# bin/controller-gen survived the bump to v0.22.0 and kept stamping v0.21.0 into
+# the CRDs, and the "Generated Manifests Up To Date" job failed on a tree
+# regenerated locally. With the version in the name, a bump is a missing file and
+# installs itself (docs/adr/0017-test-and-ci-policy.md, D49).
+KUSTOMIZE ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
+ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOCYCLO ?= $(LOCALBIN)/gocyclo-$(GOCYCLO_VERSION)
+GOSEC ?= $(LOCALBIN)/gosec-$(GOSEC_VERSION)
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck-$(GOVULNCHECK_VERSION)
 
 ## Tool Versions
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
-KUSTOMIZE_VERSION ?= v5.8.1
+KUSTOMIZE_VERSION ?= v5.8.2
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools/cmd/controller-gen
 CONTROLLER_GEN_VERSION ?= v0.22.0
 # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest
 ENVTEST_VERSION ?= release-0.19
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.13.2
+GOLANGCI_LINT_VERSION ?= v2.14.0
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
@@ -79,7 +87,7 @@ lint: golangci-lint ## Run linting.
 .PHONY: cyclo
 cyclo: $(GOCYCLO) ## Run cyclomatic complexity analysis.
 	@echo "Running cyclomatic complexity analysis (threshold: $(CYCLO_THRESHOLD))..."
-	@$(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && $(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go" . && exit 1)
+	@$(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && echo "✅ All functions are below complexity threshold $(CYCLO_THRESHOLD)" || (echo "❌ Functions above complexity threshold $(CYCLO_THRESHOLD) found!" && $(GOCYCLO) -over $(CYCLO_THRESHOLD) -ignore "_test.go|zz_generated" . && exit 1)
 
 .PHONY: cyclo-report
 cyclo-report: $(GOCYCLO) ## Show full cyclomatic complexity report (including tests).
@@ -392,7 +400,7 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects, then sync into the Helm chart.
+manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects, then sync the CRDs into the Helm chart.
 	$(CONTROLLER_GEN) rbac:roleName=valkey-operator-role crd paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac
 	$(MAKE) sync-helm-crd
 
@@ -420,12 +428,18 @@ $(GOSEC): $(LOCALBIN)
 $(GOVULNCHECK): $(LOCALBIN)
 	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
 
-# go-install-tool will 'go install' any package with custom target and target path
+# go-install-tool 'go install's a package into $(LOCALBIN) under the versioned
+# path its variable names. $1 - target path, ending in -$3; $2 - package;
+# $3 - version. go install names the binary after the package, so it installs
+# into a directory of its own and is moved onto the versioned path from there.
 define go-install-tool
 @[ -f $(1) ] || { \
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
-GOBIN=$(LOCALBIN) go install $${package} ;\
+rm -rf $(1).install ;\
+GOBIN=$(1).install go install $${package} ;\
+mv $(1).install/$$(basename $(patsubst %-$(3),%,$(1))) $(1) ;\
+rm -rf $(1).install ;\
 }
 endef

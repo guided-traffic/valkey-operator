@@ -12,9 +12,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-func boolPtr(b bool) *bool    { return &b }
-func int32Ptr(i int32) *int32 { return &i }
-func int64Ptr(i int64) *int64 { return &i }
+func boolPtr(b bool) *bool       { return &b }
+func int32Ptr(i int32) *int32    { return &i }
+func stringPtr(s string) *string { return &s }
+func int64Ptr(i int64) *int64    { return &i }
 
 // fixtureTime is a fixed timestamp so two independently built fixtures compare
 // equal. metav1.Date carries no monotonic reading and time.UTC is a singleton.
@@ -64,6 +65,9 @@ func fullValkeySpec() ValkeySpec {
 			PodAnnotations:   map[string]string{"example.com/sentinel": "true"},
 			AllowUnencrypted: true,
 			DisableAuth:      true,
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")},
+			},
 		},
 		Auth: &AuthSpec{
 			SecretName:        "my-valkey-secret",
@@ -133,6 +137,13 @@ func fullValkeySpec() ValkeySpec {
 		RollingUpdate:       &RollingUpdateSpec{SyncTimeout: &metav1.Duration{Duration: 7 * time.Minute}},
 		PodDisruptionBudget: &PodDisruptionBudgetSpec{Enabled: true, MaxUnavailable: int32Ptr(1)},
 		AntiAffinity:        &AntiAffinitySpec{Mode: AntiAffinityModeHard, TopologyKey: "topology.kubernetes.io/zone"},
+		PodSecurity: &PodSecuritySpec{
+			SeccompProfile: &SeccompProfileSpec{
+				Type:             corev1.SeccompProfileTypeLocalhost,
+				LocalhostProfile: stringPtr("profiles/valkey.json"),
+			},
+			UserNamespaces: true,
+		},
 	}
 }
 

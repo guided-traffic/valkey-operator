@@ -349,12 +349,16 @@ func TestFindMaster_SkipsPodsThatAreNotRunning(t *testing.T) {
 		// test-2 is absent entirely, which is the Get-error branch.
 	)
 
-	pod, addr, err := checker.findMaster(ctx, v, "", nil)
+	pod, addr, replies, err := checker.findMaster(ctx, v, "", nil)
 
 	require.Error(t, err)
 	assert.EqualError(t, err, "no master found among 3 pods")
 	assert.Empty(t, pod)
 	assert.Empty(t, addr)
+	require.Len(t, replies, 3, "one slot per ordinal, answered or not")
+	for i, info := range replies {
+		assert.Nil(t, info, "test-%d is not Running, absent or silent, so it carries no reply", i)
+	}
 	assert.Equal(t, []string{"test-1.test-headless.default.svc.cluster.local"}, resolverProbe.hosts(),
 		"a pod that is not Running must not be dialled at all")
 }
@@ -382,7 +386,7 @@ func TestFindMaster_ScansEveryOrdinalOfTheStatefulSet(t *testing.T) {
 			},
 		}).Build()
 
-	_, _, err := NewChecker(c).findMaster(ctx, v, "", nil)
+	_, _, _, err := NewChecker(c).findMaster(ctx, v, "", nil)
 
 	require.EqualError(t, err, "no master found among 5 pods")
 	mu.Lock()
@@ -397,7 +401,7 @@ func TestFindMaster_ZeroReplicasScansNothing(t *testing.T) {
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 0 })
 
-	_, _, err := newFakeChecker().findMaster(ctx, v, "", nil)
+	_, _, _, err := newFakeChecker().findMaster(ctx, v, "", nil)
 
 	require.EqualError(t, err, "no master found among 0 pods")
 	assert.Empty(t, resolverProbe.hosts())
@@ -420,7 +424,7 @@ func TestFindMaster_ClusterNameEndingInSentinelStillUsesTheDataService(t *testin
 	ctx, _ := newProbeContext(t)
 	v := newTestValkey("valkey-sentinel", "default", func(v *vkov1.Valkey) { v.Spec.Replicas = 1 })
 
-	_, _, err := newFakeChecker(
+	_, _, _, err := newFakeChecker(
 		valkeyPodObj("valkey-sentinel-0", corev1.PodRunning),
 	).findMaster(ctx, v, "", nil)
 

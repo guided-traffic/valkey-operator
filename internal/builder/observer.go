@@ -116,6 +116,17 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 		},
 	}
 
+	podSpec := corev1.PodSpec{
+		ServiceAccountName: ObserverServiceAccountName(v),
+		// The observer never calls the Kubernetes API, so it gets no
+		// token either: an unmounted token cannot be stolen out of a
+		// compromised observer pod (ADR 0012 D8 step 2).
+		AutomountServiceAccountToken: ptr.To(false),
+		Containers:                   containers,
+		Volumes:                      buildObserverVolumes(v),
+	}
+	applyObserverPodSecurity(&podSpec, v)
+
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ObserverDeploymentName(v),
@@ -131,15 +142,7 @@ func BuildObserverDeployment(v *vkov1.Valkey, operatorImage string) *appsv1.Depl
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
 				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: ObserverServiceAccountName(v),
-					// The observer never calls the Kubernetes API, so it gets no
-					// token either: an unmounted token cannot be stolen out of a
-					// compromised observer pod (ADR 0012 D8 step 2).
-					AutomountServiceAccountToken: ptr.To(false),
-					Containers:                   containers,
-					Volumes:                      buildObserverVolumes(v),
-				},
+				Spec: podSpec,
 			},
 		},
 	}
@@ -341,6 +344,14 @@ func ObserverDeploymentHasChanged(desired, current *appsv1.Deployment) bool {
 		return true
 	}
 
+	// The posture has to be its own line for the same reason: the observer carries
+	// no pod-spec hash, so without it an existing observer Deployment would never
+	// receive a securityContext at all (ADR 0032 D1).
+	if podSecurityContextChanged(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) ||
+		podHardeningChanged(&desired.Spec.Template.Spec, &current.Spec.Template.Spec) {
+		return true
+	}
+
 	desiredContainers := desired.Spec.Template.Spec.Containers
 	currentContainers := current.Spec.Template.Spec.Containers
 
@@ -356,6 +367,9 @@ func ObserverDeploymentHasChanged(desired, current *appsv1.Deployment) bool {
 			return true
 		}
 		if fmt.Sprintf("%v", desiredContainers[0].Resources) != fmt.Sprintf("%v", currentContainers[0].Resources) {
+			return true
+		}
+		if containerSecurityContextChanged(desiredContainers[0].SecurityContext, currentContainers[0].SecurityContext) {
 			return true
 		}
 	}

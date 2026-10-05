@@ -75,7 +75,11 @@ func Default() string {
 // The pair is deliberately the two pinned lines rather than two tags of one line.
 // Both ends stay current without a third pin that Renovate cannot maintain, and
 // the tests double as continuous proof that the upgrade path users will take --
-// the latest 8 to the latest 9 -- loses no data. The accepted cost: a genuine
+// the latest 8 to the latest 9 -- keeps the pre-roll dataset. They are no proof
+// that no acknowledged write is lost: on a Sentinel cluster the data tier rolls
+// while the Sentinels still run 8, which cannot coordinate a failover, so the
+// roll's failover is forced and the writes the outgoing master acknowledges
+// during it are lost (ADR 0037 D8). The accepted cost: a genuine
 // cross-major replication break upstream turns these tests red for something that
 // is not this operator, which is information worth having early rather than after
 // a support request.

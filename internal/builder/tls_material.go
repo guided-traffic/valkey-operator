@@ -45,8 +45,8 @@ var tlsMaterialKeys = []string{TLSCACertKey, TLSCertKey, TLSPrivateKeyKey}
 // gains or loses one is a different fingerprint rather than a collision.
 //
 // A nil secret returns the empty string, which every consumer reads as "no
-// fingerprint known": no annotation is written, and a pod without the annotation
-// is never restarted for it.
+// fingerprint known": nothing is stamped from it, and a pod without a recorded
+// fingerprint is never restarted for it.
 func ComputeTLSMaterialHash(secret *corev1.Secret) string {
 	if secret == nil {
 		return ""
@@ -80,24 +80,7 @@ func StampTLSMaterialHash(sts *appsv1.StatefulSet, containerName, hash string) {
 	if hash == "" {
 		return
 	}
-
-	containers := sts.Spec.Template.Spec.Containers
-	for i := range containers {
-		if containers[i].Name != containerName {
-			continue
-		}
-		for j := range containers[i].Env {
-			if containers[i].Env[j].Name == TLSMaterialHashEnvName {
-				containers[i].Env[j].Value = hash
-				return
-			}
-		}
-		containers[i].Env = append(containers[i].Env, corev1.EnvVar{
-			Name:  TLSMaterialHashEnvName,
-			Value: hash,
-		})
-		return
-	}
+	stampTemplateEnv(sts, containerName, TLSMaterialHashEnvName, hash)
 }
 
 // RecordedTLSMaterialHash returns the TLS material fingerprint recorded on a pod

@@ -10,12 +10,29 @@ answer for a level with more than one evaluator, and **D4's two declared gaps ar
 registry gains `TestConditionRegistryOwnershipRulesAreEarned`. `make test-unit`, `make lint`
 and `make cyclo` green; no e2e or integration suite was run.
 
+Amended 2026-09-26 (T32, T31): **two rows added, and D1 names a third level hazard.**
+`PodAvailabilityStalled` ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11) is the
+second level with an ownership rule, partitioned by reason rather than reserved to one tier,
+and its retraction reads the tier's pods instead of the pass's silence.
+`PodSecurityUpdatePending` ([ADR 0032](0032-generated-pods-run-rootless.md) D3) is a level
+with one evaluator. Verified 2026-09-26: `make test-unit`, `make lint`, `make cyclo` and
+`make test-integration` green; locally on Kind (control plane + 3 workers, Kubernetes v1.36.1),
+not in CI, on both Valkey lines
+`TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced` saw the data-tier evaluator
+raise `True/ValkeyPodNotAvailable` and retract to `False/PodAvailable`, and no Sentinel pod was
+replaced during the 30 s it watched the stall — the gate the ownership rule rests on.
+`TestE2E_FleetUpgrade` (`make test-e2e-fleet-upgrade E2E_UPGRADE_FROM=1.12.8`, same Kind
+cluster, not a CI job) saw `PodSecurityUpdatePending` raised `True/PodRunsAsRoot` on the
+non-persistent single pod the upgrade deliberately leaves running; its retraction and the
+Sentinel evaluator of `PodAvailabilityStalled` are verified in the unit tier only.
+
 Implemented as [`internal/controller/condition_registry.go`](../../internal/controller/condition_registry.go)
 and guarded by [`condition_registry_test.go`](../../internal/controller/condition_registry_test.go).
 The registry is read by nothing in the reconcile path; its only consumer is that test.
 Verified in this repository: `make test-unit`, `make lint` and `make cyclo` are green. The
 membership guard was confirmed to fail against a registry with a row removed. No e2e or
-integration suite was run for this ADR — there is no runtime behaviour to exercise.
+integration suite was run for the registry — it has no runtime behaviour to exercise; the
+2026-09-26 runs above exercised two conditions, not the registry.
 
 ## Context
 
@@ -83,8 +100,11 @@ decides what it owes.**
 
 The hazards are different per kind, which is why one rule for "conditions" was never
 enough. A level's hazard is an evaluator that is not reached, or two evaluators racing to
-be last. An edge's hazard is the missing clear. History's hazard is the opposite: a
-well-meaning cleanup that discards the record.
+be last — *extended 2026-09-26:* or an evaluator that is reached on a pass that did not
+measure, and reads the silence as the all-clear. `PodAvailabilityStalled` was first written
+that way and caught in review before release: every pass that stopped at another wait first
+retracted it, and the next pass raised it again (below). An edge's hazard is the missing
+clear. History's hazard is the opposite: a well-meaning cleanup that discards the record.
 
 **Amended 2026-08-26: the ownership rule is the second legal answer for a level.** The
 `evaluators` docstring described this escape from the day the registry was written and
@@ -97,6 +117,58 @@ owns `Reason` and `Message`. What removes the race is not the count but the rule
 data tier may clear (ADR 0023 D4a). A rule that names no site, or that sits on a row with a
 single evaluator, fails `TestConditionRegistryOwnershipRulesAreEarned` — the same
 traceability the ticket reference gives a declared gap.
+
+*Added 2026-09-26:* the second row is `PodAvailabilityStalled`
+([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11), and its rule has a different
+shape. Nothing is reserved to one tier; the condition is partitioned by reason instead. The
+data tier's roll reports `ValkeyPodNotAvailable`, the Sentinel tier's roll
+`SentinelPodNotAvailable`, and each evaluator (`reportAvailabilityStall`, called on every
+non-error result from `checkAndHandleRollingUpdate` and `checkAndHandleSentinelRollingUpdate`)
+raises with its own reason and retracts only a standing True carrying it. What keeps the two
+from contending is again the step order plus one gate: the data tier evaluates first, and a
+data tier that raises also holds the pass (`DeferredRequeueAfter`), which skips the Sentinel
+roll — so the two never both raise in one pass. The gate has one known gap: a paused data roll
+(`pauseRollingUpdate`) returns an empty result, so the pass that pauses does enter the
+Sentinel roll. A pause carries no stall, so the data evaluator can at most retract in that
+pass.
+
+**The retraction is taken on evidence, never on silence.** A result without a stall says only
+that this pass did not end on an expired availability wait; it may have stopped at a
+terminating pod, at the no-replicas wait after a failover or at a fresher replacement still
+inside its budget, none of which looked at the pod the report names. A standing True is
+therefore retracted only when `expiredUnavailablePod` finds no pod of the tier — the ordinal
+range of its StatefulSet, proven ours — that exists, is not being deleted, is not Ready and has
+been not-Ready longer than `syncTimeout` by its own clock. Cache reads only, and only on a pass
+that finds its own True standing and carries no stall.
+
+Three consequences follow, and none is a race. One condition carries one reason, so a stall
+raised over the other tier's standing report replaces it: a data-tier stall over a Sentinel
+report, or — only in the pass that pauses a data roll — a Sentinel stall over a data report
+whose pod is still down. A Sentinel report is not re-measured while the data tier rolls,
+because its evaluator is not reached then — the first level hazard named above, here a direct
+consequence of the Sentinel tier rolling after the data tier
+([ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D1): the report stands
+until the Sentinel roll is entered again. And a Sentinel report the data tier overwrote comes
+back on the first pass that enters the Sentinel roll again, if the Sentinel pod is still down
+on the current spec, because that pod's own clock has long expired by then. Disabling Sentinel
+moves the Sentinel evaluator to the class exit in `runSentinelRollingUpdate`, next to
+`clearSentinelUpdatePending`, which a cluster without Sentinel reaches on every pass the data
+tier does not end (a data-tier hold does not skip it), and it retracts on the same evidence:
+no code path in `internal/controller` deletes a StatefulSet, so a leftover Sentinel pod that is
+still down keeps the report True until it turns Ready or is removed by hand.
+
+*Added 2026-09-26:* `PodSecurityUpdatePending` ([ADR 0032](0032-generated-pods-run-rootless.md)
+D3) is a level with one evaluator, although its sibling deferral `SidecarUpdatePending` is an
+edge. The deferral is decided in `handleStandaloneRollingUpdate`, which the dispatch enters
+only when it finds an outdated pod or a roll still recorded in the state annotation; once the
+pod is replaced, the dispatch returns at "no rolling update needed" before it — the exact shape
+of the first row of the Context table. So the evaluator, `reportPodSecurityUpdatePending`,
+sits one frame up in `checkAndHandleRollingUpdate` next to the data tier's
+`reportAvailabilityStall`, and on every non-error result raises
+`True/PodRunsAsRoot` when the result names a deferred pod and otherwise writes
+`False/PodSecurityUpdateApplied` over a standing True only. Here the silence is a measurement,
+which is what separates it from the hazard above: the handler that names the pod is reached on
+every pass on which the pod is outdated, and no wait stands in front of that decision.
 
 **A rule is not a proof.** Nothing verifies that the code obeys the rule the row states,
 exactly as nothing verifies the `evaluators` count. What the registry buys here is that the
@@ -156,7 +228,8 @@ the split-brain condition is written at the resolver's call sites and never insi
 the delete and never at a function head. It would also have to hard-exclude the first two
 entries of its own table — `MultipleMasters`, because a flip resets the
 `splitBrainWarnAfter` deadline read from its `LastTransitionTime`, and `TopologyRestored`,
-because it is history. An abstraction that leaks on two of eleven rows is not one.
+because it is history. An abstraction that leaks on two rows of its own table — two of
+eleven when this ADR was written — is not one.
 
 **D8 — No condition is ever deleted.** `meta.RemoveStatusCondition` is called nowhere in
 the tree, and nothing here changes that. The only lifecycle is True↔False, which is why the
@@ -238,7 +311,22 @@ a test's clothes.
   the `StorageSpecNotApplied` defect, and the registry would not catch its recurrence; a rule
   that says the data tier clears while the code clears from both is equally invisible here.
   The tests that do enforce it are the three unit tests ADR 0023 D4a names, one of which
-  exists only to pin the step order the rule rests on.
+  exists only to pin the step order the rule rests on. For `PodAvailabilityStalled` they are
+  `TestCheckAndHandleRollingUpdate_NeverRetractsASentinelReport` and
+  `TestCheckAndHandleSentinelRollingUpdate_NeverRetractsADataReport`, one per direction;
+  `TestReconcileWorkload_DataAvailabilityStallHoldsTheSentinelRoll` for the gate the rule
+  rests on; `TestReportAvailabilityStall_RetractsOnlyOnEvidence` and
+  `TestSentinelRollingUpdate_TerminationPriorityDoesNotRetractTheReport` for the evidence
+  rule; and `TestHandlePostRollingUpdateChecks_SentinelDisabledRetractsTheSentinelReport` with
+  `_SentinelDisabledLeavesOtherCRsAlone` for the class exit — all in
+  [`pod_availability_test.go`](../../internal/controller/pod_availability_test.go), green in
+  `make test-unit` on 2026-09-26. Two parts of the rule are traced by reading only: no test
+  pins the pause gap in the gate, and the class-exit fixture has no Sentinel StatefulSet, so
+  it covers only a cluster with no leftover Sentinel pod.
+* **The third level hazard is invisible to the guard** (D1, extended 2026-09-26). A row whose
+  evaluator is reached on every pass passes every test whether that evaluator measures or
+  reads the pass's silence as the all-clear. `PodAvailabilityStalled` was caught by review,
+  not by the registry, and the next instance will be too.
 * ~~**The two declared gaps are open defects, not accepted designs.**~~ **Both were fixed on
   2026-08-26** — `RollingUpdatePaused` by ADR 0002 D10b, `StorageSpecNotApplied` by ADR 0023
   D4a. The one row still carrying a `declaredGap` is `Ready`/T18, and that one genuinely is
@@ -262,5 +350,9 @@ a test's clothes.
 * [ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) — D7–D10 on how conditions are written, D5a on `Ready`
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — the same idiom for RBAC drift
 * [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D6, [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5 — two of the four historical instances
+* [ADR 0023](0023-volume-claim-templates-are-immutable.md) D4a, [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 — the two levels that carry an ownership rule
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md) D1 — the tier order `PodAvailabilityStalled`'s rule rests on, and whose pause gap it inherits
+* [ADR 0032](0032-generated-pods-run-rootless.md) D3 — `PodSecurityUpdatePending`, and why its evaluator sits one frame above the deferral
+* [`internal/controller/pod_availability_test.go`](../../internal/controller/pod_availability_test.go), [`pod_security_migration_test.go`](../../internal/controller/pod_security_migration_test.go) — the unit rules behind the two 2026-09-26 rows
 * [ADR 0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) — why `MultipleMasters` must not be touched
 * [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D15 — why `TopologyRestored` is history

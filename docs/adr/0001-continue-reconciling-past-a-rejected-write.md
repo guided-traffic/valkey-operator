@@ -6,7 +6,19 @@ Accepted. Date: 2026-08-21.
 
 Clarified 2026-08-26: D4 gains an explicit statement of what its second half costs — the
 rolling-update exits skip `updateStatus`, so `Ready` and three status fields keep their
-pre-roll values for the whole roll. No rule changed and no code changed.
+pre-roll values ~~for the whole roll~~ *(corrected 2026-09-27: on every pass that ends on a
+rolling-update exit; two kinds of pass reach `updateStatus` while a roll is in flight, see the
+correction under D4)*. No rule changed and no code changed.
+
+Amended 2026-09-27 (correction, no decision changes): the clarification of 2026-08-26 said the
+four values keep their pre-roll values for as long as a roll lasts. By code reading, a pass
+whose wait has outlived its bound ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)
+D5, D11; [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D16, D17) and the pass in
+which the data roll pauses on its sync timeout reach `updateStatus` and recompute them, unless
+a post-update check ends that pass. Both sentences are struck and made precise in place, here and
+under D4; D4 itself is unchanged. Verified by reading `reconcileWorkload`,
+`handlePostRollingUpdateChecks` and `pauseRollingUpdate` in
+[`internal/controller`](../../internal/controller/); nothing was run.
 
 Implemented on branch `feat/support-pdb` (51 commits ahead of `main` at the time
 of writing; not yet released). Verified by
@@ -97,8 +109,16 @@ itself.
 Clarified 2026-08-26: the rule is unchanged, and the price of its second half is now named
 rather than implied. Because those exits skip `updateStatus` entirely, `readyReplicas`,
 `masterPod`, `observerReady` **and the `Ready` condition** all keep their pre-roll values
-for the whole duration of a roll — so a cluster reports `Ready=True` while its pods are
-being replaced one by one, with the phase reporting `Rolling Update i/n` beside it. The
+~~for the whole duration of a roll~~ *(corrected 2026-09-27: on every pass that ends on a
+rolling-update exit. Two kinds of pass reach `updateStatus` while a roll is in flight and
+recompute them: one whose wait has outlived its bound — `terminationWait`, `recreationWait` and
+`availabilityWait` return `DeferredRequeueAfter`, which `reconcileWorkload` does not return on
+([ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D5, D11;
+[ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D16, D17) — and the one in which the
+data roll pauses on its sync timeout, because `pauseRollingUpdate` returns an empty result; both
+unless a post-update check — the Sentinel roll, the no-master recovery or the steady-state
+split-brain check — ends that pass. From such a pass on the values are that pass's)* — so a
+cluster reports `Ready=True` while its pods are being replaced one by one, with the phase reporting `Rolling Update i/n` beside it. The
 `Ready` contract states this ([ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md)
 D5a). Whether that is the intended reading of the condition — "the last steady state was
 healthy" rather than "the cluster is serving now" — is deliberately left open here: it is a

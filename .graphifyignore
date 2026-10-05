@@ -1,0 +1,15 @@
+# Generated artifacts - not part of the knowledge corpus.
+# graphify reads this file only, not .gitignore; make coverage writes .txt and .html here.
+coverage
+
+# graphify's own output (graphify-out/memory/ stays indexed on purpose)
+graphify-out/GRAPH_REPORT.md
+graphify-out/graph.html
+graphify-out/graph.json
+graphify-out/wiki/*
+graphify-out/obsidian/*
+graphify-out/cache/*
+graphify-out/converted/*
+
+# Archived tickets - finished work lists, kept readable but never a current rule (ADR 0034)
+docs/tickets/archive

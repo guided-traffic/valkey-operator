@@ -269,8 +269,18 @@ func TestE2E_SidecarFailoverDrainMaster(t *testing.T) {
 
 	// Delete the master pod — triggers SIGTERM → sidecar drain handler.
 	t.Run("delete master pod triggers failover", func(t *testing.T) {
+		killedUID := tc.getPod(t, ns, initialMaster).UID
 		t.Logf("Deleting master pod %s", initialMaster)
 		tc.deletePod(t, ns, initialMaster)
+
+		// By identity, not by controller state (ADR 0017 D50): every wait below
+		// is already satisfied by the old master while it terminates -- kubelet keeps
+		// it Ready for the whole termination (ADR 0026) and it still answers master
+		// -- so without this the subtest passed in 0.4 s and "data survives
+		// failover" picked the dying pod as the new master, then read DBSIZE 0 from
+		// its empty replacement (measured 2026-09-26, Valkey 9, local Kind cluster
+		// of control-plane + 3 workers).
+		tc.waitForPodRecreated(t, ns, initialMaster, killedUID)
 
 		// Wait for StatefulSet to recreate all pods.
 		tc.waitForStatefulSetReady(t, ns, name, 3)

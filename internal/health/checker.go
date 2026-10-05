@@ -29,13 +29,16 @@ type ClusterState struct {
 	// MasterAddress is the address of the master.
 	MasterAddress string
 
-	// ReadyReplicas is the number of replicas that are ready and synced.
+	// ReadyReplicas is the number of replicas whose own INFO replication proves
+	// they hold the dataset (ReplicationInfo.NotEstablishedReason). A master's
+	// connected_slaves is not that number: it counts a replica from its sync
+	// request on, while it still holds nothing.
 	ReadyReplicas int32
 
 	// TotalReplicas is the total number of expected replicas (excluding master).
 	TotalReplicas int32
 
-	// AllSynced is true when all replicas have completed sync with the master.
+	// AllSynced is true when every expected replica is among ReadyReplicas.
 	AllSynced bool
 
 	// SentinelMonitoring is true when sentinel instances agree on the master.
@@ -105,7 +108,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 	}
 
 	// Find the master by querying each pod.
-	masterPod, masterAddr, err := h.findMaster(ctx, v, password, tlsConfig)
+	masterPod, masterAddr, replies, err := h.findMaster(ctx, v, password, tlsConfig)
 	if err != nil {
 		logger.Info("Could not find master via INFO replication", "error", err)
 		state.Error = err
@@ -115,19 +118,15 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 	state.MasterPod = masterPod
 	state.MasterAddress = masterAddr
 
-	// Check master replication info.
-	masterClient := h.newValkeyClient(masterAddr, password, tlsConfig)
-	masterInfo, err := masterClient.InfoReplication()
-	if err != nil {
-		logger.Info("Could not get master replication info", "pod", masterPod, "error", err)
-		state.Error = fmt.Errorf("master replication info: %w", err)
-		return state
-	}
-
-	// Count ready replicas from master's perspective.
-	// #nosec G115 — ConnectedSlaves is bounded by the number of pods in the cluster, safe to convert.
-	state.ReadyReplicas = int32(min(masterInfo.ConnectedSlaves, int(state.TotalReplicas)))
-	state.AllSynced = !masterInfo.MasterSyncInProgress && state.ReadyReplicas == state.TotalReplicas
+	// Count the replicas that hold the dataset, from their own replies -- the ones
+	// findMaster already collected, so this costs no dial
+	// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2).
+	// The master's reply cannot answer it: connected_slaves counts a replica from its
+	// sync request on, and master_sync_in_progress exists only in a replica's reply.
+	// A pod that is not Running or did not answer proves nothing and is not counted;
+	// a second master is not a synced replica either.
+	state.ReadyReplicas = syncedReplicas(replies)
+	state.AllSynced = state.ReadyReplicas == state.TotalReplicas
 
 	// Check sentinel view if sentinel is enabled.
 	if v.IsSentinelEnabled() {
@@ -175,12 +174,12 @@ type masterCandidate struct {
 	connectedSlaves int
 }
 
-// probeMasterRole asks one pod whether it is the master and returns a candidate
-// when it says yes. A pod the API server does not report as Running is not
-// dialled at all, and a pod that does not answer is not a candidate.
-func (h *Checker) probeMasterRole(
+// probeReplication asks one pod for its INFO replication. A pod the API server does
+// not report as Running is not dialled at all, and a pod that does not answer
+// returns nil, as does the one that is not Running.
+func (h *Checker) probeReplication(
 	ctx context.Context, v *vkov1.Valkey, podName, addr string, password string, tlsConfig *tls.Config,
-) *masterCandidate {
+) *valkeyclient.ReplicationInfo {
 	pod := &corev1.Pod{}
 	err := h.client.Get(ctx, types.NamespacedName{
 		Name:      podName,
@@ -190,19 +189,31 @@ func (h *Checker) probeMasterRole(
 		return nil
 	}
 
-	c := h.newValkeyClient(addr, password, tlsConfig)
-	info, err := c.InfoReplication()
-	if err != nil || info.Role != "master" {
+	info, err := h.newValkeyClient(addr, password, tlsConfig).InfoReplication()
+	if err != nil {
 		return nil
 	}
-
-	return &masterCandidate{podName: podName, addr: addr, connectedSlaves: info.ConnectedSlaves}
+	return info
 }
 
-// findMaster probes all Valkey pods and returns the one reporting role=master.
-// When multiple pods report as master (split-brain), a warning is logged and the
-// one with the most connected slaves is preferred (it is the active master serving
-// real data); ties are broken by the lowest ordinal.
+// syncedReplicas counts the replies whose pod proves it holds the dataset. Only a
+// replica can: a master's reply always names a reason.
+func syncedReplicas(replies []*valkeyclient.ReplicationInfo) int32 {
+	var n int32
+	for _, info := range replies {
+		if info != nil && info.NotEstablishedReason() == "" {
+			n++
+		}
+	}
+	return n
+}
+
+// findMaster probes all Valkey pods and returns the one reporting role=master,
+// together with every pod's reply indexed by ordinal (nil for a pod that is not
+// Running or did not answer), so CheckCluster can judge the replicas without
+// dialling them again. When multiple pods report as master (split-brain), a
+// warning is logged and the one with the most connected slaves is preferred (it is
+// the active master serving real data); ties are broken by the lowest ordinal.
 //
 // The probes run concurrently. Sequentially they cost up to one client timeout
 // (5 s, internal/valkeyclient) per pod, so a cluster whose pods stopped answering
@@ -215,11 +226,12 @@ func (h *Checker) probeMasterRole(
 // completion order, and the sort below is stable with an explicit ordinal
 // tie-break. Before this the tie-break was sort.Slice, which is not stable — with
 // two masters reporting the same slave count the winner was already unspecified.
-func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string, tlsConfig *tls.Config) (string, string, error) {
+func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password string,
+	tlsConfig *tls.Config) (string, string, []*valkeyclient.ReplicationInfo, error) {
 	logger := log.FromContext(ctx)
 	stsName := common.StatefulSetName(v, common.ComponentValkey)
 
-	found := make([]*masterCandidate, v.Spec.Replicas)
+	replies := make([]*valkeyclient.ReplicationInfo, v.Spec.Replicas)
 	var wg sync.WaitGroup
 
 	for i := int32(0); i < v.Spec.Replicas; i++ {
@@ -227,20 +239,24 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		go func(idx int32) {
 			defer wg.Done()
 			podName := fmt.Sprintf("%s-%d", stsName, idx)
-			found[idx] = h.probeMasterRole(ctx, v, podName, valkeyPodAddress(v, podName), password, tlsConfig)
+			replies[idx] = h.probeReplication(ctx, v, podName, valkeyPodAddress(v, podName), password, tlsConfig)
 		}(i)
 	}
 	wg.Wait()
 
-	candidates := make([]masterCandidate, 0, len(found))
-	for _, c := range found {
-		if c != nil {
-			candidates = append(candidates, *c)
+	candidates := make([]masterCandidate, 0, len(replies))
+	for i, info := range replies {
+		if info == nil || info.Role != "master" {
+			continue
 		}
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		candidates = append(candidates, masterCandidate{
+			podName: podName, addr: valkeyPodAddress(v, podName), connectedSlaves: info.ConnectedSlaves,
+		})
 	}
 
 	if len(candidates) == 0 {
-		return "", "", fmt.Errorf("no master found among %d pods", v.Spec.Replicas)
+		return "", "", replies, fmt.Errorf("no master found among %d pods", v.Spec.Replicas)
 	}
 
 	if len(candidates) > 1 {
@@ -254,7 +270,7 @@ func (h *Checker) findMaster(ctx context.Context, v *vkov1.Valkey, password stri
 		})
 	}
 
-	return candidates[0].podName, candidates[0].addr, nil
+	return candidates[0].podName, candidates[0].addr, replies, nil
 }
 
 // masterCandidateNames returns the pod names from a slice of masterCandidates.

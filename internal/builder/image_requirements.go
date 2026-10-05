@@ -2,14 +2,15 @@ package builder
 
 // The operator does not build the Valkey image; it consumes the upstream one and
 // runs shell in it. The container command wraps valkey-server in `sh -c` when auth
-// is enabled, both init containers are shell scripts, the readiness and liveness
+// is enabled, the config-writer init containers of both tiers, the data-volume
+// pre-flight and the ownership repair are shell scripts, the readiness and liveness
 // probes exec valkey-cli, and the drain preStop hook is a shell loop. Every one of
 // those is an assumption about a filesystem somebody else maintains.
 //
 // RequiredImageTools states those assumptions so they can be checked against the
 // real image instead of inferred from whichever tag happened to work last
 // (test/imagetools, `make test-image-tools`). The list is kept honest from the
-// other side too: TestRequiredImageTools_MatchesTheGeneratedScripts walks every
+// other side too: TestRequiredImageTools_CoversTheGeneratedScripts walks every
 // exec command the builder puts into a container that runs the Valkey image and
 // fails when one of them uses a tool this list does not name.
 
@@ -63,5 +64,12 @@ func RequiredImageTools() []string {
 		// whatever the ConfigMap happened to say -- a running Sentinel that
 		// authenticates against nothing, not a crash somebody notices.
 		"sed",
+
+		// The migration-only ownership repair (docs/adr/0032-generated-pods-run-rootless.md,
+		// D2): re-owns root-written data to uid 999 on storage without fsGroup support.
+		// Without them the repair fails and the pre-flight holds the pod -- loud, but
+		// on every legacy persistent pod of such storage at once.
+		"find",
+		"chown",
 	}
 }

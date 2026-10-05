@@ -4,6 +4,15 @@
 
 Accepted. Date: 2026-08-26.
 
+Corrected 2026-09-29: **a rotation did not reach a rootless single data pod that ran the sidecar
+of an earlier operator** — which every operator upgrade leaves on it until it restarts. The
+single-pod deferral's image-only test read the rotation as part of a sidecar-only delta and held
+it for as long as the pod lived: the rotated-away key stayed in use, and, if `valkey-server` does
+not reload, the pod would have kept serving the old certificate past its expiry. Neither tier of a
+Sentinel cluster with one data pod took a rotation at all. Both are fixed by
+[ADR 0007](0007-failover-aware-rolling-update.md) D6 (amended 2026-09-29: a rotated record is
+never a sidecar-only delta) and D11; D4 is marked in place.
+
 Implemented in `0aaf79d`, ahead of this document: the ADR was **deliberately deferred**
 (`ADR spaeter, erst Code`) with the debt written down in
 [`CLAUDE.md`](../../CLAUDE.md) rather than silently carried, and this file pays it. That
@@ -54,8 +63,13 @@ never issues a certificate. `valkey-server` and `valkey-sentinel` are still **un
 covered by D6 rather than by verification.
 
 Amends [ADR 0016](0016-authentication-and-tls-posture.md) D12 and its cert-manager residual
-risk, [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D10, and
-[SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) sections 2, 6 and 9.
+risk, [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D10, and the
+security documentation now in
+[`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md#tls-material) (section
+"TLS material" and gap [H-4](../security/secrets-and-tls.md#h-4)) and
+[`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md)
+(gaps [H-23](../security/rotation-and-change-propagation.md#h-23) and
+[H-24](../security/rotation-and-change-propagation.md#h-24)).
 
 ## Context
 
@@ -159,7 +173,11 @@ not by a builder, because a builder never sees Secret content
 ([`internal/controller/tls_material.go`](../../internal/controller/tls_material.go)). A changed
 fingerprint is pod-template drift like any other and is replaced by the rolling update of
 [ADR 0007](0007-failover-aware-rolling-update.md), with its failover, its sync waits and its
-bounds. **No new replacement mechanism was introduced, and none may be.**
+bounds. **No new replacement mechanism was introduced, and none may be.** *(A single data pod has
+no failover target and is replaced by the single-pod roll of ADR 0007 — even beside an earlier
+operator's sidecar only since 2026-09-29, ADR 0007 D6 as amended; since 2026-09-29 also
+beside Sentinel, ADR 0007 D11; until then neither tier of a Sentinel cluster with one data pod
+ever took a rotation.)*
 
 > **Amended 2026-08-27 — the carrier changed, the mechanism did not.** This decision
 > originally named the ~~`vko.gtrfc.com/tls-material-hash` pod annotation~~ as the carrier.
@@ -388,7 +406,8 @@ cluster.
   private key. It does not follow that it holds one only briefly: the manager cache backs an
   unfiltered Secret informer, so every watched Secret is resident for the process lifetime, with
   or without this change. What the change adds is one more consumer to satisfy before the
-  `secrets` scope on the hardening checklist can be narrowed.
+  `secrets` scope of gap [H-1](../security/privilege-footprint.md#h-1) in
+  `docs/security/privilege-footprint.md` can be narrowed.
 * **A 4-byte digest derived from a private key is readable by anyone with `get pods` or
   `get statefulsets`.** See D11 and the residual risks.
 * **`TLSMaterialStale` adds a `vko_valkey_status_condition` series per TLS cluster** and one
@@ -468,7 +487,8 @@ measurement, and in that order.
   sidecar, the one container step 4 cannot help. The corrections: **forging was never the
   cheap attack** — a merge patch setting the key to `null` makes the pod unmeasured under the
   presence rule, which no digest strength addresses — and it was **not the third** forgeable
-  field of that grant but one of nine. `SECURITY_ARCHITECTURE.md` section 3 now
+  field of that grant but one of nine. `docs/security/isolation-and-tenancy.md`, section
+  ["What does not hold"](../security/isolation-and-tenancy.md#what-does-not-hold), now
   enumerates them instead of counting.
 
   **The two rejected repairs are recorded where they can be found again** — a stronger or
@@ -574,4 +594,5 @@ measurement, and in that order.
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) — the presence guard of D8
 * [ADR 0019](0019-reconcile-concurrency-and-the-cost-of-a-stuck-pass.md) — the only pacing the roll has
 * [ADR 0027](0027-conditions-are-levels-edges-or-history.md) — why `TLSMaterialStale` is a resource step
-* [SECURITY_ARCHITECTURE.md](../../SECURITY_ARCHITECTURE.md) — sections 2, 6 and the hardening checklist
+* [`docs/security/secrets-and-tls.md`](../security/secrets-and-tls.md#tls-material) — TLS material, and gap [H-4](../security/secrets-and-tls.md#h-4)
+* [`docs/security/rotation-and-change-propagation.md`](../security/rotation-and-change-propagation.md) — what propagates, and gaps [H-23](../security/rotation-and-change-propagation.md#h-23) and [H-24](../security/rotation-and-change-propagation.md#h-24)

@@ -18,9 +18,8 @@ package common
 // terminationGracePeriodSeconds, and the sidecar writes the file on every exit
 // path of its handler.
 //
-// These constants live in internal/common for the reason AnnotationDrainPromotedAt
-// gives: it is the only package both internal/sidecar and internal/builder can
-// share without pulling the API type tree into the sidecar binary.
+// These constants live in internal/common next to AnnotationDrainPromotedAt:
+// the sidecar and internal/builder both use them.
 const (
 	// DrainSignalMountPath is the emptyDir shared by the Valkey container and the
 	// sidecar. Its presence in the sidecar is what marks the handshake as active

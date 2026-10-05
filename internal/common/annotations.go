@@ -11,8 +11,7 @@ package common
 // pod annotation is the only trace of it, and the operator uses it to tell an
 // unrecorded but legitimate promotion apart from a pod that elected itself.
 //
-// The constant lives here rather than next to the builder annotations because
-// internal/common is the only package both internal/sidecar and
-// internal/controller already import; putting it in internal/builder would pull
-// the whole API type tree into the sidecar binary for one string.
+// It lives in internal/common because both sides use it: the sidecar drain
+// handler writes it, the controller reads and clears it, and internal/common is
+// where the other names both sides share (the labels) live.
 const AnnotationDrainPromotedAt = "vko.gtrfc.com/drain-promoted-at"

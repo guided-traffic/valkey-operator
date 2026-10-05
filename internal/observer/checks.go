@@ -88,22 +88,60 @@ func (o *Observer) pingHost(addr string) error {
 	return client.Ping()
 }
 
-// checkReplicaSync verifies that all replicas are connected and synced by querying INFO REPLICATION on the master.
-func (o *Observer) checkReplicaSync(masterAddr string) error {
-	client := o.newClient(masterAddr, o.cfg.Password)
-	info, err := client.InfoReplication()
-	if err != nil {
-		return fmt.Errorf("INFO REPLICATION: %w", err)
-	}
-
+// checkReplicaSync verifies that every replica holds the dataset, asking each data
+// pod for its own INFO REPLICATION, one call per pod per cycle.
+//
+// The master cannot answer it: it counts a replica as connected from its sync
+// request on, while the replica still holds nothing, and master_sync_in_progress
+// exists only in a replica's reply, so the master's own reply never says a bulk
+// sync is running. The replica's full answer -- role, link up, no sync in progress
+// (ReplicationInfo.NotEstablishedReason) -- is the one the operator asks too
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D2).
+// The master answers role:master and is simply not a synced replica; so is a second
+// master.
+func (o *Observer) checkReplicaSync() error {
 	expectedReplicas := o.cfg.Replicas - 1
-	if info.ConnectedSlaves < expectedReplicas {
-		return fmt.Errorf("expected %d connected replicas, got %d", expectedReplicas, info.ConnectedSlaves)
+	synced := 0
+	var notSynced, masters []string
+	for i := 0; i < o.cfg.Replicas; i++ {
+		pod := fmt.Sprintf("%s-%d", o.cfg.ClusterName, i)
+		info, err := o.newClient(o.dataPodAddr(i), o.cfg.Password).InfoReplication()
+		if err != nil {
+			notSynced = append(notSynced, fmt.Sprintf("%s: INFO REPLICATION: %v", pod, err))
+			continue
+		}
+		if info.Role == roleMaster {
+			masters = append(masters, pod)
+			continue
+		}
+		if reason := info.NotEstablishedReason(); reason != "" {
+			notSynced = append(notSynced, pod+": "+reason)
+			continue
+		}
+		synced++
 	}
-	if info.MasterSyncInProgress {
-		return fmt.Errorf("master sync in progress")
+	if len(masters) > 1 {
+		notSynced = append(notSynced, fmt.Sprintf("%d pods answer role:master (%s)",
+			len(masters), strings.Join(masters, ", ")))
+	}
+	if synced < expectedReplicas {
+		return fmt.Errorf("expected %d synced replicas, got %d: %s",
+			expectedReplicas, synced, strings.Join(notSynced, "; "))
 	}
 	return nil
+}
+
+// dataPodAddr is the address of the data pod with the given ordinal: its name under
+// the headless Service, on the TLS port when TLS is on.
+func (o *Observer) dataPodAddr(ordinal int) string {
+	if o.dataPodAddrFn != nil {
+		return o.dataPodAddrFn(ordinal)
+	}
+	port := 6379
+	if o.cfg.TLSEnabled {
+		port = 16379
+	}
+	return fmt.Sprintf("%s-%d.%s:%d", o.cfg.ClusterName, ordinal, o.cfg.ValkeyHeadlessSvc, port)
 }
 
 // writeHealthKey writes the observer health key to the master using SELECT + SET with TTL.

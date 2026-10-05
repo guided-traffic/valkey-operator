@@ -39,8 +39,9 @@ func TestRecreationWait_PlainRequeueWithinTheBudget(t *testing.T) {
 }
 
 // Past the overrun the pass stops ending on the wait: DeferredRequeueAfter lets
-// the status write, the steady-state split-brain check and the Sentinel roll run
-// again, and the condition says whose controller is being waited for (T10).
+// the status write and the steady-state split-brain check run again -- the
+// Sentinel roll waits for the data tier (ADR 0026 D11) -- and the condition says
+// whose controller is being waited for (T10).
 func TestRecreationWait_PastTheOverrunHoldsAndReports(t *testing.T) {
 	v := newTestValkey("recwait-old", "default")
 	v.Annotations = map[string]string{

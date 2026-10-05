@@ -14,6 +14,12 @@ written before this date.
 Not done, deliberately: `config-hash` and `pod-spec-hash` are forgeable by the identical
 mechanism and stay in pod metadata. Consequences names why, and it is not "we forgot".
 
+Applied 2026-10-05 to a second record: the pod metadata record of
+[ADR 0007](0007-failover-aware-rolling-update.md) D2 (`VKO_POD_METADATA_HASH`, a digest of the
+pod labels and annotations the CR author sets) is carried on the same two carrier containers and
+stamped after the builder, per D1 to D3. D4 holds for it on the data tier only: a Sentinel pod
+without the record is outdated (ADR 0007 D2, amended 2026-10-05).
+
 Amends [ADR 0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
 D4, which named the annotation as the carrier, and closes the second half of the gap
 [ADR 0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) D8 step 4 opened the
@@ -93,10 +99,14 @@ for a forger: a pod with the env never consults the annotation, and every pod th
 writes from now on has the env.
 
 Without it the **Sentinel tier** would go silently unmeasured. Sentinel pods carry no sidecar,
-so a plain operator upgrade never rolls them (ADR 0005 D11); they would keep the annotation,
-the reader would see no env, and a rotation in that window would neither replace them nor
-report them — the exact silent failure ADR 0030 exists to prevent, reintroduced by the change
-meant to harden it.
+so a plain operator upgrade rolls them only when the release changes their pod spec or
+configuration (ADR 0005 D11); they would keep the annotation, the reader would see no env, and
+a rotation in that window would neither replace them nor report them — the exact silent failure
+ADR 0030 exists to prevent, reintroduced by the change meant to harden it. (Amended 2026-09-26:
+the sentence said "never rolls them". The rootless release of
+[ADR 0032](0032-generated-pods-run-rootless.md) changes the Sentinel pod spec and rolls every
+Sentinel tier once, which replaces every remaining annotation-only Sentinel pod with one that
+carries the env; the fallback stays for any pod that release does not reach.)
 
 **D6 — This rule is not a licence to move every hash.** `config-hash` and `pod-spec-hash` stay
 in pod metadata for now. Moving them is a separate change with its own risks (see
@@ -205,7 +215,8 @@ so it is opt-in or a floor bump. Filed, not taken here.
 * **A compromised sidecar still has other levers.** `metadata.ownerReferences`,
   `metadata.finalizers`, any selector label and `spec.containers[*].image` are all reachable
   through `pods: patch`, and none of them is a record this ADR could move.
-  `SECURITY_ARCHITECTURE.md` section 3 enumerates them.
+  `docs/security/isolation-and-tenancy.md` enumerates them under
+  ["What does not hold"](../security/isolation-and-tenancy.md#what-does-not-hold).
 
 * **Not verified: nothing in this repository proves an *older operator* tolerates a pod
   template carrying the env.** The downgrade direction was reasoned about, not measured: an

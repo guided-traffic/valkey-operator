@@ -486,8 +486,13 @@ func TestE2E_RollingUpdate_HA(t *testing.T) {
 	})
 }
 
-// TestE2E_RollingUpdate_HA_NoDataLoss is a focused test verifying zero data loss
-// during a rolling update of an HA cluster.
+// TestE2E_RollingUpdate_HA_NoDataLoss verifies that the dataset written before a
+// rolling update of an HA cluster survives it: the new master holds the pre-roll
+// DBSIZE and the written keys. It writes nothing during the roll, so it does not
+// measure the writes the outgoing master acknowledges during the roll's failover.
+// This roll is the Valkey 8 to 9 upgrade, whose failover is forced because the
+// Sentinels still run 8, and those writes are lost (ADR 0037 D8);
+// TestE2E_RollingUpdate_HA_WritesDuringHandover counts them.
 //
 // NOTE: Does NOT call t.Parallel(). Running two HA rolling-update tests in
 // parallel on a single-node Kind cluster causes severe resource contention and
