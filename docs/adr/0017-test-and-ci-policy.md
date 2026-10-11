@@ -94,7 +94,10 @@ although `release-tooling` had passed on its PR: semantic-release 25 depends on 
 `^14.1.0`, npm nested a 14.1.1 under `node_modules/semantic-release`, and semantic-release loads a
 plugin from its own install before the project's, so the release rendered with 14.1.1 and writer@8
 while the check had imported the pinned 15.0.0-beta.3 from the project root. Release 1.14.7 was held
-until the fix.
+until the fix. *(Verified 2026-10-11: with the fix merged, the release job published 1.14.7, run
+38133300276, its notes rendered by the generator 15.0.0-beta.3 and preset 10.4.1 with every
+section; a `semantic-release --dry-run` on the fix branch had rendered the same notes before the
+merge.)*
 
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
