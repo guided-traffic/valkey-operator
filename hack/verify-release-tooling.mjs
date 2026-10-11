@@ -17,8 +17,44 @@
 // Run via: make test-release-tooling (CI: the release-tooling job).
 
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const RELEASERC_URL = new URL("../.releaserc.json", import.meta.url);
+
+// semantic-release loads a plugin from its own install first and from the
+// project only when that finds nothing (lib/plugins/utils.js:
+// importFrom.silent(__dirname, name) || importFrom(cwd, name)). Its own
+// dependency on a plugin therefore wins over the project's pin whenever the two
+// ranges disagree and npm nests a second copy under node_modules/semantic-release.
+// This check resolves the plugins the same way, or it renders with a copy the
+// release job never loads: on 2026-10-11 it rendered preset 10 with the pinned
+// release-notes-generator 15.0.0-beta.3 and passed, while the release job loaded
+// the 14.1.1 that semantic-release 25 depends on and failed with "Missing helper".
+const projectRequire = createRequire(import.meta.url);
+const semanticReleaseRequire = createRequire(
+  join(
+    dirname(projectRequire.resolve("semantic-release/package.json")),
+    "lib",
+    "plugins",
+    "utils.js",
+  ),
+);
+
+async function loadPlugin(name) {
+  let path;
+  try {
+    path = semanticReleaseRequire.resolve(name);
+  } catch {
+    path = projectRequire.resolve(name);
+  }
+  const { version } = JSON.parse(
+    await readFile(join(dirname(path), "package.json"), "utf8"),
+  );
+  console.log(`    ${name} ${version} from ${path.replace(process.cwd() + "/", "")}`);
+  return import(pathToFileURL(path).href);
+}
 
 // One commit per release type the analyzer must distinguish, subjects chosen
 // so the rendered notes can be asserted on.
@@ -79,7 +115,7 @@ const context = {
 };
 
 // Step 1: the analyzer must load the preset and classify the commit set.
-const { analyzeCommits } = await import("@semantic-release/commit-analyzer");
+const { analyzeCommits } = await loadPlugin("@semantic-release/commit-analyzer");
 const analyzerConfig = pluginConfigFrom(
   releaserc,
   "@semantic-release/commit-analyzer",
@@ -101,8 +137,8 @@ if (releaseType !== "major") {
 // This is the step that failed on 2026-08-22: the preset's handlebars template
 // called a helper the installed conventional-changelog-writer does not
 // register, so rendering threw "Missing helper".
-const { generateNotes } = await import(
-  "@semantic-release/release-notes-generator"
+const { generateNotes } = await loadPlugin(
+  "@semantic-release/release-notes-generator",
 );
 const notesConfig = pluginConfigFrom(
   releaserc,

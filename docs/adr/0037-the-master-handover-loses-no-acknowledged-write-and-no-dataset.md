@@ -466,7 +466,11 @@ already decides how long that may take.
   [`topology_restore_dataset_test.go`](../../internal/controller/topology_restore_dataset_test.go)
   (both entries, the bound, the existence filter); disabling the veto fails all four, and
   counting a missing pod fails the existence case. The e2e that measured the loss is the field
-  check; it is timing-dependent and does not reach this shape on every run.
+  check; it is timing-dependent and does not reach this shape on every run. It passed on Kind on
+  both Valkey lines and in the three CI legs of #251 (run 38118996335); in the two local runs pod-0
+  was promoted back 13 s after it was re-pointed, the data already on it, so the veto did not
+  fire there, and whether it fired in CI is not recorded — the workflow collects operator logs
+  only from a failed leg.
 
 ## References
 
