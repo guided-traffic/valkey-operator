@@ -82,6 +82,12 @@ no-op, so every release from v1.10.26 (2026-06-28) to v1.10.48 published header-
 nobody noticed. Preset 10.4.0 added an upstream guard that turned the same mismatch into a
 hard `Missing helper` failure, and releasing stopped entirely.
 
+Amended 2026-10-11: **D46's third rule is re-decided.** The preset waited on the 9.x line for
+`@semantic-release/release-notes-generator` to ship conventional-changelog-writer@9. Upstream
+ships it in the 15.0.0 prereleases (`15.0.0-beta.3`: writer `^9.0.0`, preset `^10.0.0`), with no
+stable release yet, and Renovate's preset 10 PR had been red on `release-tooling` since
+2026-09-25. The generator is now pinned to that prerelease and the preset is on 10.x.
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -806,11 +812,23 @@ committed lockfile.** Three rules:
   runs the byte-identical tree the PR tested. Before, `npm install` resolved transitive
   ranges at run time — the preset's `@conventional-changelog/template ^1.3.0` floated to a
   version published days after the pin that referenced it.
-* `conventional-changelog-conventionalcommits` stays pinned on the 9.x line, the last one
+* ~~`conventional-changelog-conventionalcommits` stays pinned on the 9.x line, the last one
   that ships handlebars string templates for writer@8, until
   `@semantic-release/release-notes-generator` ships conventional-changelog-writer@9. A
   Renovate PR bumping the preset to 10.x goes red in `release-tooling`; that red is the
-  signal that upstream is still incompatible, not an obstacle to work around.
+  signal that upstream is still incompatible, not an obstacle to work around.~~
+  *(Re-decided 2026-10-11:)* The preset is on the 10.x line and
+  `@semantic-release/release-notes-generator` is pinned to `15.0.0-beta.3`, the first release
+  that ships writer@9 next to it. It is a prerelease, taken because no stable one exists and the
+  render check above is what decides whether a set works: it rendered every section with this
+  set, where 14.1.1 with preset 10 threw `Missing helper`. A prerelease pin is moved by Renovate
+  to a later prerelease of the same version or to the stable release (its documented
+  `ignoreUnstable` behaviour, not yet observed here), each through the same check; npm PRs are
+  not automerged, so a person merges them.
+  `@semantic-release/commit-analyzer` stays on 13.x: it loads the preset with parser 6 and
+  classified the synthetic commit set correctly, so its 14.0.0 prerelease is not needed. A
+  preset or generator PR that goes red in `release-tooling` still means the set does not work,
+  and it is still not worked around.
 
 ### The rootless posture ([ADR 0032](0032-generated-pods-run-rootless.md))
 
