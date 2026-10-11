@@ -184,6 +184,11 @@ Amended 2026-08-22: **D13 is restated.** The gates in front of the promotion now
 longer its only consumer ([ADR 0007](0007-failover-aware-rolling-update.md) D10). The property
 D13 protects is unchanged: none of them runs while the restore phases hold the state.
 
+Amended 2026-10-11: **D2 gains a second Phase 1 wait.** The dataset veto of
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D9 refuses to
+promote an empty pod-0 over a pod holding the data, and its refusal waits on the Phase 1 bound
+and abandons on it like the sync wait. No bound changed.
+
 ## Context
 
 The non-Sentinel rolling update is a state machine that waits: for a replaced pod to come
@@ -223,7 +228,12 @@ because it is the same wait — a replaced pod pulling a full dataset — and it
 candidate a user can raise when the dataset does not fit the default. It gets its **own**
 annotation: reusing `annotationSyncWaitStarted` would inherit a stamp the replica-replacement
 phase leaves behind on every early return, and reusing the finalization stamp would let a
-long Phase 1 eat Phase 2's budget.
+long Phase 1 eat Phase 2's budget. *(Amended 2026-10-11: Phase 1 also waits, on the same
+bound, while the dataset veto of
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D9 refuses the
+promotion — pod-0 holding no keys while a pod the restoration would re-point holds some. A
+synced link is not enough on its own: pod-0 can be synced with an upstream that came back
+empty.)*
 
 **D3 — On Phase 1 timeout, give up the topology, never the data. Pod-0 is never
 force-promoted.** An unsynced pod-0 forced to master comes up empty and discards the

@@ -763,8 +763,13 @@ sentences are repeated here so nothing is changed without them.
    recorded before anything is demoted; two are ambiguous and demote nobody. A refusal emits no
    Event — `MultipleMasters` and the 90 s `SplitBrainDetected` already carry it — and it
    deliberately re-enters the deadlock the resolver exists to break, which is safe only because
-   every state that names an authority is bounded.
-   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)
+   every state that names an authority is bounded. **The veto binds every `REPLICAOF` fan-out,
+   not only the resolver**: `forceReplicaConnections`, and the topology restoration, which
+   promotes pod-0 back only while it holds keys or no pod it re-points holds any — a synced
+   link proves only that pod-0 copied its upstream, and CI lost a dataset to an upstream that
+   had come back empty (decided 2026-10-11).
+   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md),
+   [ADR 0037](docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4, D9
 
 ## Provenance before every write and every delete
 

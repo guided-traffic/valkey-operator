@@ -4940,8 +4940,18 @@ func (r *ValkeyReconciler) recordTopologyRestoredCondition(ctx context.Context, 
 // all other pods to replicate from it, and transitions to stateVerifyingTopology.
 // It is the shared final step of both the normal topology restoration path and the
 // self-loop recovery path.
+//
+// Nothing happens while the redirect would discard the only dataset
+// (pod0RedirectRefusal): the restoration waits on its Phase 1 bound instead, and an
+// abandon leaves the master where it is.
 func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.Valkey, currentSts *appsv1.StatefulSet, masterPodName string) RollingUpdateResult {
 	logger := log.FromContext(ctx)
+
+	if refusal := r.pod0RedirectRefusal(ctx, v, currentSts, masterPodName); refusal != "" {
+		logger.Info("Not promoting pod-0 back: pointing the other pods at it would discard the only dataset",
+			"pod", masterPodName, "reason", refusal)
+		return r.waitOrAbandonTopologyRestoration(ctx, v, refusal)
+	}
 
 	tlsConfig, tlsErr := r.buildTLSConfig(ctx, v, builder.ValkeyTLSSecretName(v))
 	if tlsErr != nil {
@@ -5034,6 +5044,35 @@ func (r *ValkeyReconciler) promotePod0AndRedirect(ctx context.Context, v *vkov1.
 	}
 
 	return RollingUpdateResult{NeedsRequeue: true, RequeueAfter: rollingUpdateRequeueDelay}
+}
+
+// pod0RedirectRefusal returns why pod-0 must not be promoted back, or "" when it may.
+// promotePod0AndRedirect points every other pod of the tier at pod-0, and a REPLICAOF
+// discards the dataset of the pod that receives it, so the ADR 0028 veto binds the
+// restoration as it binds forceReplicaConnections: while pod-0 holds no keys or cannot
+// be counted, and any other existing pod of the tier holds some or cannot be counted,
+// pod-0 is not promoted at all
+// (docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md, D9).
+//
+// pod0SyncWaitReason does not answer this question. It asks whether pod-0 finished
+// syncing from the pod it replicates, and that pod can itself be empty: a promoted
+// replica killed mid-roll comes back on an empty volume while the drain promotes the
+// pod holding the data, and pod-0, a synced replica of the empty one, was promoted
+// back and took every key with it.
+func (r *ValkeyReconciler) pod0RedirectRefusal(ctx context.Context, v *vkov1.Valkey,
+	currentSts *appsv1.StatefulSet, pod0Name string) string {
+	stsName := common.StatefulSetName(v, common.ComponentValkey)
+	totalPods := int(*currentSts.Spec.Replicas)
+
+	pods := make([]podState, 0, totalPods)
+	for i := 1; i < totalPods; i++ {
+		podName := fmt.Sprintf("%s-%d", stsName, i)
+		// Only a pod that is not there is skipped. Any other read error counts the pod
+		// as existing, so its count is asked and an unanswered one refuses.
+		err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: v.Namespace}, &corev1.Pod{})
+		pods = append(pods, podState{name: podName, exists: !apierrors.IsNotFound(err)})
+	}
+	return replicaOfRefusal(keyCountsOnce(r.dbSizeReader(ctx, v)), pod0Name, pods)
 }
 
 // rollbackPod0Promotion hands pod-0 back to previousMasterHost after the promotion

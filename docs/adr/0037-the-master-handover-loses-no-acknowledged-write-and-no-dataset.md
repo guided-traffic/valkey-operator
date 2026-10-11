@@ -70,6 +70,12 @@ bounded) and [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) D11 (the *
 argument's gate). [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) is the
 companion refusal: no write fence.
 
+Amended 2026-10-11: **D9 is new.** The veto of D4 did not bind the third `REPLICAOF` fan-out,
+the topology restoration of the non-Sentinel roll (`promotePod0AndRedirect`), and CI lost a
+dataset through it (*Context*, last paragraph). Implemented in the same change:
+`pod0RedirectRefusal` at the head of `promotePod0AndRedirect`, which runs `replicaOfRefusal`
+over every existing pod the restoration re-points and waits on the Phase 1 bound when it refuses.
+
 ## Context
 
 A Sentinel data-tier roll hands the master over once *(a roll with a replica: the single data
@@ -140,6 +146,20 @@ narrow — a forced failover promotes the replica with the highest offset
 all are empty, or when a promoted non-persistent pod restarts empty — and inside it the veto of
 [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) D1 is zero-against-some: the
 first write on X lifts it.
+
+**The topology restoration had no veto** (found 2026-10-11, in CI). On a non-Sentinel roll the
+operator promotes a replica, replaces the outgoing master, and then hands the role back to pod-0
+once pod-0 reports a synced link (`pod0SyncWaitReason`), pointing every other pod at it. The
+e2e for [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) killed the recorded
+master right after the roll's own promotion on a cluster without persistence (run 38021043058,
+`TestE2E_SplitBrain_RecordedMasterReturningEmptyKeepsTheDataset`, Valkey 9): the drain promoted
+`sb-empty-2`, which held the three keys; `sb-empty-1`, the promoted replica, came back empty;
+pod-0, replaced by the roll, came back empty and replicated `sb-empty-1`. The resolver adopted the
+drain promotion and demoted `sb-empty-1` under the ADR 0028 veto, and in the same pass the
+restoration found pod-0 synced — with its upstream, which held nothing — promoted it, and sent
+`sb-empty-2` a `REPLICAOF` to it. Every pod ended at `DBSIZE 0`, the phase at `OK`. The sync
+predicate cannot see this: it says pod-0 copied the pod it replicates, not that that pod held the
+data.
 
 ## Decision
 
@@ -287,6 +307,19 @@ loss\|no data is lost\|loses no data\|zero data loss'` over `README.md`, `CLAUDE
 `docs/adr/`, `docs/operations/` and `test/` finds no unqualified claim. The `verifyNewMasterReady`
 log line drops "with data" and logs the count as a field.
 
+**D9 — The topology restoration promotes pod-0 back only when its redirect discards no dataset.**
+`promotePod0AndRedirect` asks `pod0RedirectRefusal` before it sends anything: the D4 veto
+(`replicaOfRefusal`) with pod-0 as the master and every other existing pod of the tier — the
+ordinals the redirect re-points, a pod that is not there skipped — as the receivers. While
+pod-0 holds no keys or cannot be counted, and any of them holds some or cannot be counted,
+neither `REPLICAOF NO ONE` nor a redirect is sent and nothing is recorded; the reason is logged
+and the restoration waits on its Phase 1 bound (`waitOrAbandonTopologyRestoration`,
+[ADR 0010](0010-every-rolling-update-wait-is-bounded.md) D2), so a refusal that outlasts
+`spec.rollingUpdate.syncTimeout` abandons the restoration and leaves the master where it is,
+with the refusal in the `TopologyRestored=False` message. It binds both entries, the synced
+branch and the self-loop branch, because it sits in the function both call. A pod-0 holding
+keys costs one `DBSIZE`, as in D4.
+
 ## Consequences
 
 - **An e2e writer harness is the prerequisite, and the measurement.** During a Sentinel roll it
@@ -326,6 +359,13 @@ log line drops "with data" and logs the count as a field.
   README condition row and [status.md](../operations/status.md) gain `MasterHandoverStalled`
   with its repair, [rolling-updates.md](../operations/rolling-updates.md) the hold, and
   [upgrading.md](../operations/upgrading.md) the 8 to 9 roll and the 60 s block.
+- **D9 can end a roll with the master off pod-0** where it used to restore pod-0. A pod-0 that
+  stays empty while another pod holds the data for the whole `syncTimeout` is not promoted; the
+  restoration is abandoned (`TopologyRestored=False`, one `TopologyRestoreAbandoned` Warning) and
+  Phase 2 consolidates on the recorded master. That is the outcome
+  [rolling-updates.md](../operations/rolling-updates.md) already documents for a pod-0 that never
+  syncs back. In the measured shape it does not come to that: the holder's data reaches pod-0
+  through the chain within a pass or two, and the restoration goes ahead.
 
 ## Alternatives Considered
 
@@ -362,6 +402,15 @@ blocks, a Warning and phase `Error` every `syncTimeout`. *`RollingUpdatePaused` 
 reason* — the condition would then mean both "cleared and retrying" and "held, never retrying",
 while what a pause leaves behind is itself being re-decided. *A phase override to `Error` for
 the hold* — see D7.
+
+**The topology restoration (D9).** *Ask `verifyPromotionCandidateHoldsData` with the promoted
+pod as the master* — the promoted pod is the one that came back empty in the measured shape,
+and both empty is no refusal, so pod-0 would still be promoted over the holder. *Make the sync
+wait follow the chain* — a replica cannot tell that its upstream is empty, and a link that is up
+through an empty upstream is a correct answer to the question it asks; the dataset is what
+discriminates, as ADR 0028 says inside a roll. *Abandon at once on a refusal* — the measured shape
+resolves itself within a pass or two once the holder's data reaches pod-0, and the Phase 1 bound
+already decides how long that may take.
 
 ## Residual risks
 
@@ -409,6 +458,15 @@ the hold* — see D7.
   connection that never completed. A cut-off write counts as not acknowledged, which is what the
   client saw; the cause of the hang is not established.
 - **`DBSIZE` counts db0 only**, as in ADR 0028.
+- **D9 is zero against some, like D4** (recorded 2026-10-11). A pod-0 that holds fewer keys than
+  the holder, not none, is promoted and the redirect resyncs the holder to pod-0's dataset;
+  nothing compares offsets. A pod that does not exist when the restoration runs is not counted,
+  so one that comes back on a persistent volume holding data later syncs from whatever the
+  replica ConfigMap names. Verified: the unit tests in
+  [`topology_restore_dataset_test.go`](../../internal/controller/topology_restore_dataset_test.go)
+  (both entries, the bound, the existence filter); disabling the veto fails all four, and
+  counting a missing pod fails the existence case. The e2e that measured the loss is the field
+  check; it is timing-dependent and does not reach this shape on every run.
 
 ## References
 
@@ -417,7 +475,11 @@ the hold* — see D7.
   `handlePostFailover`, `handleNewMasterFound`, `handleMasterWithNoReplicas`,
   `forceReplicaConnections`, `replaceRemainingPods`, `coordinatedFallbackReason`,
   `replicationNotEstablishedReason`, `demotionRefusalReason`, `dbSizeReader`, `terminationWait`,
-  `pauseRollingUpdate`, `clearRollingUpdateState`
+  `pauseRollingUpdate`, `clearRollingUpdateState`; for D9 `handleTopologyRestoration`,
+  `promotePod0AndRedirect`, `pod0RedirectRefusal`, `waitOrAbandonTopologyRestoration`
+* [`internal/controller/topology_restore_dataset_test.go`](../../internal/controller/topology_restore_dataset_test.go)
+  — the D9 unit tests; [`test/e2e/split_brain_dataset_test.go`](../../test/e2e/split_brain_dataset_test.go)
+  — the e2e that measured the loss D9 closes
 * [`internal/controller/master_handover.go`](../../internal/controller/master_handover.go) —
   `gateOutgoingPodDelete`, `verifyNewMasterReady`, `replicasNotOnNewMaster`, `datasetRefusal`,
   `stillMasterRefusal`, `holdHandover`, `endHandoverHold`, `reportMasterHandoverStalled`,
@@ -441,7 +503,7 @@ the hold* — see D7.
 * [ADR 0002](0002-surface-a-blocked-reconcile-on-the-cr.md) D3, D5a — the one phase override, `Ready` as the data-plane verdict
 * [ADR 0005](0005-upgrade-neutral-defaults-and-anti-affinity.md) D1 — why D2 is no opt-in
 * [ADR 0007](0007-failover-aware-rolling-update.md) D1, D3, D10 — the sequence, the fail direction, the predicate D2 generalises
-* [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — why D6 holds and never clears
+* [ADR 0010](0010-every-rolling-update-wait-is-bounded.md) — why D6 holds and never clears; D2, the Phase 1 bound D9 waits on
 * [ADR 0017](0017-test-and-ci-policy.md) — the revert checks and the e2e tier the harness lives in
 * [ADR 0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) — the condition export
 * [ADR 0022](0022-sentinel-identity-is-pinned-to-the-pod.md) — the table the election counts

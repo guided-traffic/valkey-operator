@@ -219,6 +219,12 @@ stays open.
 
 Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
 
+Amended 2026-10-11: **D10's last look reaches the topology restoration.** The promotion that
+hands pod-0 the master role back asked only for a synced link and promoted an empty pod-0 over
+the pod holding the data (measured in CI); it now asks the dataset veto against every pod it
+re-points ([ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+D9). The residual risk on that function's unbounded exits is narrowed in place.
+
 ## Context
 
 The data StatefulSet uses `updateStrategy: OnDelete` and
@@ -627,7 +633,10 @@ before it. An empty master returns early
 -- a cluster that holds no data yet must still be able to roll -- and an unreadable count
 waits rather than assuming a yes (D3). The two counts are also logged on the way through,
 because after the delete of the outgoing master nothing can be asked about what the
-promotion was based on.
+promotion was based on. *(Amended 2026-10-11: the second promotion of a non-Sentinel roll —
+pod-0 handed the role back by the topology restoration — had no such look and promoted an
+empty pod-0 over the pod holding the data; it now asks the veto against every pod it re-points,
+[ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D9.)*
 
 **D11 — A Sentinel cluster with one data pod is rolled as a single pod.** When the CR and the
 persisted data StatefulSet both ask for one data pod (`singleDataPodBehindSentinel`),
@@ -713,7 +722,12 @@ for the master, gets its own hostname (`announce-hostnames yes`) and boots as ma
   sync-wait branch alone (`pod0SyncWaitReason(...) != ""`). All three failure exits of
   `promotePod0AndRedirect` — TLS config error, failed `REPLICAOF NO ONE`, failed
   `recordPromotedMaster` — return a bare requeue instead (the record exit rolls the
-  promotion back first, per D5, but the requeue it returns is just as unbounded), and a
+  promotion back first, per D5, but the requeue it returns is just as unbounded) *(narrowed
+  2026-10-11: the dataset veto of [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+  D9 now runs first and reads the key counts with a TLS config of its own; one that cannot be
+  built refuses there, and the refusal waits on the Phase 1 bound, so a TLS failure present
+  when the pass starts no longer reaches the unbounded exit — the other two exits are
+  unchanged)*, and a
   pod-0 that is reachable and already a synced replica keeps `pod0SyncWaitReason` empty on
   every following pass. ADR 0010 does not track it either; it claims Phase 1's sync wait
   (D2) and the six `handlePostManualFailover` branches (D6), and its own open list names

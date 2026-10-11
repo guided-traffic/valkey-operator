@@ -20,6 +20,8 @@ Open, and named as such: `vko.gtrfc.com/promoted-pod` is not rewritten by the ad
 
 Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
 
+Amended 2026-10-11: **the premise that the operator never promotes an empty candidate over a non-empty master is corrected in place** (*Context*). The topology restoration broke it until [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D9 bound D1's veto to that promotion; no rule of this record changed.
+
 Amended 2026-09-28: **D1's veto binds a second `REPLICAOF` site and the delete of the outgoing master, and on the Sentinel path D8's refusal is held, not ended.** [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4 (`forceReplicaConnections`, vetoed for the whole call), D5 (the delete in `replaceRemainingPods`) and D6 (the hold, `MasterHandoverStalled`). D3's "the divergence is bounded" no longer holds on that path, and the write fence D3 named as the price is refused in [ADR 0038](0038-the-operator-does-not-offer-min-replicas-to-write.md). The residual risk that expected the veto to stay inert on the Sentinel path is corrected in place. ~~Decided, not built.~~ *(Implemented 2026-09-28, on the Sentinel roll only: `forceReplicaConnections` sends no `REPLICAOF` at all while `replicaOfRefusal` finds the veto refusing for any other existing pod, and the delete in `replaceRemainingPods` passes the handover gate `gateOutgoingPodDelete` of [`master_handover.go`](../../internal/controller/master_handover.go) first. Both are reached only from the Sentinel roll; the non-Sentinel roll deletes its outgoing master in `handleManualFailover`, behind `verifyPromotionCandidateHoldsData`, which refuses an empty candidate before the promotion, and a leftover outdated pod in `deleteNextPendingPod`, and neither delete asks the veto. Unit-tested in [`master_handover_test.go`](../../internal/controller/master_handover_test.go); the full e2e suite and the writer harness of ADR 0037 ran green on the built code on Kind, both Valkey lines, the refusal shape itself not driven on a cluster.)*
 
 ## Context
@@ -88,7 +90,11 @@ Porting `refuseDemotion` verbatim breaks the rolling update, and the reason gene
 The dataset qualifies because the operator never promotes an empty candidate over a non-empty
 master — `verifyPromotionCandidateHoldsData`
 ([ADR 0007](0007-failover-aware-rolling-update.md) D10) — so "the authority holds no keys while
-the rogue holds some" is a state the operator cannot have created. The stamp qualifies because
+the rogue holds some" is a state the operator cannot have created. *(Corrected 2026-10-11: this
+did not hold for the topology restoration of the non-Sentinel roll, which promoted pod-0 back on
+a synced link alone — measured in CI with pod-0 empty and the data on another pod, every key
+lost. It holds since [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+D9 puts the veto in front of that promotion.)* The stamp qualifies because
 `recordPromotedMaster` clears every stamp of the cluster at the moment the operator records a
 promotion of its own ([ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md)
 D16), so a stamp still present during a roll is a promotion that happened *after* the last one
