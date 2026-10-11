@@ -19,20 +19,20 @@ package e2e
 // entered and TopologyRestoreAbandoned can never fire.
 //
 // What does reach the abandon path is a pod-0 that returns, becomes Ready, accepts
-// the operator's REPLICAOF and then never reports master_link_status:up. That is
-// what jamPod0Replication produces, in a form that survives the operator's own
-// REPLICAOF.
+// the operator's REPLICAOF and then never reports master_link_status:up. The jam
+// that produces it sits on the other end of the link: jamSyncFromPromotedReplica
+// tells the replacement pod-1 -- the pod the roll is about to promote -- to hold every
+// full sync it is asked for, before the failover has happened.
 //
-// It does not, however, survive pod-0 being replaced, and for its first life this
-// test read as if it did: the jam gate was "rolling-update state is one of three
-// values and pod-0 answers role:slave", which the *outgoing* master also satisfies
-// for the one second between "Demoted outgoing master to replica" and "Deleting old
-// master pod after manual failover". A jam that lands there is thrown away with the
-// pod, Phase 1 finds a healthy link on the replacement and promotes pod-0 back, and
-// the test fails on TopologyRestored=True/Restored having never reached the path it
-// exists to cover. jamPod0Replication therefore waits for the pod-0 that is running
-// the *new* image and carries no deletionTimestamp, and reads the poison back
-// instead of trusting the two OKs.
+// It used to sit on pod-0, and that is why it moved. A jam on pod-0 can only land on
+// the pod-0 that comes back, in the seconds between its return and Phase 1 seeing a
+// healthy link; a jam that lands on the outgoing pod-0 dies with it (measured on runs
+// 35312304295, 35315129844 and 35317540380), and one that misses the seconds fails
+// the test without the abandon path ever being entered (run 37881026168: "never came
+// back as a replica ... while the manual failover was in flight"). The replacement
+// pod-1 exists from the first step of the roll and is promoted, not replaced, so the
+// jam has from its start until the failover to land, and nothing the roll does
+// afterwards removes it.
 //
 // One property of the scenario is worth knowing before reading a failure: from the
 // promotion until the jam is lifted, the promoted replica holds the only copy of the
@@ -82,24 +82,23 @@ const (
 // deliberately.
 const topologyAbandonSyncTimeout = "60s"
 
-// blackholeMasterIP is an unroutable address (RFC 1112 class E) used as the jammed
-// replication target, so no packet the replica sends can be answered.
-const blackholeMasterIP = "240.0.0.1"
-
-// masterauthPoison is what makes the jam survive the operator's own REPLICAOF: a
-// replica with masterauth set sends AUTH during the handshake, the master has no
-// requirepass and answers with an error, and the replica aborts the handshake and
-// retries forever. master_link_status therefore never reaches "up", whichever
-// master the link is pointed at.
-const masterauthPoison = "vko-e2e-abandon-poison"
+// syncJamDelay is the repl-diskless-sync-delay, in seconds, the jammed master runs
+// with. With diskless sync on (the operator's configuration) a master starts the
+// transfer only once a waiting replica has waited this long, and it answers the
+// replica's PSYNC only when the transfer starts. Until then the replica reports
+// master_link_status:down (measured on Valkey 9.1.1 at the abandon:
+// master_sync_in_progress:0, master_last_io_seconds_ago:-1), and a replica that gives
+// up and asks again waits the delay again. Nothing in the jam is a failure, so the
+// operator's REPLICAOF -- a no-op on a pod already replicating the promoted master --
+// cannot clear it.
+const syncJamDelay = "3600"
 
 const (
-	// jamPollInterval is one cheap CR GET per tick while the master replacement is
-	// still running; the kubectl exec only runs once the state gate matches.
+	// jamPollInterval is one cheap pod GET per tick while pod-1 is being replaced;
+	// the kubectl exec only runs once the replacement exists.
 	jamPollInterval = 500 * time.Millisecond
 
-	// jamPollTimeout covers the whole replica replacement plus the failover and the
-	// recreation of pod-0.
+	// jamPollTimeout covers the replacement of pod-1, the first step of the roll.
 	jamPollTimeout = 10 * time.Minute
 
 	// abandonConditionTimeout covers pod-0 becoming Ready, one operator pass, the
@@ -158,7 +157,7 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	t.Log("Triggering the rolling update that ends in the manual failover")
 	tc.updateValkeyImage(t, ns, name, updatedImage)
 
-	tc.jamPod0Replication(t, ns, name, updatedImage)
+	liftJam := tc.jamSyncFromPromotedReplica(t, ns, name, updatedImage)
 
 	t.Run("Phase 1 gives up and leaves the promoted replica as master", func(t *testing.T) {
 		cond := tc.waitForValkeyCondition(t, ns, name, "TopologyRestored", "False", abandonConditionTimeout)
@@ -235,16 +234,21 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	})
 
 	t.Run("The abandoned topology converges once pod-0 restarts", func(t *testing.T) {
-		// The jam lives in the process only -- the operator never issues CONFIG
-		// REWRITE -- so restarting the pod removes it. The recreated pod-0 reads the
-		// replica ConfigMap, whose replicaof still names the promoted master.
+		// The restart proves the end state serviceable on its own terms: the recreated
+		// pod-0 reads the replica ConfigMap, whose replicaof still names the promoted
+		// master. It is awaited by UID before the jam is lifted, so every gate below can
+		// only be met by the new pod -- lifted first, the jam would let the outgoing
+		// pod-0 finish its own sync while it terminates, and it would answer them
+		// (ADR 0017 D50).
+		oldPod0 := tc.getPod(t, ns, pod0).UID
 		tc.deletePod(t, ns, pod0)
+		tc.waitForPodRecreated(t, ns, pod0, oldPod0)
+		liftJam()
 
 		// Two gates, and each closes what the other leaves open. The master-side one
-		// rejects the still-terminating old pod-0: it replicates the blackhole and
-		// never registers, so waiting on the pod Ready condition first would accept
-		// it. It does not prove the dataset arrived, though -- a replica is counted
-		// from the moment it asks for synchronization, and the master then sits out
+		// proves pod-0 attached to the promoted master and not elsewhere. It does not
+		// prove the dataset arrived, though -- a replica is counted from the moment it
+		// asks for synchronization, and the master then sits out
 		// repl-diskless-sync-delay before it even starts the BGSAVE. The replica-side
 		// master_link_status:up is the moment the RDB is loaded and the GET below
 		// can be answered.
@@ -258,94 +262,77 @@ func TestE2E_RollingUpdate_TopologyRestoreAbandoned(t *testing.T) {
 	})
 }
 
-// jamPod0Replication breaks the replication link of the returning pod-0 so that
-// Phase 1 of the topology restoration can never succeed and has to run into its
-// sync timeout.
+// jamSyncFromPromotedReplica makes the replacement pod-1 -- the replica the rolling
+// update is about to promote -- hold every full sync it is asked for, so that the
+// pod-0 which comes back after the failover can never finish syncing from it and
+// Phase 1 has to run into its sync timeout. It returns the function that lifts the
+// jam.
 //
-// Two commands, applied together and retried until both are accepted:
+// The gate is the pod's identity, never controller state (ADR 0017 D50): the pod-1
+// running the new image and carrying no deletionTimestamp is the one the roll
+// promotes, and nothing in the roll replaces it again. The outgoing pod-1 runs the
+// old image. The jam is read back rather than trusted: a CONFIG SET that answered
+// OK from a process about to be replaced proves nothing.
 //
-//   - CONFIG SET masterauth <poison> makes every future handshake fail at AUTH, so
-//     the jam holds even when the operator afterwards points pod-0 at the promoted
-//     master (that REPLICAOF is a real master change and restarts the handshake).
-//   - REPLICAOF <blackhole> 6379 holds on its own when the jam lands after the
-//     operator already re-pointed pod-0: nothing re-points it again while the state
-//     is restoring-topology.
-//
-// The state gate is what keeps this safe. promotePod0AndRedirect is the only path
-// that makes pod-0 master again, and it moves the state to verifying-topology in
-// the same pass, so the gate closes before pod-0 can be master. The residual race
-// (state read as restoring-topology, promotion lands during the exec) demotes a
-// freshly promoted pod-0 and fails the TopologyRestored assertion loudly; it cannot
-// produce a green false pass. Never widen the gate to verifying-topology or to the
-// empty state -- there pod-0 may legitimately be master.
-//
-// If pod-0 is ever seen reporting master_link_status:up after the operator has
-// re-pointed it, the masterauth half is not biting and the fallback is to re-issue
-// REPLICAOF <blackhole> on a short interval until the abandon fires -- correct, but
-// with a small window between the operator's REPLICAOF and the next re-jam.
-func (tc *testClients) jamPod0Replication(t *testing.T, namespace, name, updatedImage string) {
+// The setting is a master-side one and harmless while pod-1 is still a replica, so
+// the jam can land at any time between pod-1's return and pod-0's first sync request
+// after the failover. That window holds pod-1's own full sync, its readiness, the
+// operator's WAIT and the replacement of pod-0, where the pod-0-side jam this replaces
+// had the few seconds between pod-0's return and Phase 1. The role pod-1 answered when
+// the jam landed is logged, so a jam that missed the window -- which can only fail the
+// test, at the TopologyRestored wait, never pass it -- is visible as such.
+func (tc *testClients) jamSyncFromPromotedReplica(t *testing.T, namespace, name, updatedImage string) func() {
 	t.Helper()
 
-	pod0 := fmt.Sprintf("%s-0", name)
+	pod1 := fmt.Sprintf("%s-1", name)
+	configValue := func(reply string) string {
+		lines := strings.Split(strings.TrimSpace(reply), "\n")
+		return strings.TrimSpace(lines[len(lines)-1])
+	}
+
+	original := ""
 	err := wait.PollUntilContextTimeout(context.Background(), jamPollInterval, jamPollTimeout, true,
 		func(ctx context.Context) (bool, error) {
-			state := tc.getValkeyAnnotations(t, namespace, name)[annotationRollingUpdateStateKey]
-			switch state {
-			case "manual-failover", "replacing-master", "restoring-topology":
-			default:
-				// pod-0 is still the master, or it was already promoted back.
+			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, pod1, metav1.GetOptions{})
+			if err != nil || pod.DeletionTimestamp != nil || containerImage(pod, valkeyContainerName) != updatedImage {
 				return false, nil
 			}
-
-			// The jam has to land on the pod-0 that comes *back*, and "pod-0 is a
-			// replica" does not say that: the operator demotes the outgoing master
-			// one second before it deletes it ("Demoted outgoing master to replica"
-			// then "Deleting old master pod after manual failover"), so for that
-			// second the dying pod matches every gate above. CONFIG SET is runtime
-			// state, the replacement boots clean, Phase 1 then finds a healthy link
-			// and promotes pod-0 back -- the abandon path is never entered and the
-			// test fails on TopologyRestored=True/Restored. Measured on runs
-			// 35312304295, 35315129844 and 35317540380.
-			//
-			// The returned pod-0 is the one running the new image and not carrying a
-			// deletionTimestamp; the outgoing one still runs the old image.
-			pod, err := tc.kube.CoreV1().Pods(namespace).Get(ctx, pod0, metav1.GetOptions{})
-			if err != nil || pod.DeletionTimestamp != nil {
+			if original == "" {
+				if original = configValue(tc.valkeyExecQuick(t, namespace, pod1, 6379,
+					"CONFIG", "GET", "repl-diskless-sync-delay")); original == "" {
+					return false, nil
+				}
+			}
+			// Diskless sync and an unset replica threshold are what the operator
+			// configures; they are set again so that the jam does not rest on it.
+			if tc.valkeyExecQuick(t, namespace, pod1, 6379, "CONFIG", "SET",
+				"repl-diskless-sync", "yes",
+				"repl-diskless-sync-max-replicas", "0",
+				"repl-diskless-sync-delay", syncJamDelay) != "OK" {
 				return false, nil
 			}
-			if containerImage(pod, valkeyContainerName) != updatedImage {
-				return false, nil
-			}
-
-			info := tc.valkeyExecQuick(t, namespace, pod0, 6379, "INFO", "replication")
-			if !strings.Contains(info, "role:slave") {
-				return false, nil
-			}
-
-			// Both commands are idempotent, so a partially applied jam is simply
-			// re-applied on the next tick.
-			if tc.valkeyExecQuick(t, namespace, pod0, 6379, "CONFIG", "SET", "masterauth", masterauthPoison) != "OK" {
-				return false, nil
-			}
-			if tc.valkeyExecQuick(t, namespace, pod0, 6379, "REPLICAOF", blackholeMasterIP, "6379") != "OK" {
-				return false, nil
-			}
-
-			// Read the value back rather than trust the two OKs: a pod replaced
-			// between them answers OK from the old process and boots clean, which is
-			// the same silent miss in a narrower window.
-			if !strings.Contains(
-				tc.valkeyExecQuick(t, namespace, pod0, 6379, "CONFIG", "GET", "masterauth"), masterauthPoison) {
-				return false, nil
-			}
-
-			t.Logf("Jammed replication on %s (image %s) while the rolling update was in state %q",
-				pod0, updatedImage, state)
-			return true, nil
+			return configValue(tc.valkeyExecQuick(t, namespace, pod1, 6379,
+				"CONFIG", "GET", "repl-diskless-sync-delay")) == syncJamDelay, nil
 		})
 	require.NoError(t, err,
-		"%s never came back as a replica on %s while the manual failover was in flight; "+
-			"without the jam the test cannot reach the abandon path", pod0, updatedImage)
+		"the replacement %s on %s never accepted the sync jam; without it the test cannot reach the abandon path",
+		pod1, updatedImage)
+
+	role := "unknown"
+	for _, line := range strings.Split(tc.valkeyExecQuick(t, namespace, pod1, 6379, "INFO", "replication"), "\n") {
+		if strings.HasPrefix(line, "role:") {
+			role = strings.TrimSpace(strings.TrimPrefix(line, "role:"))
+		}
+	}
+	t.Logf("Jammed full syncs from %s (image %s, repl-diskless-sync-delay %s -> %s) while it answered role:%s",
+		pod1, updatedImage, original, syncJamDelay, role)
+
+	return func() {
+		t.Helper()
+		require.Equal(t, "OK", tc.valkeyExec(t, namespace, pod1, 6379,
+			"CONFIG", "SET", "repl-diskless-sync-delay", original),
+			"the sync jam on %s must be lifted before pod-0 is expected to sync", pod1)
+	}
 }
 
 // valkeyStatusCondition returns one status condition of a Valkey CR by type, or nil

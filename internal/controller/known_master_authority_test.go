@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -245,9 +246,12 @@ func TestCheckAndRecoverNoMaster_PromotesNothingWhenTheRecordFails(t *testing.T)
 
 // --- promotePod0AndRedirect: an unrecorded promotion must not be left standing ---
 
-// recordingValkeyServer answers every command with +OK and keeps the raw command
-// text, so a test can assert which commands a pass actually issued rather than
-// only which addresses it dialed. The client opens one connection per command.
+// recordingValkeyServer answers DBSIZE with a non-empty count and every other command
+// with +OK, and keeps the raw command text, so a test can assert which commands a
+// pass actually issued rather than only which addresses it dialed. The client opens
+// one connection per command. The count is what the dataset veto in front of the
+// topology restoration reads (ADR 0037 D9); an +OK there is an unreadable count, and
+// the veto refuses on one.
 func recordingValkeyServer(t *testing.T) (string, func() []string) {
 	t.Helper()
 
@@ -276,6 +280,10 @@ func recordingValkeyServer(t *testing.T) (string, func() []string) {
 				mu.Unlock()
 				// Recorded before the reply, so a command is in the log by the
 				// time the client that sent it returns.
+				if strings.Contains(strings.ToUpper(string(buf[:n])), "DBSIZE") {
+					_, _ = conn.Write([]byte(":4711\r\n"))
+					return
+				}
 				_, _ = conn.Write([]byte("+OK\r\n"))
 			}()
 		}
@@ -288,14 +296,24 @@ func recordingValkeyServer(t *testing.T) (string, func() []string) {
 	}
 }
 
-// wireRecordingServer points every Valkey client at one recording server.
+// wireRecordingServer points every Valkey client at one recording server and returns
+// the REPLICAOF commands it saw, in order -- the commands that move a role. The key
+// counts read on the way are left out.
 func wireRecordingServer(t *testing.T, r *ValkeyReconciler) func() []string {
 	t.Helper()
 	addr, commands := recordingValkeyServer(t)
 	r.NewValkeyClientFn = func(_, _ string, _ *tls.Config) *valkeyclient.Client {
 		return valkeyclient.New(addr)
 	}
-	return commands
+	return func() []string {
+		var replicaOf []string
+		for _, command := range commands() {
+			if strings.Contains(strings.ToUpper(command), "REPLICAOF") {
+				replicaOf = append(replicaOf, command)
+			}
+		}
+		return replicaOf
+	}
 }
 
 // Not advancing the state machine is only half the fix. The REPLICAOF NO ONE has

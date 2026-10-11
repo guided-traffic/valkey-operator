@@ -276,7 +276,9 @@ identity, never by controller state.** A rolling-update state annotation names a
 phase outlives the pod it is about: the abandon e2e jammed pod-0 on "state is one of three
 values and pod-0 answers `role:slave`", which the *outgoing* master also satisfies for the one
 second between the demote and the delete — runtime `CONFIG SET` dies with that pod, and the
-test failed on four runs in ten days, each on a different leg. Again on 2026-09-26, in the shape
+test failed on four runs in ten days, each on a different leg. *(Since 2026-10-11 that jam sits
+on the replica the roll promotes — `repl-diskless-sync-delay`, gated on the new image — because
+a jam on the returning pod-0 still had only seconds to land and missed them again.)* Again on 2026-09-26, in the shape
 `waitForPodRecreated` was written for on 2026-08-22 (`TestE2E_NoSentinel_MasterKill_NoSplitBrain`,
 `cea8222`): `TestE2E_SidecarFailoverDrainMaster` waited, after deleting the master, on
 conditions the terminating old master already met (kubelet keeps it Ready, ADR 0026) — vacuous
@@ -763,8 +765,13 @@ sentences are repeated here so nothing is changed without them.
    recorded before anything is demoted; two are ambiguous and demote nobody. A refusal emits no
    Event — `MultipleMasters` and the 90 s `SplitBrainDetected` already carry it — and it
    deliberately re-enters the deadlock the resolver exists to break, which is safe only because
-   every state that names an authority is bounded.
-   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md)
+   every state that names an authority is bounded. **The veto binds every `REPLICAOF` fan-out,
+   not only the resolver**: `forceReplicaConnections`, and the topology restoration, which
+   promotes pod-0 back only while it holds keys or no pod it re-points holds any — a synced
+   link proves only that pod-0 copied its upstream, and CI lost a dataset to an upstream that
+   had come back empty (decided 2026-10-11).
+   → [ADR 0028](docs/adr/0028-a-demotion-may-not-discard-the-only-dataset.md),
+   [ADR 0037](docs/adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D4, D9
 
 ## Provenance before every write and every delete
 

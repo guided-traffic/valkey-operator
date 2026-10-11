@@ -149,6 +149,13 @@ on the vulnerability alone and would have stayed red after #246 merged, because 
 rebased a conflicted branch. One of them, #247, bumped the Containerfile's `golang` image without
 `go.mod` and the workflows, a duplicate of #246 opened by a second manager.
 
+Amended 2026-10-11, the same day: **D50's abandon instance moves its jam onto the promoted
+replica.** The Go version PR failed its Valkey 9 leg twice, each time on another e2e:
+`TestE2E_RollingUpdate_TopologyRestoreAbandoned` missed the window its pod-0 jam needs, the
+residual risk D50 had recorded; the other run was a real dataset loss in the topology
+restoration, fixed by [ADR 0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
+D9 and not a test defect.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -568,14 +575,30 @@ commit and the k8s patch release that adopts it.
 
 **D50 — An e2e that forces a transient state pins the object identity it acts on, never a
 state name.** A rolling-update state annotation names a *phase*, and a phase spans more than
-one generation of the pod it is about. `jamPod0Replication` therefore waits for the pod-0 that
+one generation of the pod it is about. ~~`jamPod0Replication` therefore waits for the pod-0 that
 runs the **new** image and carries no `deletionTimestamp` -- the outgoing master still runs the
 old one -- and reads the poisoned `masterauth` back rather than trusting the two `OK`s, because
-a pod replaced between the two commands answers `OK` from the process that is going away.
+a pod replaced between the two commands answers `OK` from the process that is going away.~~
+*(Superseded 2026-10-11, see the amendment below: the jam moved to the promoted replica.)*
 Runtime `CONFIG SET` does not survive a pod replacement, so a jam that lands one second early
 is silently discarded, Phase 1 then finds a healthy link on the replacement, and the test fails
 on `TopologyRestored=True`/`Restored` having never entered the path it exists to cover
 (measured on runs 35312304295, 35315129844 and 35317540380).
+
+*(Amended 2026-10-11: the abandon jam sits on the other end of the link.)* The identity gate
+closed one way to miss the window and left the other: a jam on pod-0 has to land between the
+returning pod-0's start and Phase 1 seeing a healthy link, and run 37881026168 missed those
+seconds — "never came back as a replica … while the manual failover was in flight", the abandon
+path never entered. `jamSyncFromPromotedReplica` now jams pod-1, the replica the roll is about to
+promote: `repl-diskless-sync-delay` 3600 (with diskless sync and an unset replica threshold set
+again), so the promoted master holds every full sync it is asked for. The gate is identity, as
+above — the pod-1 on the new image with no `deletionTimestamp`, which the roll promotes and never
+replaces again — and the value is read back. The setting is master-side and inert while pod-1 is
+still a replica, so the jam has from pod-1's return until pod-0's first sync request after the
+failover to land, a window holding pod-1's own full sync, the operator's `WAIT` and the
+replacement of pod-0. The role pod-1 answered when the jam landed is logged. The last subtest
+waits for pod-0's replacement by UID before it lifts the jam, or the outgoing pod-0 could finish
+its own sync while terminating and answer the gates that follow.
 
 **The general rule is the one the four failures teach:** where a fixture manipulates a pod the
 operator is concurrently replacing, "which pod" is part of the assertion and has to be
@@ -1375,6 +1398,17 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   D50 records it on CI legs, and it passed in both local full-suite runs of 2026-09-26 (Kind,
   Valkey 9 and Valkey 8) *(and in both on the last image of that day, Status)*. A premise that does not bite fails loudly at the
   `TopologyRestored=False` wait and cannot pass falsely, so those passes are the measurement.
+  *(Amended 2026-10-11: the premise is now the D50 amendment's — a master running
+  `repl-diskless-sync-delay` 3600 holds the full sync a replica asks it for. Run on Kind
+  (Kubernetes 1.36.1, the local cluster of 2026-09-26) on that day's code, once per Valkey line
+  and alone with the split-brain e2e: green on both, the jam landing while pod-1 still answered
+  `role:slave`, Phase 1 giving up after 82–86 s, and pod-0 at the abandon reporting
+  `master_link_status:down`, `master_sync_in_progress:0`, `master_last_io_seconds_ago:-1` on
+  Valkey 9.1.1 — the replica waits in the handshake, not in a transfer. Not run: a CI leg and a
+  full suite on this fixture. The split-brain e2e of
+  [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) passed in the same two runs,
+  but neither reached the shape ADR 0037 D9 closes: pod-0 was promoted back 13 s after it was
+  re-pointed, when the data had already reached it.)*
 * **No automated rule forbids a new `testing.Short()` gate** — D3 rests on convention plus a
   grep.
 * **The "never observed" retry branch of the eviction assertion has never been exercised** by a
@@ -1411,11 +1445,16 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   now zero. A test that failed intermittently needs a green streak, not one green run, and the
   streak is what CI will or will not produce. *(The 2026-09-26 instance of the D50 amendment
   has the same limit: 8 green runs of the fixed test on one host.)*
-* **D50 leaves the window itself intact.** The jam still has to land between pod-0 becoming
+* ~~**D50 leaves the window itself intact.** The jam still has to land between pod-0 becoming
   Ready and Phase 1 observing a healthy link -- roughly ten seconds in the runs measured. It is
   now the *only* window rather than one of two, and the read-back makes a missed jam retry
   instead of pass, but a sufficiently slow `kubectl exec` can still miss it and would then fail
-  on the `jamPollTimeout` with a message naming the image, not on a confusing `Restored`.
+  on the `jamPollTimeout` with a message naming the image, not on a confusing `Restored`.~~
+  *(Closed 2026-10-11 by moving the jam to the promoted replica, D50 amended: it missed the
+  window once more, on CI run 37881026168.)* What is left: a jam that lands on pod-1 after pod-0
+  has already started its sync from it does not hold that sync, and the test then fails at the
+  `TopologyRestored=False` wait — loudly, never green. The logged role says whether that was
+  the cause.
 
 * **D49's `govulncheck` pin freezes what CI scans with.** It ran `@latest` before, so the
   scanner now advances only when Renovate bumps `GOVULNCHECK_VERSION`. The vulnerability
@@ -1509,7 +1548,7 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`test/integration/`](../../test/integration/) — envtest suites, including the UID delete-precondition test
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
 * `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
-* [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamPod0Replication` and the D50 identity gate
+* [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamSyncFromPromotedReplica` and the D50 identity gate (`jamPod0Replication` until 2026-10-11)
 * [`test/e2e/sidecar_test.go`](../../test/e2e/sidecar_test.go) — `TestE2E_SidecarFailoverDrainMaster`, the second D50 instance (2026-09-26); `waitForPodRecreated` lives in [`e2e_test.go`](../../test/e2e/e2e_test.go)
 * [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
 * [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`; `rebaseWhen` (D56), the disabled `dockerfile` `golang` dependency (D57) and the Makefile regex manager that accepts a pseudo-version (D58)

@@ -40,7 +40,7 @@ of the delete of the outgoing master. It does something different at each:
 | Wait | On timeout |
 |------|------------|
 | A replaced replica syncing from the master, before the next pod is replaced | The wait ends and is **reported** (`RollingUpdatePaused` condition, phase `Error` only until the next status write, normally later in the same pass *(corrected 2026-09-27: this said "for that pass")*). It is a report, not a halt: the pass clears the rolling-update state, so a later pass that still finds outdated pods starts the state machine again on a fresh `syncTimeout` budget, and the phase returns to `OK` as soon as the cluster is Ready. A spec change restarts the roll from the beginning. |
-| The former master (pod-0) syncing back after the failover, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
+| The former master (pod-0) syncing back after the failover, and holding keys when another pod does, before it is promoted again | The restoration is **abandoned**: the promoted replica stays master and the update finishes (`TopologyRestored=False`). |
 | A pod the roll waits on that exists, is not being deleted and does not become available — an unpullable image, a container that crashes at boot, a request no node can schedule, a data volume the [`check-data-writable` pre-flight](persistence.md#the-data-writable-pre-flight) refuses | The wait **continues** and is **reported** (`PodAvailabilityStalled`, naming the pod; its message and what retracts it are in [status.md](status.md#podavailabilitystalled)). The budget is measured from the pod's own clock — when its `Ready` condition last turned false, or its creation if it has never been Ready (no `Ready` condition yet, or only the `Ready=False` kubelet stamps at its first status sync of the pod) — so neither an operator restart nor the moment a long-`Pending` pod is finally scheduled resets it. Nothing is deleted for it: a pod on the current spec comes back identical. Past the budget the reconcile pass stops ending on the wait, so the status write runs again; on a Sentinel cluster a holding data tier holds the Sentinel roll too, because both tiers run `spec.image` ([ADR 0026](../adr/0026-a-pod-being-deleted-is-not-available.md) D11). |
 | On a Sentinel cluster, the handover checks on the new master, the replicas on the current spec and the pod about to be deleted, before the outgoing master is deleted | The delete stays **held** and is **reported** (`MasterHandoverStalled`, one Warning Event). No timeout releases the delete and the roll is not paused: the rolling-update state is kept, the reconcile pass stops ending on the wait so the status write runs again, and the Sentinel roll waits for the data tier. The checks, the reasons and the repair are [below](#the-delete-of-the-outgoing-master-is-held-never-timed-out). |
 
@@ -49,6 +49,12 @@ of the delete of the outgoing master. It does something different at each:
 The second case never force-promotes pod-0. An unsynced pod-0 would come up as an
 empty master and discard every write the promoted replica accepted since the
 failover, so the operator gives up the canonical topology rather than the data.
+A synced pod-0 is not enough either: it has copied the pod it replicates, and that pod
+can itself have come back empty — the promoted replica restarted without persistence
+while another pod took over the data. The operator therefore promotes pod-0 back only
+while it holds keys, or while no pod it would re-point at it holds any; until then it
+waits on the same budget
+([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) D9).
 The cluster stays fully usable — the `-rw`/`-r` Services select the master by
 label, not by ordinal. Raise `syncTimeout` for large datasets whose initial sync
 does not fit in five minutes.
