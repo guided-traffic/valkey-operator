@@ -140,6 +140,15 @@ coverage targets, `make test-image-tools` and `make test-release-tooling` — ar
 from a clean-copy run on the code **before** the clock, the single write and the D50 fix. Their
 rerun on the final code had not finished when this was written, and nothing here claims it.
 
+Amended 2026-10-11: **D56 to D58 are new.** Go 1.27.2 fixed nine standard-library
+vulnerabilities, and from the day they were published every pull request failed the required
+`Vulnerability Check`, because CI scans with the Go version on `main`. Only Renovate's Go version
+PR (#246) could clear that, and it failed `GoSec Security Scan` itself: gosec v2.29.0 cannot read
+the export data Go 1.27.2 writes. The four other Renovate PRs of the week (#247 to #250) were red
+on the vulnerability alone and would have stayed red after #246 merged, because Renovate only
+rebased a conflicted branch. One of them, #247, bumped the Containerfile's `golang` image without
+`go.mod` and the workflows, a duplicate of #246 opened by a second manager.
+
 ## Context
 
 Three things happened in this repo that shaped every rule below.
@@ -1064,6 +1073,40 @@ and nothing rolled in the 90 s after the second roll. *(Green again 2026-09-26 f
 last image of the day, with ADR 0025 D9's clock and ADR 0010 D14's single failover write.)* Still
 a local run on one host; it is not a CI job.
 
+### Renovate's pull requests ([`renovate.json`](../../renovate.json))
+
+**D56 — An automerge PR that has fallen behind `main` is rebased, so a red that `main` caused is
+re-tested once `main` is fixed.** `rebaseWhen` is `auto`: Renovate rebases a branch when it
+conflicts, and an automerge branch also when it is behind its base. A required check can be red
+for a reason that lives on `main` rather than in the PR — the vulnerability scan above, which
+runs with `main`'s Go — and a pull-request run is pinned to the merge commit it was triggered
+on, so re-running it re-tests the old base. With `conflicted`, the only events that ran CI
+again were a conflict, a newer upstream version, or someone ticking the rebase box. A green
+automerge PR merges as soon as its checks pass, so the PRs this rebases are the red and the
+pending ones; non-automerge PRs (majors, npm) keep rebasing on conflict only.
+
+**D57 — The Go builder image belongs to the Go version group alone.** The Containerfile's
+`FROM golang:<version>-alpine` is updated by the group's custom manager, together with
+`go.mod`, the workflows' `GO_VERSION` and the release-template badge; the `dockerfile` manager is
+disabled for the `golang` image. It extracted the same line a second time and opened its own PR,
+which moves the build image while CI keeps testing and scanning with the old Go: on a Go release
+that fixes a vulnerability that PR cannot pass, and once the group has merged it is empty. The
+runtime base image stays with the `dockerfile` manager.
+
+**D58 — A Makefile tool may run on an upstream commit until its next release, and the pin says
+so.** The Makefile regex manager accepts a Go pseudo-version (`vX.Y.Z-0.<time>-<commit>`) as
+well as a release. Semver orders the pseudo-version above the release it is based on and below
+the next one, so Renovate proposes the next release on its own and no hand has to remember the
+commit. `GOSEC_VERSION` is the first such pin: gosec v2.29.0, the latest release, is built
+against `golang.org/x/tools` v0.49.0, whose export-data reader stops at version 4, and Go 1.27.2
+writes version 5 (`PreserveMethodOrder`, x/tools v0.50.0). Every package then failed to load,
+gosec reported 0 issues and exited non-zero, and `GoSec Security Scan` was red on the Go version
+PR alone. The commit pinned, `7b1b5cebe007`, is upstream's own "Update to go version 1.27.2",
+built against x/tools v0.51.0. The pin is chosen only when a release cannot run on the Go CI
+moves to; it is never a way to take unreleased rules early. The comment above the variable
+names the reason, and the regex has to see the `# renovate:` line directly above the variable,
+so the comment goes above that line.
+
 ## Consequences
 
 * Every fix costs an extra build-and-run cycle for the mutation check, and the result is
@@ -1131,6 +1174,14 @@ a local run on one host; it is not a CI job.
   than the 253 s recorded for its first version. ~~How much longer has not been measured~~
   *(measured 2026-09-26, one run on the ~~final~~ pre-clock image, Status: 288 s)*; the `make` target's 45 min timeout
   was not changed.
+* **Every Renovate run may restart CI on every open automerge PR (D56).** A rebase is a push,
+  so each red or pending automerge PR behind `main` costs a full pipeline, three E2E legs
+  included, once per Renovate run that finds `main` moved. A PR that is red for its own reason
+  pays that daily until it is fixed or closed.
+* **gosec runs unreleased code (D58)**, with whatever rules upstream merged between v2.29.0 and
+  the commit. On this tree that commit reported 0 issues, as v2.29.0 did on Go 1.27.1; a rule
+  that starts reporting on a later commit arrives only through a Renovate PR, which goes red on
+  it like any other gate.
 
 ## Alternatives Considered
 
@@ -1249,6 +1300,31 @@ Rejected: the conflict is inside `apimachinery`'s own source, which constructs a
 from what kube-openapi now returns as `v7`. No version selection in this module can reconcile
 that; only a kube-openapi digest from apimachinery's own compatibility window can.
 
+### Keep `rebaseWhen: conflicted` and tick the rebase box by hand
+
+Rejected: the stalled state is invisible until somebody looks, and it is the normal shape of a
+Go security release, not a rare one. Every standard-library fix turns every open PR red at once,
+and only the one PR that carries the fix can turn green on its own.
+
+### Make the Vulnerability Check non-blocking on pull requests
+
+Rejected: it is the gate that stops a vulnerable toolchain from shipping, and it is red for the
+right reason. D56 removes the stall the red causes, not the red.
+
+### Wait for the next gosec release, or build v2.29.0 against a newer x/tools
+
+Waiting rejected: it holds the Go security fix, and with it every other Renovate PR, for as long
+as upstream takes. Building v2.29.0 in a tools module of its own with x/tools raised by MVS
+rejected for now: `go install pkg@version` ignores any requirement outside the tool's own
+`go.mod`, so it needs a second `go.mod` beside the Makefile, Renovate would open a PR for each
+of gosec's indirect dependencies there, and the binary's path would no longer carry everything
+that changes it (D49). The pseudo-version is one line that Renovate retires on its own.
+
+### Put the `golang` image of the `dockerfile` manager into the Go version group
+
+Rejected: two managers would then rewrite the same line in one branch. Disabling the
+duplicate leaves one owner per line, which is what the custom managers were written to be.
+
 ### Assert the Pod Security profile as hand-written field checks
 
 Rejected for the admission question (D52): a restatement is exactly what a reader has to trust,
@@ -1264,6 +1340,18 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 
 ## Residual risks
 
+* **D56 to D58 rest on Renovate's documented behaviour and an offline check, not on a run of
+  this repository's Renovate** (recorded 2026-10-11). Verified: `renovate.json` passes
+  `renovate-config-validator` (Renovate 41); the Makefile regex, run as its Python equivalent
+  over the Makefile, captures every pinned tool exactly as before and the whole gosec
+  pseudo-version, where the old pattern stopped at `v2.29.1` and a later update would have kept
+  the commit suffix behind the new version; npm `semver` orders that pseudo-version above v2.29.0
+  and below v2.29.1 and v2.30.0; gosec at the pinned commit loads every package of this tree under
+  Go 1.27.2 and reports 0 issues, where v2.29.0 failed 199 imports with "export data version 5 is
+  greater than maximum supported version 4". Not verified: that `rebaseWhen: auto` rebases the
+  behind automerge PRs on the next run, that Renovate closes the `golang` image PR once the
+  `dockerfile` rule disables it, and that the `go` datasource takes the pseudo-version as a
+  current value without complaint.
 * **The drift guard sees only a vocabulary (D42).** `shellCommandCatalog` covers the
   coreutils and busybox applets a container script realistically uses. A generated script
   that calls something outside it is not noticed, and the image check then never asks for
@@ -1424,7 +1512,8 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamPod0Replication` and the D50 identity gate
 * [`test/e2e/sidecar_test.go`](../../test/e2e/sidecar_test.go) — `TestE2E_SidecarFailoverDrainMaster`, the second D50 instance (2026-09-26); `waitForPodRecreated` lives in [`e2e_test.go`](../../test/e2e/e2e_test.go)
 * [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
-* [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`
+* [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`; `rebaseWhen` (D56), the disabled `dockerfile` `golang` dependency (D57) and the Makefile regex manager that accepts a pseudo-version (D58)
+* [`Makefile`](../../Makefile) — `GOSEC_VERSION`, the D58 pin, and the comment above its `# renovate:` line
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the decision table these tests are written against

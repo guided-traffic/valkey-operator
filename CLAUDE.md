@@ -406,6 +406,18 @@ pseudo-versioned with no release branches, and advancing it past the commit wher
 `k8s-go-modules` group, which is the only version of them that was ever supported.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D47, D48
 
+### Renovate keeps its own PRs moving
+
+A Go release that fixes a vulnerability turns `Vulnerability Check` red on every open PR, and
+only the Go version group can turn it green. **An automerge PR behind `main` is rebased**
+(`rebaseWhen: auto`), so the others are re-tested once the group has merged; re-running a
+failed job re-tests the old merge commit and fixes nothing. **The `golang` builder image moves
+with the Go version group only** — the `dockerfile` manager is disabled for it, because its
+duplicate PR could never pass alone. **A Makefile tool may sit on an upstream pseudo-version**
+when its last release cannot run on the Go CI moves to (gosec v2.29.0 cannot read Go 1.27.2's
+export data); the regex accepts it and Renovate replaces it with the next release.
+→ [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D56, D57, D58
+
 ### E2E cluster topology
 
 CI runs the E2E job three times, as a matrix in `.github/workflows/release.yml`:

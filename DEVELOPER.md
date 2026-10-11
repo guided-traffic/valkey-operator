@@ -265,9 +265,9 @@ not do for you:
 
 | What | Where the literal lives | What moves it |
 |---|---|---|
-| Go | `go.mod` (`go 1.27.1`), `Containerfile` (`FROM golang:1.27.1-alpine`), `GO_VERSION` in `.github/workflows/release.yml` and `build.yml` | Renovate, one group "Go version": custom regex managers for each of these files, minor and patch automerged, major reviewed by hand. `golang.org/x/*` modules ride the same group |
+| Go | `go.mod` (the `go` directive), `Containerfile` (`FROM golang:<version>-alpine`), `GO_VERSION` in `.github/workflows/release.yml` and `build.yml` | Renovate, one group "Go version": custom regex managers for each of these files, minor and patch automerged, major reviewed by hand. `golang.org/x/*` modules ride the same group. The `dockerfile` manager is disabled for the `golang` image, so the builder image moves with the group and never in a PR of its own ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D57) |
 | Go badge | `.github/release-template.hbs` (`go-1.26`, major.minor) | The same group. The file is referenced by nothing but `renovate.json`, and its badge lags `go.mod`; why Renovate has not moved it was not verified |
-| Pinned Go tools | the `*_VERSION` variables in the [Makefile](Makefile), each under a `# renovate:` comment | Renovate's Makefile regex manager. The regex captures only values starting with `v`, so `ENVTEST_VERSION ?= release-0.19` is not matched (read from the regex, not observed) |
+| Pinned Go tools | the `*_VERSION` variables in the [Makefile](Makefile), each directly under a `# renovate:` comment | Renovate's Makefile regex manager. The regex captures a value starting with `v` and a digit, so `ENVTEST_VERSION ?= release-0.19` is not matched (read from the regex, not observed). A value may be a Go pseudo-version, which Renovate replaces with the next release: `GOSEC_VERSION` runs on an upstream commit because gosec v2.29.0 cannot load packages built by Go 1.27.2 ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D58) |
 | envtest API server | `ENVTEST_K8S_VERSION = 1.29.0` in the Makefile | nothing automatic |
 | CI cluster | `KUBERNETES_VERSION: '1.33.4'` (Kind node image and kubectl) and the Kind `version: v0.33.0` input in `release.yml`; Helm `v4.3.0` in both workflows | no custom manager in `renovate.json` names them; ~~whether Renovate's github-actions manager moves the action inputs was not verified~~ *(corrected 2026-09-27)* Renovate moves the Kind and Helm inputs anyway — bot commits `795d332` (Kind `v0.30.0` → `v0.33.0`, `release.yml`) and `d3e731f` (Helm `v4.2.4` → `v4.3.0`, both workflows) — so a built-in manager extracts them, which one the commits do not record; `KUBERNETES_VERSION` is moved by nothing, last changed by hand in `0a90483` |
 | cert-manager | v1.17.2 in the Makefile (`cert-manager-install`) and in `release.yml` | nothing automatic |
@@ -324,7 +324,11 @@ with the latter would not start the next workflow. That next workflow is
 A green pull request therefore proves nothing about the published image or chart.
 
 `.github/workflows/renovate.yml` runs self-hosted Renovate daily at 02:00 Europe/Berlin, or on
-demand, with [renovate.json](renovate.json).
+demand, with [renovate.json](renovate.json). An automerge PR that has fallen behind `main` is
+rebased on the next run, so a check that was red because of `main` (a Go release fixing a
+vulnerability turns every open PR's `Vulnerability Check` red) is re-tested once `main` carries the
+fix ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D56). Re-running a failed job does not do
+that: the run stays on the merge commit it was started for.
 
 ## Adding things
 

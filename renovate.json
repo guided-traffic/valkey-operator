@@ -19,7 +19,7 @@
   "prConcurrentLimit": 0,
   "prHourlyLimit": 0,
   "branchConcurrentLimit": 0,
-  "rebaseWhen": "conflicted",
+  "rebaseWhen": "auto",
   "postUpdateOptions": [
     "gomodTidy",
     "gomodUpdateImportPaths"
@@ -68,6 +68,16 @@
         "dependencies",
         "major-update"
       ]
+    },
+    {
+      "description": "Go version: the golang builder image in the Containerfile moves with the Go version group alone, through its custom manager. The dockerfile manager extracted the same line as a second dependency and opened its own PR, which bumps the image without go.mod and the workflows' GO_VERSION. When the Go release fixes a vulnerability, that PR cannot pass, because CI still scans with the old Go; once the group has merged it is empty (docs/adr/0017-test-and-ci-policy.md, D57).",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchDepNames": [
+        "golang"
+      ],
+      "enabled": false
     },
     {
       "description": "Go modules: enable updates for indirect dependencies so transitive security patches (e.g. golang.org/x/net via govulncheck) land without waiting for a direct require to bump",
@@ -291,13 +301,13 @@
   ],
   "customManagers": [
     {
-      "description": "Update Go tool versions pinned in Makefile via renovate comments",
+      "description": "Update Go tool versions pinned in Makefile via renovate comments. The value may be a release or a Go pseudo-version (vX.Y.Z-0.<time>-<commit>), which semver orders below the next release, so a tool pinned to an upstream commit moves onto that release on its own (docs/adr/0017-test-and-ci-policy.md, D58).",
       "customType": "regex",
       "managerFilePatterns": [
         "/^Makefile$/"
       ],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\n.+\\?=\\s*(?<currentValue>v[\\d.]+)"
+        "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\n.+\\?=\\s*(?<currentValue>v\\d[^\\s]*)"
       ],
       "versioningTemplate": "semver"
     },
