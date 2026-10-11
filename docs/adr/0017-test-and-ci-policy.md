@@ -88,6 +88,14 @@ ships it in the 15.0.0 prereleases (`15.0.0-beta.3`: writer `^9.0.0`, preset `^1
 stable release yet, and Renovate's preset 10 PR had been red on `release-tooling` since
 2026-09-25. The generator is now pinned to that prerelease and the preset is on 10.x.
 
+Amended 2026-10-11, later the same day: **D46 gains a fourth rule, and the third an override.**
+The first release after that change failed (run 38127911751, `generateNotes`: `Missing helper`)
+although `release-tooling` had passed on its PR: semantic-release 25 depends on the generator
+`^14.1.0`, npm nested a 14.1.1 under `node_modules/semantic-release`, and semantic-release loads a
+plugin from its own install before the project's, so the release rendered with 14.1.1 and writer@8
+while the check had imported the pinned 15.0.0-beta.3 from the project root. Release 1.14.7 was held
+until the fix.
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -851,7 +859,16 @@ committed lockfile.** Three rules:
   `@semantic-release/commit-analyzer` stays on 13.x: it loads the preset with parser 6 and
   classified the synthetic commit set correctly, so its 14.0.0 prerelease is not needed. A
   preset or generator PR that goes red in `release-tooling` still means the set does not work,
-  and it is still not worked around.
+  and it is still not worked around. *(Amended 2026-10-11:)* `package.json` overrides the
+  generator everywhere in the tree with the version of the direct pin
+  (`"$@semantic-release/release-notes-generator"`), so semantic-release's own `^14.1.0` cannot
+  keep a second, older copy beside it; the override follows the pin, and Renovate moves only the
+  pin.
+* *(Added 2026-10-11.)* **The check loads each plugin the way semantic-release does** — from
+  semantic-release's own install first, from the project only when that finds nothing — and
+  prints the version and path it rendered with. A check that imports the plugins from the
+  project root tests the pin, not what the release job runs, and passed on the set that failed
+  the release above.
 
 ### The rootless posture ([ADR 0032](0032-generated-pods-run-rootless.md))
 
@@ -1389,10 +1406,18 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   the commit suffix behind the new version; npm `semver` orders that pseudo-version above v2.29.0
   and below v2.29.1 and v2.30.0; gosec at the pinned commit loads every package of this tree under
   Go 1.27.2 and reports 0 issues, where v2.29.0 failed 199 imports with "export data version 5 is
-  greater than maximum supported version 4". Not verified: that `rebaseWhen: auto` rebases the
+  greater than maximum supported version 4". ~~Not verified: that `rebaseWhen: auto` rebases the
   behind automerge PRs on the next run, that Renovate closes the `golang` image PR once the
   `dockerfile` rule disables it, and that the `go` datasource takes the pseudo-version as a
-  current value without complaint.
+  current value without complaint.~~ *(Verified 2026-10-11, in the first Renovate run after the
+  change, run 38118976808, dispatched by hand right after #246 merged: "Branch updated" on #248,
+  #249 and #250, the three automerge PRs behind `main`, whose rerun CI then passed and merged
+  them; "Autoclosing PR" on #247, the `golang` image PR — which of D57's rule and the bump
+  already being on `main` made it obsolete, an info-level log does not say; and no lookup
+  failure for the gosec pin, the only one logged being `aquasecurity/trivy-action`'s digest, as on
+  runs before the change. The same run opened #252, govulncheck v1.8.0 to v1.9.0, from the
+  Makefile manager, so the widened pattern still moves a released pin. Still not observed: the
+  gosec pseudo-version replaced by a release, which needs the release.)*
 * **The drift guard sees only a vocabulary (D42).** `shellCommandCatalog` covers the
   coreutils and busybox applets a container script realistically uses. A generated script
   that calls something outside it is not noticed, and the image check then never asks for
@@ -1422,8 +1447,10 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   and alone with the split-brain e2e: green on both, the jam landing while pod-1 still answered
   `role:slave`, Phase 1 giving up after 82–86 s, and pod-0 at the abandon reporting
   `master_link_status:down`, `master_sync_in_progress:0`, `master_last_io_seconds_ago:-1` on
-  Valkey 9.1.1 — the replica waits in the handshake, not in a transfer. Not run: a CI leg and a
-  full suite on this fixture. The split-brain e2e of
+  Valkey 9.1.1 — the replica waits in the handshake, not in a transfer. ~~Not run: a CI leg and a
+  full suite on this fixture.~~ *(Run since: the CI of #251, run 38118996335, Kubernetes 1.33.4,
+  green on all three legs — the full suite on both single-node legs, Valkey 9 and Valkey 8, the
+  abandon e2e among it.)* The split-brain e2e of
   [ADR 0028](0028-a-demotion-may-not-discard-the-only-dataset.md) passed in the same two runs,
   but neither reached the shape ADR 0037 D9 closes: pod-0 was promoted back 13 s after it was
   re-pointed, when the data had already reached it.)*

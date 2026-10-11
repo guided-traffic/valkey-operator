@@ -389,7 +389,11 @@ conventional-changelog-writer@9 — a red Renovate PR for preset 10.x is the sig
 upstream is still incompatible.~~ *(Re-decided 2026-10-11:)* the preset is on 10.x with the
 generator pinned to `15.0.0-beta.3`, the first release shipping writer@9; the commit analyzer
 stays on 13.x. A red `release-tooling` on a preset or generator PR still means the set does not
-work.
+work. **semantic-release loads a plugin from its own install before the project's**, so its own
+dependency on the generator (`^14.1.0`) won over the pin and the first release on preset 10
+failed while the check was green: `package.json` now overrides the generator to the pinned
+version tree-wide, and the check resolves every plugin the way semantic-release does and prints
+the copy it used.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46
 
 ### A gate job that is not required is not a gate
