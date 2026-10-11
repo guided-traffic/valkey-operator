@@ -383,10 +383,13 @@ job installs npm dependencies. `make test-release-tooling`
 ([`hack/verify-release-tooling.mjs`](hack/verify-release-tooling.mjs)) renders release notes
 through the plugin config in `.releaserc.json` and fails on a throw **and** on silently
 missing sections; the `release-tooling` CI job runs it on every PR, and the `semantic-release`
-job depends on it. `package-lock.json` is committed, both jobs use `npm ci`, and the preset
+job depends on it. `package-lock.json` is committed and both jobs use `npm ci`. ~~The preset
 stays on the 9.x line until `@semantic-release/release-notes-generator` ships
 conventional-changelog-writer@9 — a red Renovate PR for preset 10.x is the signal that
-upstream is still incompatible.
+upstream is still incompatible.~~ *(Re-decided 2026-10-11:)* the preset is on 10.x with the
+generator pinned to `15.0.0-beta.3`, the first release shipping writer@9; the commit analyzer
+stays on 13.x. A red `release-tooling` on a preset or generator PR still means the set does not
+work.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46
 
 ### A gate job that is not required is not a gate
