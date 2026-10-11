@@ -52,8 +52,14 @@ ENVTEST_VERSION ?= release-0.19
 GOLANGCI_LINT_VERSION ?= v2.14.0
 # renovate: datasource=go depName=github.com/fzipp/gocyclo/cmd/gocyclo
 GOCYCLO_VERSION ?= v0.6.0
+# gosec runs on an upstream commit until the release after v2.29.0. That release
+# is built against golang.org/x/tools v0.49.0, which reads export data up to
+# version 4; Go 1.27.2 writes version 5 (x/tools v0.50.0), so every package
+# failed to load and the scan failed without a finding. The pseudo-version is
+# semver, and Renovate moves it onto the next release like any other pin
+# (docs/adr/0017-test-and-ci-policy.md, D58).
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.29.0
+GOSEC_VERSION ?= v2.29.1-0.20261009120814-7b1b5cebe007
 # renovate: datasource=go depName=golang.org/x/vuln/cmd/govulncheck
 GOVULNCHECK_VERSION ?= v1.8.0
 
