@@ -276,7 +276,9 @@ identity, never by controller state.** A rolling-update state annotation names a
 phase outlives the pod it is about: the abandon e2e jammed pod-0 on "state is one of three
 values and pod-0 answers `role:slave`", which the *outgoing* master also satisfies for the one
 second between the demote and the delete — runtime `CONFIG SET` dies with that pod, and the
-test failed on four runs in ten days, each on a different leg. Again on 2026-09-26, in the shape
+test failed on four runs in ten days, each on a different leg. *(Since 2026-10-11 that jam sits
+on the replica the roll promotes — `repl-diskless-sync-delay`, gated on the new image — because
+a jam on the returning pod-0 still had only seconds to land and missed them again.)* Again on 2026-09-26, in the shape
 `waitForPodRecreated` was written for on 2026-08-22 (`TestE2E_NoSentinel_MasterKill_NoSplitBrain`,
 `cea8222`): `TestE2E_SidecarFailoverDrainMaster` waited, after deleting the master, on
 conditions the terminating old master already met (kubelet keeps it Ready, ADR 0026) — vacuous
