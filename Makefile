@@ -59,7 +59,7 @@ GOCYCLO_VERSION ?= v0.6.0
 # semver, and Renovate moves it onto the next release like any other pin
 # (docs/adr/0017-test-and-ci-policy.md, D58).
 # renovate: datasource=go depName=github.com/securego/gosec/v2/cmd/gosec
-GOSEC_VERSION ?= v2.29.1-0.20261009120814-7b1b5cebe007
+GOSEC_VERSION ?= v2.30.0
 # renovate: datasource=go depName=golang.org/x/vuln/cmd/govulncheck
 GOVULNCHECK_VERSION ?= v1.9.0
 
