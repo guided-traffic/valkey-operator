@@ -116,6 +116,10 @@ type ValkeyReconciler struct {
 	// in-memory copies of the rolling-update wait bounds, keyed by CR name plus
 	// a bound suffix (waitBoundKey). See the nudgeTracker type doc.
 	nudges nudgeTracker
+
+	// sentinelDivergence tracks since when each Sentinel pod has named another
+	// master than the data tier's (handleSentinelMasterDivergence, ADR 0040).
+	sentinelDivergence sentinelDivergenceTracker
 }
 
 // getInstanceChecker returns the configured InstanceChecker or creates a default one.
@@ -2513,6 +2517,7 @@ func (r *ValkeyReconciler) updateHAStatus(ctx context.Context, v *vkov1.Valkey, 
 		checker := r.getInstanceChecker()
 		clusterState := checker.CheckCluster(ctx, v)
 		r.recordSentinelPeerDrift(ctx, v, clusterState)
+		r.handleSentinelMasterDivergence(ctx, v, clusterState)
 
 		if clusterState.Error != nil {
 			v.Status.Phase = vkov1.ValkeyPhaseError

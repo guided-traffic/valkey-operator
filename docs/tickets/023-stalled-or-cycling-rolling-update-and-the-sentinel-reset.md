@@ -212,8 +212,12 @@ promotion ADR 0037 records); loop B re-opens ADR 0025 D9's 90 s split-brain wind
 `observeSentinels` ([`checker.go:295-345`](../../internal/health/checker.go#L295-L345)) runs only
 when every pod is Ready and a master was found
 ([`valkey_controller.go:2458-2462`](../../internal/controller/valkey_controller.go#L2458-L2462)),
-sends `SENTINEL MASTER` and keeps `num-other-sentinels` and whether `flags` is `master`.
-`SentinelPeersStale` (ADR 0022 D4, D5) looks only for a surplus (`staleSentinelPods`, `:2415-2424`).
+sends `SENTINEL MASTER` and keeps `num-other-sentinels`, whether `flags` is `master`, and the whole
+reply per pod (`ClusterState.SentinelMasters`). `SentinelPeersStale` (ADR 0022 D4, D5) looks only
+for a surplus (`staleSentinelPods`). A Sentinel that answers but names another master than the data
+tier's is ADR 0040's (`SentinelMasterDiverged`, and its pod is replaced), not this report's; that
+ADR also polls every healthy Sentinel cluster every 5 min, so Q8's recheck only has to cover the
+debounce.
 
 - **No monitor:** `ERR No such master` becomes a plain error
   ([`client.go:479-481`](../../internal/valkeyclient/client.go#L479-L481)) and the pod is skipped
@@ -348,8 +352,8 @@ Depending on the answers:
   in `updateHAStatus` beside `recordSentinelPeerDrift` with Q8's debounce and a 5 min recheck
   while True; condition, reasons and registry row (level, one evaluator); alert
   `ValkeySentinelMonitorDegraded` shaped like `ValkeyReconcileBlocked`, `for: 15m`, warning; ADR
-  0022 Residual risks (no report without a master or with a pod not Ready, no address comparison,
-  a restart restarts the clock); one sentence in CLAUDE.md's Sentinel section.
+  0022 Residual risks (no report without a master or with a pod not Ready, a restart restarts the
+  clock); one sentence in CLAUDE.md's Sentinel section.
 - Tests (`NewValkeyClientFn`, `fakeValkeyServer(t)`), each failing with its clause removed:
   `No such master` counts, a refused connection and an auth refusal do not; 0 peers raises; short
   replicas raise only with `AllSynced`; no answer writes nothing over `True`; a deficit seen once
@@ -489,8 +493,8 @@ A: the states worth reporting last until someone acts, so one bound late loses n
   Sentinel side is measured in docker only (no TLS, auth, CoreDNS, termination instead of pause).
 - Whether `:1049` completes in production (a fleet observation of peer tables 4/3/2 suggests not),
   and whether a data-tier-only roll's last pass reads a Sentinel inside the window on a cluster.
-- Whether anything depends on the routine all-Sentinel wipe, and that Sentinel's `ip` is the pod
-  FQDN in Kubernetes (Q4).
+- Whether anything depends on the routine all-Sentinel wipe (Q4). That Sentinel's `ip` is the pod
+  FQDN is measured on one TLS cluster on wds18 only.
 - The sidecar labeler trusting the first Sentinel (`labeler.go:135-141`) under a split `:958`
   reset; a forced failover during `-INPROG`; client impact per retrigger.
 - Whether the pause loses a sole master's drain stamp for adoption, lets the no-master recovery
