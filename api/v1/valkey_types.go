@@ -121,6 +121,14 @@ const (
 	// See docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md.
 	ConditionTypeSentinelPeersStale ConditionType = "SentinelPeersStale"
 
+	// ConditionTypeSentinelMasterDiverged reports that at least one Sentinel names
+	// another master than the pod the data tier answers master from. Such a Sentinel
+	// neither confirms that master's failure nor votes on its failover, and it hands
+	// the wrong address to every client that asks it. The operator replaces the pod
+	// of one that keeps doing so outside a rolling update.
+	// See docs/adr/0040-a-sentinel-that-names-another-master-is-replaced.md.
+	ConditionTypeSentinelMasterDiverged ConditionType = "SentinelMasterDiverged"
+
 	// ConditionTypeSentinelUpdatePending reports that the Sentinel tier is being
 	// rolled: at least one Sentinel pod runs a spec older than the Sentinel
 	// StatefulSet template, or a replacement pod is not Ready yet. The data tier

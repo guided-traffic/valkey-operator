@@ -651,6 +651,77 @@ func TestCheckCluster_CarriesSentinelPeerCounts(t *testing.T) {
 	assert.Equal(t, 2, state.SentinelPeers["test-sentinel-2"])
 }
 
+// sentinelMasterReplyNaming is a SENTINEL MASTER reply that names host as the master.
+func sentinelMasterReplyNaming(host, flags string) string {
+	return respArray("name", "mymaster", "ip", host, "port", "6379",
+		"flags", flags, "num-slaves", "2", "quorum", "2", "num-other-sentinels", "2")
+}
+
+// The master each Sentinel names rides on the same reply as its peer count, and a
+// Sentinel that names another one is kept as it answered -- that difference is the
+// whole signal of ADR 0040.
+func TestObserveSentinels_KeepsTheMasterEachSentinelNames(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+	master := "test-0.test-headless.default.svc.cluster.local"
+	replica := "test-2.test-headless.default.svc.cluster.local"
+
+	router := newProbeRouter()
+	router.serve(t, "test-sentinel-0", answers(sentinelMasterReplyNaming(master, "master")))
+	router.serve(t, "test-sentinel-1", answers(sentinelMasterReplyNaming(master, "master")))
+	router.serve(t, "test-sentinel-2", answers(sentinelMasterReplyNaming(replica, "s_down,master")))
+
+	observed := router.install(newFakeChecker()).observeSentinels(ctx, v)
+
+	require.Len(t, observed.masters, 3)
+	assert.Equal(t, master, observed.masters["test-sentinel-0"].IP)
+	assert.Equal(t, "6379", observed.masters["test-sentinel-0"].Port)
+	assert.Equal(t, replica, observed.masters["test-sentinel-2"].IP)
+	assert.Equal(t, "s_down,master", observed.masters["test-sentinel-2"].Flags)
+	assert.Len(t, router.dialedAddrs(), 3, "one dial per sentinel, the master included")
+}
+
+func TestCheckCluster_CarriesSentinelMastersAndMasterCandidates(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+	master := "test-0.test-headless.default.svc.cluster.local"
+
+	router := newProbeRouter()
+	router.serve(t, "test-0", answers(masterInfo(2)))
+	router.serve(t, "test-1", answers(replicaInfo()))
+	router.serve(t, "test-2", answers(replicaInfo()))
+	for i := 0; i < 3; i++ {
+		router.serve(t, fmt.Sprintf("test-sentinel-%d", i), answers(sentinelMasterReplyNaming(master, "master")))
+	}
+
+	state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
+	require.NoError(t, state.Error)
+
+	assert.Equal(t, 1, state.MasterCandidates)
+	assert.Equal(t, master+":6379", state.MasterAddress,
+		"the form a Sentinel reply is compared against")
+	require.Len(t, state.SentinelMasters, 3)
+	assert.Equal(t, master, state.SentinelMasters["test-sentinel-1"].IP)
+}
+
+// findMaster still picks one master on a split brain; MasterCandidates is what says
+// there were two.
+func TestCheckCluster_CountsEveryMasterCandidate(t *testing.T) {
+	ctx, _ := newProbeContext(t)
+	v := newTestValkey("test", "default")
+
+	router := newProbeRouter()
+	router.serve(t, "test-0", answers(masterInfo(0)))
+	router.serve(t, "test-1", answers(replicaInfo()))
+	router.serve(t, "test-2", answers(masterInfo(1)))
+
+	state := router.install(newFakeChecker(runningTestPods(3)...)).CheckCluster(ctx, v)
+
+	require.NoError(t, state.Error)
+	assert.Equal(t, "test-2", state.MasterPod)
+	assert.Equal(t, 2, state.MasterCandidates)
+}
+
 // --- checkSentinel quorum ---
 
 func TestCheckSentinel_AgreementIsAMajority(t *testing.T) {

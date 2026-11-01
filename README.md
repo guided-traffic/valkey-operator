@@ -513,6 +513,7 @@ A **level** is re-measured on every pass, an **edge** records something and is c
 | `ReconcileBlocked` | level | [status.md](docs/operations/status.md#reconcileblocked) |
 | `StorageSpecNotApplied` | level | [status.md](docs/operations/status.md#storagespecnotapplied) |
 | `SentinelPeersStale` | level | [status.md](docs/operations/status.md#sentinelpeersstale) |
+| `SentinelMasterDiverged` | level | [status.md](docs/operations/status.md#sentinelmasterdiverged) |
 | `SentinelUpdatePending` | level | [status.md](docs/operations/status.md#sentinelupdatepending) |
 | `PodTerminationStalled` | edge | [status.md](docs/operations/status.md#podterminationstalled) |
 | `TLSMaterialStale` | level | [status.md](docs/operations/status.md#tlsmaterialstale) |

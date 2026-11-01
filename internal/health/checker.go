@@ -52,6 +52,15 @@ type ClusterState struct {
 	// one less than the configured replica count.
 	SentinelPeersExpected int
 
+	// SentinelMasters maps each sentinel pod that answered to its SENTINEL MASTER
+	// reply: the master it monitors (IP, Port) and the flags it reports for it.
+	// Empty when Sentinel is disabled or no sentinel answered.
+	SentinelMasters map[string]valkeyclient.SentinelMasterInfo
+
+	// MasterCandidates is how many data pods answered that they are the master.
+	// MasterPod is one of them; more than one is a split brain.
+	MasterCandidates int
+
 	// Error holds any error encountered during health check.
 	Error error
 }
@@ -127,6 +136,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 	// a second master is not a synced replica either.
 	state.ReadyReplicas = syncedReplicas(replies)
 	state.AllSynced = state.ReadyReplicas == state.TotalReplicas
+	state.MasterCandidates = masterReplies(replies)
 
 	// Check sentinel view if sentinel is enabled.
 	if v.IsSentinelEnabled() {
@@ -134,6 +144,7 @@ func (h *Checker) CheckCluster(ctx context.Context, v *vkov1.Valkey) *ClusterSta
 		state.SentinelMonitoring = observed.monitoring()
 		state.SentinelPeers = observed.peers
 		state.SentinelPeersExpected = observed.expectedPeers
+		state.SentinelMasters = observed.masters
 	}
 
 	return state
@@ -202,6 +213,17 @@ func syncedReplicas(replies []*valkeyclient.ReplicationInfo) int32 {
 	var n int32
 	for _, info := range replies {
 		if info != nil && info.NotEstablishedReason() == "" {
+			n++
+		}
+	}
+	return n
+}
+
+// masterReplies counts the replies whose pod answered role master.
+func masterReplies(replies []*valkeyclient.ReplicationInfo) int {
+	n := 0
+	for _, info := range replies {
+		if info != nil && info.Role == common.RoleMaster {
 			n++
 		}
 	}
@@ -299,6 +321,9 @@ type sentinelObservation struct {
 	// peers maps a sentinel pod name to its num-other-sentinels. A sentinel that
 	// did not answer is absent rather than zero.
 	peers map[string]int
+	// masters maps a sentinel pod name to its whole reply, for the master address
+	// it names. Absent for a sentinel that did not answer, as in peers.
+	masters map[string]valkeyclient.SentinelMasterInfo
 }
 
 // monitoring reports whether a majority of the configured sentinels sees a healthy
@@ -330,6 +355,7 @@ func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentine
 		replicas:      sentinelReplicas,
 		expectedPeers: int(sentinelReplicas) - 1,
 		peers:         map[string]int{},
+		masters:       map[string]valkeyclient.SentinelMasterInfo{},
 	}
 
 	tlsConfig, err := h.buildTLSConfig(ctx, v, builder.SentinelTLSSecretName(v))
@@ -350,6 +376,7 @@ func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentine
 		}
 
 		observation.peers[podName] = masterInfo.NumOtherSentinels
+		observation.masters[podName] = *masterInfo
 
 		// Sentinel should report the master with "master" flag and no error flags.
 		if masterInfo.Flags == "master" {
