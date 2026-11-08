@@ -393,7 +393,12 @@ work. **semantic-release loads a plugin from its own install before the project'
 dependency on the generator (`^14.1.0`) won over the pin and the first release on preset 10
 failed while the check was green: `package.json` now overrides the generator to the pinned
 version tree-wide, and the check resolves every plugin the way semantic-release does and prints
-the copy it used.
+the copy it used. **Node is pinned once, exactly, in `.nvmrc`** (decided 2026-11-08): both Node
+jobs read it with `node-version-file` and install `libatomic1` first. They used to take
+`lts/*`, which moved to Node 26 on 2026-10-28; its binary links `libatomic.so.1`, the runner
+image lacks it, `node` exited 127 and `Release Tooling` was red on every PR with no PR touching
+Node. Renovate's nvm manager automerges a minor or patch as `chore`, a major waits for a person;
+the check fails on a local Node of another major.
 → [ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46
 
 ### A gate job that is not required is not a gate

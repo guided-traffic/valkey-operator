@@ -22,6 +22,20 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const RELEASERC_URL = new URL("../.releaserc.json", import.meta.url);
+const NVMRC_URL = new URL("../.nvmrc", import.meta.url);
+
+// Both workflow jobs that run Node install the version pinned in .nvmrc, so a
+// run on another major tests a runtime the release job never uses: the plugins'
+// engine ranges and the shared libraries a Node binary links change by major
+// (Node 26 needs libatomic.so.1, which Node 24 did not). Same major passes; the
+// exact versions are printed so a CI log names the one it ran.
+const pinnedNode = (await readFile(NVMRC_URL, "utf8")).trim();
+console.log(`    node ${process.version} (.nvmrc pins ${pinnedNode})`);
+if (process.versions.node.split(".")[0] !== pinnedNode.split(".")[0]) {
+  fail(
+    `node ${process.version} runs this check, but .nvmrc pins ${pinnedNode} - use the pinned major (nvm use, fnm use) or update .nvmrc`,
+  );
+}
 
 // semantic-release loads a plugin from its own install first and from the
 // project only when that finds nothing (lib/plugins/utils.js:

@@ -32,7 +32,8 @@ nothing shipped, and the operator image the chart names is not pinned at all. Al
 44.115.10; Dependency Dashboard issue #229). `renovate.json:225-236` automerges minor, patch and
 digest updates of every `custom.regex` manager, so a new custom manager inherits automerge; majors
 are manual (`:237-250`); `minimumReleaseAge` is set nowhere. `:274-283` makes custom-manager commits
-`fix(deps)`, only github-actions is `chore` (`:284-290`). Every `fix` is a patch release, and under
+`fix(deps)`, only github-actions (`:284-290`) and the `nvm` manager (`.nvmrc`, Node for the release
+tooling, ADR 0017 D46) are `chore`. Every `fix` is a patch release, and under
 [ADR 0005](../adr/0005-upgrade-neutral-defaults-and-anti-affinity.md) D11 a release rolls every
 multi-replica data StatefulSet on the chart-default path (not on kustomize or a floating Helm
 `image.tag`). [ADR 0033](../adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md)

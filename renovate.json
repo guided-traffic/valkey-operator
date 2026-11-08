@@ -297,6 +297,38 @@
         "github-actions"
       ],
       "semanticCommitType": "chore"
+    },
+    {
+      "description": "Node.js for the release tooling (.nvmrc, read by both workflow jobs that run Node): automerge minor and patch updates after CI passes; the PR's own release-tooling job runs on the new version (docs/adr/0017-test-and-ci-policy.md, D46)",
+      "matchManagers": [
+        "nvm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Node.js for the release tooling: require manual review for major updates. The workflows followed lts/* until Node 26 became LTS and every PR went red: its binaries link libatomic.so.1, which the runner image does not ship (docs/adr/0017-test-and-ci-policy.md, D46)",
+      "matchManagers": [
+        "nvm"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "major-update"
+      ]
+    },
+    {
+      "description": "Node.js for the release tooling: use 'chore' instead of 'fix'. Nothing shipped runs on it, so a bump must not cut a release that rolls the fleet",
+      "matchManagers": [
+        "nvm"
+      ],
+      "semanticCommitType": "chore"
     }
   ],
   "customManagers": [

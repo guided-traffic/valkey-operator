@@ -1129,10 +1129,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The Node binaries from 26 on link libatomic.so.1, which the runner image
+      # does not ship; without it node exits 127 and setup-node fails.
+      - name: Install the shared libraries Node needs
+        run: sudo apt-get update && sudo apt-get install -y libatomic1
+
+      # The one Node pin, shared with the semantic-release job and moved by
+      # Renovate's nvm manager (docs/adr/0017-test-and-ci-policy.md, D46).
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "lts/*"
+          node-version-file: .nvmrc
 
       - name: Install dependencies
         run: npm ci
@@ -1187,10 +1194,13 @@ jobs:
             echo "⚠️ Coverage badge not found, using existing file"
           fi
 
+      - name: Install the shared libraries Node needs
+        run: sudo apt-get update && sudo apt-get install -y libatomic1
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "lts/*"
+          node-version-file: .nvmrc
 
       - name: Install dependencies
         run: npm ci

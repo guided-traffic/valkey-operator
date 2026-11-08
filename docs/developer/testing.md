@@ -17,7 +17,7 @@ Read against the tree on 2026-09-27.
 | Fleet upgrade | `make test-e2e-fleet-upgrade` | `e2e && fleetupgrade` | a Kind cluster with cert-manager and the local image loaded, no operator | Installs a released chart and upgrades it to the local image |
 | Helm migration | `make test-e2e-helm` | `e2e && e2e_helm` | a Kind cluster with the operator | Runs `manager migrate` against real CRs |
 | Image tools | `make test-image-tools` | `imagetools` | docker, no cluster | What the operator executes inside the pinned Valkey images, and the processes under the rootless posture |
-| Release tooling | `make test-release-tooling` | — (node) | node and npm | That the semantic-release dependency set still renders release notes |
+| Release tooling | `make test-release-tooling` | — (node) | node of the major in `.nvmrc`, and npm | That the semantic-release dependency set still renders release notes |
 
 The tier boundaries are [ADR 0017](../adr/0017-test-and-ci-policy.md) D2. The per-package
 timeouts are in the Makefile: 60 min integration, 30 min E2E, 45 min fleet upgrade, 10 min

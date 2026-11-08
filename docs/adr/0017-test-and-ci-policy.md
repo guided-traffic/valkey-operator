@@ -99,6 +99,15 @@ until the fix. *(Verified 2026-10-11: with the fix merged, the release job publi
 section; a `semantic-release --dry-run` on the fix branch had rendered the same notes before the
 merge.)*
 
+Amended 2026-11-08: **D46 gains a fifth rule.** Both jobs that run Node installed it as
+`lts/*`. Node 26 became LTS on 2026-10-28 (26.13.0), and from 2026-11-02 on `setup-node`
+resolved the selector to it. Its linux-x64 binary links `libatomic.so.1`, which the self-hosted
+runner image does not ship: `node` exited 127, `setup-node` failed, and the required
+`Release Tooling` check was red on every pull request — Renovate's #277 to #280, none of which
+touched Node — while the release job would have failed the same way on the next push to `main`.
+The selector moved under the repository, the same arriving change D43 refuses for the Valkey
+lines.
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -831,7 +840,8 @@ a failed run leaves one namespace running for the rest of the suite, on a cluste
 deleted at the end of the job anyway.
 
 **D46 — The release tooling is exercised where its updates land: in PR CI, against the
-committed lockfile.** Three rules:
+committed lockfile.** ~~Three~~ Five rules *(the fourth added 2026-10-11, the fifth
+2026-11-08)*:
 
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) drives
   `analyzeCommits` and `generateNotes` through the plugin configuration read from
@@ -872,6 +882,17 @@ committed lockfile.** Three rules:
   prints the version and path it rendered with. A check that imports the plugins from the
   project root tests the pin, not what the release job runs, and passed on the set that failed
   the release above.
+* *(Added 2026-11-08.)* **Node is pinned once, exactly, in [`.nvmrc`](../../.nvmrc)**, and both
+  jobs that run it — `release-tooling` and `semantic-release` — install that version with
+  `node-version-file`, after installing `libatomic1`. Exact rather than a major, for the reason
+  rule two gives for the lockfile: the release job runs the runtime the pull request tested.
+  Renovate's `nvm` manager moves the pin; a minor or patch automerges, because the PR's own
+  `release-tooling` job runs on the new version, and a major waits for a person, because a major
+  is where the shared libraries the binary links and the plugins' engine ranges change. Both are
+  `chore`: nothing shipped runs on Node, so a bump must not cut a release that rolls the fleet
+  (ADR 0005 D11). The check fails a run whose Node major differs from the pin and prints both
+  versions, so a local `make test-release-tooling` on another major goes red instead of testing a
+  runtime the release never uses.
 
 ### The rootless posture ([ADR 0032](0032-generated-pods-run-rootless.md))
 
@@ -1239,6 +1260,10 @@ so the comment goes above that line.
   so each red or pending automerge PR behind `main` costs a full pipeline, three E2E legs
   included, once per Renovate run that finds `main` moved. A PR that is red for its own reason
   pays that daily until it is fixed or closed.
+* **Every Node release of the pinned major costs a pull request and a full pipeline (D46, fifth
+  rule)**, three E2E legs included, for a runtime two jobs use; and both of those jobs pay an
+  `apt-get update` and an install per run. A developer whose Node is another major gets a red
+  `make test-release-tooling` until they switch.
 * **gosec runs unreleased code (D58)**, with whatever rules upstream merged between v2.29.0 and
   the commit. On this tree that commit reported 0 issues, as v2.29.0 did on Go 1.27.1; a rule
   that starts reporting on a later commit arrives only through a Renovate PR, which goes red on
@@ -1474,6 +1499,17 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   silently. The synthetic context also freezes the plugin API shape of semantic-release 25:
   a future major that changes what `generateNotes` receives fails the check, which is the
   point, but the failure will name this script rather than the incompatibility.
+* **D46's fifth rule was checked off CI, not yet on a runner** (recorded 2026-11-08). Verified:
+  the Node 26.13.0 linux-x64 binary exits 127 on `libatomic.so.1` in `ubuntu:22.04` and
+  `ubuntu:24.04` (amd64, emulated), the failure the CI logs show; with `libatomic1` installed,
+  `npm ci` and the check pass in `ubuntu:24.04`; `make test-release-tooling` passes on macOS with
+  Node 26.13.0 and fails with `.nvmrc` set to 24.22.2; `renovate-config-validator --strict`
+  (Renovate 44.222.4) accepts `renovate.json`; actionlint 1.7.7 finds nothing in the changed
+  steps. Not verified: that the runner image is Ubuntu with passwordless `sudo` and `libatomic1`
+  in its sources — inferred from the jobs that already `sudo apt-get install build-essential`,
+  which pulls `libatomic1` in through gcc; that Renovate's `nvm` manager extracts `.nvmrc` and,
+  under its `node` versioning, proposes only majors that have entered LTS (documented, not
+  observed here). The first CI run of the change settles the first, the dashboard the second.
 * **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
   Nothing regenerates them; the commits they cover are in the git history and the compare
   links still work.
@@ -1601,7 +1637,8 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
 * [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`; `rebaseWhen` (D56), the disabled `dockerfile` `golang` dependency (D57) and the Makefile regex manager that accepts a pseudo-version (D58)
 * [`Makefile`](../../Makefile) — `GOSEC_VERSION`, the D58 pin, and the comment above its `# renovate:` line
-* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
+* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check and its Node major check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
+* [`.nvmrc`](../../.nvmrc) — the one Node pin (D46, fifth rule); the `nvm` rules at the end of `packageRules` in [`renovate.json`](../../renovate.json)
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the decision table these tests are written against
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — the CI job that proves the generated manifests are current
