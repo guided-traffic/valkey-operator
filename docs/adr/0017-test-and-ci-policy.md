@@ -108,6 +108,12 @@ touched Node — while the release job would have failed the same way on the nex
 The selector moved under the repository, the same arriving change D43 refuses for the Valkey
 lines.
 
+Amended 2026-11-08, later the same day: **D31 names the runner pool of the E2E legs.** The
+pull request that fixed the Node pin lost both single-node legs to an evicted runner pod, as
+three of the four Renovate PRs had before it: the default runner pool, in place since
+2026-11-05, gives the dind daemon 15 Gi, and a full-suite Kind cluster outgrows it. The legs now
+ask for the `large` pool.
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -551,6 +557,18 @@ suite; `multi-node-valkey9` (control-plane + **3** workers) runs
 full suite against the other pinned line. The legs run in parallel on separate runner pods with
 distinct cluster names. A separate `e2e-gate` job named "E2E Tests" aggregates all of them, so
 the pre-existing required status check keeps one stable name while legs are renamed or added.
+
+*(Amended 2026-11-08.)* **The legs run on the `large` runner pool** (`runs-on: large`); every
+other job, the gate included, stays on the default pool (`self-hosted`). Since 2026-11-05 the
+organisation's runners are two ARC scale sets on the runner cluster: `wds18-small` (label
+`self-hosted`, at most 24 runners, a 15 Gi `docker-storage` emptyDir for the dind daemon, 10 Gi
+work) and `wds18-large` (label `large`, at most 6, twice both). A full-suite leg's Kind cluster
+outgrows 15 Gi: kubelet evicted the runner pod with `Usage of EmptyDir volume "docker-storage"
+exceeds the limit "15Gi"`, GitHub reported only "The self-hosted runner lost communication with
+the server", and six of seven single-node legs on the small pool died that way, 24 to 35 minutes
+in, while the multi-node leg (two tests, about 7 minutes) never did. All three legs move, because
+one job definition carries the matrix; at most six large runners means two pipelines' legs at a
+time, and a third queues.
 
 **Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
 empty selector that resolves to the default — including the leg that varies the node count,
@@ -1505,11 +1523,18 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   `npm ci` and the check pass in `ubuntu:24.04`; `make test-release-tooling` passes on macOS with
   Node 26.13.0 and fails with `.nvmrc` set to 24.22.2; `renovate-config-validator --strict`
   (Renovate 44.222.4) accepts `renovate.json`; actionlint 1.7.7 finds nothing in the changed
-  steps. Not verified: that the runner image is Ubuntu with passwordless `sudo` and `libatomic1`
-  in its sources — inferred from the jobs that already `sudo apt-get install build-essential`,
-  which pulls `libatomic1` in through gcc; that Renovate's `nvm` manager extracts `.nvmrc` and,
-  under its `node` versioning, proposes only majors that have entered LTS (documented, not
-  observed here). The first CI run of the change settles the first, the dashboard the second.
+  steps. *(Verified on a runner the same day, run 42488378159: the `wds18-small` image is Ubuntu
+  24.04, `libatomic1` was not installed before the step, `.nvmrc` resolved to 26.13.0, and the
+  check passed.)* Not verified: that Renovate's `nvm` manager extracts `.nvmrc` and, under its
+  `node` versioning, proposes only majors that have entered LTS (documented, not observed here);
+  the dashboard settles it.
+* **The `large` pool's 30 Gi is assumed, not measured, to hold a full-suite leg (D31, amended
+  2026-11-08).** The small pool's evictions are read from the runner cluster's events for the two
+  pods of run 42488378159; the earlier losses (2026-11-05 and 2026-11-07) left only GitHub's
+  "lost communication" annotation, their events having expired, and are attributed to the same
+  cause by their shape. How much a leg writes was not measured. One `Code Linting` job also lost
+  its runner on the small pool (2026-11-05, 16 minutes in); its cause is not recorded, and lint
+  stays on the small pool.
 * **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
   Nothing regenerates them; the commits they cover are in the git history and the compare
   links still work.

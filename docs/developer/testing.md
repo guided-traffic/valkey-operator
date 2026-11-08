@@ -186,7 +186,9 @@ D42, D53).
 ## What CI runs
 
 The `E2E Tests` matrix in `.github/workflows/release.yml` runs three legs in parallel, each on
-its own Kind cluster (Kubernetes 1.33.4, containerd's `native` snapshotter):
+its own Kind cluster (Kubernetes 1.33.4, containerd's `native` snapshotter) on a runner of the
+`large` pool, whose dind storage holds a full-suite cluster where the default pool's 15 Gi evicts
+the runner pod:
 
 | Leg | Workers | Valkey line | Scope |
 |---|---|---|---|

@@ -26,7 +26,10 @@ env:
 jobs:
   e2e-tests:
     name: E2E Tests (${{ matrix.topology }})
-    runs-on: self-hosted
+    # The large runner pool: a full-suite Kind cluster outgrows the default pool's
+    # 15Gi docker-storage volume and the runner pod is evicted mid-run
+    # (docs/adr/0017-test-and-ci-policy.md, D31).
+    runs-on: large
     timeout-minutes: 60
     strategy:
       # The legs run in parallel: each lands on its own ephemeral ARC runner pod,

@@ -447,6 +447,13 @@ resolves to whatever the default is, so a leg carrying one would keep its name
 and quietly change what it tests the day the default moves - and crossing a
 major is meant to be a decision, not an arriving PR (ADR 0017 D43).
 
+**Every leg runs on the `large` runner pool** (`runs-on: large`, decided 2026-11-08): the
+default pool (`self-hosted`, scale set `wds18-small`) gives the dind daemon a 15 Gi emptyDir, a
+full-suite Kind cluster outgrows it, and kubelet evicts the runner pod — GitHub shows only "The
+self-hosted runner lost communication with the server". Six of seven single-node legs died that
+way between 2026-11-05 and 2026-11-08. The runner cluster's events name it (kubeconfig
+`wds18-k8s-runner`, namespace `arc-runners`).
+
 The multi-node leg exists because two behaviors are meaningless on one node:
 eviction serialization and hard-mode anti-affinity spread. Three
 workers, not two: Kind keeps the control-plane `NoSchedule` taint on multi-node

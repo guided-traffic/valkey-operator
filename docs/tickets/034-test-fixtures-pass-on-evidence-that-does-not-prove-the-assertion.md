@@ -63,6 +63,10 @@ master `sc-repdr-0` by construction, replica `sc-repdr-1` deleted at `:485`.
 - `:505` `waitForPodLabel`, `:520` `waitForConnectedReplicas` and the read at `:525-530` can be met
   by the old pod (vacuous in 2 of 17 legs). The comment at `:523-524` names
   `valkeyExecAllowError`; `:526` calls `valkeyExecQuick`. `:534` (`-r` endpoint count) is sound.
+- The same gap also fails the test: on 2026-11-03 (run 41596666798, Renovate PR #278,
+  `single-node-valkey9`) `:505` was met by the old replica, which was gone before its
+  replacement existed, and `getPod` at `:510` failed with `pods "sc-repdr-1" not found`; the
+  required `E2E Tests` held the PR.
 - The unit tier catches removal of the replica role check at
   [`drain.go:114`](../../internal/sidecar/drain.go) (`TestDrainHandler_ReplicaExitsImmediately`),
   but no unit test drains a replica with `sentinelEnabled`: a Sentinel-path regression, a role
