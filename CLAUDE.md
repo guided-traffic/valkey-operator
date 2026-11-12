@@ -464,6 +464,10 @@ workers, not two: Kind keeps the control-plane `NoSchedule` taint on multi-node
 clusters, so spreading three replicas needs three schedulable workers.
 
 - `E2E_RUN` narrows `make test-e2e` to matching test names; empty runs everything.
+- `make test-e2e` runs **at most eight tests at once** (`-parallel=8`, decided 2026-11-12, locally
+  and in CI). Without the cap `go test` ran 32 at once on a runner node, the one Kind node hit its
+  kubelet's 110-pod limit, and six legs of the Renovate PRs failed on `Too many pods` and a test pod
+  preempted for a critical one. ADR 0017 D31.
 - `E2E_REQUIRE_MULTI_NODE=true` turns the "fewer than 3 schedulable nodes" skip in
   `test/e2e/affinity_test.go` into a failure, so a cluster that came up smaller
   than requested cannot pass as a green skip. The multi-node leg sets it, and it

@@ -225,7 +225,16 @@ files is fatal; persistence mode `both` (duplicate `dir /data`,
 [`configmap.go:203-243`](../../internal/builder/configmap.go#L203-L243)) boots, and no test uses it.
 No production path is affected.
 
-### E2E user-namespace probe
+### E2E evidence read from an unschedulable pod
+
+A single-node leg runs every test on one Kind node, whose kubelet admits 110 pods. Past that the
+scheduler refuses every new pod with `FailedScheduling: 0/1 nodes are available: 1 Too many pods`,
+naming nothing else. With 32 tests at once (`go test`'s default on a runner node) that happened
+twice in a quiet run (one leg of 42979506015 on `native`, one of 43220189841 on overlayfs) and 11
+to 30 times per leg when six Renovate PRs ran their legs at once on 2026-11-12 (runs 43228307124,
+43228371873, 43228277849, 43228398495). `make test-e2e` now runs eight at a time
+([ADR 0017](../adr/0017-test-and-ci-policy.md) D31); a node at its limit still refuses pods that
+way, and two fixtures read that refusal as the evidence they wait for.
 
 `userNamespacesSupported` ([`pod_hardening_test.go`](../../test/e2e/pod_hardening_test.go)) ends its
 poll on the first Warning Event of the probe pod and reports it as the runtime's refusal of
@@ -237,6 +246,13 @@ that leg (the `single-node-valkey9` leg of the same run measured the real refusa
 mount `sysfs`), but on a node that supports user namespaces the same event skips the subtest
 silently, and with `E2E_REQUIRE_USER_NAMESPACES=true` fails it with a reason that is not about user
 namespaces.
+
+`isUnschedulable` ([`affinity_test.go:330`](../../test/e2e/affinity_test.go)), behind
+`TestE2E_AntiAffinity_HardLeavesSurplusPending`, accepts any `PodScheduled=False/Unschedulable`,
+whatever the scheduler's message. With the node at its pod limit the test fails when all three
+pods are refused (four of the six failed legs of 2026-11-12), and it passes when one pod was
+admitted before the limit and two after it, although the refusal of those two names only the
+pod limit: removing the hard term would not turn that run red.
 
 ## Required changes
 
@@ -352,12 +368,15 @@ namespaces.
   on both pins; a bad directive fails with the line named; removing the `replicaof` append fails the
   role assertion; `make cyclo` clean.
 
-### E2E user-namespace probe
+### E2E evidence read from an unschedulable pod
 
 - `userNamespacesSupported` counts only a refusal from the node's runtime (a sandbox or container
   failure) as unsupported; a probe not yet scheduled keeps the poll running, and a window that
   closes on an unscheduled probe reports it as such. Verify: a probe with an unsatisfiable
   `nodeSelector` on a local Kind cluster with overlayfs reports "not scheduled", not "unsupported".
+- `isUnschedulable` counts a pod only when the scheduler's message names the anti-affinity term
+  (`didn't match pod anti-affinity rules`). Verify: with the hard term removed from the builder the
+  test fails on a node at its pod limit, not only on an idle one.
 
 ## Open questions
 
