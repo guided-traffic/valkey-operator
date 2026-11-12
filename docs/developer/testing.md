@@ -186,9 +186,9 @@ D42, D53).
 ## What CI runs
 
 The `E2E Tests` matrix in `.github/workflows/release.yml` runs three legs in parallel, each on
-its own Kind cluster (Kubernetes 1.33.4, containerd's `native` snapshotter) on a runner of the
-`large` pool, whose dind storage holds a full-suite cluster where the default pool's 15 Gi evicts
-the runner pod:
+its own Kind cluster (Kubernetes 1.33.4, containerd's default overlayfs snapshotter — the
+`native` one copied every container's image file system and outgrew the runner's storage,
+[ADR 0017](../adr/0017-test-and-ci-policy.md) D31):
 
 | Leg | Workers | Valkey line | Scope |
 |---|---|---|---|
@@ -197,7 +197,8 @@ the runner pod:
 | `single-node-valkey8` | 0 | 8 | the full suite |
 
 Why these three, and why three workers, is [ADR 0017](../adr/0017-test-and-ci-policy.md) D31,
-D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES`, and no workflow runs the fleet-upgrade or the
+D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES` — a Kind node inside Docker-in-Docker cannot
+start a pod with `hostUsers: false` (ADR 0017 D5) — and no workflow runs the fleet-upgrade or the
 Helm-migration target. A failing leg collects the operator log, events and the pod logs of
 every `e2e-*` namespace, previous containers included.
 

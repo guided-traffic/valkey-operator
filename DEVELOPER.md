@@ -280,8 +280,7 @@ not do for you:
 ## Continuous integration and the release
 
 `.github/workflows/release.yml` ("Test and Release") runs on every push to `main`, on every
-pull request into it, and on demand. All jobs run on self-hosted runners: the three E2E legs on
-the `large` pool, every other job on the default one ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D31).
+pull request into it, and on demand. All jobs run on self-hosted runners.
 
 | Job | Gates |
 |---|---|

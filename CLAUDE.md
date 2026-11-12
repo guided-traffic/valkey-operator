@@ -447,12 +447,16 @@ resolves to whatever the default is, so a leg carrying one would keep its name
 and quietly change what it tests the day the default moves - and crossing a
 major is meant to be a decision, not an arriving PR (ADR 0017 D43).
 
-**Every leg runs on the `large` runner pool** (`runs-on: large`, decided 2026-11-08): the
-default pool (`self-hosted`, scale set `wds18-small`) gives the dind daemon a 15 Gi emptyDir, a
-full-suite Kind cluster outgrows it, and kubelet evicts the runner pod — GitHub shows only "The
-self-hosted runner lost communication with the server". Six of seven single-node legs died that
-way between 2026-11-05 and 2026-11-08. The runner cluster's events name it (kubeconfig
-`wds18-k8s-runner`, namespace `arc-runners`).
+**The Kind nodes run containerd's default overlayfs snapshotter** (decided 2026-11-12). The CI
+config used to set `snapshotter = "native"`, which unpacks a full copy of the image file system
+for every container: ~100 containers of the parallel suite came to 24 GB of snapshots on one
+node, kubelet evicted the runner pod at its `docker-storage` limit (15 Gi on `wds18-small`, and
+30 Gi on `wds18-large`, so a bigger pool was no fix), and GitHub showed only "The self-hosted
+runner lost communication with the server" — six of seven single-node legs between 2026-11-05
+and 2026-11-08. On overlayfs a single-node leg peaks at 5.3 GB. The tests write almost nothing;
+disk scales with the containers running at once. The overlay is not nested: the node's
+`/var/lib/containerd` is a Docker volume on the dind daemon's ext4. The runner cluster's events
+name an eviction (kubeconfig `wds18-k8s-runner`, namespace `arc-runners`).
 
 The multi-node leg exists because two behaviors are meaningless on one node:
 eviction serialization and hard-mode anti-affinity spread. Three
@@ -466,10 +470,12 @@ clusters, so spreading three replicas needs three schedulable workers.
   additionally greps the test output to prove both scenarios actually ran.
 - `E2E_REQUIRE_USER_NAMESPACES=true` turns the "this node cannot start a pod with
   `hostUsers: false`" skip in `test/e2e/pod_hardening_test.go` into a failure. **No CI leg sets
-  it, because none can**: the legs run Kind inside Docker-in-Docker with containerd's `native`
-  snapshotter, where such a pod fails with "container ID … cannot be mapped to a host ID"
-  (measured 2026-09-26 with the CI Kind config), or already at its sandbox
-  (`FailedCreatePodSandBox`, seen only as an Event — CI logs). A probe pod decides, reading its
+  it, because none can**: the legs run Kind inside Docker-in-Docker, where such a pod fails at
+  its sandbox (`FailedCreatePodSandBox`, seen only as an Event). ~~with containerd's `native`
+  snapshotter, where such a pod fails with "container ID … cannot be mapped to a host ID"~~
+  *(corrected 2026-11-12: that was the native snapshotter's refusal; on overlayfs runc still
+  fails mounting `sysfs` with "operation not permitted", so the snapshotter was not the only
+  obstacle)*. A probe pod decides, reading its
   container states and its Warning Events; without support the
   hardening e2e moves the cluster without the user namespace and skips only those assertions.
   The user-namespace half runs on a local Kind cluster (`make kind-create`, overlayfs).
