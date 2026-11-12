@@ -610,8 +610,11 @@ Kind node whose kubelet admits 110 pods. A quiet run touched the limit 0 to 2 ti
 saw three refused pods where its term refuses two, and in a rerun kubelet preempted a running
 Sentinel pod "in order to admit critical pod", whose StatefulSet recreated it on the new
 template — read by `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced` as a
-Sentinel roll the operator had released. The summed test time of a quiet leg is 72 to 93
-minutes, so eight at a time stays inside the 30-minute `go test` timeout by arithmetic.
+Sentinel roll the operator had released. Measured on the pull request of the cap (run
+43250993135, a quiet run): `go test` took 927 s and 953 s on the two single-node legs, against
+954 s and 765 s with 32 at once, with no `Too many pods` and every test passed; the user-namespace
+probe now met the runtime's refusal on both legs. Not measured: a burst of Renovate PRs testing
+together under the cap.
 
 **Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
 empty selector that resolves to the default — including the leg that varies the node count,
