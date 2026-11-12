@@ -136,14 +136,11 @@ jobs:
               echo "- role: worker"
               worker=$((worker + 1))
             done
-            cat << EOF
-          # Use native snapshotter to avoid nested overlay issues in DinD
-          containerdConfigPatches:
-          - |-
-            [plugins."io.containerd.grpc.v1.cri".containerd]
-              snapshotter = "native"
-              disable_snapshot_annotations = false
-          EOF
+            # No containerd patch: Kind's default overlayfs snapshotter. The node's
+            # /var/lib/containerd is a Docker volume on the runner's own disk, so the
+            # overlay is not nested. The native snapshotter it replaces copied the
+            # full image file system for every container and filled the runner's
+            # docker-storage volume (docs/adr/0017-test-and-ci-policy.md, D31).
           } > kind-config.yaml
           echo "=== kind-config.yaml ==="
           cat kind-config.yaml
@@ -288,8 +285,8 @@ jobs:
         run: |
           set -euo pipefail
           make docker-build IMG=valkey-operator:test
-          # Manual ctr import without --all-platforms/--snapshotter flags
-          # to avoid "no unpack platforms defined" error with native snapshotter in DinD.
+          # Manual ctr import into the k8s.io namespace, unpacked by containerd's
+          # default snapshotter, which is the one the CRI uses.
           # Imported into every node: the operator Deployment runs with
           # pullPolicy: Never (test/e2e/helm-values.yaml) and may land on any worker.
           mkdir -p tmp
