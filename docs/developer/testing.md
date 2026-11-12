@@ -196,6 +196,10 @@ its own Kind cluster (Kubernetes 1.33.4, containerd's default overlayfs snapshot
 | `multi-node-valkey9` | 3 | 9 | `E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'`, with `E2E_REQUIRE_MULTI_NODE=true`, and a grep that `TestE2E_AntiAffinity_HardSpreadsAcrossNodes` and `TestE2E_PodDisruptionBudget_SerializesEvictions` passed |
 | `single-node-valkey8` | 0 | 8 | the full suite |
 
+Every leg runs `make test-e2e`, which runs at most eight tests at once (`-parallel=8`, the same
+locally): with more, the single Kind node reaches its kubelet's 110-pod limit and pods are refused
+or preempted (D31).
+
 Why these three, and why three workers, is [ADR 0017](../adr/0017-test-and-ci-policy.md) D31,
 D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES` — a Kind node inside Docker-in-Docker cannot
 start a pod with `hostUsers: false` (ADR 0017 D5) — and no workflow runs the fleet-upgrade or the

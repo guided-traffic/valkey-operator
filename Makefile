@@ -161,11 +161,16 @@ test-release-tooling: ## Verify the semantic-release dependency set renders rele
 	npm ci --no-audit --no-fund
 	node hack/verify-release-tooling.mjs
 
+# -parallel=8: at most eight E2E tests at once, locally and in CI. Without it go test
+# runs GOMAXPROCS of them (32 on a CI runner node, nearly the whole suite), and a
+# single Kind node reaches its kubelet's 110-pod limit: new pods are refused ("Too
+# many pods") and running test pods are preempted for critical ones
+# (docs/adr/0017-test-and-ci-policy.md, D31).
 .PHONY: test-e2e
-test-e2e: ## Run E2E tests against a running Kind cluster (E2E_RUN filters by test name).
+test-e2e: ## Run E2E tests against a running Kind cluster, eight at a time (E2E_RUN filters by test name).
 	@echo "Running E2E tests..."
 	E2E_VALKEY_LINE=$(E2E_VALKEY_LINE) E2E_VALKEY_IMAGE=$(E2E_VALKEY_IMAGE) \
-		$(GOTEST) -v -tags=e2e -count=1 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
+		$(GOTEST) -v -tags=e2e -count=1 -parallel=8 -timeout=30m $(if $(E2E_RUN),-run '$(E2E_RUN)') ./test/e2e/...
 
 # E2E_UPGRADE_FROM is the released chart version the fleet-upgrade E2E provisions
 # its clusters on before upgrading to the local chart. Keep it at the version the

@@ -118,6 +118,12 @@ only moved the limit: evicted at 30 Gi instead of 15. The legs run Kind's defaul
 snapshotter on the default pool, peak 5.3 GB. On overlayfs a pod with `hostUsers: false` still
 does not start in CI, for a reason the native snapshotter's refusal had hidden (D5).
 
+Amended 2026-11-12, later the same day: **D31 caps the E2E suite at eight tests at once**
+(`-parallel=8` in `make test-e2e`, locally and in CI). When the rebased Renovate PRs ran their
+legs together, six of their single-node legs failed: the one Kind node reached its kubelet's
+110-pod limit, new pods were refused with `Too many pods` (11 to 30 times per leg) and a running
+Sentinel pod was preempted for a critical one. Decided by Hans.
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -593,6 +599,19 @@ one run died the same way at 30 Gi. The overlay is not nested: the Kind node's
 containerd's overlayfs plugin `ok`). On overlayfs both single-node legs peaked
 at 5.3 GB and all three legs passed, on the `large` pool (run 43220189841) and on the default one
 (run 43224271599). The legs stay on the default pool, with every other job.
+
+*(Amended 2026-11-12, later the same day.)* **At most eight E2E tests run at once**: `make
+test-e2e` passes `-parallel=8`, the same locally and in CI, and no leg overrides it. Without it
+`go test` ran GOMAXPROCS tests at once — 32 on a runner node, so nearly all of the 53 — on one
+Kind node whose kubelet admits 110 pods. A quiet run touched the limit 0 to 2 times per leg; on
+2026-11-12, with six rebased Renovate PRs testing together, six single-node legs failed with
+11 to 30 `FailedScheduling … Too many pods` each (runs 43228307124, 43228371873, 43228277849,
+43228398495): tests timed out on pods that never scheduled, `TestE2E_AntiAffinity_HardLeavesSurplusPending`
+saw three refused pods where its term refuses two, and in a rerun kubelet preempted a running
+Sentinel pod "in order to admit critical pod", whose StatefulSet recreated it on the new
+template — read by `TestE2E_RollingUpdate_UnavailableReplacementIsReportedAndReplaced` as a
+Sentinel roll the operator had released. The summed test time of a quiet leg is 72 to 93
+minutes, so eight at a time stays inside the 30-minute `go test` timeout by arithmetic.
 
 **Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
 empty selector that resolves to the default — including the leg that varies the node count,
@@ -1379,6 +1398,13 @@ The `large` pool was tried on 2026-11-08 and evicted both single-node legs at it
 limit that holds the native snapshotter's copies has to grow with every test that runs in
 parallel, and buys disk for copies nobody uses. Fewer parallel tests would shrink the copies and
 lengthen every leg. Removing the copies cost one deleted config block.
+
+### Raise the Kind node's `maxPods`, or rerun the failed legs (D31, the eight-test cap)
+
+Both were put to Hans on 2026-11-12 together with a lower parallelism, and he chose the cap. A
+kubelet patch to `maxPods: 200` (inside the node's /24 pod range) would have kept the leg time and
+left the runner node's CPU and memory as the bound, shared by every leg on it. Rerunning failed
+legs changes nothing and pays a rerun at every burst of Renovate PRs.
 
 ### Rename or replace the required status check instead of adding `e2e-gate`
 
