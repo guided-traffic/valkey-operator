@@ -99,6 +99,25 @@ until the fix. *(Verified 2026-10-11: with the fix merged, the release job publi
 section; a `semantic-release --dry-run` on the fix branch had rendered the same notes before the
 merge.)*
 
+Amended 2026-11-08: **D46 gains a fifth rule.** Both jobs that run Node installed it as
+`lts/*`. Node 26 became LTS on 2026-10-28 (26.13.0), and from 2026-11-02 on `setup-node`
+resolved the selector to it. Its linux-x64 binary links `libatomic.so.1`, which the self-hosted
+runner image does not ship: `node` exited 127, `setup-node` failed, and the required
+`Release Tooling` check was red on every pull request — Renovate's #277 to #280, none of which
+touched Node — while the release job would have failed the same way on the next push to `main`.
+The selector moved under the repository, the same arriving change D43 refuses for the Valkey
+lines.
+
+Amended 2026-11-12: **D31 fixes the Kind snapshotter of the E2E legs, and D5 corrects why no
+leg can run a user namespace.** From 2026-11-05 on, the single-node legs lost their runner pod
+to eviction — three of the four Renovate PRs of D46's amendment, and the pull request that
+pinned Node: the CI Kind config set containerd's `native` snapshotter, which unpacks a full copy
+of the image file system for every container, and the parallel suite's ~100 containers came to
+24 GB of snapshots on one node. Moving the legs to the `large` runner pool (tried 2026-11-08)
+only moved the limit: evicted at 30 Gi instead of 15. The legs run Kind's default overlayfs
+snapshotter on the default pool, peak 5.3 GB. On overlayfs a pod with `hostUsers: false` still
+does not start in CI, for a reason the native snapshotter's refusal had hidden (D5).
+
 Amended 2026-09-26: **D52 to D55 are new; D6, D42 and the D42 residual risk on executing the
 scripts are amended.** [ADR 0032](0032-generated-pods-run-rootless.md) makes every generated pod
 rootless and moves every existing cluster onto that posture at the operator upgrade, which is
@@ -298,7 +317,8 @@ restricted probe pod with `hostUsers: false` (`userNamespacesSupported`); when i
 not start, the test moves the cluster without the user namespace and skips only the
 user-namespace subtest, by name and with the runtime's message — the variable turns that into a
 failure. The first push of the test failed both single-node legs on `b13377e`: the legs run Kind
-inside Docker-in-Docker with containerd's `native` snapshotter, and there a pod with
+inside Docker-in-Docker with containerd's `native` snapshotter *(until 2026-11-12, D31; the
+snapshotter was not the whole reason, see the amendment below)*, and there a pod with
 `hostUsers: false` never starts. **Measured** locally with the CI Kind config (`kindest/node`
 v1.33.4, containerd 2.1.3, `snapshotter = "native"`, single node): the init container failed with
 "mount callback failed … container ID 1109000192 cannot be mapped to a host ID", the observer's
@@ -319,6 +339,17 @@ So the user-namespace half is **verified locally only**, never in CI. *(CI on `e
 single-node legs green, the probe logged `FailedCreatePodSandBox`, the user-namespace subtest was
 skipped by name and every other subtest passed; the D50 drain test's delete subtest now waited
 12.8 s and 22.8 s instead of returning in 0.3 s.)*
+
+*(Amended 2026-11-12, with D31.)* **The snapshotter was not the only obstacle.** With the legs
+on overlayfs the probe pod still does not start: its sandbox fails with runc's `error mounting
+"sysfs" to rootfs at "/sys" … operation not permitted` (run 43220189841, `single-node-valkey9`).
+A sandbox in a user namespace mounts a sysfs of its own, and the Kind node — a container of the
+dind daemon inside the runner pod — does not let it; which of those layers refuses was not
+isolated. `E2E_REQUIRE_USER_NAMESPACES` stays unset on every leg, and the user-namespace half
+stays verified locally only. On the `single-node-valkey8` leg of the same run the probe measured
+nothing: it was never scheduled (`FailedScheduling: 0/1 nodes are available: 1 Too many pods`,
+the single node at its pod limit while the parallel suite ran), and the probe counts any Warning
+Event as a refusal — the skip was right for a reason that says nothing about user namespaces.
 
 **D6 — A pass's unit run must report zero SKIPs on the uncached run (`-count=1`)**, which is
 also repeated (`-count=2`) so no result comes from the cache. Zero SKIPs at `-count=1` is the
@@ -542,6 +573,25 @@ suite; `multi-node-valkey9` (control-plane + **3** workers) runs
 full suite against the other pinned line. The legs run in parallel on separate runner pods with
 distinct cluster names. A separate `e2e-gate` job named "E2E Tests" aggregates all of them, so
 the pre-existing required status check keeps one stable name while legs are renamed or added.
+
+*(Amended 2026-11-12.)* **The Kind nodes run containerd's default overlayfs snapshotter**; the
+CI Kind config carries no containerd patch. Its predecessor, `snapshotter = "native"` (set "to
+avoid nested overlay issues in DinD"), unpacks a full copy of an image's file system for every
+container, where overlayfs shares the read-only layers. Measured on a full-suite leg: 435
+snapshots of 118 to 150 MB each, 24 GB under the node's `/var/lib/containerd` with 104
+containers running, against 0.5 GB of compressed image content, and above 33 GB on the dind
+daemon's storage at the end. The suite writes almost nothing; the size followed the number of
+containers running at once. Since 2026-11-05 the organisation's runners are two ARC scale sets
+on the runner cluster, `wds18-small` (label `self-hosted`, at most 24 runners, then a 15 Gi
+`docker-storage` emptyDir for the dind daemon) and `wds18-large` (label `large`, at most 6, then
+30 Gi). kubelet evicted the runner pod with `Usage of EmptyDir volume "docker-storage" exceeds
+the limit "15Gi"`, GitHub reported only "The self-hosted runner lost communication with the
+server", and six of seven single-node legs on the small pool died that way, 24 to 35 minutes in,
+while the multi-node leg (two tests, about 7 minutes) never did; on the large pool both legs of
+one run died the same way at 30 Gi. The overlay is not nested: the Kind node's
+`/var/lib/containerd` is a Docker volume on the dind daemon's ext4 storage (kernel 6.8,
+containerd's overlayfs plugin `ok`). On overlayfs both single-node legs of run 43220189841 peaked
+at 5.3 GB, and all three legs passed. The legs stay on the default pool, with every other job.
 
 **Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
 empty selector that resolves to the default — including the leg that varies the node count,
@@ -831,7 +881,8 @@ a failed run leaves one namespace running for the rest of the suite, on a cluste
 deleted at the end of the job anyway.
 
 **D46 — The release tooling is exercised where its updates land: in PR CI, against the
-committed lockfile.** Three rules:
+committed lockfile.** ~~Three~~ Five rules *(the fourth added 2026-10-11, the fifth
+2026-11-08)*:
 
 * [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) drives
   `analyzeCommits` and `generateNotes` through the plugin configuration read from
@@ -872,6 +923,17 @@ committed lockfile.** Three rules:
   prints the version and path it rendered with. A check that imports the plugins from the
   project root tests the pin, not what the release job runs, and passed on the set that failed
   the release above.
+* *(Added 2026-11-08.)* **Node is pinned once, exactly, in [`.nvmrc`](../../.nvmrc)**, and both
+  jobs that run it — `release-tooling` and `semantic-release` — install that version with
+  `node-version-file`, after installing `libatomic1`. Exact rather than a major, for the reason
+  rule two gives for the lockfile: the release job runs the runtime the pull request tested.
+  Renovate's `nvm` manager moves the pin; a minor or patch automerges, because the PR's own
+  `release-tooling` job runs on the new version, and a major waits for a person, because a major
+  is where the shared libraries the binary links and the plugins' engine ranges change. Both are
+  `chore`: nothing shipped runs on Node, so a bump must not cut a release that rolls the fleet
+  (ADR 0005 D11). The check fails a run whose Node major differs from the pin and prints both
+  versions, so a local `make test-release-tooling` on another major goes red instead of testing a
+  runtime the release never uses.
 
 ### The rootless posture ([ADR 0032](0032-generated-pods-run-rootless.md))
 
@@ -1239,6 +1301,10 @@ so the comment goes above that line.
   so each red or pending automerge PR behind `main` costs a full pipeline, three E2E legs
   included, once per Renovate run that finds `main` moved. A PR that is red for its own reason
   pays that daily until it is fixed or closed.
+* **Every Node release of the pinned major costs a pull request and a full pipeline (D46, fifth
+  rule)**, three E2E legs included, for a runtime two jobs use; and both of those jobs pay an
+  `apt-get update` and an install per run. A developer whose Node is another major gets a red
+  `make test-release-tooling` until they switch.
 * **gosec runs unreleased code (D58)**, with whatever rules upstream merged between v2.29.0 and
   the commit. On this tree that commit reported 0 issues, as v2.29.0 did on Go 1.27.1; a rule
   that starts reporting on a later commit arrives only through a Renovate PR, which goes red on
@@ -1305,6 +1371,13 @@ Rejected: nobody reads a green leg's log.
 
 Built that way first under a shared-DinD-host assumption, removed once each leg got its own
 runner pod.
+
+### Run the E2E legs on the `large` runner pool, or raise the storage limit (D31)
+
+The `large` pool was tried on 2026-11-08 and evicted both single-node legs at its 30 Gi; any
+limit that holds the native snapshotter's copies has to grow with every test that runs in
+parallel, and buys disk for copies nobody uses. Fewer parallel tests would shrink the copies and
+lengthen every leg. Removing the copies cost one deleted config block.
 
 ### Rename or replace the required status check instead of adding `e2e-gate`
 
@@ -1474,6 +1547,27 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   silently. The synthetic context also freezes the plugin API shape of semantic-release 25:
   a future major that changes what `generateNotes` receives fails the check, which is the
   point, but the failure will name this script rather than the incompatibility.
+* **D46's fifth rule was checked off CI, not yet on a runner** (recorded 2026-11-08). Verified:
+  the Node 26.13.0 linux-x64 binary exits 127 on `libatomic.so.1` in `ubuntu:22.04` and
+  `ubuntu:24.04` (amd64, emulated), the failure the CI logs show; with `libatomic1` installed,
+  `npm ci` and the check pass in `ubuntu:24.04`; `make test-release-tooling` passes on macOS with
+  Node 26.13.0 and fails with `.nvmrc` set to 24.22.2; `renovate-config-validator --strict`
+  (Renovate 44.222.4) accepts `renovate.json`; actionlint 1.7.7 finds nothing in the changed
+  steps. *(Verified on a runner the same day, run 42488378159: the `wds18-small` image is Ubuntu
+  24.04, `libatomic1` was not installed before the step, `.nvmrc` resolved to 26.13.0, and the
+  check passed.)* Not verified: that Renovate's `nvm` manager extracts `.nvmrc` and, under its
+  `node` versioning, proposes only majors that have entered LTS (documented, not observed here);
+  the dashboard settles it.
+* **Nothing bounds a leg's storage, and the runner pools are not this repository's (D31, amended
+  2026-11-12).** The 5.3 GB peak is one run's measurement, and it grows with the tests running in
+  parallel and the images they pull. On 2026-11-12 neither scale set carried a `sizeLimit` on
+  `docker-storage` any more, so a leg that outgrows its share fills the runner node's disk,
+  shared by every runner on it, instead of being evicted; nothing in the workflow measures it.
+  The evictions of 2026-11-08 are read from the runner cluster's events; the earlier losses
+  (2026-11-05 and 2026-11-07) left only GitHub's "lost communication" annotation, their events
+  having expired, and are attributed to the same cause by their shape. One `Code Linting` job
+  also lost its runner on the small pool (2026-11-05, 16 minutes in); its cause is not recorded.
+  The overlayfs peak was measured on the `large` pool.
 * **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
   Nothing regenerates them; the commits they cover are in the git history and the compare
   links still work.
@@ -1595,13 +1689,14 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [`internal/builder/init_script_exec_test.go`](../../internal/builder/init_script_exec_test.go) — the executing init-script harness
 * [`test/integration/`](../../test/integration/) — envtest suites, including the UID delete-precondition test
 * [`test/e2e/`](../../test/e2e/) — `blockResourceOperations`, `assertSecondEvictionRefused`, `schedulableNodeCount`, `requireThreeSchedulableNodes`
-* `.github/workflows/release.yml` — the two-leg E2E matrix, `e2e-gate`, `generated-manifests`, `release-tooling`
+* `.github/workflows/release.yml` — the ~~two-leg~~ three-leg E2E matrix and its Kind config (overlayfs, D31), `e2e-gate`, `generated-manifests`, `release-tooling`
 * [`test/e2e/topology_abandon_test.go`](../../test/e2e/topology_abandon_test.go) — `jamSyncFromPromotedReplica` and the D50 identity gate (`jamPod0Replication` until 2026-10-11)
 * [`test/e2e/sidecar_test.go`](../../test/e2e/sidecar_test.go) — `TestE2E_SidecarFailoverDrainMaster`, the second D50 instance (2026-09-26); `waitForPodRecreated` lives in [`e2e_test.go`](../../test/e2e/e2e_test.go)
 * [`test/e2e/e2e_test.go`](../../test/e2e/e2e_test.go) — `readyEndpointPodNames`, the single D51 endpoint reader
 * [`renovate.json`](../../renovate.json) — the D48 rule, and the automerge rules that carried the D47 break onto `main`; `rebaseWhen` (D56), the disabled `dockerfile` `golang` dependency (D57) and the Makefile regex manager that accepts a pseudo-version (D58)
 * [`Makefile`](../../Makefile) — `GOSEC_VERSION`, the D58 pin, and the comment above its `# renovate:` line
-* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
+* [`hack/verify-release-tooling.mjs`](../../hack/verify-release-tooling.mjs) — the D46 render check and its Node major check; [`package.json`](../../package.json) and `package-lock.json` carry the pins it tests
+* [`.nvmrc`](../../.nvmrc) — the one Node pin (D46, fifth rule); the `nvm` rules at the end of `packageRules` in [`renovate.json`](../../renovate.json)
 * [ADR 0003](0003-nudge-a-short-of-pods-statefulset.md) — the feature that shipped inert
 * [ADR 0011](0011-evidence-based-steady-state-split-brain-resolution.md) — the decision table these tests are written against
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — the CI job that proves the generated manifests are current

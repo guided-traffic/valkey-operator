@@ -63,6 +63,10 @@ master `sc-repdr-0` by construction, replica `sc-repdr-1` deleted at `:485`.
 - `:505` `waitForPodLabel`, `:520` `waitForConnectedReplicas` and the read at `:525-530` can be met
   by the old pod (vacuous in 2 of 17 legs). The comment at `:523-524` names
   `valkeyExecAllowError`; `:526` calls `valkeyExecQuick`. `:534` (`-r` endpoint count) is sound.
+- The same gap also fails the test: on 2026-11-03 (run 41596666798, Renovate PR #278,
+  `single-node-valkey9`) `:505` was met by the old replica, which was gone before its
+  replacement existed, and `getPod` at `:510` failed with `pods "sc-repdr-1" not found`; the
+  required `E2E Tests` held the PR.
 - The unit tier catches removal of the replica role check at
   [`drain.go:114`](../../internal/sidecar/drain.go) (`TestDrainHandler_ReplicaExitsImmediately`),
   but no unit test drains a replica with `sentinelEnabled`: a Sentinel-path regression, a role
@@ -221,6 +225,19 @@ files is fatal; persistence mode `both` (duplicate `dir /data`,
 [`configmap.go:203-243`](../../internal/builder/configmap.go#L203-L243)) boots, and no test uses it.
 No production path is affected.
 
+### E2E user-namespace probe
+
+`userNamespacesSupported` ([`pod_hardening_test.go`](../../test/e2e/pod_hardening_test.go)) ends its
+poll on the first Warning Event of the probe pod and reports it as the runtime's refusal of
+`hostUsers: false`. A scheduling refusal is one too: on 2026-11-12 (run 43220189841,
+`single-node-valkey8`) the probe was never scheduled (`FailedScheduling: 0/1 nodes are available:
+1 Too many pods`, the single node at its pod limit while the parallel suite ran), and the test
+logged "user namespaces unsupported on this node" and skipped the subtest. The skip was right on
+that leg (the `single-node-valkey9` leg of the same run measured the real refusal, runc failing to
+mount `sysfs`), but on a node that supports user namespaces the same event skips the subtest
+silently, and with `E2E_REQUIRE_USER_NAMESPACES=true` fails it with a reason that is not about user
+namespaces.
+
 ## Required changes
 
 ### Shared, in one change per landing
@@ -334,6 +351,13 @@ No production path is affected.
   ADR 0017 D53 (`:843`) and its residual risk (`:1271-1278`). Verify: `make test-image-tools` green
   on both pins; a bad directive fails with the line named; removing the `replicaof` append fails the
   role assertion; `make cyclo` clean.
+
+### E2E user-namespace probe
+
+- `userNamespacesSupported` counts only a refusal from the node's runtime (a sandbox or container
+  failure) as unsupported; a probe not yet scheduled keeps the poll running, and a window that
+  closes on an unscheduled probe reports it as such. Verify: a probe with an unsatisfiable
+  `nodeSelector` on a local Kind cluster with overlayfs reports "not scheduled", not "unsupported".
 
 ## Open questions
 

@@ -17,7 +17,7 @@ Read against the tree on 2026-09-27.
 | Fleet upgrade | `make test-e2e-fleet-upgrade` | `e2e && fleetupgrade` | a Kind cluster with cert-manager and the local image loaded, no operator | Installs a released chart and upgrades it to the local image |
 | Helm migration | `make test-e2e-helm` | `e2e && e2e_helm` | a Kind cluster with the operator | Runs `manager migrate` against real CRs |
 | Image tools | `make test-image-tools` | `imagetools` | docker, no cluster | What the operator executes inside the pinned Valkey images, and the processes under the rootless posture |
-| Release tooling | `make test-release-tooling` | — (node) | node and npm | That the semantic-release dependency set still renders release notes |
+| Release tooling | `make test-release-tooling` | — (node) | node of the major in `.nvmrc`, and npm | That the semantic-release dependency set still renders release notes |
 
 The tier boundaries are [ADR 0017](../adr/0017-test-and-ci-policy.md) D2. The per-package
 timeouts are in the Makefile: 60 min integration, 30 min E2E, 45 min fleet upgrade, 10 min
@@ -186,7 +186,9 @@ D42, D53).
 ## What CI runs
 
 The `E2E Tests` matrix in `.github/workflows/release.yml` runs three legs in parallel, each on
-its own Kind cluster (Kubernetes 1.33.4, containerd's `native` snapshotter):
+its own Kind cluster (Kubernetes 1.33.4, containerd's default overlayfs snapshotter — the
+`native` one copied every container's image file system and outgrew the runner's storage,
+[ADR 0017](../adr/0017-test-and-ci-policy.md) D31):
 
 | Leg | Workers | Valkey line | Scope |
 |---|---|---|---|
@@ -195,7 +197,8 @@ its own Kind cluster (Kubernetes 1.33.4, containerd's `native` snapshotter):
 | `single-node-valkey8` | 0 | 8 | the full suite |
 
 Why these three, and why three workers, is [ADR 0017](../adr/0017-test-and-ci-policy.md) D31,
-D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES`, and no workflow runs the fleet-upgrade or the
+D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES` — a Kind node inside Docker-in-Docker cannot
+start a pod with `hostUsers: false` (ADR 0017 D5) — and no workflow runs the fleet-upgrade or the
 Helm-migration target. A failing leg collects the operator log, events and the pod logs of
 every `e2e-*` namespace, previous containers included.
 

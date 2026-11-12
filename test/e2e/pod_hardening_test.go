@@ -108,11 +108,11 @@ func requireSeccompFilter(t *testing.T, namespace, pod, container string) {
 }
 
 // userNamespacesRequiredEnv turns "this node cannot run a user namespace" into a
-// failure. The CI legs run Kind inside Docker-in-Docker with containerd's native
-// snapshotter, where a pod with hostUsers: false does not start -- measured
-// 2026-09-26 with the CI Kind config (kindest/node v1.33.4, containerd 2.1.3):
-// "mount callback failed ... container ID 1109000192 cannot be mapped to a host
-// ID", and Kind's own createContainer hook failing with permission denied -- so CI
+// failure. The CI legs run Kind inside Docker-in-Docker, where a pod with
+// hostUsers: false does not start: on overlayfs runc fails mounting sysfs with
+// "operation not permitted" (measured 2026-11-12), and with containerd's native
+// snapshotter, which the legs used before, the ids could not be mapped at all
+// ("container ID 1109000192 cannot be mapped to a host ID", 2026-09-26) -- so CI
 // does not set it; a local Kind cluster on overlayfs runs the user-namespace half.
 const userNamespacesRequiredEnv = "E2E_REQUIRE_USER_NAMESPACES"
 
@@ -154,7 +154,8 @@ func (tc *testClients) userNamespacesSupported(t *testing.T, namespace string) (
 
 	// Two ways a node refuses, both measured on 2026-09-26: the container fails
 	// (CreateContainerError, local Kind with the native snapshotter) or the pod
-	// sandbox does (FailedCreatePodSandBox, the CI legs in Docker-in-Docker) -- and
+	// sandbox does (FailedCreatePodSandBox, the CI legs in Docker-in-Docker, on
+	// either snapshotter) -- and
 	// the second one shows only as an Event, the container stays ContainerCreating.
 	// A probe that has not started when the window closes counts as unsupported too,
 	// with whatever it last showed; E2E_REQUIRE_USER_NAMESPACES turns that into a
