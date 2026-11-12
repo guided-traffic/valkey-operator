@@ -854,6 +854,21 @@ from the `SENTINEL MASTER` reply the health pass already asks for, and cleared b
 or by the next Sentinel roll.
 → [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md)
 
+## A Sentinel that keeps naming another master is replaced
+
+Sentinel adopts a new master address only from a peer announcing a **higher** config epoch, and
+it takes the epoch before it resolves the address: a failed DNS lookup leaves it on the old
+master at the new epoch until the next failover (measured on wds18, 2026-11-01: seven hours,
+`Ready=True`, phase `OK`, read in `src/sentinel.c`). It then neither confirms the master's failure
+nor votes. The health pass compares each Sentinel's `SENTINEL MASTER` address with the data
+tier's master (`SentinelMasterDiverged`, a level) and, outside a roll, **deletes the pod** of one
+that kept naming another master for 2 min — only with one data master, a healthy Sentinel
+majority naming it, and the gates of every Sentinel delete. **Not `REMOVE` + `MONITOR`**:
+`MONITOR` resolves the hostname and fails in exactly that DNS outage, leaving a Sentinel without
+a monitor that the health pass reads as silent. Every healthy Sentinel cluster is reconciled at
+least every 5 min, because Sentinel state produces no Kubernetes event.
+→ [ADR 0040](docs/adr/0040-a-sentinel-that-names-another-master-is-replaced.md)
+
 ## Rotating certificates rotate the instances that cannot reload them
 
 A Secret volume is rewritten in place when cert-manager rotates the certificate it holds, and a
