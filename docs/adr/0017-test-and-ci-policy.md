@@ -590,8 +590,9 @@ server", and six of seven single-node legs on the small pool died that way, 24 t
 while the multi-node leg (two tests, about 7 minutes) never did; on the large pool both legs of
 one run died the same way at 30 Gi. The overlay is not nested: the Kind node's
 `/var/lib/containerd` is a Docker volume on the dind daemon's ext4 storage (kernel 6.8,
-containerd's overlayfs plugin `ok`). On overlayfs both single-node legs of run 43220189841 peaked
-at 5.3 GB, and all three legs passed. The legs stay on the default pool, with every other job.
+containerd's overlayfs plugin `ok`). On overlayfs both single-node legs peaked
+at 5.3 GB and all three legs passed, on the `large` pool (run 43220189841) and on the default one
+(run 43224271599). The legs stay on the default pool, with every other job.
 
 **Every leg is named for the Valkey line it runs and passes that line explicitly**, never an
 empty selector that resolves to the default — including the leg that varies the node count,
@@ -1555,11 +1556,14 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   (Renovate 44.222.4) accepts `renovate.json`; actionlint 1.7.7 finds nothing in the changed
   steps. *(Verified on a runner the same day, run 42488378159: the `wds18-small` image is Ubuntu
   24.04, `libatomic1` was not installed before the step, `.nvmrc` resolved to 26.13.0, and the
-  check passed.)* Not verified: that Renovate's `nvm` manager extracts `.nvmrc` and, under its
+  check passed.)* ~~Not verified: that Renovate's `nvm` manager extracts `.nvmrc` and, under its
   `node` versioning, proposes only majors that have entered LTS (documented, not observed here);
-  the dashboard settles it.
+  the dashboard settles it.~~ *(Observed 2026-11-12: the first Renovate run after the merge
+  opened #283, `chore(deps): update node.js to v26.13.1`, `.nvmrc` only, automerge on.)* Not
+  verified: that its `node` versioning proposes only majors that have entered LTS (documented,
+  not observed here); the next major settles it.
 * **Nothing bounds a leg's storage, and the runner pools are not this repository's (D31, amended
-  2026-11-12).** The 5.3 GB peak is one run's measurement, and it grows with the tests running in
+  2026-11-12).** The 5.3 GB peak is two runs' measurement, and it grows with the tests running in
   parallel and the images they pull. On 2026-11-12 neither scale set carried a `sizeLimit` on
   `docker-storage` any more, so a leg that outgrows its share fills the runner node's disk,
   shared by every runner on it, instead of being evicted; nothing in the workflow measures it.
@@ -1567,7 +1571,6 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   (2026-11-05 and 2026-11-07) left only GitHub's "lost communication" annotation, their events
   having expired, and are attributed to the same cause by their shape. One `Code Linting` job
   also lost its runner on the small pool (2026-11-05, 16 minutes in); its cause is not recorded.
-  The overlayfs peak was measured on the `large` pool.
 * **The header-only release notes of v1.10.26 through v1.10.48 stay as published (D46).**
   Nothing regenerates them; the commits they cover are in the git history and the compare
   links still work.

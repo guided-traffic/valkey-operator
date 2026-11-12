@@ -81,6 +81,17 @@ The Kind and Helm `version:` inputs are moved by the built-in github-actions man
   govulncheck and kustomize never ship; controller-gen stamps the shipped CRD
   ([`crd.yaml:8`](../../deploy/helm/valkey-operator/templates/crd.yaml)); npm covers release tooling.
 
+- **A push to `main` cancels the release in flight.** The workflow's `concurrency` group
+  (`release.yml:12-14`) has `cancel-in-progress: true` for every ref, `main` included. On
+  2026-11-12 the automerge of #279 cancelled the `Semantic Release` job of the #281 merge
+  (run 43227654590) during its npm signature check, before `Release` ran: the `fix(deps)` commit of
+  that merge waits for the next run on `main` that is not cancelled. Nothing is lost while the
+  cancel lands before the tag push. If it lands between semantic-release pushing the tag and
+  `@semantic-release/github` publishing the release, the tag exists without a release:
+  `build.yml` (`release: published`) never builds that version's images, and the next run counts
+  the tag as released (by reading semantic-release's step order; not observed). Every automerge on
+  `main` restarts the window.
+
 **Impact:** every E2E result is measured on an end-of-life Kubernetes and cert-manager, with a
 kubectl outside the skew policy, on test images the docs wrongly call maintained; CI-only bumps cut
 releases that roll the fleet for nothing shipped.
@@ -207,6 +218,10 @@ release run. Installers can pin today with [`image.digest`](../operations/instal
    scratch copy removes them from a dry run.
 10. **(Q2)** the `Makefile:50` line, then `make test-unit` and `make test-integration`. **(Q3)**
     Proof: the next CI-only bump is `chore(deps)` and cuts no tag.
+
+11. **Release cancel** (independent): `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`,
+    so a run on `main` finishes and the newest push waits as the one pending run. Proof: two quick
+    merges to `main` leave the first run's `Semantic Release` completed, not cancelled.
 
 ### Default exporter image
 
