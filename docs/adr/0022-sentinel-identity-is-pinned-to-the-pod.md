@@ -18,6 +18,11 @@ Not implemented, deliberately: the operator never issues `SENTINEL RESET` to cle
 peer table. Drift that predates this ADR is cleared manually or at the next Sentinel
 roll — see D6.
 
+Amended 2026-11-01 by [ADR 0040](0040-a-sentinel-that-names-another-master-is-replaced.md) D2:
+every Sentinel pass that reaches `CheckCluster` now requests a recheck after 5 minutes, so a clean
+cluster is measured every 5 minutes too. The second half of D7 and the residual risk on the first
+`True` are marked in place.
+
 Corrected 2026-09-27 (no decision changes): the comment above `resetSentinelState` that the
 Context and Residual risks call wrong now states the measured behaviour of `SENTINEL RESET`
 (it keeps the current master address). Both sentences are struck and corrected in place.
@@ -119,17 +124,20 @@ and unrecoverable without one. Existing drift is cleared by an operator, one Sen
 at a time with the master verified healthy, or by the next Sentinel roll — which
 rebuilds every table from scratch anyway. D5 is what makes either verifiable.
 
-**D7 — A cluster that reports drift is re-checked every 5 minutes; a clean one is
-not.** Clearing the entries changes no Kubernetes object: no pod restarts, no owned
+**D7 — A cluster that reports drift is re-checked every 5 minutes; ~~a clean one is
+not~~ *(amended 2026-11-01: a clean one is too, ADR 0040 D2)*.** Clearing the entries changes no Kubernetes object: no pod restarts, no owned
 object writes, and the CR watch is generation-gated — so without a recheck the
 condition would keep asserting drift until the manager's 10 h cache resync, which is
 precisely the window an operator needs it in. Measured before the recheck existed: a
 cluster with real drift kept `SentinelPeersStale=False` indefinitely because no pass
-re-entered. Only clusters that already report drift pay for the poll
+re-entered. ~~Only clusters that already report drift pay for the poll
 (`sentinelPeerDriftRecheckInterval`), and they stop on the pass that finds the tables
 agreeing again. A clean cluster relies on the `Owns(&appsv1.StatefulSet{})` watch,
 which fires whenever a Sentinel pod is replaced — the only way drift can appear once
-D1 holds.
+D1 holds.~~ *(Amended 2026-11-01:)* the drift poll (`sentinelPeerDriftRecheckInterval`)
+is unchanged, and every Sentinel pass that measures requests the same 5 minutes
+(`sentinelStateRecheckInterval`, ADR 0040 D2), so a clean cluster is measured on that
+clock as well as on the `Owns(&appsv1.StatefulSet{})` watch.
 
 **D8 — The identity is namespace-scoped.** Two clusters of the same name in different
 namespaces derive different ids. Their Sentinels never meet — they monitor different
@@ -200,9 +208,12 @@ store for a one-off.
   `updateHAStatus` where all Valkey and Sentinel pods are Ready. A cluster that never
   reaches that branch keeps whatever the last measurement said, and D7's recheck does
   not help there: a cluster stuck in Provisioning or Error is not measured at all.
-- **The first True still depends on a pass happening.** D7 polls only once drift has
+- **The first True still depends on a pass happening.** ~~D7 polls only once drift has
   been reported. Drift that appears while nothing else triggers a reconcile is seen at
-  the next StatefulSet event or the cache resync, whichever comes first. With D1 in
+  the next StatefulSet event or the cache resync, whichever comes first.~~ *(Amended
+  2026-11-01, ADR 0040 D2:)* a healthy Sentinel cluster is measured every 5 minutes, so
+  drift that appears while nothing else triggers a reconcile is seen within 5 minutes
+  of the last pass that measured. With D1 in
   place drift can only arrive through a path D1 does not cover — a foreign Sentinel
   joining the monitor group — which is not a failure mode this operator produces.
 - **Existing fleet drift is a manual step** (D6) and nothing enforces that it happens.
