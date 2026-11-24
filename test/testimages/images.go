@@ -43,7 +43,7 @@ const (
 	// Valkey8 is the current Valkey 8 release. It is what the second e2e leg runs
 	// the suite against, and the starting point of every upgrade the suite performs.
 	// renovate: datasource=docker depName=valkey/valkey
-	Valkey8 = "valkey/valkey:8.1.9"
+	Valkey8 = "valkey/valkey:8.1.12"
 
 	// Valkey9Alpine is the current Valkey 9 release on Alpine, the variant a user is
 	// most likely to put into spec.image instead of the Debian default. It is what
