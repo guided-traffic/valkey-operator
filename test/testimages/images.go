@@ -38,7 +38,7 @@ const (
 const (
 	// Valkey9 is the current Valkey 9 release and the default for every suite.
 	// renovate: datasource=docker depName=valkey/valkey
-	Valkey9 = "valkey/valkey:9.1.1"
+	Valkey9 = "valkey/valkey:9.2.0"
 
 	// Valkey8 is the current Valkey 8 release. It is what the second e2e leg runs
 	// the suite against, and the starting point of every upgrade the suite performs.
