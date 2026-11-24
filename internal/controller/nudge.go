@@ -89,7 +89,8 @@ func (t *nudgeTracker) forget(key types.NamespacedName) {
 }
 
 // forgetNudges drops the grace-period observations of both StatefulSets belonging
-// to the named CR, plus the rolling-update wait bounds recorded for it.
+// to the named CR, plus the rolling-update wait bounds and the Sentinel divergence
+// clocks recorded for it.
 //
 // It exists for the two Reconcile exits that never look at a StatefulSet again:
 // the CR is gone, or it is being deleted. nudgeStatefulSet is the only other place
@@ -108,6 +109,7 @@ func (r *ValkeyReconciler) forgetNudges(namespace, name string) {
 		})
 	}
 	r.forgetWaitBounds(namespace, name)
+	r.sentinelDivergence.forget(types.NamespacedName{Namespace: namespace, Name: name})
 }
 
 // nudgeShortStatefulSets patches a nudge annotation onto the data and Sentinel

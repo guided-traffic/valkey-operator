@@ -116,6 +116,13 @@ var conditionRegistry = []conditionOwnership{
 		presenceGuarded: false,
 	},
 	{
+		conditionType:   vkov1.ConditionTypeSentinelMasterDiverged,
+		kind:            conditionLevel,
+		evaluators:      1,
+		clearSite:       "recordSentinelMasterDivergence",
+		presenceGuarded: false,
+	},
+	{
 		conditionType: vkov1.ConditionTypeStorageSpecNotApplied,
 		kind:          conditionLevel,
 		// The data StatefulSet and the Sentinel StatefulSet both call

@@ -369,7 +369,9 @@ All three images live in [`test/testimages`](test/testimages/images.go): the cur
 release is the default for every suite, the current Valkey 8 release is the second e2e leg and
 the start of every upgrade the suite performs, the Alpine variant of the current Valkey 9
 release (`Valkey9Alpine`, selector `9-alpine`) is the third full-suite leg — busybox instead of
-GNU tools, so `timeout` reports an expiry as 143, not 124. Renovate maintains all three and is capped per major,
+GNU tools, so `timeout` reports an expiry as 143, not 124. Renovate maintains all three and is capped per major
+*(corrected 2026-11-24: until then it never scanned the file — `config:recommended` ignores
+`**/test/**`, so `renovate.json` sets its own `ignorePaths` without that entry; keep it so)*,
 so crossing to a future major is a decision, not an arriving PR. **Do not copy a pin anywhere
 else** — CI passes `E2E_VALKEY_LINE=8`, a selector, and an unrecognised value panics rather than
 falling back. Only e2e is pinned; unit and integration never pull an image, so their image
@@ -860,6 +862,21 @@ unrecoverable without one. Drift is *reported* as the `SentinelPeersStale` condi
 from the `SENTINEL MASTER` reply the health pass already asks for, and cleared by an operator
 or by the next Sentinel roll.
 → [ADR 0022](docs/adr/0022-sentinel-identity-is-pinned-to-the-pod.md)
+
+## A Sentinel that keeps naming another master is replaced
+
+Sentinel adopts a new master address only from a peer announcing a **higher** config epoch, and
+it takes the epoch before it resolves the address: a failed DNS lookup leaves it on the old
+master at the new epoch until the next failover (measured on wds18, 2026-11-01: seven hours,
+`Ready=True`, phase `OK`, read in `src/sentinel.c`). It then neither confirms the master's failure
+nor votes. The health pass compares each Sentinel's `SENTINEL MASTER` address with the data
+tier's master (`SentinelMasterDiverged`, a level) and, outside a roll, **deletes the pod** of one
+that kept naming another master for 2 min — only with one data master, a healthy Sentinel
+majority naming it, and the gates of every Sentinel delete. **Not `REMOVE` + `MONITOR`**:
+`MONITOR` resolves the hostname and fails in exactly that DNS outage, leaving a Sentinel without
+a monitor that the health pass reads as silent. Every healthy Sentinel cluster is reconciled at
+least every 5 min, because Sentinel state produces no Kubernetes event.
+→ [ADR 0040](docs/adr/0040-a-sentinel-that-names-another-master-is-replaced.md)
 
 ## Rotating certificates rotate the instances that cannot reload them
 
