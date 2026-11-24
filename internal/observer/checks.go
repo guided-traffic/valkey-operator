@@ -63,7 +63,7 @@ func (o *Observer) discoverMasterViaSentinel() (string, error) {
 	}
 
 	for _, addr := range o.cfg.SentinelAddrList {
-		client := o.newClient(addr, password)
+		client := o.newClient(addr, password).WithSentinelAuthFallback(o.cfg.Password)
 		info, err := client.SentinelMaster(o.cfg.SentinelMonitor)
 		if err != nil {
 			continue
@@ -270,13 +270,15 @@ func (o *Observer) newClient(addr, password string) *valkeyclient.Client {
 // newSentinelClient creates a valkeyclient.Client for Sentinel connections.
 // When TLS is enabled it uses the Sentinel material source (CA-only unless
 // sentinel mTLS was opted into), falling back to the Valkey one if no
-// sentinel-specific source was built.
+// sentinel-specific source was built. The client falls back to the other
+// credential for a Sentinel that still runs the other setting after a switch of
+// disableAuth (WithSentinelAuthFallback, ADR 0016 D9).
 func (o *Observer) newSentinelClient(addr, password string) *valkeyclient.Client {
 	src := o.sentinelTLSSrc
 	if src == nil {
 		src = o.tlsSrc
 	}
-	return newTLSAwareClient(addr, src, password)
+	return newTLSAwareClient(addr, src, password).WithSentinelAuthFallback(o.cfg.Password)
 }
 
 // newTLSAwareClient builds a client for addr, reading the current TLS material

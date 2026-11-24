@@ -11,7 +11,7 @@ intent: the generated ClusterRole ([`config/rbac/role.yaml`](../../config/rbac/r
 the chart ClusterRole
 ([`deploy/helm/valkey-operator/templates/clusterrole.yaml`](../../deploy/helm/valkey-operator/templates/clusterrole.yaml)),
 the kubebuilder markers that generate the first
-([`internal/controller/valkey_controller.go:201-218`](../../internal/controller/valkey_controller.go)),
+([`internal/controller/valkey_controller.go:223-240`](../../internal/controller/valkey_controller.go)),
 and the per-instance Role builder
 ([`internal/builder/rbac.go`](../../internal/builder/rbac.go)). Where a statement is
 **not** verified against this repository, it says so.

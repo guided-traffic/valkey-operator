@@ -320,9 +320,10 @@ func newValkeyClient(addr string, tlsSrc *tlsmaterial.Reloader, password string)
 
 // sentinelMasterQuerier queries multiple Sentinel instances for the current master.
 type sentinelMasterQuerier struct {
-	addrs    []string
-	password string
-	tlsSrc   *tlsmaterial.Reloader
+	addrs           []string
+	password        string
+	clusterPassword string
+	tlsSrc          *tlsmaterial.Reloader
 }
 
 // newSentinelMasterQuerier creates a production querier from the sidecar config.
@@ -333,7 +334,10 @@ func newSentinelMasterQuerier(cfg Config) (*sentinelMasterQuerier, error) {
 		q.addrs = strings.Split(cfg.SentinelAddrs, ",")
 	}
 
-	// When sentinel auth is disabled, clients connect to Sentinel without AUTH.
+	// When sentinel auth is disabled, clients connect to Sentinel without AUTH. The
+	// cluster password stays at hand for a Sentinel that still runs the other setting
+	// after a switch of disableAuth (WithSentinelAuthFallback, ADR 0016 D9).
+	q.clusterPassword = cfg.Password
 	if !cfg.SentinelDisableAuth {
 		q.password = cfg.Password
 	}
@@ -351,7 +355,8 @@ func newSentinelMasterQuerier(cfg Config) (*sentinelMasterQuerier, error) {
 func (q *sentinelMasterQuerier) GetMasterAddress(monitor string) (string, error) {
 	var lastErr error
 	for _, addr := range q.addrs {
-		info, err := newValkeyClient(addr, q.tlsSrc, q.password).SentinelMaster(monitor)
+		info, err := newValkeyClient(addr, q.tlsSrc, q.password).
+			WithSentinelAuthFallback(q.clusterPassword).SentinelMaster(monitor)
 		if err != nil {
 			lastErr = err
 			continue

@@ -17,6 +17,11 @@ verification.
 
 Amended 2026-09-27: document references follow the documentation layout of ADR 0035 and ADR 0036; no rule changed.
 
+Amended 2026-11-24: **D14 added** — a Sentinel client falls back to the other credential when a
+Sentinel refuses its own for a switched `spec.sentinel.disableAuth`, so the switch D9 asks for
+completes. Implemented and unit-tested; the e2e in both directions is written and has not run
+yet, and the report of a refusal that the fallback cannot bridge is open (Residual risks).
+
 ## Context
 
 The operator manages a datastore whose only built-in client authentication is a shared
@@ -187,6 +192,30 @@ failover target. The enqueue in the premise is pinned by the `findValkeyForSecre
 steps 2 and 3 are derived by reading `readValkeyPassword` and the `secretKeyRef` fact in the
 Context, and were not reproduced against a cluster.
 
+**D14 — A Sentinel client falls back to the other credential on a credential mismatch, so a
+switch of `spec.sentinel.disableAuth` completes.** The operator, the health checker, the sidecar
+and the observer derive their Sentinel credential from the spec, and the operator switches it at
+once. A running Sentinel keeps the `requirepass` it booted with until its pod is replaced, and
+the Sentinel roll waits for the data tier ([ADR 0026](0026-a-pod-being-deleted-is-not-available.md)),
+whose master handover needs a Sentinel failover. Measured on a live cluster (operator 1.15.1,
+direction `true` -> `false`, 2026-11-24): every Sentinel answered `ERR AUTH <password> called
+without any password configured for the default user`. The data roll cycled before the master
+through trigger, reset and retrigger without end, and the Sentinel tier never rolled. Deleting one
+Sentinel pod by hand released it. Every Sentinel connection therefore takes
+`valkeyclient.WithSentinelAuthFallback(clusterPassword)`:
+
+* sent with a password, `AUTH` refused because the Sentinel has none configured: sent again
+  without `AUTH`;
+* sent without a password, the command refused with `NOAUTH`: sent again with the cluster
+  password.
+
+The retry runs once, on a fresh connection, and only after a refusal that executed nothing, so
+it is safe for `SENTINEL FAILOVER`. A wrong password (`WRONGPASS`), any other error reply and a
+connection failure are not retried. Without `spec.auth` there is no cluster password, and the
+`NOAUTH` half stays off. Data-node connections never take the fallback. The posture each Sentinel
+enforces is still the one in its config: the fallback changes only what a client of this
+repository sends.
+
 ## Consequences
 
 * **A CR that omits `spec.auth` is a fully open datastore** reachable by anything the
@@ -210,6 +239,15 @@ Context, and were not reproduced against a cluster.
   not reproducible from this repository
   ([ADR 0014](0014-rbac-lives-in-three-places.md)).
 * A password rotation degrades the cluster until it is manually rolled.
+* **A Sentinel connection that succeeds no longer proves that the spec's Sentinel posture is in
+  force** (D14). Until the Sentinel roll has replaced a Sentinel, it keeps the setting it booted
+  with: after a switch to `disableAuth: false` it still accepts clients without a password,
+  after a switch to `true` it still requires one. The window is the data roll plus the Sentinel
+  roll.
+* While the Sentinels still require the password after a switch to `disableAuth: true`, a data
+  pod started in that window cannot ask Sentinel for the master: `init-config-selector` queries
+  without `-a`, skips the `NOAUTH` answer and after its 30 s budget takes the known master from
+  the replica ConfigMap. Read from the generated script, not measured.
 
 ## Alternatives Considered
 
@@ -262,6 +300,17 @@ Rejected: it would put secret-derived material into the pod template.
 
 Named as an open product wish (`.github/idea.md`), explicitly **not** an implemented feature.
 
+### Roll the Sentinel tier first when its auth setting changes (D14)
+
+Rejected. It turns the tier order of ADR 0024 and ADR 0026 around for one input, and the
+data-tier hold would need an exception. The old data pods' sidecars and init containers would
+then run the stale setting during the Sentinel roll, so the mismatch moves rather than goes away.
+
+### Always keep Sentinel's `requirepass`, and let `disableAuth` only stop this repository's clients from authenticating (D14)
+
+Rejected. `disableAuth` exists for clients that cannot authenticate to Sentinel (D9). Keeping
+`requirepass` refuses exactly those clients.
+
 ## Residual risks
 
 * **`tls-auth-clients optional` (open)** — TLS authenticates the server only. "Require client
@@ -283,6 +332,17 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
   verified** — ADR 0030 D6 treats it as pinning precisely so that nobody has to find out.
 * `protected-mode no` is rendered unconditionally, so Valkey's own last-resort refusal to serve
   unauthenticated external clients is removed even on clusters with auth off.
+* **D14 is not yet verified end to end (open).** `TestE2E_SentinelDisableAuthSwitchRollsBothTiers`
+  switches the flag both ways on a running cluster and has not run. The unit tier pins the
+  fallback per reply and at the operator's failover trigger, with a mutation check: both trigger
+  tests fail without the fallback.
+* **A Sentinel refusal the fallback cannot bridge is not reported (open).** A `WRONGPASS` or an
+  auth error on every Sentinel still shows only at debug level, while the roll cycles before the
+  master and the phase reads `Rolling Update i/n`.
+* **Whether Sentinels with mixed `requirepass` settings can elect a failover leader is not
+  verified.** Sentinels authenticate to each other with their own `requirepass`. The roll's
+  failover does not depend on it, because the forced retrigger needs no election, but an
+  automatic failover in the window might.
 
 ## References
 
@@ -299,3 +359,7 @@ Named as an open product wish (`.github/idea.md`), explicitly **not** an impleme
 * [`internal/tlsmaterial/reloader.go`](../../internal/tlsmaterial/reloader.go) — the reload half
 * [`internal/builder/tls_material.go`](../../internal/builder/tls_material.go), [`internal/controller/tls_material.go`](../../internal/controller/tls_material.go) — the fingerprint half
 * [ADR 0015](0015-one-crd-validated-by-schema-only.md) — why the two TLS sources are not mutually exclusive at admission
+* [`internal/valkeyclient/client.go`](../../internal/valkeyclient/client.go) — `WithSentinelAuthFallback`, the D14 retry
+* [`internal/controller/valkey_controller.go`](../../internal/controller/valkey_controller.go) — `sentinelCredentials`, `newSentinelClient`; [`internal/health/checker.go`](../../internal/health/checker.go) — `observeSentinels`; [`internal/sidecar/drain.go`](../../internal/sidecar/drain.go) — `realSentinelClientFactory`; [`internal/sidecar/labeler.go`](../../internal/sidecar/labeler.go) — `sentinelMasterQuerier`; [`internal/observer/checks.go`](../../internal/observer/checks.go) — `newSentinelClient`
+* [`test/e2e/sentinel_auth_switch_test.go`](../../test/e2e/sentinel_auth_switch_test.go) — the D14 switch in both directions
+* [ADR 0024](0024-the-sentinel-tier-reports-its-own-completion.md), [ADR 0026](0026-a-pod-being-deleted-is-not-available.md) — the tier order D14 leaves in place

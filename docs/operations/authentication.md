@@ -29,6 +29,27 @@ One password serves every purpose:
 Which container receives it under which environment variable is in the
 [naming conventions](../../README.md#naming-conventions).
 
+## Switching `spec.sentinel.disableAuth`
+
+The flag goes into each Sentinel's config and into the data pods (the sidecar's Sentinel
+credential and the `init-config-selector` query). Switching it on a running cluster rolls both
+tiers, the data tier first, then the Sentinel tier.
+
+**A Sentinel keeps the setting it started with until its pod is replaced.** After a switch to
+`false`, a Sentinel not yet replaced still accepts clients without a password. After a switch
+to `true`, it still requires one. A client of yours that talks to Sentinel meets both settings
+during the roll.
+
+**The operator, the sidecar and the observer handle both settings.** They use the setting in
+the spec, and when a Sentinel refuses that credential for a switched setting, they send the
+command once more with the other one
+([ADR 0016](../adr/0016-authentication-and-tls-posture.md) D14).
+
+**An operator without the fallback stops the data roll before the master.** Every Sentinel
+refuses the operator, and the phase stays at `Rolling Update i/n`. This was measured on 1.15.1.
+Older versions derive the Sentinel credential the same way, but were not measured. Deleting one Sentinel pod by hand releases the roll: it starts with the
+new setting, takes the failover, and the Sentinel roll replaces the rest.
+
 ## Changing the password
 
 **Changing the password inside the Secret restarts nothing.** Every pod read the password

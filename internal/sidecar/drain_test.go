@@ -1239,8 +1239,6 @@ func TestBuildDrainHandler_CopiesConfigAndDerivesPort(t *testing.T) {
 	assert.Equal(t, 3, handler.replicas)
 	assert.Equal(t, "16379", handler.valkeyPort)
 	assert.Nil(t, handler.sentinelAddrs)
-	assert.Same(t, handler.clientFactory, handler.sentinelClientFactory,
-		"without disabled sentinel auth both paths share one factory")
 }
 
 func TestBuildDrainHandler_DefaultsThePortWhenTheAddressCarriesNone(t *testing.T) {

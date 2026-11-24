@@ -320,7 +320,7 @@ func TestBuildTLSConfig_ErrorWhenCAIsNotPEM(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to parse CA certificate")
 }
 
-// --- readValkeyPassword / sentinelPassword ---
+// --- readValkeyPassword / sentinelCredentials ---
 
 func authValkey(secretName, key string) *vkov1.Valkey {
 	return newTestValkey("test", "default", func(v *vkov1.Valkey) {

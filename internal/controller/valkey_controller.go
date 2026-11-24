@@ -198,14 +198,26 @@ func (r *ValkeyReconciler) readValkeyPassword(ctx context.Context, v *vkov1.Valk
 	return string(secret.Data[v.Spec.Auth.SecretPasswordKey])
 }
 
-// sentinelPassword returns the password to use when connecting to Sentinel.
-// When sentinel auth is disabled (disableAuth: true), Sentinel does not
-// require client authentication, so an empty password is returned.
-func (r *ValkeyReconciler) sentinelPassword(ctx context.Context, v *vkov1.Valkey) string {
+// sentinelCredentials returns the password the spec gives Sentinel clients and the
+// cluster password. The first is empty when sentinel auth is disabled
+// (disableAuth: true) or auth is off; the second is what newSentinelClient falls
+// back to when a Sentinel still requires the password it booted with.
+func (r *ValkeyReconciler) sentinelCredentials(ctx context.Context, v *vkov1.Valkey) (password, clusterPassword string) {
+	clusterPassword = r.readValkeyPassword(ctx, v)
 	if v.IsSentinelAuthDisabled() {
-		return ""
+		return "", clusterPassword
 	}
-	return r.readValkeyPassword(ctx, v)
+	return clusterPassword, clusterPassword
+}
+
+// newSentinelClient builds the client for one Sentinel. A running Sentinel keeps
+// the auth setting it booted with until the Sentinel roll replaces it, and that
+// roll waits for the data tier, which needs a working Sentinel failover: the
+// fallback retries a command the Sentinel refused for a credential mismatch with
+// the other credential, so a switch of spec.sentinel.disableAuth completes
+// (docs/adr/0016-authentication-and-tls-posture.md, D9).
+func (r *ValkeyReconciler) newSentinelClient(addr, password, clusterPassword string, tlsConfig *tls.Config) *valkeyclient.Client {
+	return r.newValkeyClient(addr, password, tlsConfig).WithSentinelAuthFallback(clusterPassword)
 }
 
 // +kubebuilder:rbac:groups=vko.gtrfc.com,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
