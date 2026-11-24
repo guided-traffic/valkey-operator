@@ -24,6 +24,13 @@ its fixture rule, `TestE2E_SidecarFailoverDrainMaster`, found by the last full e
 day and fixed. Each is recorded at its decision. The same day also made D52 to D55 new and
 amended D6 and D42 (the paragraphs below).
 
+Amended 2026-11-24: **D43 is corrected.** It said Renovate keeps the Valkey image pins
+current; Renovate had never scanned `test/testimages/images.go`, because the
+`:ignoreModulesAndTests` preset ignores `**/test/**`. `renovate.json` now sets `ignorePaths`
+without that entry. Not yet verified: the first Renovate run after the merge has to list the
+file on the Dependency Dashboard and open the pending bumps, and the per-major `allowedVersions`
+caps have never been exercised before that run.
+
 Amended 2026-08-22: **D42 and D43 are new.** The operator runs shell inside an image it does
 not build, and nothing checked that the image still contained what the shell executes -- the
 unit tier stubs `timeout` away because macOS lacks it, and the integration tier runs no
@@ -851,6 +858,18 @@ default for every suite) and the current Valkey 8 release (the second e2e leg, a
 of every upgrade the suite performs). Renovate keeps both current and is capped per major by
 `allowedVersions`, so crossing to a future major stays a decision rather than an arriving
 pull request.
+
+*(Amended 2026-11-24.)* **Until this date Renovate never read the file, and neither pin moved.**
+`config:recommended` extends `:ignoreModulesAndTests`, whose `ignorePaths` contains
+`**/test/**`, and a path in `ignorePaths` is skipped before any manager runs, the custom regex
+manager for `images.go` included. Neither Dependency Dashboard of the repository ever listed the
+file, while the regex itself matches every pin in it; Valkey 9 stayed on 9.1.1 and Valkey 8 on
+8.1.9 through 9.1.4, 9.2.0 and 8.1.12. **`renovate.json` now sets `ignorePaths` itself**: the
+preset's list without `**/test/**`. The option does not merge, so the repository's list replaces
+the preset's rather than adding to it. Nothing else under `test/` is a file an enabled manager
+reads (`test/e2e/helm-values.yaml` does not match the helm-values pattern), so the change brings
+exactly this file into the scan. The cost: an entry Renovate adds to the preset later does not
+reach this repository until somebody copies it.
 
 The e2e matrix passes `E2E_VALKEY_LINE=8`, not an image, and an unrecognised value panics
 instead of falling back. A copy of the pin in the workflow would have to move in lockstep,

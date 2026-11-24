@@ -367,7 +367,9 @@ uses any more.
 
 Both images live in [`test/testimages`](test/testimages/images.go): the current Valkey 9
 release is the default for every suite, the current Valkey 8 release is the second e2e leg and
-the start of every upgrade the suite performs. Renovate maintains both and is capped per major,
+the start of every upgrade the suite performs. Renovate maintains both and is capped per major
+*(corrected 2026-11-24: until then it never scanned the file — `config:recommended` ignores
+`**/test/**`, so `renovate.json` sets its own `ignorePaths` without that entry; keep it so)*,
 so crossing to a future major is a decision, not an arriving PR. **Do not copy a pin anywhere
 else** — CI passes `E2E_VALKEY_LINE=8`, a selector, and an unrecognised value panics rather than
 falling back. Only e2e is pinned; unit and integration never pull an image, so their image
