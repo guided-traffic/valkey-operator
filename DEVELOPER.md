@@ -142,7 +142,8 @@ one-line descriptions.
 - [cert-manager](https://cert-manager.io/) (for TLS E2E tests; `make cert-manager-install`
   applies v1.17.2 to the current cluster)
 - `kubectl` and Helm (`cert-manager-install`, `e2e-local`, `install`/`deploy`)
-- Node.js and npm (`test-release-tooling` only)
+- Node.js of the major pinned in [`.nvmrc`](.nvmrc), and npm (`test-release-tooling` only; the
+  check fails on another major)
 
 Every pinned Go tool — controller-gen, setup-envtest, kustomize, golangci-lint, gocyclo, gosec,
 govulncheck — installs itself into `bin/` on first use.
@@ -274,7 +275,7 @@ not do for you:
 | Valkey test images | [`test/testimages/images.go`](test/testimages/images.go), one pin per major line | Renovate custom manager, capped per major so a new major is a decision ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D43) |
 | Exporter default image | `DefaultMetricsExporterImage` in [`api/v1/valkey_types.go`](api/v1/valkey_types.go), pinned by digest | nothing automatic; no Renovate manager covers `api/v1` ([ADR 0033](docs/adr/0033-generated-pods-take-a-seccomp-profile-and-an-opt-in-user-namespace.md) D5) |
 | Kubernetes Go modules | `go.mod` | Renovate group "Kubernetes Go modules"; `k8s.io/kube-openapi` and `sigs.k8s.io/structured-merge-diff` are disabled and follow `k8s.io/apimachinery` by MVS ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D48) |
-| semantic-release | exact versions in `package.json`, locked in `package-lock.json`; Node is `lts/*` in the workflows | Renovate's npm manager (enabled by `config:recommended`; its PRs are not automerged); the conventionalcommits preset is on 10.x with `@semantic-release/release-notes-generator` on its `15.0.0` prerelease, the first that ships writer@9, and an `overrides` entry keeps semantic-release's own older range from nesting a second copy, which semantic-release would load first ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46) |
+| semantic-release | exact versions in `package.json`, locked in `package-lock.json`; Node exactly in [`.nvmrc`](.nvmrc), read by both jobs that run Node | Renovate's npm manager (enabled by `config:recommended`; its PRs are not automerged); `.nvmrc` by its nvm manager, minor and patch automerged as `chore`, a major by hand; the conventionalcommits preset is on 10.x with `@semantic-release/release-notes-generator` on its `15.0.0` prerelease, the first that ships writer@9, and an `overrides` entry keeps semantic-release's own older range from nesting a second copy, which semantic-release would load first ([ADR 0017](docs/adr/0017-test-and-ci-policy.md) D46) |
 
 ## Continuous integration and the release
 
@@ -295,7 +296,7 @@ pull request into it, and on demand. All jobs run on self-hosted runners.
 | Integration Tests (envtest) | `make test-integration-coverage` |
 | Valkey Image Tools | `make test-image-tools` |
 | Generated Manifests Up To Date | `make generate-all`, then fails on any diff or untracked file ([ADR 0014](docs/adr/0014-rbac-lives-in-three-places.md) D5) |
-| Release Tooling | `npm ci`, `npm audit signatures`, `node hack/verify-release-tooling.mjs` |
+| Release Tooling | installs `libatomic1` and the Node of `.nvmrc`, then `npm ci`, `npm audit signatures`, `node hack/verify-release-tooling.mjs` |
 | Combined Coverage Report | merges the unit and integration profiles, writes the badge artifact and comments on the pull request. No coverage threshold fails it |
 | Semantic Release | push to `main` only, and only when all thirteen jobs in its `needs:` succeed: every job above except `e2e-gate`, with the E2E matrix counted once |
 

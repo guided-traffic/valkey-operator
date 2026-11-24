@@ -134,6 +134,12 @@ the image-tools check and the release-tooling check. **Not claimed:** its rerun 
 still in progress when this was written, and CI, which has not seen the change, which is
 uncommitted.
 
+Amended 2026-11-12: **the reason CI cannot run a user namespace is corrected** (residual risk,
+[ADR 0017](0017-test-and-ci-policy.md) D5 and D31). The CI legs moved from containerd's
+`native` snapshotter to overlayfs, and a pod with `hostUsers: false` still does not start
+there: runc fails mounting `sysfs`. The node requirement that `native` cannot map the ids
+stands; it was not the only obstacle in CI. No decision changes.
+
 ## Context
 
 ADR 0032 removed root from every generated pod. It fixed the identity (uid/gid/fsGroup 999,
@@ -505,9 +511,13 @@ is empty by default.** *(Decided 2026-09-26; see Status.)*
 ## Residual risks
 
 - **User namespaces are verified locally only, never in CI** *(added 2026-09-26)*. The CI legs
-  run Kind in Docker-in-Docker with containerd's `native` snapshotter, where a pod with
+  run Kind in Docker-in-Docker ~~with containerd's `native` snapshotter, where a pod with
   `hostUsers: false` does not start ("container ID … cannot be mapped to a host ID"; measured with
-  the CI Kind config, [ADR 0017](0017-test-and-ci-policy.md) D5). The hardening e2e probes for
+  the CI Kind config, [ADR 0017](0017-test-and-ci-policy.md) D5)~~, where a pod with
+  `hostUsers: false` does not start *(corrected 2026-11-12: the `native` refusal was measured
+  with the then CI Kind config; on overlayfs, which the legs run since, the sandbox fails with
+  runc's `error mounting "sysfs" … operation not permitted` — the nesting refuses, not only the
+  snapshotter; which layer was not isolated, [ADR 0017](0017-test-and-ci-policy.md) D5)*. The hardening e2e probes for
   support and, without it, runs everything but the user-namespace subtest, which it skips by
   name (`E2E_REQUIRE_USER_NAMESPACES=true` makes that a failure) — CI on `e6a9d7c` is green that
   way, and the Localhost, digest, allow-list and restricted-namespace subtests ran there. The same measurement is a node
