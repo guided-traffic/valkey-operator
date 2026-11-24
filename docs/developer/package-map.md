@@ -48,6 +48,7 @@ one of four modes.
 | [`pod_hardening.go`](../../internal/controller/pod_hardening.go) | The `Localhost` seccomp allow-list gate and `writeWorkload`, which reads back whether the API server dropped `hostUsers` |
 | [`pod_security_migration.go`](../../internal/controller/pod_security_migration.go) | Whether the data template carries the ownership repair, and which single root pod is deferred (`PodSecurityUpdatePending`) |
 | [`rw_service_report.go`](../../internal/controller/rw_service_report.go) | Whether the `-rw` Service can select a master at all (`RWServiceEmpty`) |
+| [`sentinel_master_divergence.go`](../../internal/controller/sentinel_master_divergence.go) | Whether every Sentinel names the data tier's master (`SentinelMasterDiverged`), the replacement of a Sentinel that keeps naming another one and its gates, and the poll of a healthy Sentinel cluster |
 
 ## The object builders — `internal/builder/`
 

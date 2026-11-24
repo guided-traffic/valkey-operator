@@ -42,7 +42,7 @@ built, or supersedes a rule, updates the row's *State* with it.
 
 Every record here is **Accepted**. Rules superseded by a later decision: D9 of ADR 0013 by
 ADR 0032, its D12, D13 and the first half of its D14 by ADR 0036, and parts of its D7 and D6 of
-ADR 0018 by ADR 0039; D7 of ADR 0020 by that
+ADR 0018 by ADR 0039; the second half of D7 of ADR 0022 by ADR 0040; D7 of ADR 0020 by that
 record's own amendment of 2026-08-22. A part of a rule that a later amendment replaced is struck
 through in place in its record and not listed here. The *State* column is the coarse build state
 as of 2026-09-27, on the uncommitted working tree of the `feat/rootless` branch:
@@ -82,7 +82,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0010](0010-every-rolling-update-wait-is-bounded.md) | Every rolling-update wait is bounded and has a named exit | Implemented, except the plain requeues on a master or a promotion step that does not answer, and on a Sentinel pod that is missing |
 | [0011](0011-evidence-based-steady-state-split-brain-resolution.md) | Evidence-based steady-state split-brain resolution | Implemented |
 | [0012](0012-the-sidecar-records-its-drain-promotion-on-the-pod.md) | The sidecar records its drain promotion on the pod, not on the CR | Implemented |
-| [0022](0022-sentinel-identity-is-pinned-to-the-pod.md) | A Sentinel's identity is pinned to its pod, and peer drift is reported rather than reset | Implemented |
+| [0022](0022-sentinel-identity-is-pinned-to-the-pod.md) | A Sentinel's identity is pinned to its pod, and peer drift is reported rather than reset | Implemented; the second half of D7 superseded by ADR 0040 |
 | [0024](0024-the-sentinel-tier-reports-its-own-completion.md) | The Sentinel tier reports its own completion — RollingUpdateComplete means the data tier | Implemented |
 | [0025](0025-a-split-brain-warning-means-one-that-did-not-resolve-itself.md) | A Warning named split-brain means one that did not resolve itself | Implemented |
 | [0026](0026-a-pod-being-deleted-is-not-available.md) | A pod being deleted is not available — readiness answers reachability, never spendability | Implemented |
@@ -90,6 +90,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0029](0029-a-name-is-not-a-component.md) | A name is not a component — the tier is passed, never parsed | Implemented |
 | [0037](0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) | The master handover loses no acknowledged write and no dataset — a coordinated failover, the replica-side predicate and the key-count veto before the delete, the veto at every `REPLICAOF` (the topology restoration's since D9), a held handover | Implemented |
 | [0038](0038-the-operator-does-not-offer-min-replicas-to-write.md) | The operator does not offer `min-replicas-to-write` as a CRD field | Implemented |
+| [0040](0040-a-sentinel-that-names-another-master-is-replaced.md) | A Sentinel that keeps naming another master than its tier is replaced — reported as `SentinelMasterDiverged`, its pod deleted after 2 min under the Sentinel delete gates, a healthy Sentinel cluster measured every 5 min | Implemented |
 
 ### Security and API surface
 
