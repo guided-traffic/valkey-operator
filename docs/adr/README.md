@@ -111,7 +111,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 
 | ADR | Decision | State |
 |---|---|---|
-| [0017](0017-test-and-ci-policy.md) | Test, verification and CI policy | Implemented, except the open items at D6 (two conditional skips), D25 (the `require.Eventually` conversion) and D50 (the fixture fix for two vacuous sites) |
+| [0017](0017-test-and-ci-policy.md) | Test, verification and CI policy | Implemented, except the open items at D6 (two conditional skips), D25 (the `require.Eventually` conversion) and D50 (the fixture fix for two vacuous sites); the D43 correction awaits its first Renovate run |
 | [0018](0018-metrics-and-the-exporter-sidecar.md) | Metrics — an opt-in exporter sidecar, and the operator's own endpoint | Implemented |
 | [0021](0021-per-resource-metrics-and-the-alert-that-was-missing.md) | Export per-resource state as metrics, because the only alertable signal could not name a resource | Implemented |
 | [0034](0034-tickets-are-work-lists-that-get-archived.md) | Tickets are work lists that get archived, and an open security finding is embargoed | Implemented, except D7: the ticket citations that predate it stay until they are rewritten, by decision |

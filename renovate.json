@@ -5,6 +5,20 @@
     ":semanticCommits",
     ":automergeDigest"
   ],
+  "description": [
+    "ignorePaths replaces the list of :ignoreModulesAndTests (pulled in by config:recommended; ignorePaths does not merge) without its **/test/** entry. That entry hid test/testimages/images.go, so the Valkey images the e2e suite runs against were never updated (docs/adr/0017-test-and-ci-policy.md, D43). Nothing else under test/ is a file any enabled manager reads."
+  ],
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/examples/**",
+    "**/__tests__/**",
+    "**/tests/**",
+    "**/__fixtures__/**",
+    "**/.mise/locks/**",
+    "**/.config/mise/locks/**"
+  ],
   "schedule": [
     "at any time"
   ],
