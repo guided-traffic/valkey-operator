@@ -28,8 +28,12 @@ Amended 2026-11-24: **D59 is new; D31 and D43 are restated.** The Alpine variant
 Valkey 9 line is pinned beside the two Debian images and runs the full suite as a fourth leg,
 and `make test-image-tools` checks it like the others. Adding it to the image check found one
 GNU assumption at once, in a fixture and not in the operator: the drain hook's negative control
-expected `timeout`'s expiry code 124, and busybox returns 143. No CI run of the fourth leg is
-recorded here yet.
+expected `timeout`'s expiry code 124, and busybox returns 143. First CI run on the pull request
+(run 45367092711): every job green; `single-node-valkey9-alpine` 357 passes, 0 failures and the
+same two skips as `single-node-valkey9` (the hard-spread test on one node, the user-namespace
+assertions under Docker-in-Docker), in 21m51s; the handover e2e logged `valkey/valkey:9.2.0-alpine`
+with a coordinated failover and 0 acknowledged writes lost; `Valkey Image Tools` passed all seven
+checks on the Alpine image.
 
 Amended 2026-08-22: **D42 and D43 are new.** The operator runs shell inside an image it does
 not build, and nothing checked that the image still contained what the shell executes -- the
