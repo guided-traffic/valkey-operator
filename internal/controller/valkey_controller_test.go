@@ -2624,9 +2624,9 @@ func TestReconcile_StatusOperatorVersion_UpdatedOnVersionChange(t *testing.T) {
 		"status.operatorVersion must be updated when the operator version changes")
 }
 
-// --- sentinelPassword Tests ---
+// --- sentinelCredentials Tests ---
 
-func TestSentinelPassword_ReturnsEmpty_WhenDisableAuthTrue(t *testing.T) {
+func TestSentinelCredentials_ReturnsEmpty_WhenDisableAuthTrue(t *testing.T) {
 	authSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-secret",
@@ -2650,11 +2650,13 @@ func TestSentinelPassword_ReturnsEmpty_WhenDisableAuthTrue(t *testing.T) {
 	})
 	r, _ := newTestReconciler(v, authSecret)
 
-	pwd := r.sentinelPassword(context.Background(), v)
+	pwd, cluster := r.sentinelCredentials(context.Background(), v)
 	assert.Equal(t, "", pwd, "sentinel password must be empty when disableAuth is true")
+	assert.Equal(t, "supersecret", cluster,
+		"the cluster password must stay at hand for a Sentinel that still requires it")
 }
 
-func TestSentinelPassword_ReturnsPassword_WhenDisableAuthFalse(t *testing.T) {
+func TestSentinelCredentials_ReturnsPassword_WhenDisableAuthFalse(t *testing.T) {
 	authSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-secret",
@@ -2678,11 +2680,12 @@ func TestSentinelPassword_ReturnsPassword_WhenDisableAuthFalse(t *testing.T) {
 	})
 	r, _ := newTestReconciler(v, authSecret)
 
-	pwd := r.sentinelPassword(context.Background(), v)
+	pwd, cluster := r.sentinelCredentials(context.Background(), v)
 	assert.Equal(t, "supersecret", pwd, "sentinel password must match secret when disableAuth is false")
+	assert.Equal(t, "supersecret", cluster)
 }
 
-func TestSentinelPassword_ReturnsEmpty_WhenNoAuth(t *testing.T) {
+func TestSentinelCredentials_ReturnsEmpty_WhenNoAuth(t *testing.T) {
 	v := newTestValkey("test", "default", func(v *vkov1.Valkey) {
 		v.Spec.Replicas = 3
 		v.Spec.Sentinel = &vkov1.SentinelSpec{
@@ -2692,8 +2695,9 @@ func TestSentinelPassword_ReturnsEmpty_WhenNoAuth(t *testing.T) {
 	})
 	r, _ := newTestReconciler(v)
 
-	pwd := r.sentinelPassword(context.Background(), v)
+	pwd, cluster := r.sentinelCredentials(context.Background(), v)
 	assert.Equal(t, "", pwd, "sentinel password must be empty when auth is not configured")
+	assert.Equal(t, "", cluster, "without auth there is no password to fall back to")
 }
 
 // --- Observer Deployment Tests ---

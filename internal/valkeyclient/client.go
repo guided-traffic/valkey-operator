@@ -21,6 +21,11 @@ type Client struct {
 	timeout   time.Duration
 	tlsConfig *tls.Config
 	password  string
+
+	// sentinelAuthFallback and clusterPassword are set only by
+	// WithSentinelAuthFallback, on a connection to a Sentinel.
+	sentinelAuthFallback bool
+	clusterPassword      string
 }
 
 // ReplicationInfo holds parsed INFO replication output.
@@ -240,6 +245,30 @@ func NewTLSWithPassword(addr string, tlsConfig *tls.Config, password string) *Cl
 	}
 }
 
+// WithSentinelAuthFallback lets a connection to a Sentinel survive a switch of
+// spec.sentinel.disableAuth. The operator, the sidecar and the observer derive the
+// Sentinel credential from the spec, which switches at once, while a running
+// Sentinel keeps the requirepass it booted with until its pod is replaced -- and
+// the Sentinel roll waits for a data-tier roll that needs a working Sentinel.
+// With the fallback, a command the Sentinel refused for a credential mismatch is
+// sent once more on a fresh connection with the other credential:
+//
+//   - sent with a password, AUTH refused because the Sentinel has none configured:
+//     sent again without AUTH;
+//   - sent without a password, the command refused with NOAUTH: sent again with
+//     clusterPassword, the password a Sentinel of this cluster requires.
+//
+// The retry happens only when the Sentinel executed nothing, so it is safe for
+// SENTINEL FAILOVER. It never sends a password the cluster does not use, and never
+// to a server that did not ask for one. An empty clusterPassword (auth off) leaves
+// the NOAUTH direction off. Only exec takes the fallback; ExecMulti and ExecGet
+// are data-node paths. docs/adr/0016-authentication-and-tls-posture.md, D9.
+func (c *Client) WithSentinelAuthFallback(clusterPassword string) *Client {
+	c.sentinelAuthFallback = true
+	c.clusterPassword = clusterPassword
+	return c
+}
+
 // SetTimeout overrides the default connection/read/write timeout.
 // This is useful for blocking commands like WAIT, where the server-side
 // timeout may approach or exceed the default client timeout.
@@ -405,7 +434,7 @@ func (c *Client) ExecMulti(commands ...[]string) error {
 		return err
 	}
 
-	if err := c.authenticate(conn); err != nil {
+	if err := c.authenticate(conn, c.password); err != nil {
 		return err
 	}
 
@@ -435,7 +464,7 @@ func (c *Client) ExecGet(commands ...[]string) (string, error) {
 		return "", err
 	}
 
-	if err := c.authenticate(conn); err != nil {
+	if err := c.authenticate(conn, c.password); err != nil {
 		return "", err
 	}
 
@@ -470,12 +499,12 @@ func (c *Client) dial() (net.Conn, error) {
 	return conn, nil
 }
 
-// authenticate sends AUTH if a password is configured. Must be called after dial.
-func (c *Client) authenticate(conn net.Conn) error {
-	if c.password == "" {
+// authenticate sends AUTH if password is not empty. Must be called after dial.
+func (c *Client) authenticate(conn net.Conn, password string) error {
+	if password == "" {
 		return nil
 	}
-	authCmd := formatRESP([]string{"AUTH", c.password})
+	authCmd := formatRESP([]string{"AUTH", password})
 	if _, err := conn.Write([]byte(authCmd)); err != nil {
 		return fmt.Errorf("sending AUTH: %w", err)
 	}
@@ -489,8 +518,45 @@ func (c *Client) authenticate(conn net.Conn) error {
 	return nil
 }
 
-// exec sends a RESP command and reads the response.
+// exec sends a RESP command and reads the response, retrying once with the other
+// credential when WithSentinelAuthFallback is set and the server refused the first.
 func (c *Client) exec(args ...string) (string, error) {
+	resp, err := c.execAs(c.password, args)
+	if alternate, ok := c.alternateSentinelCredential(c.password, err); ok {
+		return c.execAs(alternate, args)
+	}
+	return resp, err
+}
+
+// alternateSentinelCredential returns the credential to retry with after err, and
+// whether a retry is due. See WithSentinelAuthFallback.
+func (c *Client) alternateSentinelCredential(used string, err error) (string, bool) {
+	if !c.sentinelAuthFallback || err == nil {
+		return "", false
+	}
+	var reply *ReplyError
+	if !errors.As(err, &reply) {
+		return "", false
+	}
+	switch {
+	case used != "" && isNoPasswordConfigured(reply):
+		return "", true
+	case used == "" && c.clusterPassword != "" && reply.Code() == "NOAUTH":
+		return c.clusterPassword, true
+	}
+	return "", false
+}
+
+// isNoPasswordConfigured reports the reply a server without requirepass gives to
+// AUTH <password>: "ERR AUTH <password> called without any password configured for
+// the default user. Are you sure your configuration is correct?" (measured on
+// valkey/valkey:9.2.0-alpine Sentinel).
+func isNoPasswordConfigured(reply *ReplyError) bool {
+	return reply.Code() == "ERR" && strings.Contains(reply.Message, "without any password configured")
+}
+
+// execAs sends one command on a fresh connection, authenticating with password.
+func (c *Client) execAs(password string, args []string) (string, error) {
 	conn, err := c.dial()
 	if err != nil {
 		return "", err
@@ -501,7 +567,7 @@ func (c *Client) exec(args ...string) (string, error) {
 		return "", err
 	}
 
-	if err := c.authenticate(conn); err != nil {
+	if err := c.authenticate(conn, password); err != nil {
 		return "", err
 	}
 

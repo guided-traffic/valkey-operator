@@ -2029,7 +2029,7 @@ func (r *ValkeyReconciler) getSentinelMasterPodName(ctx context.Context, v *vkov
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.sentinelPassword(ctx, v)
+	password, clusterPassword := r.sentinelCredentials(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -2044,7 +2044,7 @@ func (r *ValkeyReconciler) getSentinelMasterPodName(ctx context.Context, v *vkov
 		}
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, password, tlsConfig)
+		c := r.newSentinelClient(addr, password, clusterPassword, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			logger.V(1).Info("Could not query sentinel for master", "sentinel", podName, "error", err)
@@ -3836,7 +3836,7 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.sentinelPassword(ctx, v)
+	password, clusterPassword := r.sentinelCredentials(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -3851,7 +3851,7 @@ func (r *ValkeyReconciler) isSentinelAwareOfReplicas(ctx context.Context, v *vko
 		}
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, password, tlsConfig)
+		c := r.newSentinelClient(addr, password, clusterPassword, tlsConfig)
 		info, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			continue
@@ -3909,8 +3909,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	sentinelPwd := r.sentinelPassword(ctx, v)
-	valkeyPwd := r.readValkeyPassword(ctx, v)
+	sentinelPwd, valkeyPwd := r.sentinelCredentials(ctx, v)
 
 	for i := int32(0); i < sentinelReplicas; i++ {
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
@@ -3926,7 +3925,7 @@ func (r *ValkeyReconciler) resetSentinelState(ctx context.Context, v *vkov1.Valk
 		}
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, sentinelPwd, tlsConfig)
+		c := r.newSentinelClient(addr, sentinelPwd, valkeyPwd, tlsConfig)
 
 		// Remove the existing monitor (clears all slave/sentinel tracking and cooldowns).
 		if err := c.SentinelRemove(monitorName); err != nil {
@@ -4000,7 +3999,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 	if v.Spec.Sentinel != nil && v.Spec.Sentinel.Replicas > 0 {
 		sentinelReplicas = v.Spec.Sentinel.Replicas
 	}
-	password := r.sentinelPassword(ctx, v)
+	password, clusterPassword := r.sentinelCredentials(ctx, v)
 
 	mode := failoverModeForced
 	if coordinated {
@@ -4025,7 +4024,7 @@ func (r *ValkeyReconciler) triggerSentinelFailover(ctx context.Context, v *vkov1
 		}
 		addr := health.PodAddressForComponent(v, podName, common.ComponentSentinel, sentinelPort)
 
-		c := r.newValkeyClient(addr, password, tlsConfig)
+		c := r.newSentinelClient(addr, password, clusterPassword, tlsConfig)
 		err := sendSentinelFailover(c, monitorName, mode)
 		if reason := coordinatedFallbackReason(mode, err); reason != "" {
 			logger.Info("Sentinel cannot run a coordinated failover; asking it for a forced one",

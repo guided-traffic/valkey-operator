@@ -345,9 +345,12 @@ func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentine
 
 	// Read auth password for sentinel connections (Sentinel uses the same requirepass).
 	// When sentinel auth is disabled, Sentinel does not have requirepass, so no password.
-	sentinelPassword := ""
-	if !v.IsSentinelAuthDisabled() {
-		sentinelPassword = h.readAuthPassword(ctx, v)
+	// The cluster password stays at hand for a Sentinel that still runs the other
+	// setting after a switch of disableAuth (WithSentinelAuthFallback, ADR 0016 D9).
+	clusterPassword := h.readAuthPassword(ctx, v)
+	sentinelPassword := clusterPassword
+	if v.IsSentinelAuthDisabled() {
+		sentinelPassword = ""
 	}
 
 	// Build TLS config for sentinel connections (uses sentinel TLS secret).
@@ -368,7 +371,7 @@ func (h *Checker) observeSentinels(ctx context.Context, v *vkov1.Valkey) sentine
 		podName := fmt.Sprintf("%s-%d", sentinelStsName, i)
 		addr := sentinelPodAddress(v, podName)
 
-		c := h.newValkeyClient(addr, sentinelPassword, tlsConfig)
+		c := h.newValkeyClient(addr, sentinelPassword, tlsConfig).WithSentinelAuthFallback(clusterPassword)
 		masterInfo, err := c.SentinelMaster(monitorName)
 		if err != nil {
 			logger.V(1).Info("Sentinel not responding", "pod", podName, "error", err)

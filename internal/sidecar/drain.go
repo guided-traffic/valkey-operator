@@ -477,6 +477,31 @@ func (f *realValkeyClientFactory) NewClient(addr string) ValkeyCommander {
 	return newValkeyClient(addr, f.tlsSrc, f.password)
 }
 
+// realSentinelClientFactory builds clients for Sentinel connections: with the
+// password the sidecar's flags give Sentinel clients, and with the fallback to the
+// cluster password or to none, because a running Sentinel keeps the auth setting it
+// booted with until the Sentinel roll replaces it, and this pod may be the master
+// that roll waits for (docs/adr/0016-authentication-and-tls-posture.md, D9).
+type realSentinelClientFactory struct {
+	password        string
+	clusterPassword string
+	tlsSrc          *tlsmaterial.Reloader
+}
+
+// newRealSentinelClientFactory derives the Sentinel credentials from the sidecar config.
+func newRealSentinelClientFactory(cfg Config, tlsSrc *tlsmaterial.Reloader) *realSentinelClientFactory {
+	f := &realSentinelClientFactory{clusterPassword: cfg.Password, tlsSrc: tlsSrc}
+	if !cfg.SentinelDisableAuth {
+		f.password = cfg.Password
+	}
+	return f
+}
+
+// NewClient creates a client for the Sentinel at addr.
+func (f *realSentinelClientFactory) NewClient(addr string) ValkeyCommander {
+	return newValkeyClient(addr, f.tlsSrc, f.password).WithSentinelAuthFallback(f.clusterPassword)
+}
+
 // buildDrainHandler creates a DrainHandler from the sidecar Config with shared dependencies.
 func buildDrainHandler(cfg Config, detector RoleDetector, patcher PodPatcher) (*DrainHandler, error) {
 	factory, err := newRealValkeyClientFactory(cfg)
@@ -484,19 +509,11 @@ func buildDrainHandler(cfg Config, detector RoleDetector, patcher PodPatcher) (*
 		return nil, err
 	}
 
-	// When sentinel auth is disabled, create a separate factory without password
-	// for sentinel connections. Sentinel still connects to Valkey with auth-pass,
-	// but clients (including the sidecar) connect to Sentinel without AUTH.
-	sentinelFactory := ValkeyClientFactory(factory)
-	if cfg.SentinelDisableAuth {
-		sentinelCfg := cfg
-		sentinelCfg.Password = ""
-		sf, err := newRealValkeyClientFactory(sentinelCfg)
-		if err != nil {
-			return nil, err
-		}
-		sentinelFactory = sf
-	}
+	// Sentinel connections take their own factory. When sentinel auth is disabled,
+	// clients (including the sidecar) connect to Sentinel without AUTH; Sentinel still
+	// connects to Valkey with auth-pass. Either way a Sentinel that still runs the
+	// other setting after a switch of disableAuth is reached through the fallback.
+	sentinelFactory := newRealSentinelClientFactory(cfg, factory.tlsSrc)
 
 	var sentinelAddrs []string
 	if cfg.SentinelAddrs != "" {
