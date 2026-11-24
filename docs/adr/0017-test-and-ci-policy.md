@@ -24,6 +24,13 @@ its fixture rule, `TestE2E_SidecarFailoverDrainMaster`, found by the last full e
 day and fixed. Each is recorded at its decision. The same day also made D52 to D55 new and
 amended D6 and D42 (the paragraphs below).
 
+Amended 2026-11-24: **D59 is new; D31 and D43 are restated.** The Alpine variant of the
+Valkey 9 line is pinned beside the two Debian images and runs the full suite as a fourth leg,
+and `make test-image-tools` checks it like the others. Adding it to the image check found one
+GNU assumption at once, in a fixture and not in the operator: the drain hook's negative control
+expected `timeout`'s expiry code 124, and busybox returns 143. No CI run of the fourth leg is
+recorded here yet.
+
 Amended 2026-08-22: **D42 and D43 are new.** The operator runs shell inside an image it does
 not build, and nothing checked that the image still contained what the shell executes -- the
 unit tier stubs `timeout` away because macOS lacks it, and the integration tier runs no
@@ -571,12 +578,13 @@ not optional, and names what to check beyond PASS/FAIL.
 
 ### CI topology
 
-**D31 — E2E runs as a three-leg matrix with an aggregating gate job.**
+**D31 — E2E runs as a ~~three-leg~~ four-leg matrix with an aggregating gate job.**
 ~~Two legs, the full-suite one named `single-node` and the topology one `multi-node`~~
 (superseded 2026-08-22, when D43 added the third leg): `single-node-valkey9` runs the full
 suite; `multi-node-valkey9` (control-plane + **3** workers) runs
 `E2E_RUN='TestE2E_AntiAffinity|TestE2E_PodDisruptionBudget'`; `single-node-valkey8` runs the
-full suite against the other pinned line. The legs run in parallel on separate runner pods with
+full suite against the other pinned line; *(since 2026-11-24, D59)* `single-node-valkey9-alpine`
+runs the full suite against the Alpine variant of the 9 line. The legs run in parallel on separate runner pods with
 distinct cluster names. A separate `e2e-gate` job named "E2E Tests" aggregates all of them, so
 the pre-existing required status check keeps one stable name while legs are renamed or added.
 
@@ -867,6 +875,28 @@ the tests double as continuous proof that the upgrade users will actually perfor
 data. Accepted cost: a genuine cross-major replication break upstream turns these tests red
 for something that is not this operator -- information worth having before a support request
 rather than after one.
+
+**D59 — The Alpine variant of the Valkey 9 line is a third pinned image and runs the full suite
+as its own leg** *(2026-11-24)*. `testimages.Valkey9Alpine` is pinned beside the two Debian
+images under the same Renovate comment; the `allowedVersions` rule that keeps the Debian 9 pin
+below 10 matches it too, and docker versioning keeps the `-alpine` suffix. The matrix leg
+`single-node-valkey9-alpine` passes the selector `E2E_VALKEY_LINE=9-alpine`, never the image,
+for the reason D43 gives. `make test-image-tools` checks it with the other two, and
+`TestPinnedImagesAreDistinctMajors` fails if the pin loses the suffix, because a pin without it
+would be a second run of the Debian leg reported as the Alpine one.
+
+The variant earns a leg because it differs in exactly what the operator depends on inside the
+image: every generated script runs on busybox instead of dash and the GNU tools, and the image's
+`valkey` group is gid 1000 where the Debian image has 999 — the pods run as 999:999 by number
+either way (ADR 0032), so the second difference should not matter, and the leg is what says so.
+The first one mattered at once, in a fixture: busybox `timeout` exits 143 (128 + SIGTERM) on
+expiry where GNU exits 124, and the drain hook's negative control in
+`restricted_runtime_test.go` now accepts both. The generated scripts read `timeout`'s output and
+never its exit code, so the operator is unaffected.
+
+**The upgrade pair stays Debian** (D43): on this leg the rolling-update and upgrade tests still
+move from `Valkey8` to `Valkey9`, so they prove the operator on the Debian images there too.
+What the leg covers on Alpine is every test that creates its cluster with `Default()`.
 
 **D44 — A log scan ignores a retry only when the same log shows the recovery, and never a
 pattern outright.** The data StatefulSet uses `podManagementPolicy: Parallel`, so all pods
@@ -1536,10 +1566,12 @@ legacy pods exist, and a restricted namespace would simply refuse it.
   The probe (plaintext, no auth), the drain preStop hook, the pre-flight and the ownership
   repair now run inside both pinned images. The two original init container scripts, the
   auth-wrapped container command and the auth and TLS probe variants still do not.
-* **Only the two pinned images are checked (D42).** `spec.image` is a user field with no
-  operator default, so a cluster may run any image -- `valkey/valkey:9-alpine` being the
+* **Only the ~~two~~ three pinned images are checked (D42).** `spec.image` is a user field with
+  no operator default, so a cluster may run any image. ~~`valkey/valkey:9-alpine` being the
   realistic one. Measured on 2026-08-22: that variant provides every required tool. Nothing
-  keeps it that way, and nothing checks it on a schedule.
+  keeps it that way, and nothing checks it on a schedule.~~ *(Amended 2026-11-24, D59:)* the
+  realistic other one, the Alpine variant of the 9 line, is now pinned and checked on every PR.
+  Still unchecked: Alpine on the 8 line, the Debian `-trixie` tags, and any image a user builds.
 
 * **The abandon-path e2e ran only after this ADR was written.** Its load-bearing premise — a
   replica with `masterauth` set against a master with no `requirepass` must abort the handshake
@@ -1734,7 +1766,8 @@ legacy pods exist, and a restricted namespace would simply refuse it.
 * [ADR 0014](0014-rbac-lives-in-three-places.md) — the CI job that proves the generated manifests are current
 * [`internal/builder/pod_security_test.go`](../../internal/builder/pod_security_test.go) — the D52 evaluator matrix, both sides and the legacy-shape control; `TestDataWritableCheck_Executes`, the D6 root skip
 * [`internal/builder/image_requirements_test.go`](../../internal/builder/image_requirements_test.go) — `commandsUsedBy` and `valkeyImageScripts`, the D42 walker and its 2026-09-26 command positions
-* [`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go) — the D53 restricted runtime and the pre-flight → repair → pass sequence
+* [`test/imagetools/restricted_runtime_test.go`](../../test/imagetools/restricted_runtime_test.go) — the D53 restricted runtime and the pre-flight → repair → pass sequence; the drain hook's negative control accepts busybox's expiry code (D59)
+* [`test/testimages/images.go`](../../test/testimages/images.go) — the three pinned images and the `E2E_VALKEY_LINE` selector (D43, D59)
 * [`test/e2e/pod_security_test.go`](../../test/e2e/pod_security_test.go) — `TestE2E_PodSecurity_RestrictedNamespace` (D54)
 * [`test/e2e/fleet_upgrade_test.go`](../../test/e2e/fleet_upgrade_test.go) — `TestE2E_FleetUpgrade`, `requireHostPathVolume`, `shapeLegacyVolumes`, `countValkeyEventsSince` (D55; `requireRepairRan` was removed on 2026-09-26)
 * [`test/e2e/pod_availability_test.go`](../../test/e2e/pod_availability_test.go) — `pollUntil` (D25) and `TestE2E_RollingUpdate_TwoSentinelsRollSerially` (~~NOT EXECUTED, D30~~ green 2026-09-26 on both Valkey lines, locally)

@@ -71,6 +71,17 @@ jobs:
             run_filter: ""
             require_multi_node: "false"
             valkey_line: "8"
+          # Valkey 9 Alpine leg: the full suite against the Alpine variant of the 9
+          # line, the image users most often put into spec.image instead of the
+          # Debian default. Every generated script then runs on busybox, and the
+          # image's valkey group is gid 1000 rather than 999. Like the Valkey 8 leg
+          # it carries a selector; the pin lives in test/testimages/images.go.
+          - topology: single-node-valkey9-alpine
+            workers: 0
+            cluster: valkey-operator-test-valkey9-alpine
+            run_filter: ""
+            require_multi_node: "false"
+            valkey_line: "9-alpine"
     env:
       KIND_CLUSTER: ${{ matrix.cluster }}
       KIND_WORKERS: ${{ matrix.workers }}
@@ -426,7 +437,8 @@ jobs:
           E2E_RUN: ${{ matrix.run_filter }}
           # Turns "not enough nodes" from a skip into a failure on the multi-node leg.
           E2E_REQUIRE_MULTI_NODE: ${{ matrix.require_multi_node }}
-          # Empty means the pinned Valkey 9 release; the Valkey 8 leg sets "8".
+          # Empty means the pinned Valkey 9 release; the Valkey 8 leg sets "8",
+          # the Alpine leg "9-alpine".
           # An unrecognised value panics rather than falling back, so a typo here
           # cannot turn this leg into a second Valkey 9 run reported as a pass.
           E2E_VALKEY_LINE: ${{ matrix.valkey_line }}

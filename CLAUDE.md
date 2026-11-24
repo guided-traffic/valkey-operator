@@ -365,9 +365,11 @@ the config-writer scripts are not run there.
 generated scripts and fails otherwise, and the converse test fails on a declared tool nothing
 uses any more.
 
-Both images live in [`test/testimages`](test/testimages/images.go): the current Valkey 9
+All three images live in [`test/testimages`](test/testimages/images.go): the current Valkey 9
 release is the default for every suite, the current Valkey 8 release is the second e2e leg and
-the start of every upgrade the suite performs. Renovate maintains both and is capped per major,
+the start of every upgrade the suite performs, the Alpine variant of the current Valkey 9
+release (`Valkey9Alpine`, selector `9-alpine`) is the third full-suite leg — busybox instead of
+GNU tools, so `timeout` reports an expiry as 143, not 124. Renovate maintains all three and is capped per major,
 so crossing to a future major is a decision, not an arriving PR. **Do not copy a pin anywhere
 else** — CI passes `E2E_VALKEY_LINE=8`, a selector, and an unrecognised value panics rather than
 falling back. Only e2e is pinned; unit and integration never pull an image, so their image
@@ -434,13 +436,14 @@ export data); the regex accepts it and Renovate replaces it with the next releas
 
 ### E2E cluster topology
 
-CI runs the E2E job three times, as a matrix in `.github/workflows/release.yml`:
+CI runs the E2E job four times, as a matrix in `.github/workflows/release.yml`:
 
 | Leg                   | Cluster                    | Valkey line              | Scope                                             |
 |-----------------------|----------------------------|--------------------------|---------------------------------------------------|
 | `single-node-valkey9` | control-plane only         | `E2E_VALKEY_LINE=9`      | full suite (`make test-e2e`)                      |
 | `multi-node-valkey9`  | control-plane + 3 workers  | `E2E_VALKEY_LINE=9`      | `make test-e2e E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'` |
 | `single-node-valkey8` | control-plane only         | `E2E_VALKEY_LINE=8`      | full suite                                        |
+| `single-node-valkey9-alpine` | control-plane only  | `E2E_VALKEY_LINE=9-alpine` | full suite                                      |
 
 Every leg names the line it runs and passes it explicitly. An empty selector
 resolves to whatever the default is, so a leg carrying one would keep its name

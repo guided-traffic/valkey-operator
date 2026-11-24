@@ -106,7 +106,7 @@ by hand.
 | Variable | Read by | Effect |
 |---|---|---|
 | `E2E_RUN` | the Makefile's `test-e2e` | Passed as `-run`; empty runs everything |
-| `E2E_VALKEY_LINE` | `testimages.Default()` | `""` or `9` runs Valkey 9, `8` runs Valkey 8; any other value panics rather than falling back |
+| `E2E_VALKEY_LINE` | `testimages.Default()` | `""` or `9` runs Valkey 9, `8` runs Valkey 8, `9-alpine` the Alpine variant of Valkey 9; any other value panics rather than falling back |
 | `E2E_VALKEY_IMAGE` | `testimages.Default()` | Names an image directly and wins over the line. The upgrade pair does not follow it |
 | `E2E_REQUIRE_MULTI_NODE` | `requireThreeSchedulableNodes` ([`affinity_test.go`](../../test/e2e/affinity_test.go)) | `true` turns the "fewer than 3 schedulable nodes" skip into a failure |
 | `E2E_REQUIRE_USER_NAMESPACES` | `TestE2E_PodHardening_UserNamespacesLocalhostSeccompAndDigest` ([`pod_hardening_test.go`](../../test/e2e/pod_hardening_test.go)) | `true` fails the test when a probe pod with `hostUsers: false` cannot start; otherwise the test runs without the user namespace and skips only those assertions |
@@ -185,7 +185,7 @@ D42, D53).
 
 ## What CI runs
 
-The `E2E Tests` matrix in `.github/workflows/release.yml` runs three legs in parallel, each on
+The `E2E Tests` matrix in `.github/workflows/release.yml` runs four legs in parallel, each on
 its own Kind cluster (Kubernetes 1.33.4, containerd's default overlayfs snapshotter — the
 `native` one copied every container's image file system and outgrew the runner's storage,
 [ADR 0017](../adr/0017-test-and-ci-policy.md) D31):
@@ -195,12 +195,13 @@ its own Kind cluster (Kubernetes 1.33.4, containerd's default overlayfs snapshot
 | `single-node-valkey9` | 0 | 9 | the full suite |
 | `multi-node-valkey9` | 3 | 9 | `E2E_RUN='TestE2E_AntiAffinity\|TestE2E_PodDisruptionBudget'`, with `E2E_REQUIRE_MULTI_NODE=true`, and a grep that `TestE2E_AntiAffinity_HardSpreadsAcrossNodes` and `TestE2E_PodDisruptionBudget_SerializesEvictions` passed |
 | `single-node-valkey8` | 0 | 8 | the full suite |
+| `single-node-valkey9-alpine` | 0 | 9, Alpine variant | the full suite |
 
 Every leg runs `make test-e2e`, which runs at most eight tests at once (`-parallel=8`, the same
 locally): with more, the single Kind node reaches its kubelet's 110-pod limit and pods are refused
 or preempted (D31).
 
-Why these three, and why three workers, is [ADR 0017](../adr/0017-test-and-ci-policy.md) D31,
+Why these four, and why three workers, is [ADR 0017](../adr/0017-test-and-ci-policy.md) D31,
 D32. No leg sets `E2E_REQUIRE_USER_NAMESPACES` — a Kind node inside Docker-in-Docker cannot
 start a pod with `hostUsers: false` (ADR 0017 D5) — and no workflow runs the fleet-upgrade or the
 Helm-migration target. A failing leg collects the operator log, events and the pod logs of

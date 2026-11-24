@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	// EnvValkeyLine selects which pinned line the suite runs against: "8" or "9".
+	// EnvValkeyLine selects which pinned image the suite runs against: "8", "9" or
+	// "9-alpine".
 	//
 	// The CI matrix carries a selector rather than an image so the pins never leave
 	// this file. A copy in the workflow would be a second thing Renovate has to move
@@ -43,6 +44,18 @@ const (
 	// the suite against, and the starting point of every upgrade the suite performs.
 	// renovate: datasource=docker depName=valkey/valkey
 	Valkey8 = "valkey/valkey:8.1.9"
+
+	// Valkey9Alpine is the current Valkey 9 release on Alpine, the variant a user is
+	// most likely to put into spec.image instead of the Debian default. It is what
+	// the third full-suite e2e leg runs. The variant differs in exactly what the
+	// operator depends on inside the image: every generated script runs on busybox
+	// rather than dash, coreutils and findutils, and the image's valkey group is
+	// gid 1000 where the Debian image has 999 -- the pods run as 999:999 by number
+	// either way. Renovate keeps the -alpine suffix (docker versioning treats it as
+	// the compatibility part of the tag) and the same allowedVersions rule as the
+	// Debian pin keeps it on the 9 line.
+	// renovate: datasource=docker depName=valkey/valkey
+	Valkey9Alpine = "valkey/valkey:9.2.0-alpine"
 )
 
 // Default is the image a test creates its cluster with unless it has a reason to
@@ -62,8 +75,10 @@ func Default() string {
 		return Valkey9
 	case "8":
 		return Valkey8
+	case "9-alpine":
+		return Valkey9Alpine
 	default:
-		panic(fmt.Sprintf("%s=%q names no pinned Valkey line; use \"8\", \"9\", or set %s to a full image",
+		panic(fmt.Sprintf("%s=%q names no pinned Valkey line; use \"8\", \"9\", \"9-alpine\", or set %s to a full image",
 			EnvValkeyLine, line, EnvValkeyImage))
 	}
 }
@@ -84,8 +99,9 @@ func Default() string {
 // is not this operator, which is information worth having early rather than after
 // a support request.
 //
-// The pair does not follow EnvValkeyImage. The Valkey 8 leg runs the same upgrade
-// as the Valkey 9 leg, because what is under test is the operator, not the leg.
+// The pair does not follow EnvValkeyImage or EnvValkeyLine. The Valkey 8 and the
+// Alpine leg run the same upgrade as the Valkey 9 leg, because what is under test
+// is the operator, not the leg.
 const (
 	UpgradeFrom = Valkey8
 	UpgradeTo   = Valkey9
