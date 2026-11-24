@@ -28,13 +28,16 @@ Everything else is a pass asking for its own successor:
 - **A `RequeueAfter`** from a rolling-update wait, the nudge, an unhealthy phase or a recheck —
   the ladder is under [The workload pass](#the-workload-pass).
 - **A recheck the pass asked for without failing** (`requestRecheck`; the shortest request
-  wins). There are three sources: a refusal that did not fail its step
+  wins). There are four sources: a refusal that did not fail its step
   (`foreignObjectRecheckInterval`, 30 s: a foreign object,
   [ADR 0020](../adr/0020-write-only-what-the-operator-owns.md) D6, or a TLS pod template without
   a material record,
   [ADR 0030](../adr/0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md)
   D12); Sentinel peer-table drift (`sentinelPeerDriftRecheckInterval`, 5 min, only while drift
-  is reported, [ADR 0022](../adr/0022-sentinel-identity-is-pinned-to-the-pod.md) D7); and the
+  is reported, [ADR 0022](../adr/0022-sentinel-identity-is-pinned-to-the-pod.md) D7); every
+  Sentinel pass that reaches `CheckCluster` (`sentinelStateRecheckInterval`, 5 min, and
+  `sentinelMasterDivergenceRecheckInterval`, 30 s, while a Sentinel names another master,
+  [ADR 0040](../adr/0040-a-sentinel-that-names-another-master-is-replaced.md) D2, D3); and the
   pass after a completed data roll whose persisted template still carries the ownership repair
   (`rollingUpdateRequeueDelay`, 10 s, from `finishDataRoll`,
   [ADR 0032](../adr/0032-generated-pods-run-rootless.md) D4). The request is carried on a
@@ -194,6 +197,15 @@ eviction, a restart or a Sentinel reconfiguration too. The master's `connected_s
 asked, because it counts a replica from its sync request on
 ([ADR 0037](../adr/0037-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md)
 D2). A cluster without Sentinel never reads `Syncing`.
+
+On a Sentinel cluster `CheckCluster` also asks every Sentinel `SENTINEL MASTER` once, and the
+same reply feeds two evaluators beside each other in `updateHAStatus`: `recordSentinelPeerDrift`
+(the peer count, [ADR 0022](../adr/0022-sentinel-identity-is-pinned-to-the-pod.md)) and
+`handleSentinelMasterDivergence` (the master address,
+[sentinel_master_divergence.go](../../internal/controller/sentinel_master_divergence.go)). The
+second is the one status step that can delete a pod: a Sentinel that kept naming another master
+than the data tier's for `sentinelMasterDivergenceBound` is replaced under the Sentinel delete
+gates ([ADR 0040](../adr/0040-a-sentinel-that-names-another-master-is-replaced.md) D4, D5).
 
 Conditions reach the CR in two ways:
 
