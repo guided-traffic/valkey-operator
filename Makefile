@@ -141,7 +141,8 @@ test-integration-coverage: envtest ## Run integration tests with coverage.
 E2E_RUN ?=
 
 # E2E_VALKEY_LINE picks the pinned Valkey line the E2E suite runs against: empty
-# or 9 for the current Valkey 9 release, 8 for the current Valkey 8 one.
+# or 9 for the current Valkey 9 release, 8 for the current Valkey 8 one, 9-alpine for
+# the Alpine variant of the current Valkey 9 release.
 # E2E_VALKEY_IMAGE names an image directly and wins over the line.
 #
 # Both pins live in test/testimages/images.go and are kept current by Renovate.

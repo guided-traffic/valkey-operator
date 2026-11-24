@@ -16,7 +16,9 @@ func TestDefault_UsesValkey9WhenNothingIsSelected(t *testing.T) {
 }
 
 func TestDefault_SelectsThePinnedLine(t *testing.T) {
-	for line, want := range map[string]string{"": Valkey9, "9": Valkey9, "8": Valkey8} {
+	for line, want := range map[string]string{
+		"": Valkey9, "9": Valkey9, "8": Valkey8, "9-alpine": Valkey9Alpine,
+	} {
 		t.Setenv(EnvValkeyLine, line)
 		assert.Equal(t, want, Default(), "line %q", line)
 	}
@@ -40,7 +42,7 @@ func TestDefault_UnknownLineIsLoud(t *testing.T) {
 	t.Setenv(EnvValkeyLine, "8.1")
 
 	assert.PanicsWithValue(t,
-		`E2E_VALKEY_LINE="8.1" names no pinned Valkey line; use "8", "9", or set E2E_VALKEY_IMAGE to a full image`,
+		`E2E_VALKEY_LINE="8.1" names no pinned Valkey line; use "8", "9", "9-alpine", or set E2E_VALKEY_IMAGE to a full image`,
 		func() { _ = Default() })
 }
 

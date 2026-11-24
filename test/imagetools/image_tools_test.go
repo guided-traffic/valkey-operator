@@ -70,13 +70,14 @@ func runInImage(t *testing.T, image, script string) string {
 	return strings.TrimSpace(stdout.String())
 }
 
-// pinnedImages are the images the suites create clusters with. Both are checked,
-// not just the default one: the Valkey 8 leg has to be able to rely on the same
-// contract, and a leg that is skipped must not take the check with it.
+// pinnedImages are the images the suites create clusters with. All are checked,
+// not just the default one: the Valkey 8 and the Alpine leg have to be able to rely
+// on the same contract, and a leg that is skipped must not take the check with it.
 func pinnedImages() map[string]string {
 	return map[string]string{
 		"valkey 9 (default for every suite)": testimages.Valkey9,
 		"valkey 8 (second e2e leg)":          testimages.Valkey8,
+		"valkey 9 alpine (third e2e leg)":    testimages.Valkey9Alpine,
 	}
 }
 
@@ -147,4 +148,11 @@ func TestPinnedImagesAreDistinctMajors(t *testing.T) {
 		"the default image must stay on the Valkey 9 line")
 	assert.Contains(t, testimages.Valkey8, ":8.",
 		"the second leg must stay on the Valkey 8 line; check the Renovate allowedVersions rule")
+	// The Alpine leg is worth running only while it runs a different variant: a pin
+	// that lost its suffix would be a second run of the Debian leg reported as the
+	// Alpine one.
+	assert.Contains(t, testimages.Valkey9Alpine, ":9.",
+		"the Alpine leg must stay on the Valkey 9 line; check the Renovate allowedVersions rule")
+	assert.True(t, strings.HasSuffix(testimages.Valkey9Alpine, "-alpine"),
+		"the Alpine leg must run the Alpine variant, got %s", testimages.Valkey9Alpine)
 }

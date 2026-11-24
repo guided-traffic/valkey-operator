@@ -194,7 +194,11 @@ func TestRestrictedRuntime_DrainPreStopReleases(t *testing.T) {
 					"rm %[1]s; timeout 3 sh -c '%[2]s'; echo \"without-marker:$?\"", marker, hook[2])
 			out := restricted(t, image, []string{common.DrainSignalMountPath}, script)
 			assert.Contains(t, out, "RELEASED")
-			assert.Contains(t, out, "without-marker:124", "without the marker the hook must still be waiting")
+			// A timeout that fired is 124 from GNU coreutils (Debian) and 143, 128 +
+			// SIGTERM, from busybox (Alpine). The generated scripts never read the exit
+			// code of timeout, only its output, so either spelling is the same verdict.
+			assert.Regexp(t, `without-marker:(124|143)\b`, out,
+				"without the marker the hook must still be waiting")
 		})
 	}
 }
