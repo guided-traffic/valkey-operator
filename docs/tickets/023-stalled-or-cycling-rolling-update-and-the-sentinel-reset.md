@@ -202,6 +202,14 @@ measured). No pod template changes.
   and `:3308` resets the tier toward it, which is measured scenario A and sustains the cycle until
   the node returns; also a current master that is not `available()`, or replicas that cannot
   connect (loop B). ADR 0025 D9 records ten triggers in 9.5 min on a driver since removed.
+- Driver: every Sentinel refuses the operator's credential. A switched
+  `spec.sentinel.disableAuth` drove loop A on a live cluster (operator 1.15.1, 2026-11-24). Every
+  trigger, reset and retrigger failed on `AUTH` until one Sentinel pod was deleted by hand.
+  [ADR 0016](../adr/0016-authentication-and-tls-posture.md) D14 bridges that switch with a
+  one-time retry on the other credential. A refusal it does not bridge still drives the cycle and
+  is logged at debug level only (`Sentinel failover attempt failed`, `Could not query sentinel
+  for master`): a `WRONGPASS` (a Secret changed while the Sentinels kept the old password, T50),
+  or an auth error on every Sentinel.
 
 Impact: medium. The roll never completes and never says so; loop A resets the tier toward an
 unverified address about once a minute with an ungated failover (the route to an empty
@@ -332,6 +340,12 @@ Depending on the answers:
   checked before `:3159` and `:3161`, no clear at `:3170`. Resume procedure in
   `docs/operations/rolling-updates.md` (`SENTINEL FAILOVER` to one Sentinel, or remove state and
   counter); `:90-94`, `:1369-1373`, `:2721-2725` describe the capped cycle.
+- **(any option)** A trigger, reset or retrigger that every Sentinel refused with an auth error
+  (`WRONGPASS`, `NOAUTH`, or the no-password `ERR`, after the ADR 0016 D14 retry) is reported
+  with its own reason (example `SentinelAuthRefused`) on the cycle's condition, or as
+  `ReconcileBlocked` through the one evaluator
+  ([ADR 0002](../adr/0002-surface-a-blocked-reconcile-on-the-cr.md)). Test: every Sentinel
+  answers `WRONGPASS`, and the reason appears. It must fail with the classification removed.
 - Tests: N + 1 cycles with every Sentinel answering `NOGOODSLAVE` assert count and condition, fail
   with the counter write removed; a failing CR update shows counter and state are one write. Under
   B: past the cap no `FAILOVER`, `REMOVE` or `MONITOR`; at loop B's cap no `REPLICAOF`; a master
@@ -510,5 +524,6 @@ A: the states worth reporting last until someone acts, so one bound late loses n
 - T35: no dataset-aware no-master recovery; a tier that cannot fail over is a route into it.
 - T40: rewrites the T23 citations outside `docs/tickets/` at this ticket's close.
 - T50: a changed auth Secret pauses the roll; under Q3 = B a master on the old password fails the gate.
+- [T84](archive/084-switching-sentinel-client-auth-deadlocks-the-roll.md) (done): the Sentinel credential fallback for a switched `disableAuth`; its unreported refusal is this ticket's.
 - T43: no CI gate renders the chart (Q2, Q7).
 - [T12](archive/012-the-master-handover-loses-no-acknowledged-write-and-no-dataset.md) (done): closed the Sentinel slow-sync gap of the pause and vetoed `forceReplicaConnections` on the dataset; the retrigger it left ungated, and its repair routes through, is this ticket's.

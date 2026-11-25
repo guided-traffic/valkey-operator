@@ -19,8 +19,9 @@ Amended 2026-09-27: document references follow the documentation layout of ADR 0
 
 Amended 2026-11-24: **D14 added** — a Sentinel client falls back to the other credential when a
 Sentinel refuses its own for a switched `spec.sentinel.disableAuth`, so the switch D9 asks for
-completes. Implemented and unit-tested; the e2e in both directions is written and has not run
-yet, and the report of a refusal that the fallback cannot bridge is open (Residual risks).
+completes. Implemented. The unit tier pins it, and the e2e runs it in both directions, green on
+Valkey 9 and Valkey 8 in CI. A refusal the fallback cannot bridge is still not reported
+(Residual risks).
 
 ## Context
 
@@ -332,10 +333,11 @@ Rejected. `disableAuth` exists for clients that cannot authenticate to Sentinel 
   verified** — ADR 0030 D6 treats it as pinning precisely so that nobody has to find out.
 * `protected-mode no` is rendered unconditionally, so Valkey's own last-resort refusal to serve
   unauthenticated external clients is removed even on clusters with auth off.
-* **D14 is not yet verified end to end (open).** `TestE2E_SentinelDisableAuthSwitchRollsBothTiers`
-  switches the flag both ways on a running cluster and has not run. The unit tier pins the
-  fallback per reply and at the operator's failover trigger, with a mutation check: both trigger
-  tests fail without the fallback.
+* **D14 has no e2e mutation check.** `TestE2E_SentinelDisableAuthSwitchRollsBothTiers` switches
+  the flag both ways on a running cluster. It was green in CI on Valkey 9 and Valkey 8
+  (2026-11-24: on Valkey 9 the switch on took 125 s, the switch off 223 s). It has not been run
+  with the fallback reverted. The unit tier has the mutation check: both failover-trigger tests
+  fail without the fallback.
 * **A Sentinel refusal the fallback cannot bridge is not reported (open).** A `WRONGPASS` or an
   auth error on every Sentinel still shows only at debug level, while the roll cycles before the
   master and the phase reads `Rolling Update i/n`.

@@ -99,7 +99,7 @@ them. The record's own `Status` section is the authority; this column is a readi
 | [0013](0013-operator-is-cluster-wide-privileged.md) | The operator is a cluster-wide privileged component | Implemented; D9 superseded by ADR 0032, D12, D13 and the first half of D14 by ADR 0036; D7 re-decided by ADR 0039 |
 | [0014](0014-rbac-lives-in-three-places.md) | RBAC lives in three places, and drift is guarded by a test and a CI job | Implemented |
 | [0015](0015-one-crd-validated-by-schema-only.md) | One CRD, validated by schema only — no admission webhook | Implemented |
-| [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture | Implemented; D14 (Sentinel credential fallback) implemented, its e2e not yet run |
+| [0016](0016-authentication-and-tls-posture.md) | Authentication and TLS posture | Implemented |
 | [0020](0020-write-only-what-the-operator-owns.md) | Write only what the operator can prove it owns, and grant only to a subject it owns | Implemented; D7 superseded by the record's own amendment of 2026-08-22 |
 | [0030](0030-rotating-certificates-rotate-the-instances-that-cannot-reload-them.md) | Rotating certificates rotate the instances that cannot reload them — ours re-read their material, everything else rides a roll | Implemented |
 | [0031](0031-a-record-the-operator-trusts-lives-in-pod-spec.md) | A per-pod record the operator trusts lives in pod spec, not pod metadata — a pod can patch its own metadata | Implemented, except `config-hash` and `pod-spec-hash`, which D6 leaves in pod metadata as a follow-up, not a non-goal |
