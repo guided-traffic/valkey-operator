@@ -168,7 +168,11 @@ outgoing master's delete.
 
 ## Image tools
 
-[`test/imagetools/`](../../test/imagetools/) runs both pinned images with docker:
+[`test/imagetools/`](../../test/imagetools/) runs the three pinned images with docker.
+Before any check, `TestMain` ([`main_test.go`](../../test/imagetools/main_test.go)) pulls
+every image the checks run, retrying a failed pull up to five times. Every check then runs on
+a local image, so a registry hiccup cannot fail a single check
+([ADR 0017](../adr/0017-test-and-ci-policy.md) D61). The checks:
 `TestImageProvidesEveryRequiredTool` asks each image for every tool in `RequiredImageTools`,
 `TestImageShellSupportsTheConstructsTheScriptsUse` checks the shell, and the
 `TestRestrictedRuntime_*` tests run `valkey-server`, `valkey-sentinel` (on a hand-written

@@ -24,6 +24,15 @@ its fixture rule, `TestE2E_SidecarFailoverDrainMaster`, found by the last full e
 day and fixed. Each is recorded at its decision. The same day also made D52 to D55 new and
 amended D6 and D42 (the paragraphs below).
 
+Amended 2026-11-25: **D61 is new.** `make test-image-tools` pulls every image it checks before
+the first check, with retries. On 2026-11-24 one TLS handshake timeout at `auth.docker.io` turned
+the job red on `main` and skipped the release. Verified locally, green; the retry path itself
+has not run.
+
+Amended 2026-11-25: **D60 is new.** The Kind nodes of the e2e legs pull with the Docker Hub
+credentials of `DOCKERHUB_PAT`. The runner's own `docker login` never reached them, so every
+image a test pod ran was pulled anonymously. Not yet verified: no CI run has carried the step.
+
 Amended 2026-11-24: **D59 is new; D31 and D43 are restated.** The Alpine variant of the
 Valkey 9 line is pinned beside the two Debian images and runs the full suite as a fourth leg,
 and `make test-image-tools` checks it like the others. Adding it to the image check found one
@@ -1306,6 +1315,36 @@ moves to; it is never a way to take unreleased rules early. The comment above th
 names the reason, and the regex has to see the `# renovate:` line directly above the variable,
 so the comment goes above that line.
 
+**D60 — The Kind nodes of the e2e legs pull from Docker Hub with credentials.** `Login to Docker
+Hub` authenticates the runner's Docker daemon, which builds the operator image. Every image a
+test pod runs, though, is pulled by the containerd inside a Kind node: the Valkey images of
+`test/testimages`, the exporter and the fixtures' writer images. That containerd had no
+credentials, so it pulled anonymously, counted against the rate limit of the one address the
+self-hosted runners share. Four legs pull at once. The step `Give the Kind nodes the Docker Hub
+credentials` writes a Docker `config.json` for the `guidedtraffic` account with
+`DOCKERHUB_PAT` to `/var/lib/kubelet/config.json` on every node and restarts kubelet before
+any workload starts. kubelet reads that file and hands the credential to the CRI with each pull,
+which is the mechanism Kind documents for private registries.
+- The file is written owner-only and removed from the runner even when a copy fails.
+- On a node it is mode 600, inside a cluster the leg deletes.
+- No test pod mounts the node's file system.
+- A run without the secret (a pull request from a fork) skips the step and pulls anonymously,
+  as before.
+
+**D61 — The image check pulls its images up front, with retries, and the checks run on local
+images.** The check runs each image with `docker run`, which pulls on first use. A Docker Hub
+pull starts with a token request to `auth.docker.io`, and a transient error there failed a whole
+check. On 2026-11-24 that was a TLS handshake timeout on a logged-in runner (run 45427536346); it
+turned `Valkey Image Tools` red on `main` and `Semantic Release` was skipped. `TestMain` in
+[`test/imagetools/main_test.go`](../../test/imagetools/main_test.go) pulls every image the
+checks run before any check starts: the `test/testimages` pins through `pinnedImages()` and
+`DefaultMetricsExporterImage`, read where they are pinned, never copied (D43).
+- Each pull gets five attempts, with 5, 10, 20 and 40 s between them.
+- A reference the registry does not know (`manifest unknown`, `not found`) fails at once.
+- `docker run` then finds every image locally (pull policy `missing`) and does not contact the
+  registry again.
+- A failed pull ends the run before any check, naming the image and the last error.
+
 ## Consequences
 
 * Every fix costs an extra build-and-run cycle for the mutation check, and the result is
@@ -1549,6 +1588,19 @@ and it stays silent when the profile gains a check. Field assertions are kept fo
 profile does not require (the read-only root filesystem, and an empty `capabilities.add` where
 Pod Security would allow `NET_BIND_SERVICE`; `drop: [ALL]` itself it does require).
 
+### Docker Hub credentials through a containerd registry patch (D60)
+
+Not taken. `containerdConfigPatches` with `registry.configs."registry-1.docker.io".auth`
+depends on the containerd config version of the node image. containerd 2 deprecates that
+section in favour of `hosts.toml`, which carries no credentials. The kubelet file does not
+depend on the containerd version.
+
+### Mount the credentials with Kind's `extraMounts` (D60)
+
+Not taken. The runners use Docker-in-Docker, so an `extraMounts` host path is resolved on the
+DinD daemon's file system, not on the runner's. `docker cp` goes through the API and works on
+either.
+
 ### Let the restricted-namespace e2e carry the Pod Security question alone
 
 Rejected: it covers four cluster shapes, not the 72-row matrix, and it cannot express the
@@ -1556,6 +1608,18 @@ repair template's "baseline, but not restricted" at all. The repair is inserted 
 legacy pods exist, and a restricted namespace would simply refuse it.
 
 ## Residual risks
+
+* **D61's retry has not run.** Locally the pre-pull succeeded at the first attempt, and the
+  check was green. The marker for a missing reference was read off a real `docker pull` of a
+  tag that does not exist (`manifest unknown`). A registry failure that outlasts about 75 s
+  still fails the job. The e2e legs pull inside the Kind nodes and get no retry from D61;
+  kubelet retries a failed pull itself, with back-off.
+* **D60 is not verified by a run (open).** The step is checked by `actionlint` only. A CI run has
+  to show it applying on every node of every leg, and the pulls staying green. That kubelet
+  reads `/var/lib/kubelet/config.json` is Kind's and Kubernetes' documented behaviour; whether
+  the pulls were ever actually refused for the rate limit is not established. The `Valkey Image
+  Tools` failure of 2026-11-24 (run 45427536346) was a TLS handshake timeout at
+  `auth.docker.io` on a daemon that was already logged in. D60 does not cover it; D61 does.
 
 * **D56 to D58 rest on Renovate's documented behaviour and an offline check, not on a run of
   this repository's Renovate** (recorded 2026-10-11). Verified: `renovate.json` passes

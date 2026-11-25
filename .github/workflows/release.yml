@@ -197,6 +197,37 @@ jobs:
             docker exec "$node" sysctl -w fs.inotify.max_user_instances=8192
           done
 
+      - name: Give the Kind nodes the Docker Hub credentials
+        env:
+          DOCKERHUB_USER: guidedtraffic
+          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}
+        run: |
+          set -euo pipefail
+          # "Login to Docker Hub" authenticates the runner's Docker daemon only. Every
+          # Valkey, exporter and writer image a test pod runs is pulled by the containerd
+          # of a Kind node, which had no credentials: anonymous pulls, counted against
+          # the rate limit of the runners' shared address. kubelet reads
+          # /var/lib/kubelet/config.json and hands the matching credential to the CRI
+          # with every pull (docs/adr/0017-test-and-ci-policy.md, D60).
+          if [ -z "${DOCKERHUB_PAT}" ]; then
+            echo "No DOCKERHUB_PAT in this run (fork PR); the Kind nodes pull anonymously"
+            exit 0
+          fi
+          mkdir -p tmp
+          config="tmp/kubelet-dockerhub-config.json"
+          # The file holds the token: owner-only, and removed even when a copy fails.
+          trap 'rm -f "${config}"' EXIT
+          ( umask 077
+            auth=$(printf '%s:%s' "${DOCKERHUB_USER}" "${DOCKERHUB_PAT}" | base64 -w0)
+            printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}\n' "${auth}" > "${config}" )
+          for node in $(kind get nodes --name "${KIND_CLUSTER}"); do
+            docker cp "${config}" "${node}:/var/lib/kubelet/config.json"
+            docker exec "${node}" chmod 600 /var/lib/kubelet/config.json
+            # Restarted so the file is read regardless of how kubelet caches its keyring.
+            docker exec "${node}" systemctl restart kubelet
+          done
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
       - name: Wait for kube-system pods
         run: |
           set -euo pipefail
